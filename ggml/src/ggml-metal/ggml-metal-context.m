@@ -133,7 +133,11 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
-    res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
+    // Continuum default: keep the Metal backend GPU-resident but avoid
+    // optimistic graph rewrites that throw Objective-C exceptions across the
+    // Rust FFI boundary on qwen3.5/Gated-Delta-Net models. Operators can opt
+    // back in explicitly when validating a newer Metal/llama.cpp stack.
+    res->use_fusion      = getenv("GGML_METAL_FUSION_ENABLE") != nil && getenv("GGML_METAL_FUSION_DISABLE") == nil;
     res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
 
     {
@@ -146,11 +150,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->debug_fusion = val ? atoi(val) : 0;
     }
 
-    res->use_graph_optimize = true;
-
-    if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
-        res->use_graph_optimize = false;
-    }
+    res->use_graph_optimize = getenv("GGML_METAL_GRAPH_OPTIMIZE_ENABLE") != NULL && getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") == NULL;
 
     memset(res->fuse_cnt, 0, sizeof(res->fuse_cnt));
 
