@@ -394,6 +394,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool fused_gdn_ar; // use fused Gated Delta Net autoregressive graph when supported
+        bool fused_gdn_ch; // use fused Gated Delta Net chunked graph when supported
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

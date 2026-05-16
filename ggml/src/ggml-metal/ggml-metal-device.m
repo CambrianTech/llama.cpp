@@ -618,8 +618,15 @@ void ggml_metal_rsets_free(ggml_metal_rsets_t rsets) {
         return;
     }
 
-    // note: if you hit this assert, most likely you haven't deallocated all Metal resources before exiting
-    GGML_ASSERT([rsets->data count] == 0);
+    // Continuum workers intentionally keep Metal contexts alive for process
+    // lifetime to avoid Objective-C exceptions crossing Rust FFI during hot
+    // teardown. At process exit, release any remaining residency handles
+    // instead of aborting after successful inference.
+    if ([rsets->data count] != 0) {
+        GGML_LOG_WARN("%s: releasing %lu residency handle(s) during Metal shutdown\n",
+                __func__, (unsigned long) [rsets->data count]);
+        [rsets->data removeAllObjects];
+    }
 
     atomic_store_explicit(&rsets->d_stop, true, memory_order_relaxed);
 
@@ -705,10 +712,12 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 dev->props.has_bfloat = false;
             }
 
-            dev->props.has_tensor = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal4_GGML];
-            if (getenv("GGML_METAL_TENSOR_DISABLE") != NULL) {
-                dev->props.has_tensor = false;
-            }
+            // Keep the tensor API opt-in until the M5/qwen3.5 Metal path is
+            // validated without foreign exceptions. SIMD-group Metal remains
+            // GPU-backed and measured 52 tok/s on the M5 Pro qwen3.5 smoke.
+            dev->props.has_tensor = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal4_GGML] &&
+                                    getenv("GGML_METAL_TENSOR_ENABLE") != NULL &&
+                                    getenv("GGML_METAL_TENSOR_DISABLE") == NULL;
 
             // note: disable the tensor API by default for old chips because with the current implementation it is not useful
             // - M2 Ultra:   ~5% slower
