@@ -635,7 +635,90 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
     assert(dev != NULL);
 
     if (dev->mtl_device == nil) {
-        dev->mtl_device = MTLCreateSystemDefaultDevice();
+        // Card 346b356f: don't blindly use MTLCreateSystemDefaultDevice().
+        // On Intel Macs the system default is often the discrete GPU
+        // (e.g. Radeon Pro 560X / Vega 16/20), and on certain hardware
+        // (Polaris-class AMD on macOS 15.x) `newCommandQueue` enters
+        // amdMtlBronzeLazyInit → IOAccelResourceCreate → mach_msg2_trap
+        // and never returns — the ggml_metal_device_init hang task #131
+        // captured on MacBookPro15,1 / Radeon Pro 560X / macOS 15.7.7.
+        //
+        // Strategy: enumerate via MTLCopyAllDevices() and prefer in order:
+        //   1. Apple Silicon (best perf; always works)
+        //   2. Integrated low-power GPU (Intel UHD/Iris on Intel Mac) —
+        //      hundreds of millions of Intel Macs ship with one; LCD floor
+        //   3. External / eGPU (rare but valid)
+        //   4. Discrete (last; known to hang on some Polaris-era AMD)
+        // Env var GGML_METAL_DEVICE_NAME=<substring> overrides for ops who
+        // want to force a specific device by name match.
+        const char * device_name_hint = getenv("GGML_METAL_DEVICE_NAME");
+#if TARGET_OS_OSX
+        NSArray<id<MTLDevice>> * all_devices = MTLCopyAllDevices();
+#else
+        NSArray<id<MTLDevice>> * all_devices = @[ MTLCreateSystemDefaultDevice() ];
+#endif
+        if ([all_devices count] == 0) {
+            GGML_LOG_ERROR("%s: error: no Metal devices available\n", __func__);
+        } else {
+            GGML_LOG_INFO("%s: enumerated %lu Metal device(s)\n", __func__, (unsigned long) [all_devices count]);
+            for (id<MTLDevice> d in all_devices) {
+                GGML_LOG_INFO("%s:   - %s (lowPower=%d, removable=%d, location=%ld)\n",
+                    __func__, [[d name] UTF8String],
+                    (int) d.lowPower, (int) d.removable, (long) d.location);
+            }
+            // 0) Operator override
+            if (device_name_hint && device_name_hint[0] != '\0') {
+                NSString * hint = [NSString stringWithUTF8String:device_name_hint];
+                for (id<MTLDevice> d in all_devices) {
+                    if ([[d name] containsString:hint]) {
+                        dev->mtl_device = [d retain];
+                        GGML_LOG_INFO("%s: selected via GGML_METAL_DEVICE_NAME hint: %s\n",
+                            __func__, [[d name] UTF8String]);
+                        break;
+                    }
+                }
+            }
+            // 1) Apple Silicon
+            if (dev->mtl_device == nil) {
+                for (id<MTLDevice> d in all_devices) {
+                    if ([d supportsFamily:MTLGPUFamilyApple1]) {
+                        dev->mtl_device = [d retain];
+                        GGML_LOG_INFO("%s: selected Apple Silicon device: %s\n",
+                            __func__, [[d name] UTF8String]);
+                        break;
+                    }
+                }
+            }
+            // 2) Integrated low-power (Intel UHD/Iris on Intel Mac — substrate LCD floor)
+            if (dev->mtl_device == nil) {
+                for (id<MTLDevice> d in all_devices) {
+                    if (d.lowPower) {
+                        dev->mtl_device = [d retain];
+                        GGML_LOG_INFO("%s: selected integrated low-power device: %s\n",
+                            __func__, [[d name] UTF8String]);
+                        break;
+                    }
+                }
+            }
+            // 3) External / eGPU
+            if (dev->mtl_device == nil) {
+                for (id<MTLDevice> d in all_devices) {
+                    if (d.location == MTLDeviceLocationExternal) {
+                        dev->mtl_device = [d retain];
+                        GGML_LOG_INFO("%s: selected external device: %s\n",
+                            __func__, [[d name] UTF8String]);
+                        break;
+                    }
+                }
+            }
+            // 4) Discrete (last resort — may hang on Polaris-era AMD, see card 346b356f)
+            if (dev->mtl_device == nil) {
+                dev->mtl_device = [[all_devices objectAtIndex:0] retain];
+                GGML_LOG_WARN("%s: falling back to first available device (may be discrete AMD): %s\n",
+                    __func__, [[dev->mtl_device name] UTF8String]);
+            }
+        }
+        [all_devices release];
 
         if (dev->mtl_device) {
             dev->mtl_queue = [dev->mtl_device newCommandQueue];
