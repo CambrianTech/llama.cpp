@@ -3103,6 +3103,20 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
     return model->tensors_by_name;
 }
 
+// continuum (private fork; K3 slice-2 per-expert paging): public accessor for a named
+// weight tensor, returning the MUTABLE ggml_tensor* so callers can ggml_backend_tensor_set
+// a fresh expert's bytes into a sub-range of its buffer at runtime (no model reload).
+// Same lookup as llama_model::get_tensor, but the vector holds non-const ggml_tensor*
+// (like llama_internal_get_tensor_map), so the pointee stays writable even off a const model.
+struct ggml_tensor * llama_model_get_tensor(const llama_model * model, const char * name) {
+    for (const auto & it : model->tensors_by_name) {
+        if (it.first == name) {
+            return it.second;
+        }
+    }
+    return nullptr;
+}
+
 int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
