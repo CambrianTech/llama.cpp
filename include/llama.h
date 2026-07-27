@@ -577,6 +577,13 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
 
+    // continuum (private fork; K3 slice-2 per-expert paging): fetch a named model weight
+    // tensor for RUNTIME modification. Returns a MUTABLE ggml_tensor* so a caller can
+    // ggml_backend_tensor_set a fresh expert's bytes into a sub-range of its buffer WITHOUT
+    // reloading the model; NULL if no tensor has that name. Reuses tensors_by_name (the same
+    // map llama_internal_get_tensor_map exposes). AI-assisted edit, human-designed.
+    LLAMA_API struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
