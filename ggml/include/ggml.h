@@ -627,6 +627,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SITU,        // Kimi K3: beta*tanh(g/beta)*sigmoid(g) * (linear_beta*tanh(u/linear_beta))
 
         GGML_GLU_OP_COUNT,
     };
@@ -1366,6 +1367,17 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 alpha,
             float                 limit);
+
+    // Kimi K3 SiTU (Sigmoid-Tanh Unit) gated activation:
+    //   out = (beta*tanh(gate/beta)*sigmoid(gate)) * (linear_beta*tanh(up/linear_beta))
+    // `linear_beta <= 0` skips the up-transform (up passes through). `a`=gate, `b`=up;
+    // when `b`==NULL, `a` is split in half (gate|up) like the other GLU ops.
+    GGML_API struct ggml_tensor * ggml_situ(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 beta,
+            float                 linear_beta);
 
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
