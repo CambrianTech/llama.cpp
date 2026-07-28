@@ -305,6 +305,7 @@ enum llm_kv {
     LLM_KV_SSM_DT_B_C_RMS,
 
     LLM_KV_KDA_HEAD_DIM,
+    LLM_KV_ATTN_RES_BLOCK_SIZE,     // kimi k3: cross-block residual attention period
 
     LLM_KV_WKV_HEAD_SIZE,
 
@@ -478,6 +479,10 @@ enum llm_tensor {
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
+    LLM_TENSOR_ATTN_RES_NORM,       // kimi k3: attn-side block-residual score norm
+    LLM_TENSOR_ATTN_RES_PROJ,       // kimi k3: attn-side block-residual score proj
+    LLM_TENSOR_FFN_RES_NORM,        // kimi k3: mlp-side block-residual score norm
+    LLM_TENSOR_FFN_RES_PROJ,        // kimi k3: mlp-side block-residual score proj
     LLM_TENSOR_TIME_MIX_W0,
     LLM_TENSOR_TIME_MIX_W1,
     LLM_TENSOR_TIME_MIX_W2,

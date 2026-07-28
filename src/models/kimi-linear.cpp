@@ -8,6 +8,8 @@ void llama_model_kimi_linear::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
     ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.n_embd_head_kda);
+    // K3 only — absent on Kimi-Linear-48B, leaving AttnRes disabled (0).
+    ml.get_key(LLM_KV_ATTN_RES_BLOCK_SIZE,         hparams.attn_res_block_size, false);
 
     // MLA qk_rope_head_dim (for reference)
     // qk_rope_head_dim = 64, qk_nope_head_dim = 128, qk_head_dim = 192
@@ -44,6 +46,16 @@ void llama_model_kimi_linear::load_arch_tensors(llama_model_loader &) {
         auto & layer = layers[i];
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+        // K3 AttnRes score tensors — optional; absent on Kimi-Linear-48B.
+        // HF: self_attention_res_proj / mlp_res_proj are Linear(hidden, 1, bias=False)
+        // → converter writes their weight as a {n_embd} vector; norms are RMS weights.
+        if (hparams.attn_res_block_size > 0) {
+            layer.attn_res_norm = create_tensor(tn(LLM_TENSOR_ATTN_RES_NORM, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+            layer.attn_res_proj = create_tensor(tn(LLM_TENSOR_ATTN_RES_PROJ, "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+            layer.ffn_res_norm  = create_tensor(tn(LLM_TENSOR_FFN_RES_NORM,  "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+            layer.ffn_res_proj  = create_tensor(tn(LLM_TENSOR_FFN_RES_PROJ,  "weight", i), {n_embd}, TENSOR_NOT_REQUIRED);
+        }
 
         // Check for KDA specific tensors to determine layer type or if it's a mixed model
         // Assuming KDA layer if KDA tensors are present
@@ -275,8 +287,76 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
     // Attention scale for MLA
     const float kq_scale_mla = 1.0f / sqrtf((float)n_embd_head_k_mla);
 
+    // ── K3 AttnRes: learned attention over cross-block residual checkpoints ──
+    // HF reference: KimiDecoderLayer._forward_attn_residual / _apply_attn_res.
+    // Every attn_res_block_size layers the PRE-norm residual stream is
+    // checkpointed; each later layer blends its stream with those checkpoints
+    // via a softmax over per-(token,block) scores:
+    //   v      = [checkpoints..., current]                    (blocks axis)
+    //   score  = Σ_h rms_norm(v) ⊙ (norm_w ⊙ proj_w)          (per token, block)
+    //   out    = Σ_b softmax_b(score) · v_b
+    // Pure composition of existing ggml ops — attn + mlp sides keep SEPARATE
+    // checkpoint lists, mirroring the reference. Disabled (empty lists, null
+    // tensors) on Kimi-Linear-48B: byte-identical behavior.
+    std::vector<ggml_tensor *> attn_res_cps;
+    std::vector<ggml_tensor *> ffn_res_cps;
+    const uint32_t attn_res_blk = hparams.attn_res_block_size;
+    const float    attn_res_eps = hparams.f_norm_rms_eps;
+
+    auto build_attn_res_blend = [&](ggml_tensor * prefix_sum,
+                                    const std::vector<ggml_tensor *> & cps,
+                                    ggml_tensor * res_norm,
+                                    ggml_tensor * res_proj,
+                                    ggml_tensor * out_ids) -> ggml_tensor * {
+        // v: [n_embd, n_tok, n_blk] — checkpoints (row-selected if the stream
+        // was, i.e. the final layer's output-token selection) then current.
+        ggml_tensor * v = nullptr;
+        for (ggml_tensor * cp : cps) {
+            ggml_tensor * cpu = cp;
+            if (cpu->ne[1] != prefix_sum->ne[1] && out_ids != nullptr) {
+                cpu = ggml_get_rows(ctx0, cpu, out_ids);
+            }
+            ggml_tensor * c3 = ggml_reshape_3d(ctx0, cpu, cpu->ne[0], cpu->ne[1], 1);
+            v = v ? ggml_concat(ctx0, v, c3, 2) : c3;
+        }
+        ggml_tensor * p3 = ggml_reshape_3d(ctx0, prefix_sum, prefix_sum->ne[0], prefix_sum->ne[1], 1);
+        v = v ? ggml_concat(ctx0, v, p3, 2) : p3;
+        const int64_t n_blk = v->ne[2];
+        // scores over the hidden dim with the combined norm⊙proj weight
+        ggml_tensor * w   = ggml_mul(ctx0, res_norm, res_proj);      // [n_embd]
+        ggml_tensor * v_n = ggml_rms_norm(ctx0, v, attn_res_eps);    // per (tok, blk)
+        ggml_tensor * s   = ggml_sum_rows(ctx0, ggml_mul(ctx0, v_n, w)); // [1, n_tok, n_blk]
+        s = ggml_cont(ctx0, ggml_permute(ctx0, s, 2, 1, 0, 3));      // [n_blk, n_tok]
+        ggml_tensor * p = ggml_soft_max(ctx0, s);                    // softmax over blocks
+        // weighted sum over blocks (n_blk ≤ n_layer/block_size + 1 — tiny loop)
+        ggml_tensor * out = nullptr;
+        for (int64_t b = 0; b < n_blk; ++b) {
+            ggml_tensor * vb = ggml_view_2d(ctx0, v, v->ne[0], v->ne[1], v->nb[1], b * v->nb[2]);
+            ggml_tensor * pb = ggml_view_2d(ctx0, p, 1, p->ne[1], p->nb[1], b * p->nb[0]);
+            ggml_tensor * term = ggml_mul(ctx0, ggml_cont(ctx0, vb), ggml_cont(ctx0, pb));
+            out = out ? ggml_add(ctx0, out, term) : term;
+        }
+        return out;
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
+
+        // K3 AttnRes (attn side): blend BEFORE the norm, checkpoint the
+        // ORIGINAL stream at block boundaries; the blended stream becomes the
+        // residual base (inpSA) — pre-norm semantics per the reference.
+        if (attn_res_blk > 0 && layer.attn_res_norm && layer.attn_res_proj) {
+            ggml_tensor * prefix_sum = inpL;
+            if (!attn_res_cps.empty()) {
+                inpL = build_attn_res_blend(prefix_sum, attn_res_cps,
+                                            layer.attn_res_norm, layer.attn_res_proj, nullptr);
+                cb(inpL, "attn_res_blend", il);
+            }
+            if (il % (int) attn_res_blk == 0) {
+                attn_res_cps.push_back(prefix_sum);
+            }
+        }
+
         ggml_tensor * inpSA = inpL;
 
         // Attention Norm
@@ -481,6 +561,23 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
         // Residual
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
         cb(ffn_inp, "ffn_inp", il);
+
+        // K3 AttnRes (mlp side): same blend/checkpoint dance on the post-attn
+        // stream, with the MLP-side score tensors + its OWN checkpoint list.
+        // Final layer note: the stream was row-selected above (inp_out_ids),
+        // so blend row-selects earlier full-width checkpoints to match.
+        if (attn_res_blk > 0 && layer.ffn_res_norm && layer.ffn_res_proj) {
+            ggml_tensor * prefix_sum = ffn_inp;
+            if (!ffn_res_cps.empty()) {
+                ffn_inp = build_attn_res_blend(prefix_sum, ffn_res_cps,
+                                               layer.ffn_res_norm, layer.ffn_res_proj,
+                                               (il == n_layer - 1) ? inp_out_ids : nullptr);
+                cb(ffn_inp, "ffn_res_blend", il);
+            }
+            if (il % (int) attn_res_blk == 0) {
+                ffn_res_cps.push_back(prefix_sum);
+            }
+        }
 
         // FFN Norm
         cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);

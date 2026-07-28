@@ -509,6 +509,13 @@ struct llama_layer {
     struct ggml_tensor * ssm_g_b    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
 
+    // Kimi K3 AttnRes — learned attention over cross-block residual
+    // checkpoints (attn + mlp sides). Absent (nullptr) on Kimi-Linear-48B.
+    struct ggml_tensor * attn_res_norm = nullptr;
+    struct ggml_tensor * attn_res_proj = nullptr;
+    struct ggml_tensor * ffn_res_norm  = nullptr;
+    struct ggml_tensor * ffn_res_proj  = nullptr;
+
     // DSA (deepseek sparse attention)
     struct ggml_tensor * indexer_k_norm   = nullptr;
     struct ggml_tensor * indexer_k_norm_b = nullptr;

@@ -162,6 +162,10 @@ struct llama_hparams {
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
 
+    // Kimi K3 cross-block residual attention (AttnRes): checkpoint the
+    // residual stream every N layers; 0 = disabled (Kimi-Linear-48B).
+    uint32_t attn_res_block_size = 0;
+
     bool ssm_dt_b_c_rms = false;
 
     float f_clamp_kqv      = 0.0f;
