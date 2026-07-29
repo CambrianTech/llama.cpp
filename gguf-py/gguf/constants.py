@@ -658,6 +658,10 @@ class MODEL_TENSOR(IntEnum):
     SSM_BETA             = auto() # Kimi Linear qwen3.5
     SSM_G_A              = auto() # Kimi Linear
     SSM_G_B              = auto() # Kimi Linear
+    ATTN_RES_NORM        = auto() # Kimi K3 (cross-block residual attention)
+    ATTN_RES_PROJ        = auto() # Kimi K3
+    FFN_RES_NORM         = auto() # Kimi K3
+    FFN_RES_PROJ         = auto() # Kimi K3
     TIME_MIX_W0          = auto()
     TIME_MIX_W1          = auto()
     TIME_MIX_W2          = auto()
@@ -1245,6 +1249,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_BETA:                  "blk.{bid}.ssm_beta",             # Kimi Linear qwen3.5
     MODEL_TENSOR.SSM_G_A:                   "blk.{bid}.ssm_g_a",              # Kimi Linear
     MODEL_TENSOR.SSM_G_B:                   "blk.{bid}.ssm_g_b",              # Kimi Linear
+    MODEL_TENSOR.ATTN_RES_NORM:             "blk.{bid}.attn_res_norm",        # Kimi K3
+    MODEL_TENSOR.ATTN_RES_PROJ:             "blk.{bid}.attn_res_proj",        # Kimi K3
+    MODEL_TENSOR.FFN_RES_NORM:              "blk.{bid}.ffn_res_norm",         # Kimi K3
+    MODEL_TENSOR.FFN_RES_PROJ:              "blk.{bid}.ffn_res_proj",         # Kimi K3
     MODEL_TENSOR.TIME_MIX_W0:               "blk.{bid}.time_mix_w0",
     MODEL_TENSOR.TIME_MIX_W1:               "blk.{bid}.time_mix_w1",
     MODEL_TENSOR.TIME_MIX_W2:               "blk.{bid}.time_mix_w2",
@@ -4468,6 +4476,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_A,
         MODEL_TENSOR.SSM_G_A,
         MODEL_TENSOR.SSM_G_B,
+        MODEL_TENSOR.ATTN_RES_NORM,
+        MODEL_TENSOR.ATTN_RES_PROJ,
+        MODEL_TENSOR.FFN_RES_NORM,
+        MODEL_TENSOR.FFN_RES_PROJ,
         MODEL_TENSOR.SSM_DT,
         MODEL_TENSOR.SSM_NORM,
         MODEL_TENSOR.FFN_EXP_PROBS_B,

@@ -420,6 +420,34 @@ class ModelBase:
 
                 return (unpacked * scale.unsqueeze(-1).float()).reshape(shape)
 
+            def dequant_mxfp4(packed: Tensor, scale: Tensor, group_size: int) -> Tensor:
+                # compressed-tensors "mxfp4-pack-quantized" (Kimi K3 routed experts).
+                # `packed`: uint8, TWO E2M1 (fp4) values per byte along the last dim
+                #   (low nibble = even element, high nibble = odd element).
+                # `scale`:  uint8 E8M0 shared exponent, ONE per `group_size` (=32)
+                #   elements along the last dim; real multiplier = 2^(scale - 127).
+                # OCP MXFP4 E2M1 magnitudes for codes 0..7 are [0,.5,1,1.5,2,3,4,6];
+                # bit 3 is the sign. VALIDATION GATE: bit-exactness vs the HF/
+                # llm-compressor unpack is only PROVEN when K3 generates coherent
+                # text — a wrong nibble order still "converts" but yields garbage.
+                e2m1 = torch.tensor(
+                    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                    dtype=torch.float32,
+                )
+                if self.lazy:
+                    e2m1 = LazyTorchTensor.from_eager(e2m1)
+                pk = packed.to(torch.int64)
+                low = pk & 0xF
+                high = (pk >> 4) & 0xF
+                # interleave low/high back to the original element order along dim -1
+                vals = torch.stack((e2m1[low], e2m1[high]), dim=-1).reshape(*packed.shape[:-1], -1)
+                # E8M0 -> 2^(e-127); one scale per group_size elements along the last dim
+                mult = torch.exp2(scale.to(torch.float32) - 127.0)
+                n = vals.shape[-1]
+                grouped = vals.reshape(*vals.shape[:-1], n // group_size, group_size)
+                return (grouped * mult.unsqueeze(-1)).reshape(*vals.shape[:-1], n)
+
             if quant_method == "bitnet":
                 for name in self.model_tensors.keys():
                     if name.endswith(".weight_scale"):
@@ -531,6 +559,24 @@ class ModelBase:
                             tensors_to_remove += [base_name + n for n in ("_packed", "_shape", "_scale")]
                             if (base_name + "_zero_point") in self.model_tensors:
                                 tensors_to_remove.append(base_name + "_zero_point")
+                elif quant_format == "mxfp4-pack-quantized":
+                    # Kimi K3: only the routed experts are MXFP4 (E2M1, group 32,
+                    # E8M0 scale); attn/shared-experts/gates/lm_head stay full-precision
+                    # (the config `ignore` list). Dequant each .weight_packed via its
+                    # sibling .weight_scale. llama.cpp requantizes to the target outtype
+                    # afterward (or keep bf16 -> llama-quantize to MXFP4/Q4 for serving).
+                    assert weight_config.get("strategy") == "group"
+                    group_size = weight_config.get("group_size", 32)
+                    assert isinstance(group_size, int)
+                    for name in list(self.model_tensors.keys()):
+                        if name.endswith(".weight_packed"):
+                            base_name = name.removesuffix("_packed")
+                            w = self.model_tensors[name]
+                            scale = self.model_tensors[base_name + "_scale"]
+                            new_tensors[base_name] = (
+                                lambda w=w, scale=scale: dequant_mxfp4(w(), scale(), group_size)
+                            )
+                            tensors_to_remove += [base_name + n for n in ("_packed", "_scale")]
                 elif nvfp4_compressed_tensors:
                     # Don't error from compressed-tensors, we'll handle them in _generate_nvfp4_tensors
                     pass

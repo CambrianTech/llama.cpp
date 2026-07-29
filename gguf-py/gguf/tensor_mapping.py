@@ -916,6 +916,18 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_G_B: (
             "model.layers.{bid}.self_attn.g_b_proj",
         ),
+        MODEL_TENSOR.ATTN_RES_NORM: (
+            "model.layers.{bid}.self_attention_res_norm",   # kimi k3
+        ),
+        MODEL_TENSOR.ATTN_RES_PROJ: (
+            "model.layers.{bid}.self_attention_res_proj",   # kimi k3
+        ),
+        MODEL_TENSOR.FFN_RES_NORM: (
+            "model.layers.{bid}.mlp_res_norm",              # kimi k3
+        ),
+        MODEL_TENSOR.FFN_RES_PROJ: (
+            "model.layers.{bid}.mlp_res_proj",              # kimi k3
+        ),
         MODEL_TENSOR.TIME_MIX_W0: (
             "model.layers.{bid}.attention.w0",            # rwkv7
         ),
