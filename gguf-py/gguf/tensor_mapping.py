@@ -928,6 +928,9 @@ class TensorNameMap:
         MODEL_TENSOR.FFN_RES_PROJ: (
             "model.layers.{bid}.mlp_res_proj",              # kimi k3
         ),
+        MODEL_TENSOR.ATTN_OUT_GATE: (
+            "model.layers.{bid}.self_attn.g_proj",          # kimi k3 (MLA output gate)
+        ),
         MODEL_TENSOR.TIME_MIX_W0: (
             "model.layers.{bid}.attention.w0",            # rwkv7
         ),

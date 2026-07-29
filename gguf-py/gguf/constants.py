@@ -662,6 +662,7 @@ class MODEL_TENSOR(IntEnum):
     ATTN_RES_PROJ        = auto() # Kimi K3
     FFN_RES_NORM         = auto() # Kimi K3
     FFN_RES_PROJ         = auto() # Kimi K3
+    ATTN_OUT_GATE        = auto() # Kimi K3 (MLA output gate, mla_use_output_gate)
     TIME_MIX_W0          = auto()
     TIME_MIX_W1          = auto()
     TIME_MIX_W2          = auto()
@@ -1253,6 +1254,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_RES_PROJ:             "blk.{bid}.attn_res_proj",        # Kimi K3
     MODEL_TENSOR.FFN_RES_NORM:              "blk.{bid}.ffn_res_norm",         # Kimi K3
     MODEL_TENSOR.FFN_RES_PROJ:              "blk.{bid}.ffn_res_proj",         # Kimi K3
+    MODEL_TENSOR.ATTN_OUT_GATE:             "blk.{bid}.attn_gate",            # Kimi K3
     MODEL_TENSOR.TIME_MIX_W0:               "blk.{bid}.time_mix_w0",
     MODEL_TENSOR.TIME_MIX_W1:               "blk.{bid}.time_mix_w1",
     MODEL_TENSOR.TIME_MIX_W2:               "blk.{bid}.time_mix_w2",
@@ -4480,6 +4482,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_RES_PROJ,
         MODEL_TENSOR.FFN_RES_NORM,
         MODEL_TENSOR.FFN_RES_PROJ,
+        MODEL_TENSOR.ATTN_OUT_GATE,
         MODEL_TENSOR.SSM_DT,
         MODEL_TENSOR.SSM_NORM,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
