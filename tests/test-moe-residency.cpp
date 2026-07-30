@@ -50,6 +50,7 @@ extern "C" {
 #include <list>
 #include <fstream>
 #include <sstream>
+#include <filesystem>
 
 // ------------------------------------------------------------------------------------------------
 // tiny test harness
@@ -378,6 +379,52 @@ static void test_wexp_source_packs_valid_records() {
     CHECK(ok, "each packed record is a valid WEXP header for its (layer,expert) — reader-ready");
 }
 
+// what this catches: the DIRECTORY emitter (M5's reader format) — manifest.json v1 with the exact
+// fields, per-layer experts-L{n}.bin banks whose size == record_bytes*experts_per_layer, and records
+// laid out so offset = expert_id*record_bytes (one pread). This is the envelope her Rust reader opens;
+// a geometry drift (wrong bank size, unsorted records, bad offset) is what her open()/fetch rejects.
+static void test_pack_dir_matches_reader_geometry() {
+    const uint64_t record_bytes = 4096;                        // must be a 4KiB multiple
+    const uint32_t layers = 3, experts = 5, activated = 16;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "moec_pack_test";
+    fs::remove_all(dir); fs::create_directories(dir);
+
+    WexpSource src((uint32_t) (record_bytes / 4096));
+    const bool ok = ggml_moe::moec_pack_dir(dir.string().c_str(), "kimi-k3", ggml_moe::WEXP_VQ3R,
+                                            layers, experts, record_bytes, activated, src);
+    CHECK(ok, "moec_pack_dir writes the directory");
+    CHECK(fs::exists(dir / "manifest.json"), "manifest.json exists");
+
+    // manifest carries the pinned v1 fields
+    { std::ifstream m(dir / "manifest.json"); std::stringstream ss; ss << m.rdbuf(); const std::string j = ss.str();
+      CHECK(j.find("\"version\": 1") != std::string::npos,          "manifest version 1");
+      CHECK(j.find("\"model\": \"kimi-k3\"") != std::string::npos,  "manifest model");
+      CHECK(j.find("\"fmt\": 4") != std::string::npos,              "manifest fmt = VQ3R(4)");
+      CHECK(j.find("\"record_bytes\": 4096") != std::string::npos,  "manifest record_bytes");
+      CHECK(j.find("\"n_layers\": 3") != std::string::npos,         "manifest n_layers");
+      CHECK(j.find("\"experts_per_layer\": 5") != std::string::npos,"manifest experts_per_layer");
+      CHECK(j.find("\"activated_per_token\": 16") != std::string::npos, "manifest activated_per_token (cliff feed)");
+    }
+    // each bank: exact size, and offset = expert_id*record_bytes reads the right WEXP record
+    bool geom_ok = true, offset_ok = true;
+    for (uint32_t L = 0; L < layers; L++) {
+        const fs::path bank = dir / ("experts-L" + std::to_string(L) + ".bin");
+        if (!fs::exists(bank) || fs::file_size(bank) != record_bytes * experts) geom_ok = false;
+        std::ifstream in(bank, std::ios::binary);
+        std::vector<uint8_t> buf((size_t) record_bytes);
+        for (uint32_t E = 0; E < experts; E++) {
+            in.seekg((std::streamoff) (E * record_bytes));     // her offset math: expert_id * record_bytes
+            in.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) record_bytes);
+            ggml_moe::WexpRecord r;
+            if (!ggml_moe::wexp_read_header(buf.data(), r) || r.layer != L || r.expert_id != E) offset_ok = false;
+        }
+    }
+    fs::remove_all(dir);
+    CHECK(geom_ok, "each bank file size == record_bytes*experts_per_layer (no truncated tail)");
+    CHECK(offset_ok, "offset=expert_id*record_bytes reads the correct WEXP record in every bank");
+}
+
 // ================================================================================================
 // VDD — reference LFRU cache + replay of a captured expert-selection trace
 // ================================================================================================
@@ -526,6 +573,7 @@ int main(int argc, char ** argv) {
     test_packer_fetcher_end_to_end();
     test_wexp_header_byte_exact();
     test_wexp_source_packs_valid_records();
+    test_pack_dir_matches_reader_geometry();
     test_refcache_reuse_with_locality();
     test_refcache_lfru_retains_hot_above_cliff();
     test_reuse_cliff_around_one_token_working_set();

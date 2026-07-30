@@ -14,6 +14,7 @@
 #include "ggml-moe-container.h"
 #include <cstdio>
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <algorithm>
 
@@ -68,6 +69,53 @@ static inline bool moec_pack(const char * path, uint32_t layers, uint32_t expert
     }
     std::fclose(f);
     return ok;
+}
+
+// Emit M5's Rust-reader format: a DIRECTORY of manifest.json + per-layer experts-L{n}.bin banks.
+// (capacity/expert_container.rs opens banks lazily so a node holding 2/60 shards never stats the rest
+// — the grid shard unit.) Contract, pinned on #k3-serving: record_bytes is a 4KiB multiple (her open()
+// refuses otherwise); within a bank, records are sorted by expert_id so offset = expert_id*record_bytes
+// (one pread); bank file size == record_bytes*experts_per_layer (she refuses a truncated tail). `dir`
+// must already exist. This is the ENVELOPE that replaces the single-file container; the WEXP record and
+// budget governor are unchanged — activated_per_token is exactly the field the cliff policy consumes.
+static inline bool moec_pack_dir(const char * dir, const char * model, uint32_t fmt,
+                                 uint32_t layers, uint32_t experts, uint64_t record_bytes,
+                                 uint32_t activated_per_token, ExpertSource & src) {
+    if (record_bytes == 0 || record_bytes % 4096 != 0) { return false; }   // her open() refuses otherwise
+
+    {   // manifest.json (v1) — her reader gates on version; fields exactly as pinned.
+        const std::string mp = std::string(dir) + "/manifest.json";
+        FILE * f = std::fopen(mp.c_str(), "wb");
+        if (!f) { return false; }
+        std::fprintf(f,
+            "{\n"
+            "  \"version\": 1,\n"
+            "  \"model\": \"%s\",\n"
+            "  \"fmt\": %u,\n"
+            "  \"record_bytes\": %llu,\n"
+            "  \"n_layers\": %u,\n"
+            "  \"experts_per_layer\": %u,\n"
+            "  \"activated_per_token\": %u\n"
+            "}\n",
+            model, fmt, (unsigned long long) record_bytes, layers, experts, activated_per_token);
+        std::fclose(f);
+    }
+
+    std::vector<char> rec((size_t) record_bytes);
+    for (uint32_t L = 0; L < layers; L++) {                    // one bank per layer
+        const std::string bp = std::string(dir) + "/experts-L" + std::to_string(L) + ".bin";
+        FILE * f = std::fopen(bp.c_str(), "wb");
+        if (!f) { return false; }
+        bool ok = true;
+        for (uint32_t E = 0; E < experts && ok; E++) {         // sorted by expert_id => offset = E*record_bytes
+            std::fill(rec.begin(), rec.end(), 0);
+            if (!src.write_record(L, E, rec.data(), (size_t) record_bytes)) { ok = false; break; }
+            if (std::fwrite(rec.data(), 1, (size_t) record_bytes, f) != (size_t) record_bytes) { ok = false; break; }
+        }
+        std::fclose(f);
+        if (!ok) { return false; }                             // bank size == record_bytes*experts by construction
+    }
+    return true;
 }
 
 } // namespace ggml_moe
