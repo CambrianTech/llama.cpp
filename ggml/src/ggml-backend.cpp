@@ -1546,6 +1546,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // [K3-EXPERT-PAGING] measure the host->VRAM MoE expert stream per graph-compute (per decode token).
+    // Values feed the design's residency negotiation: working_set_size (distinct experts streamed) and
+    // bytes streamed (basis for pcie_h2d_bps). Zero-cost by default: accumulation is a couple of int
+    // adds; the summary log is emitted only when GGML_MOE_OFFLOAD_STATS is set.
+    static const bool k3_moe_stats = getenv("GGML_MOE_OFFLOAD_STATS") != nullptr;
+    size_t  k3_moe_bytes_streamed  = 0;
+    int64_t k3_moe_experts_streamed = 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1626,6 +1634,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+
+                        k3_moe_experts_streamed += (last_id - first_id + 1);
+                        k3_moe_bytes_streamed   += expert_size_copy + padding_end;
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
@@ -1719,6 +1730,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+    }
+
+    // [K3-EXPERT-PAGING] per-compute MoE-stream summary (opt-in). On a decode step (batch=1) this is the
+    // per-token host->VRAM expert working set: the number the persistent VRAM slot cache must shrink.
+    if (k3_moe_stats && k3_moe_experts_streamed > 0) {
+        // stderr (not GGML_LOG_INFO) so it survives the server's log-level filtering.
+        fprintf(stderr, "[K3PAGER] moe_stream: experts=%lld bytes=%.1f MiB\n",
+            (long long) k3_moe_experts_streamed, (double) k3_moe_bytes_streamed / (1024.0 * 1024.0));
     }
 
     return GGML_STATUS_SUCCESS;
