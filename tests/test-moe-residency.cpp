@@ -39,6 +39,7 @@ extern "C" {
 #include "ggml-moe-container.h"
 #include "ggml-moe-container-fetcher.h"
 #include "ggml-moe-packer.h"
+#include "ggml-moe-wexp.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -296,6 +297,87 @@ static void test_packer_fetcher_end_to_end() {
     CHECK(ok, "packer output and fetcher offsets agree byte-for-byte, every expert");
 }
 
+// what this catches: the WEXP record header must be BYTE-EXACT — it's a wire format shared with M5's
+// Rust reader, so every field must land at its exact offset, little-endian, and the fmt trap must be
+// 4/5 not 0/1. Assert the raw bytes at fixed positions, not just a round-trip (a symmetric writer+reader
+// bug would pass a round-trip but still mismatch the Rust reader). This is the confirmed-contract pin.
+static void test_wexp_header_byte_exact() {
+    // the fmt trap, pinned as a constant so a regression to 0/1 fails to compile-intent here.
+    CHECK(ggml_moe::WEXP_VQ3R == 4 && ggml_moe::WEXP_VQ2R == 5, "fmt is VQ3R=4 / VQ2R=5, never 0/1");
+
+    ggml_moe::WexpRecord r;
+    r.layer = 0x1234; r.expert_id = 0x5678; r.fmt = ggml_moe::WEXP_VQ2R; r.codebook_id = 0x9ABC;
+    r.gate_off = 32; r.up_off = 0x00010000; r.down_off = 0x00020000; r.correction_off = 0x00030000;
+    r.record_4k_blocks = 7;
+    uint8_t b[ggml_moe::WEXP_HEADER_BYTES] = {0};
+    ggml_moe::wexp_write_header(b, r);
+
+    CHECK(std::memcmp(b, "WEXP", 4) == 0, "bytes 0..4 are ASCII 'WEXP'");
+    CHECK(b[4] == 0x34 && b[5] == 0x12, "layer is little-endian u16 at offset 4");
+    CHECK(b[6] == 0x78 && b[7] == 0x56, "expert_id is little-endian u16 at offset 6");
+    CHECK(b[8] == 5, "fmt (VQ2R) is the raw byte 5 at offset 8");
+    CHECK(b[9] == 0, "flags byte at offset 9 is 0");
+    CHECK(b[10] == 0xBC && b[11] == 0x9A, "codebook_id LE u16 at offset 10");
+    CHECK(ggml_moe::wexp_get_u32(b + 12) == 32u,          "gate_off u32 at offset 12");
+    CHECK(ggml_moe::wexp_get_u32(b + 16) == 0x00010000u,  "up_off u32 at offset 16");
+    CHECK(ggml_moe::wexp_get_u32(b + 20) == 0x00020000u,  "down_off u32 at offset 20");
+    CHECK(ggml_moe::wexp_get_u32(b + 24) == 0x00030000u,  "correction_off u32 at offset 24");
+    CHECK(ggml_moe::wexp_get_u32(b + 28) == 7u,           "record_4k_blocks u32 at offset 28");
+    CHECK(ggml_moe::wexp_record_bytes(r) == 7ull * 4096,  "record bytes = record_4k_blocks * 4096");
+
+    ggml_moe::WexpRecord back;
+    CHECK(ggml_moe::wexp_read_header(b, back), "header parses (magic ok)");
+    CHECK(back.layer == r.layer && back.expert_id == r.expert_id && back.fmt == r.fmt &&
+          back.codebook_id == r.codebook_id && back.gate_off == r.gate_off && back.up_off == r.up_off &&
+          back.down_off == r.down_off && back.correction_off == r.correction_off &&
+          back.record_4k_blocks == r.record_4k_blocks, "all fields round-trip");
+    uint8_t bad[ggml_moe::WEXP_HEADER_BYTES] = {0};
+    ggml_moe::WexpRecord tmp;
+    CHECK(!ggml_moe::wexp_read_header(bad, tmp), "bad magic must be rejected (read-side validation)");
+}
+
+// what this catches: a WEXP ExpertSource packs a real container whose records M5's reader accepts.
+// The source writes a proper WEXP header + payload into each record; we pack, then read each record
+// back and confirm the header is byte-exact for its (layer,expert). This is the GgufRvqSource shape
+// minus the RVQ encoding — the record framing is proven; only the codebook bytes remain.
+struct WexpSource : ggml_moe::ExpertSource {
+    uint32_t blocks;
+    explicit WexpSource(uint32_t b) : blocks(b) {}
+    bool write_record(uint32_t L, uint32_t E, void * dst, size_t stride) override {
+        if (stride < ggml_moe::WEXP_HEADER_BYTES) { return false; }
+        ggml_moe::WexpRecord r;
+        r.layer = (uint16_t) L; r.expert_id = (uint16_t) E; r.fmt = ggml_moe::WEXP_VQ3R;
+        r.gate_off = (uint32_t) ggml_moe::WEXP_HEADER_BYTES;   // payload starts right after the header
+        r.up_off = r.gate_off + 64; r.down_off = r.up_off + 64; r.correction_off = r.down_off + 64;
+        r.record_4k_blocks = (uint32_t) (stride / 4096);
+        wexp_write_header(static_cast<uint8_t *>(dst), r);
+        return true;
+    }
+};
+static void test_wexp_source_packs_valid_records() {
+    const uint64_t stride = ggml_moe::moec_align_up(4096);
+    const uint32_t layers = 3, experts = 4;
+    char path[L_tmpnam]; std::tmpnam(path);
+    std::string p = std::string(path) + ".moec";
+    WexpSource src((uint32_t) (stride / 4096));
+    CHECK(ggml_moe::moec_pack(p.c_str(), layers, experts, stride, ggml_moe::MOEC_Q_RVQ3, src),
+          "pack a container of real WEXP records");
+    ggml_moe::ContainerHeader h = make_header(layers, experts, stride);
+    std::ifstream in(p, std::ios::binary);
+    bool ok = true;
+    std::vector<uint8_t> buf((size_t) stride);
+    for (uint32_t L = 0; L < layers; L++)
+        for (uint32_t E = 0; E < experts; E++) {
+            in.seekg((std::streamoff) ggml_moe::moec_record_offset(h, L, E));
+            in.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) stride);
+            ggml_moe::WexpRecord r;
+            if (!ggml_moe::wexp_read_header(buf.data(), r) || r.layer != L || r.expert_id != E ||
+                r.fmt != ggml_moe::WEXP_VQ3R) ok = false;
+        }
+    in.close(); std::remove(p.c_str());
+    CHECK(ok, "each packed record is a valid WEXP header for its (layer,expert) — reader-ready");
+}
+
 // ================================================================================================
 // VDD — reference LFRU cache + replay of a captured expert-selection trace
 // ================================================================================================
@@ -442,6 +524,8 @@ int main(int argc, char ** argv) {
     test_container_roundtrip_real_io();
     test_container_fetcher_reads_right_expert();
     test_packer_fetcher_end_to_end();
+    test_wexp_header_byte_exact();
+    test_wexp_source_packs_valid_records();
     test_refcache_reuse_with_locality();
     test_refcache_lfru_retains_hot_above_cliff();
     test_reuse_cliff_around_one_token_working_set();
