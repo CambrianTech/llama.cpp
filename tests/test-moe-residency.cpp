@@ -385,14 +385,14 @@ static void test_wexp_source_packs_valid_records() {
 // a geometry drift (wrong bank size, unsorted records, bad offset) is what her open()/fetch rejects.
 static void test_pack_dir_matches_reader_geometry() {
     const uint64_t record_bytes = 4096;                        // must be a 4KiB multiple
-    const uint32_t layers = 3, experts = 5, activated = 16;
+    const uint32_t layers = 3, experts = 5, top_k = 16, activated = top_k * layers;   // TOTAL, not per-layer
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "moec_pack_test";
     fs::remove_all(dir); fs::create_directories(dir);
 
     WexpSource src((uint32_t) (record_bytes / 4096));
     const bool ok = ggml_moe::moec_pack_dir(dir.string().c_str(), "kimi-k3", ggml_moe::WEXP_VQ3R,
-                                            layers, experts, record_bytes, activated, src);
+                                            layers, experts, record_bytes, activated, top_k, src);
     CHECK(ok, "moec_pack_dir writes the directory");
     CHECK(fs::exists(dir / "manifest.json"), "manifest.json exists");
 
@@ -404,7 +404,8 @@ static void test_pack_dir_matches_reader_geometry() {
       CHECK(j.find("\"record_bytes\": 4096") != std::string::npos,  "manifest record_bytes");
       CHECK(j.find("\"n_layers\": 3") != std::string::npos,         "manifest n_layers");
       CHECK(j.find("\"experts_per_layer\": 5") != std::string::npos,"manifest experts_per_layer");
-      CHECK(j.find("\"activated_per_token\": 16") != std::string::npos, "manifest activated_per_token (cliff feed)");
+      CHECK(j.find("\"activated_per_token\": 48") != std::string::npos, "manifest activated_per_token = TOTAL (top_k*layers)");
+      CHECK(j.find("\"top_k_per_layer\": 16") != std::string::npos,     "manifest top_k_per_layer (audit field)");
     }
     // each bank: exact size, and offset = expert_id*record_bytes reads the right WEXP record
     bool geom_ok = true, offset_ok = true;
@@ -423,6 +424,39 @@ static void test_pack_dir_matches_reader_geometry() {
     fs::remove_all(dir);
     CHECK(geom_ok, "each bank file size == record_bytes*experts_per_layer (no truncated tail)");
     CHECK(offset_ok, "offset=expert_id*record_bytes reads the correct WEXP record in every bank");
+}
+
+// what this catches: THE activated_per_token trap (M5, reader 9c85a4f88). It must be the TOTAL across
+// all MoE layers, not per-layer top-k. Feeding per-layer understates the working set ~n_layers-fold, so
+// the budget policy green-lights a cache that can't retain -> silently recreates reuse=0, the exact
+// failure this lane exists to kill. Pin: (a) the working set scales with the TOTAL; (b) the packer
+// rejects a manifest where activated_per_token != top_k_per_layer * n_layers.
+static void test_activated_per_token_is_total_not_per_layer() {
+    const uint64_t GB = 1024ull * 1024 * 1024;
+    const uint32_t n_layers = 61, top_k = 8;                    // K3-ish
+    ggml_moe::BudgetInputs in{};
+    in.expert_bytes = 12ull * 1024 * 1024;                     // ~12MB VQ3 record
+
+    in.experts_per_token = top_k;                              // WRONG: per-layer
+    const uint64_t ws_per_layer = ggml_moe::moec_one_token_working_set(in);
+    in.experts_per_token = top_k * n_layers;                   // RIGHT: total
+    const uint64_t ws_total = ggml_moe::moec_one_token_working_set(in);
+    CHECK(ws_total == ws_per_layer * n_layers, "total working set is n_layers x the per-layer misreading");
+    CHECK(ws_total > 5ull * GB && ws_per_layer < 128ull * 1024 * 1024,
+          "per-layer understates the cliff ~61x (GBs vs ~100MB) — the silent reuse=0 recreator");
+
+    // the packer refuses a manifest whose activated_per_token isn't the total (top_k*layers).
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "moec_trap_test";
+    fs::remove_all(dir); fs::create_directories(dir);
+    WexpSource src(1);
+    const bool rejected = !ggml_moe::moec_pack_dir(dir.string().c_str(), "k3", ggml_moe::WEXP_VQ3R,
+        n_layers, /*experts*/ 8, /*record_bytes*/ 4096, /*activated=per-layer WRONG*/ top_k, top_k, src);
+    const bool accepted = ggml_moe::moec_pack_dir(dir.string().c_str(), "k3", ggml_moe::WEXP_VQ3R,
+        n_layers, 8, 4096, /*activated=total RIGHT*/ top_k * n_layers, top_k, src);
+    fs::remove_all(dir);
+    CHECK(rejected, "packer REJECTS activated_per_token != top_k*n_layers (the per-layer trap)");
+    CHECK(accepted, "packer accepts the correct total");
 }
 
 // ================================================================================================
@@ -574,6 +608,7 @@ int main(int argc, char ** argv) {
     test_wexp_header_byte_exact();
     test_wexp_source_packs_valid_records();
     test_pack_dir_matches_reader_geometry();
+    test_activated_per_token_is_total_not_per_layer();
     test_refcache_reuse_with_locality();
     test_refcache_lfru_retains_hot_above_cliff();
     test_reuse_cliff_around_one_token_working_set();

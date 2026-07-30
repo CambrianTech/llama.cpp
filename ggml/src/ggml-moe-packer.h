@@ -78,10 +78,17 @@ static inline bool moec_pack(const char * path, uint32_t layers, uint32_t expert
 // (one pread); bank file size == record_bytes*experts_per_layer (she refuses a truncated tail). `dir`
 // must already exist. This is the ENVELOPE that replaces the single-file container; the WEXP record and
 // budget governor are unchanged — activated_per_token is exactly the field the cliff policy consumes.
+// activated_per_token MUST be the TOTAL activated experts across ALL MoE layers (K3: top_k * n_layers
+// ~= 8*61 ~= 488), NOT the per-layer top-k. The budget governor uses it as the per-token working set
+// (expert_bytes * activated_per_token); a per-layer value understates the cliff ~n_layers-fold and
+// silently green-lights a cache that CANNOT retain — recreating the reuse=0 failure this lane exists to
+// kill (semantics pinned by M5, reader commit 9c85a4f88). top_k_per_layer is the auditable per-layer
+// value so the total is verifiable: activated_per_token == top_k_per_layer * n_layers.
 static inline bool moec_pack_dir(const char * dir, const char * model, uint32_t fmt,
                                  uint32_t layers, uint32_t experts, uint64_t record_bytes,
-                                 uint32_t activated_per_token, ExpertSource & src) {
+                                 uint32_t activated_per_token, uint32_t top_k_per_layer, ExpertSource & src) {
     if (record_bytes == 0 || record_bytes % 4096 != 0) { return false; }   // her open() refuses otherwise
+    if (top_k_per_layer != 0 && activated_per_token != top_k_per_layer * layers) { return false; } // total, not per-layer
 
     {   // manifest.json (v1) — her reader gates on version; fields exactly as pinned.
         const std::string mp = std::string(dir) + "/manifest.json";
@@ -95,9 +102,10 @@ static inline bool moec_pack_dir(const char * dir, const char * model, uint32_t 
             "  \"record_bytes\": %llu,\n"
             "  \"n_layers\": %u,\n"
             "  \"experts_per_layer\": %u,\n"
-            "  \"activated_per_token\": %u\n"
+            "  \"activated_per_token\": %u,\n"
+            "  \"top_k_per_layer\": %u\n"
             "}\n",
-            model, fmt, (unsigned long long) record_bytes, layers, experts, activated_per_token);
+            model, fmt, (unsigned long long) record_bytes, layers, experts, activated_per_token, top_k_per_layer);
         std::fclose(f);
     }
 
