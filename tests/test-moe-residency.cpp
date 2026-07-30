@@ -38,6 +38,7 @@ extern "C" {
 #include "ggml-moe-residency.hpp"
 #include "ggml-moe-container.h"
 #include "ggml-moe-container-fetcher.h"
+#include "ggml-moe-packer.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -254,6 +255,47 @@ static void test_container_fetcher_reads_right_expert() {
     CHECK(ok, "ContainerFetcher must return each expert's own payload for its record offset");
 }
 
+// what this catches: THE packer<->fetcher contract, through BOTH real components. moec_pack writes a
+// container from a synthetic interior; ContainerFetcher reads each record back by offset; the payload
+// must match. This is the write-side proof — if the packer's ordering/stride ever drifts from the
+// fetcher's offset math, this fails loudly. (The GGUF/RVQ interior plugs into ExpertSource unchanged.)
+struct SyntheticSource : ggml_moe::ExpertSource {
+    bool write_record(uint32_t L, uint32_t E, void * dst, size_t stride) override {
+        std::memset(dst, (int) (unsigned char) (11 + L * 7 + E), stride);   // a marker per (layer,expert)
+        return true;
+    }
+};
+static void test_packer_fetcher_end_to_end() {
+    const uint64_t stride = ggml_moe::moec_align_up(4096);
+    const uint32_t layers = 4, experts = 6;
+    char path[L_tmpnam]; std::tmpnam(path);
+    std::string p = std::string(path) + ".moec";
+
+    SyntheticSource src;
+    const bool packed = ggml_moe::moec_pack(p.c_str(), layers, experts, stride, ggml_moe::MOEC_Q_RVQ3, src);
+    CHECK(packed, "moec_pack must write the container successfully");
+
+    // read the header back and confirm the packer authored it as the fetcher/offset-math expects.
+    ggml_moe::ContainerHeader h{};
+    { std::ifstream in(p, std::ios::binary); in.read(reinterpret_cast<char *>(&h), sizeof(h)); }
+    CHECK(h.magic == ggml_moe::MOEC_MAGIC && h.n_layers == layers && h.experts_per_layer == experts &&
+          h.record_stride == stride, "packed header must round-trip the shape");
+
+    ggml_moe::ContainerFetcher cf(p.c_str());
+    CHECK(cf.ok(), "fetcher opens the packed container");
+    bool ok = true;
+    std::vector<char> buf((size_t) stride);
+    for (uint32_t L = 0; L < layers; L++)
+        for (uint32_t E = 0; E < experts; E++) {
+            const uint64_t off = ggml_moe::moec_record_offset(h, L, E);
+            const unsigned char want = (unsigned char) (11 + L * 7 + E);
+            if (!cf.fetch(buf.data(), (const void *) (uintptr_t) off, (size_t) stride) ||
+                (unsigned char) buf.front() != want || (unsigned char) buf.back() != want) ok = false;
+        }
+    std::remove(p.c_str());
+    CHECK(ok, "packer output and fetcher offsets agree byte-for-byte, every expert");
+}
+
 // ================================================================================================
 // VDD — reference LFRU cache + replay of a captured expert-selection trace
 // ================================================================================================
@@ -399,6 +441,7 @@ int main(int argc, char ** argv) {
     test_derive_budget_from_system_capabilities();
     test_container_roundtrip_real_io();
     test_container_fetcher_reads_right_expert();
+    test_packer_fetcher_end_to_end();
     test_refcache_reuse_with_locality();
     test_refcache_lfru_retains_hot_above_cliff();
     test_reuse_cliff_around_one_token_working_set();
