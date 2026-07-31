@@ -311,8 +311,17 @@ public:
 #endif // _WIN32
 
 // ------------------------------------------------------------------------------------------
-// residency cache — size-classed pinned pools + LRU, fed by a fetcher
+// residency cache — size-classed pinned pools + RECENCY-WINDOW eviction, fed by a fetcher
 // ------------------------------------------------------------------------------------------
+// Policy is a recency WINDOW at TOKEN granularity, not per-access LRU. Each expert is stamped with the
+// token-generation it was last used in; eviction removes the OLDEST generation first (tie-broken by
+// access tick). This keeps the last K tokens' expert SETS resident as units — where K = (budget /
+// per-token working set) emerges from the budget the governor sets. Measured on K3 trace replay: keeping
+// the last decode token's experts => 40.6% of the next token already resident (last 2 => 51%), vs
+// per-access LRU ~12% at the same budget. LRU loses because it churns the previous token's set out
+// mid-token (its ticks go stale as this token's experts stream in) before the next token reuses it;
+// generation-primary ordering protects whole recent tokens. The controller (continuum-core
+// ServingExpertPager) sets budget_bytes (and later per-expert precision); this is the mechanism.
 class ResidencyCache {
     // one pinned buffer per distinct expert byte-size (gate/up/down can differ), split into slots.
     // Pinned => non-pageable (hits never swap to pagefile) AND DMA-fast H2D (~25 vs ~6 GB/s pageable).
@@ -322,14 +331,14 @@ class ResidencyCache {
         size_t    slot_size = 0, max_slots = 0, used = 0;
         bool      failed = false;
         std::unordered_map<uint64_t, size_t> key2slot;
-        std::vector<uint64_t> slot_key, slot_tick;
+        std::vector<uint64_t> slot_key, slot_tick, slot_gen;
     };
     static const size_t MAX_POOLS = 3; // a MoE has at most a few distinct expert byte-sizes
 
     std::mutex mtx;
     size_t         budget_bytes;
     ExpertFetcher& fetcher;
-    uint64_t tick = 0, hits = 0, misses = 0;
+    uint64_t tick = 0, token_gen = 0, hits = 0, misses = 0;
     double   admit_us = 0.0;   // accumulated fetch time on misses
     size_t   admit_bytes = 0;  // bytes fetched on misses  -> fetch MB/s = admit_bytes / admit_us
     std::unordered_map<size_t, Pool> pools;
@@ -346,15 +355,19 @@ class ResidencyCache {
         p.base = (uint8_t *) ggml_backend_buffer_get_base(p.buf);
         p.slot_key.assign(p.max_slots, 0);
         p.slot_tick.assign(p.max_slots, 0);
+        p.slot_gen.assign(p.max_slots, 0);
     }
 
-    // pick a slot: next free one, else evict the least-recently-used (dropping its key mapping)
+    // pick a slot: next free one, else evict the OLDEST token-generation (tie-break: oldest access tick),
+    // dropping its key mapping. Generation-primary = recency window at token granularity (see class doc).
     size_t reserve_slot(Pool & p) {
         if (p.used < p.max_slots) { return p.used++; }
         size_t slot = 0;
-        uint64_t oldest = UINT64_MAX;
+        uint64_t og = UINT64_MAX, ot = UINT64_MAX;
         for (size_t i = 0; i < p.max_slots; i++) {
-            if (p.slot_tick[i] < oldest) { oldest = p.slot_tick[i]; slot = i; }
+            if (p.slot_gen[i] < og || (p.slot_gen[i] == og && p.slot_tick[i] < ot)) {
+                og = p.slot_gen[i]; ot = p.slot_tick[i]; slot = i;
+            }
         }
         p.key2slot.erase(p.slot_key[slot]);
         return slot;
@@ -364,6 +377,7 @@ public:
     ResidencyCache(size_t budget, ExpertFetcher & f) : budget_bytes(budget), fetcher(f) {}
 
     void        set_budget(size_t b)   { budget_bytes = b; }   // idempotent; apply the env budget once
+    void        advance_generation()   { std::lock_guard<std::mutex> lk(mtx); ++token_gen; }  // once per token (compute call)
     bool        enabled()        const { return budget_bytes > 0; }
     uint64_t    n_hits()         const { return hits; }
     uint64_t    n_misses()       const { return misses; }
@@ -389,6 +403,7 @@ public:
         if (it != p.key2slot.end()) {
             hits++;
             p.slot_tick[it->second] = ++tick;
+            p.slot_gen[it->second]  = token_gen;   // refresh generation on reuse
             return p.base + it->second * p.slot_size;
         }
         misses++;
@@ -402,6 +417,7 @@ public:
         if (pad) { memset(dst + expert_size, 0, pad); }
         p.slot_key[slot]  = key;
         p.slot_tick[slot] = ++tick;
+        p.slot_gen[slot]  = token_gen;
         p.key2slot[key]   = slot;
         return dst;
     }
@@ -425,12 +441,18 @@ public:
         size_t n_resident = 0, n_evict = 0;                              // retention probe
         for (size_t i = 0; i < n; i++) {
             const uint64_t key = ids[i].key();
-            if (p.key2slot.find(key) != p.key2slot.end()) { n_resident++; continue; }  // reuse!
-            if (p.used >= p.max_slots) { n_evict++; }                    // this reserve will evict an LRU
+            auto rit = p.key2slot.find(key);
+            if (rit != p.key2slot.end()) {                               // reuse! refresh generation
+                p.slot_gen[rit->second]  = token_gen;
+                p.slot_tick[rit->second] = ++tick;
+                n_resident++; continue;
+            }
+            if (p.used >= p.max_slots) { n_evict++; }                    // this reserve will evict oldest generation
             const size_t slot = reserve_slot(p);
             uint8_t * dst = p.base + slot * p.slot_size;
             p.slot_key[slot]  = key;
             p.slot_tick[slot] = ++tick;
+            p.slot_gen[slot]  = token_gen;
             p.key2slot[key]   = slot;
             batch.push_back(FetchItem{ dst, srcs[i], expert_size });
         }

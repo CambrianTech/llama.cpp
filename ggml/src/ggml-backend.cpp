@@ -1595,6 +1595,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // host-side expert residency cache (the module; budget from GGML_MOE_HOST_CACHE_GB, 0 => disabled).
     ggml_moe::ResidencyCache & k3_host_cache = moe_expert_cache();
     const bool k3_host_cache_on = k3_host_cache.enabled();
+    // [K3-RECENCY] one compute-splits call == one token (decode) / one prefill batch. Advance the cache's
+    // token-generation clock so recency-window eviction protects whole recent tokens' expert sets.
+    if (k3_host_cache_on) { k3_host_cache.advance_generation(); }
     size_t  k3_moe_bytes_streamed  = 0;
     int64_t k3_moe_experts_streamed = 0;
     // per-token deltas snapshot the cumulative cache counters at entry
