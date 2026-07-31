@@ -126,4 +126,81 @@ static inline bool moec_pack_dir(const char * dir, const char * model, uint32_t 
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------------
+// TIERED container (manifest v2) — the dynamic-quant precision axis: "all-stars sharp, decaying quant at
+// the cruft". Each expert is stored at N precomputed precision TIERS (descending fidelity); the pager
+// SELECTS a tier per expert (rate-distortion under budget) and the fetcher reads that tier's bank — pure
+// selection, no runtime re-quant. GENERIC path (here): per-(layer,tier) banks, offset = expert_id *
+// tiers[t].record_bytes — works for any quant incl. non-residual IQ2/IQ1. PROGRESSIVE path (RVQ VQ3R,
+// M5's moat move): one stage-major bank, tiers carry prefix_bytes = read-lengths — added when
+// GgufRvqSource lands. Schema pinned with M5 (7711fe60): tiers[] of {id, quant, record_bytes} DESCENDING
+// fidelity; v1 (single-tier) is the serde-default degenerate case. Reader gates on version==2.
+struct TierSpec {
+    uint32_t id;             // tier index, 0 = highest fidelity (all-star), ascending = cruft
+    uint32_t quant;          // MoecQuant of THIS tier
+    uint64_t record_bytes;   // per-expert record bytes at this tier (4KiB multiple; one pread)
+};
+
+// Emit a tiered container: manifest.json (v2) + per-(layer,tier) bank experts-L{n}-T{t}.bin.
+// `source_for(t)` returns the ExpertSource that produces tier `tiers[t]`'s records (e.g. a full-fidelity
+// GGUF source for T0 and a coarser/requantized or RVQ-prefix source for the cruft tiers). `dir` must
+// exist. Same invariants as moec_pack_dir per bank: record_bytes % 4096 == 0, sorted by expert_id so
+// offset = expert_id * record_bytes, bank size == record_bytes * experts by construction.
+static inline bool moec_pack_dir_tiered(const char * dir, const char * model, uint32_t fmt,
+                                        uint32_t layers, uint32_t experts,
+                                        uint32_t activated_per_token, uint32_t top_k_per_layer,
+                                        const TierSpec * tiers, uint32_t n_tiers,
+                                        ExpertSource & (*source_for)(uint32_t tier, void * user), void * user) {
+    if (n_tiers == 0) { return false; }
+    if (top_k_per_layer != 0 && activated_per_token != top_k_per_layer * layers) { return false; }
+    for (uint32_t t = 0; t < n_tiers; t++) {
+        if (tiers[t].record_bytes == 0 || tiers[t].record_bytes % 4096 != 0) { return false; }
+    }
+
+    {   // manifest.json (v2) — adds the tiers[] array; reader gates on version==2.
+        const std::string mp = std::string(dir) + "/manifest.json";
+        FILE * f = std::fopen(mp.c_str(), "wb");
+        if (!f) { return false; }
+        std::fprintf(f,
+            "{\n"
+            "  \"version\": 2,\n"
+            "  \"model\": \"%s\",\n"
+            "  \"fmt\": %u,\n"
+            "  \"n_layers\": %u,\n"
+            "  \"experts_per_layer\": %u,\n"
+            "  \"activated_per_token\": %u,\n"
+            "  \"top_k_per_layer\": %u,\n"
+            "  \"tiers\": [\n",
+            model, fmt, layers, experts, activated_per_token, top_k_per_layer);
+        for (uint32_t t = 0; t < n_tiers; t++) {
+            std::fprintf(f, "    { \"id\": %u, \"quant\": %u, \"record_bytes\": %llu }%s\n",
+                         tiers[t].id, tiers[t].quant, (unsigned long long) tiers[t].record_bytes,
+                         t + 1 < n_tiers ? "," : "");
+        }
+        std::fprintf(f, "  ]\n}\n");
+        std::fclose(f);
+    }
+
+    for (uint32_t t = 0; t < n_tiers; t++) {
+        ExpertSource & src = source_for(t, user);
+        std::vector<char> rec((size_t) tiers[t].record_bytes);
+        for (uint32_t L = 0; L < layers; L++) {
+            const std::string bp = std::string(dir) + "/experts-L" + std::to_string(L)
+                                 + "-T" + std::to_string(tiers[t].id) + ".bin";
+            FILE * f = std::fopen(bp.c_str(), "wb");
+            if (!f) { return false; }
+            bool ok = true;
+            for (uint32_t E = 0; E < experts && ok; E++) {
+                std::fill(rec.begin(), rec.end(), 0);
+                if (!src.write_record(L, E, rec.data(), (size_t) tiers[t].record_bytes)) { ok = false; break; }
+                if (std::fwrite(rec.data(), 1, (size_t) tiers[t].record_bytes, f)
+                        != (size_t) tiers[t].record_bytes) { ok = false; break; }
+            }
+            std::fclose(f);
+            if (!ok) { return false; }
+        }
+    }
+    return true;
+}
+
 } // namespace ggml_moe

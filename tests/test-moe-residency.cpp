@@ -507,6 +507,59 @@ static void test_iq2_source_packs_and_reads_back() {
     CHECK(ok, "IQ2 records: ident + fmt + gate/up/down bytes read back correct at declared offsets");
 }
 
+// what this catches: the TIERED container envelope (manifest v2 + per-(layer,tier) banks) — the
+// dynamic-quant precision axis ("all-stars sharp, decaying quant at the cruft"). Packs 2 tiers (all-star
+// 8KiB + cruft 4KiB) via a synthetic per-tier source, then verifies (a) manifest is v2 and declares both
+// tiers, (b) each bank experts-L{n}-T{t}.bin is EXACTLY record_bytes*experts (M5's reader refuses a
+// truncated tail), (c) offset = expert_id*record_bytes reads the right record back. GgufRvqSource (real
+// RVQ stage encode) plugs into source_for next; schema pinned with M5 (7711fe60), reader gates version==2.
+struct SyntheticTierSource : ggml_moe::ExpertSource {
+    uint32_t tier;
+    explicit SyntheticTierSource(uint32_t t) : tier(t) {}
+    bool write_record(uint32_t L, uint32_t E, void * dst, size_t stride) override {
+        std::memset(dst, (int)(uint8_t)(0x10 + tier * 0x40 + L * 4 + E), stride);   // per-(tier,layer,expert) marker
+        return true;
+    }
+};
+static void test_tiered_container_packs_and_reads_back() {
+    using namespace ggml_moe;
+    static SyntheticTierSource s0(0), s1(1);
+    auto source_for = [](uint32_t t, void *) -> ExpertSource & { return t == 0 ? (ExpertSource &) s0 : (ExpertSource &) s1; };
+    const TierSpec tiers[2] = { { 0, MOEC_Q_RVQ3, 8192 }, { 1, MOEC_Q_IQ2, 4096 } };   // all-star, cruft
+    const uint32_t layers = 3, experts = 4, top_k = 8;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "moec_tier_test";
+    fs::remove_all(dir); fs::create_directories(dir);
+    CHECK(moec_pack_dir_tiered(dir.string().c_str(), "kimi-k3-tiered", MOEC_Q_UNKNOWN,
+          layers, experts, top_k * layers, top_k, tiers, 2, source_for, nullptr), "pack tiered container");
+
+    {   // manifest v2 declares both tiers
+        std::ifstream mf(dir / "manifest.json"); std::stringstream ss; ss << mf.rdbuf(); const std::string m = ss.str();
+        CHECK(m.find("\"version\": 2") != std::string::npos, "manifest is v2");
+        CHECK(m.find("\"tiers\"") != std::string::npos &&
+              m.find("\"record_bytes\": 8192") != std::string::npos &&
+              m.find("\"record_bytes\": 4096") != std::string::npos, "manifest declares both tiers");
+    }
+    bool ok = true;
+    for (uint32_t t = 0; t < 2 && ok; t++) {
+        const uint64_t rb = tiers[t].record_bytes;
+        for (uint32_t L = 0; L < layers && ok; L++) {
+            const fs::path bp = dir / ("experts-L" + std::to_string(L) + "-T" + std::to_string(t) + ".bin");
+            std::error_code ec; const auto sz = fs::file_size(bp, ec);
+            if (ec || sz != rb * experts) { ok = false; break; }            // bank size == record_bytes*experts
+            std::ifstream in(bp, std::ios::binary);
+            std::vector<uint8_t> buf((size_t) rb);
+            for (uint32_t E = 0; E < experts; E++) {
+                in.seekg((std::streamoff) (E * rb));
+                in.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) rb);
+                if (buf[0] != (uint8_t)(0x10 + t * 0x40 + L * 4 + E)) { ok = false; break; }   // offset=E*rb correct
+            }
+        }
+    }
+    fs::remove_all(dir);
+    CHECK(ok, "tiered: manifest v2 + per-(layer,tier) bank size + offset=expert_id*record_bytes read back correct");
+}
+
 // what this catches: the GGUF expert-slice math — the crux of extracting one expert's IQ2 bytes from a
 // blk.N.ffn_*_exps.weight tensor. Slices must be equal-size, contiguous, non-overlapping, and cover the
 // whole tensor (or the byte-copy grabs a neighbour's weights — a silent wrong-expert bug). Also rejects
@@ -684,6 +737,7 @@ int main(int argc, char ** argv) {
     test_wexp_source_packs_valid_records();
     test_pack_dir_matches_reader_geometry();
     test_iq2_source_packs_and_reads_back();
+    test_tiered_container_packs_and_reads_back();
     test_gguf_expert_slice_math();
     test_activated_per_token_is_total_not_per_layer();
     test_refcache_reuse_with_locality();
