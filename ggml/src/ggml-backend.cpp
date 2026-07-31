@@ -1595,8 +1595,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // [K3-CAPTURE] structured PagerCaptureEvent JSONL for Positron (graph-control performance fields; the
     // policy fields — chosen_decay/per_arm_reward/tier_counts — are filled by the Rust ServingExpertPager).
     // One line per decode token; Positron tails it. GGML_MOE_CAPTURE_FILE=path enables it.
-    static FILE * k3_capture = []{ const char * p = getenv("GGML_MOE_CAPTURE_FILE"); return p ? fopen(p, "wb") : nullptr; }();
-    static uint64_t k3_capture_token = 0;
+    static const char * k3_capture_path = getenv("GGML_MOE_CAPTURE_FILE");
+    static FILE * k3_capture = k3_capture_path ? fopen(k3_capture_path, "wb") : nullptr;
+    static uint64_t k3_capture_token = 0, k3_capture_bytes = 0;
+    // DRAIN: bound the JSONL so it can't grow unbounded — recent data is what matters. At the cap we
+    // rotate (path -> path.1, reopen fresh), keeping ~2x cap of recent capture cleanly. This is the raw
+    // guard; the proper drain is the facility layer (Rust CaptureSink ring/rotation, as TrackedDir does
+    // for other capture). GGML_MOE_CAPTURE_MB overrides the cap (default 32 MB ~ 200k tokens).
+    static const uint64_t k3_capture_cap = (uint64_t)(getenv("GGML_MOE_CAPTURE_MB") ? atoi(getenv("GGML_MOE_CAPTURE_MB")) : 32) * 1024 * 1024;
     // host-side expert residency cache (the module; budget from GGML_MOE_HOST_CACHE_GB, 0 => disabled).
     ggml_moe::ResidencyCache & k3_host_cache = moe_expert_cache();
     const bool k3_host_cache_on = k3_host_cache.enabled();
@@ -1903,7 +1909,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 (unsigned long long) hits, (unsigned long long) misses, hit_rate, fetch_mbps, fault_ms, total_ms);
         }
         if (k3_capture) {   // structured PagerCaptureEvent (graph-control fields) — Positron tails this JSONL.
-            fprintf(k3_capture,
+            const int nw = fprintf(k3_capture,
                 "{\"token\":%llu,\"hit_rate\":%.4f,\"fault_wait_ms\":%.1f,\"tok_per_s\":%.4f,"
                 "\"bytes_fetched_mb\":%.1f,\"fetch_mb_s\":%.0f,\"resident_experts\":%llu,"
                 "\"experts\":%lld,\"misses\":%llu}\n",
@@ -1911,6 +1917,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 total_ms > 0.0 ? 1000.0 / total_ms : 0.0, fetch_mb, fetch_mbps,
                 (unsigned long long) hits, (long long) k3_moe_experts_streamed, (unsigned long long) misses);
             fflush(k3_capture);
+            if (nw > 0) { k3_capture_bytes += (uint64_t) nw; }
+            if (k3_capture_bytes >= k3_capture_cap) {   // DRAIN: rotate to path.1, reopen fresh (keep recent)
+                fclose(k3_capture);
+                std::string rot = std::string(k3_capture_path) + ".1";
+                std::remove(rot.c_str()); std::rename(k3_capture_path, rot.c_str());
+                k3_capture = fopen(k3_capture_path, "wb");
+                k3_capture_bytes = 0;
+            }
         }
     }
 
