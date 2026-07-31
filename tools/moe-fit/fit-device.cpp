@@ -117,10 +117,20 @@ int main(int argc, char ** argv) {
         std::vector<std::string> plan;
         uint64_t projected = 0, kept_hi = 0;
         for (const auto & t : resident) {
+            if (t.name.find("norm") != std::string::npos) {   // norms: llama-quant's name logic keeps them, leave unlisted
+                projected += t.bytes; kept_hi += t.bytes; continue;
+            }
+            if (t.type == GGML_TYPE_F32) {   // non-norm f32 (ssm/gdn state etc.): keep f32, but LIST it so it copies (never falls to the iq2 base ftype -> which would need an imatrix)
+                projected += t.bytes; kept_hi += t.bytes; plan.push_back(t.name + "=f32"); continue;
+            }
             const int c = sens_class(t.name);
             const std::string tgt = ladders[c][step];
             const double cur_bpw = (double) ggml_type_size(t.type) * 8.0 / (double) ggml_blck_size(t.type);
-            if (tgt == "keep" || bpw_of(tgt) >= cur_bpw) { projected += t.bytes; if (c == 2) kept_hi += t.bytes; continue; }
+            if (tgt == "keep" || bpw_of(tgt) >= cur_bpw) {   // keep at current type — but LIST it (at its own type)
+                projected += t.bytes; if (c == 2) kept_hi += t.bytes;   // so it COPIES, never falls to the base ftype
+                plan.push_back(t.name + "=" + ggml_type_name(t.type));
+                continue;
+            }
             projected += (uint64_t) (t.bytes * (bpw_of(tgt) / cur_bpw));
             plan.push_back(t.name + "=" + tgt);
         }
