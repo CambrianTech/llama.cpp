@@ -507,6 +507,33 @@ static void test_iq2_source_packs_and_reads_back() {
     CHECK(ok, "IQ2 records: ident + fmt + gate/up/down bytes read back correct at declared offsets");
 }
 
+// what this catches: the GGUF expert-slice math — the crux of extracting one expert's IQ2 bytes from a
+// blk.N.ffn_*_exps.weight tensor. Slices must be equal-size, contiguous, non-overlapping, and cover the
+// whole tensor (or the byte-copy grabs a neighbour's weights — a silent wrong-expert bug). Also rejects
+// a tensor size that isn't divisible by n_expert (a layout assumption violated).
+static void test_gguf_expert_slice_math() {
+    const uint32_t n_expert = 256;
+    const uint64_t total = (uint64_t) n_expert * 2600;     // 2600 bytes/expert, evenly divisible
+    ggml_moe::ExpertSlice s0, s1, slast, bad;
+    CHECK(ggml_moe::moec_expert_slice(total, n_expert, 0, s0) && s0.offset == 0 && s0.len == 2600,
+          "expert 0 at offset 0");
+    CHECK(ggml_moe::moec_expert_slice(total, n_expert, 1, s1) && s1.offset == 2600,
+          "expert 1 contiguous right after expert 0");
+    CHECK(ggml_moe::moec_expert_slice(total, n_expert, n_expert - 1, slast) &&
+          slast.offset + slast.len == total, "last expert ends exactly at tensor end (full coverage)");
+    CHECK(!ggml_moe::moec_expert_slice(total, n_expert, n_expert, bad), "out-of-range expert rejected");
+    CHECK(!ggml_moe::moec_expert_slice(total + 1, n_expert, 0, bad),
+          "non-divisible tensor size rejected (layout assumption guard)");
+    // contiguity + non-overlap across the whole tensor
+    bool tiled = true; uint64_t expect = 0;
+    for (uint32_t E = 0; E < n_expert; E++) {
+        ggml_moe::ExpertSlice s;
+        if (!ggml_moe::moec_expert_slice(total, n_expert, E, s) || s.offset != expect) { tiled = false; break; }
+        expect += s.len;
+    }
+    CHECK(tiled && expect == total, "experts tile the tensor exactly — contiguous, no gaps, no overlap");
+}
+
 // ================================================================================================
 // VDD — reference LFRU cache + replay of a captured expert-selection trace
 // ================================================================================================
@@ -657,6 +684,7 @@ int main(int argc, char ** argv) {
     test_wexp_source_packs_valid_records();
     test_pack_dir_matches_reader_geometry();
     test_iq2_source_packs_and_reads_back();
+    test_gguf_expert_slice_math();
     test_activated_per_token_is_total_not_per_layer();
     test_refcache_reuse_with_locality();
     test_refcache_lfru_retains_hot_above_cliff();

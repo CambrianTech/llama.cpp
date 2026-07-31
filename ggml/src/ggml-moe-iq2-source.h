@@ -16,6 +16,21 @@
 
 namespace ggml_moe {
 
+// Byte range of expert E's slice within an exps weight tensor. In ggml a blk.N.ffn_*_exps.weight has
+// shape [n_embd, n_ff, n_expert] with n_expert the SLOWEST (outermost) dim, so each expert is a single
+// CONTIGUOUS slice of equal size — offset = E * (total/n_expert), len = total/n_expert. This is the
+// crux of the GGUF byte-source: get it wrong and the byte-copy grabs the neighbouring expert's weights.
+struct ExpertSlice { uint64_t offset; uint64_t len; };
+static inline bool moec_expert_slice(uint64_t tensor_total_bytes, uint32_t n_expert, uint32_t expert_id,
+                                     ExpertSlice & out) {
+    if (n_expert == 0 || expert_id >= n_expert) { return false; }
+    if (tensor_total_bytes % n_expert != 0) { return false; }   // all experts equal size — else layout wrong
+    const uint64_t per = tensor_total_bytes / n_expert;
+    out.offset = (uint64_t) expert_id * per;
+    out.len    = per;
+    return true;
+}
+
 // Raw byte spans for one expert's three matrices (already IQ2-quantized GGUF blocks). Provided by the
 // GGUF reader in production, or a synthetic filler in tests.
 struct Iq2Bytes {
