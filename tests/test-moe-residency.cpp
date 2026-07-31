@@ -560,6 +560,43 @@ static void test_tiered_container_packs_and_reads_back() {
     CHECK(ok, "tiered: manifest v2 + per-(layer,tier) bank size + offset=expert_id*record_bytes read back correct");
 }
 
+// what this catches: TieredContainerFetcher reads the RIGHT precision tier's bank — the READ side of
+// dynamic quant, where the pager's tier selection actuates. Packs 2 tiers, reads (layer,expert,tier)
+// through the fetcher and verifies each returns THAT tier's marker (all-star vs cruft) at offset =
+// expert_id*record_bytes, and that a never-packed (layer,tier) shard returns false (grid shard boundary,
+// not a crash). Lazy bank handles are exercised across all (layer,tier).
+static void test_tiered_fetcher_reads_selected_tier() {
+    using namespace ggml_moe;
+    static SyntheticTierSource s0(0), s1(1);
+    auto source_for = [](uint32_t t, void *) -> ExpertSource & { return t == 0 ? (ExpertSource &) s0 : (ExpertSource &) s1; };
+    const TierSpec tiers[2] = { { 0, MOEC_Q_RVQ3, 8192 }, { 1, MOEC_Q_IQ2, 4096 } };
+    const uint32_t layers = 3, experts = 4, top_k = 8;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "moec_tierfetch_test";
+    fs::remove_all(dir); fs::create_directories(dir);
+    CHECK(moec_pack_dir_tiered(dir.string().c_str(), "kimi-k3-tiered", MOEC_Q_UNKNOWN,
+          layers, experts, top_k * layers, top_k, tiers, 2, source_for, nullptr), "pack tiered for fetch");
+
+    bool ok = true, missing_false = false;
+    {   // SCOPE the fetcher: its bank handles must close before remove_all (Windows won't delete open files)
+        TieredContainerFetcher tf(dir.string().c_str());
+        for (uint32_t t = 0; t < 2 && ok; t++) {
+            std::vector<uint8_t> buf((size_t) tiers[t].record_bytes);
+            for (uint32_t L = 0; L < layers && ok; L++) {
+                for (uint32_t E = 0; E < experts && ok; E++) {
+                    if (!tf.read(L, E, tiers[t].id, tiers[t].record_bytes, buf.data())) { ok = false; break; }
+                    if (buf[0] != (uint8_t)(0x10 + t * 0x40 + L * 4 + E)) { ok = false; break; }   // right tier's marker
+                }
+            }
+        }
+        std::vector<uint8_t> tmp(4096);
+        missing_false = !tf.read(0, 0, 9 /* no T9 bank */, 4096, tmp.data());
+    }
+    fs::remove_all(dir);
+    CHECK(ok, "TieredContainerFetcher returns the SELECTED tier's record for each (layer,expert,tier)");
+    CHECK(missing_false, "TieredContainerFetcher: missing (layer,tier) shard returns false, no crash");
+}
+
 // what this catches: the GGUF expert-slice math — the crux of extracting one expert's IQ2 bytes from a
 // blk.N.ffn_*_exps.weight tensor. Slices must be equal-size, contiguous, non-overlapping, and cover the
 // whole tensor (or the byte-copy grabs a neighbour's weights — a silent wrong-expert bug). Also rejects
@@ -738,6 +775,7 @@ int main(int argc, char ** argv) {
     test_pack_dir_matches_reader_geometry();
     test_iq2_source_packs_and_reads_back();
     test_tiered_container_packs_and_reads_back();
+    test_tiered_fetcher_reads_selected_tier();
     test_gguf_expert_slice_math();
     test_activated_per_token_is_total_not_per_layer();
     test_refcache_reuse_with_locality();

@@ -16,6 +16,10 @@
 #include "ggml-moe-residency.hpp"   // ExpertFetcher, FetchItem
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 #if defined(_WIN32)
 #  define MOEC_FSEEK64(f, off) (_fseeki64((f), (long long)(off), SEEK_SET))
@@ -51,6 +55,43 @@ public:
                 std::memset(items[i].dst, 0, items[i].bytes);   // loud-by-absence: a zero record fails validation downstream
             }
         }
+    }
+};
+
+// TIERED read primitive: reads an expert from a specific PRECISION TIER of a tiered container (manifest
+// v2, per-(layer,tier) banks). The pager selects the tier per expert (all-star … cruft, rate-distortion
+// under budget); this reads that tier's bank at offset = expert_id * tier_record_bytes (one positional
+// read, alignment-by-construction). Bank handles open LAZILY and are cached per (layer,tier) — a node
+// holding only some (layer,tier) shards never stats the rest (the grid shard unit). This is the read
+// side that pairs with moec_pack_dir_tiered; the serving direct-I/O variant swaps in the same way as
+// ContainerFetcher (identical offset contract). record_bytes comes from the manifest tier row.
+class TieredContainerFetcher {
+    std::string dir_;
+    std::mutex  mtx_;
+    std::unordered_map<uint64_t, FILE *> banks_;   // key = (layer<<16 | tier) -> lazily-opened bank
+
+    FILE * bank(uint32_t layer, uint32_t tier) {
+        const uint64_t key = ((uint64_t) layer << 16) | tier;
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = banks_.find(key);
+        if (it != banks_.end()) { return it->second; }
+        const std::string bp = dir_ + "/experts-L" + std::to_string(layer) + "-T" + std::to_string(tier) + ".bin";
+        FILE * f = std::fopen(bp.c_str(), "rb");    // nullptr cached too, so a missing shard isn't re-stat'd
+        banks_.emplace(key, f);
+        return f;
+    }
+public:
+    explicit TieredContainerFetcher(const char * dir) : dir_(dir) {}
+    ~TieredContainerFetcher() { for (auto & kv : banks_) { if (kv.second) { std::fclose(kv.second); } } }
+
+    // Read expert `expert` of layer `layer` at precision `tier` (record is `record_bytes`, from manifest).
+    // false => bank missing or short read (caller streams the fallback tier or a full-precision source).
+    bool read(uint32_t layer, uint32_t expert, uint32_t tier, uint64_t record_bytes, void * dst) {
+        FILE * f = bank(layer, tier);
+        if (!f) { return false; }
+        const uint64_t off = (uint64_t) expert * record_bytes;
+        if (MOEC_FSEEK64(f, off) != 0) { return false; }
+        return std::fread(dst, 1, (size_t) record_bytes, f) == (size_t) record_bytes;
     }
 };
 
