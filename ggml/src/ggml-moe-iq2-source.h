@@ -61,7 +61,7 @@ public:
         r.gate_off       = (uint32_t) hdr;
         r.up_off         = (uint32_t) (r.gate_off + b.gate_len);
         r.down_off       = (uint32_t) (r.up_off + b.up_len);
-        r.correction_off = 0;                             // IQ2: no residual-correction section
+        r.correction_off = (uint32_t)(r.down_off + b.down_len);   // marks END of down (no correction data) so down_len = correction_off - down_off is derivable across variable-size layers
         r.record_4k_blocks = (uint32_t) (stride / 4096);
         wexp_write_header(static_cast<uint8_t *>(dst), r);
 

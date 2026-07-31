@@ -497,7 +497,7 @@ static void test_iq2_source_packs_and_reads_back() {
             in.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) record_bytes);
             ggml_moe::WexpRecord r;
             if (!ggml_moe::wexp_read_header(buf.data(), r) || r.layer != L || r.expert_id != E ||
-                r.fmt != IQ2_FMT_PLACEHOLDER || r.correction_off != 0) { ok = false; break; }
+                r.fmt != IQ2_FMT_PLACEHOLDER || r.correction_off == 0) { ok = false; break; }
             if (buf[r.gate_off] != (uint8_t)(0x10 + L * 3 + E) ||    // gate/up/down at declared offsets
                 buf[r.up_off]   != (uint8_t)(0x40 + L * 3 + E) ||
                 buf[r.down_off] != (uint8_t)(0x70 + L * 3 + E)) { ok = false; break; }
