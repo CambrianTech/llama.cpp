@@ -145,9 +145,50 @@ class DirectReadFetcher final : public ExpertFetcher {
     static const size_t   HPOOL = 16; // handles per file — Windows serializes I/O on ONE file object
                                       // even when overlapped, so concurrency needs DISTINCT handles.
 
+    static const size_t MAXW = 64;    // max sliding-window depth (== fetch_many cap)
+
     std::mutex mtx;
     std::unordered_map<const void *, std::vector<HANDLE>> base2pool;  // AllocationBase -> handle pool
     size_t rr = 0;                                                    // round-robin cursor
+
+    // PERSISTENT bounce buffers + events, reused across every fetch call. Re-allocating W aligned
+    // buffers and W kernel events PER CALL (once per layer-matrix, thousands of times per generation)
+    // commits/zero-fills/decommits ~tens of MB each time — that churn is what collapses the live fetch
+    // from ~2 GB/s to ~140 MB/s under accumulating memory pressure, even though the raw NVMe does 3 GB/s.
+    // Allocated once (lazily), grown only if a bigger expert size-class appears. Access is serialized by
+    // the owning ResidencyCache's mutex (prefetch()/get() both hold it), so no extra lock is needed here.
+    std::vector<void *>  bbuf_;       // MAXW aligned bounce buffers, each `bcap_` bytes
+    std::vector<HANDLE>  bev_;        // MAXW reusable auto-reset events
+    size_t               bcap_ = 0;   // current per-buffer capacity (grows to the largest aligned read)
+    // per-call scratch, also persistent (reused, never re-allocated per fetch)
+    std::vector<OVERLAPPED> ov_;
+    std::vector<HANDLE>     hs_, evs_;
+    std::vector<size_t>     head_, item_of_, active_;
+
+    // Ensure the persistent pools exist and each buffer holds >= need bytes. One-time create of the
+    // events + scratch vectors; buffers grow (free+realloc all) only when a larger size-class is seen.
+    void ensure_pool(size_t need) {
+        if (bev_.empty()) {
+            bev_.assign(MAXW, nullptr);
+            for (size_t j = 0; j < MAXW; j++) { bev_[j] = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
+            bbuf_.assign(MAXW, nullptr);
+            ov_.resize(MAXW); hs_.assign(MAXW, INVALID_HANDLE_VALUE);
+            head_.assign(MAXW, 0); item_of_.assign(MAXW, 0);
+            active_.reserve(MAXW); evs_.reserve(MAXW);
+        }
+        if (need > bcap_) {
+            for (size_t j = 0; j < MAXW; j++) { if (bbuf_[j]) { _aligned_free(bbuf_[j]); } bbuf_[j] = _aligned_malloc(need, A); }
+            bcap_ = need;
+        }
+    }
+
+public:
+    ~DirectReadFetcher() {
+        for (void * b : bbuf_) { if (b) { _aligned_free(b); } }
+        for (HANDLE e : bev_)  { if (e) { CloseHandle(e); } }
+        for (auto & kv : base2pool) { for (HANDLE h : kv.second) { if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); } } }
+    }
+private:
 
     // Resolve an mmap host address to (a backing file handle from the pool, byte offset). Handles are
     // unbuffered + overlapped; round-robined so concurrent reads land on different file objects and
@@ -186,16 +227,16 @@ class DirectReadFetcher final : public ExpertFetcher {
         const uint64_t aoff = off & ~(A - 1);
         const size_t   head = (size_t) (off - aoff);
         const size_t   alen = (size_t) (((head + bytes) + A - 1) & ~(A - 1));
-        void * bounce = _aligned_malloc(alen, A);
+        ensure_pool(alen);                       // persistent bounce buffer[0] (reused, not malloc'd here)
+        void * bounce = bbuf_[0];
         if (!bounce) { return false; }
-        OVERLAPPED ov = {};
+        OVERLAPPED ov = {}; ov.hEvent = bev_[0];
         ov.Offset = (DWORD) (aoff & 0xFFFFFFFF); ov.OffsetHigh = (DWORD) (aoff >> 32);
         DWORD got = 0;
         bool ok = ReadFile(h, bounce, (DWORD) alen, &got, &ov) || GetLastError() == ERROR_IO_PENDING;
         if (ok) { ok = GetOverlappedResult(h, &ov, &got, TRUE) != 0; }
         if (ok && got >= head + bytes) { memcpy(dst, (uint8_t *) bounce + head, bytes); }
         else { ok = false; }
-        _aligned_free(bounce);
         return ok;
     }
 
@@ -211,16 +252,10 @@ public:
     // 279ms..4850ms). The window holds queue depth constant, killing that variance.
     void fetch_many(const FetchItem * items, size_t n) override {
         if (n == 0) { return; }
-        const size_t W   = std::min<size_t>(64, n);             // window depth (<=64 for WaitForMultipleObjects)
+        const size_t W   = std::min<size_t>(MAXW, n);           // window depth (<=64 for WaitForMultipleObjects)
         const size_t esz = items[0].bytes;                      // uniform within a size-class pool
         const size_t bsz = (esz + A + (A - 1)) & ~(A - 1);      // aligned bounce size (head slack + expert)
-
-        std::vector<void *>     buf(W, nullptr);
-        std::vector<HANDLE>     ev(W, nullptr);
-        std::vector<OVERLAPPED> ov(W);
-        std::vector<HANDLE>     hs(W, INVALID_HANDLE_VALUE);
-        std::vector<size_t>     head(W, 0), item_of(W, 0);
-        for (size_t j = 0; j < W; j++) { buf[j] = _aligned_malloc(bsz, A); ev[j] = CreateEventW(nullptr, FALSE, FALSE, nullptr); }
+        ensure_pool(bsz);                                       // PERSISTENT bounce buffers + events + scratch (reused, not per-call)
 
         size_t n_ok = 0, n_rf = 0, n_if = 0, n_pf = 0;          // probe counters
         const auto t_start = std::chrono::steady_clock::now();
@@ -229,44 +264,42 @@ public:
         auto issue = [&](size_t j, size_t i) -> bool {
             const FetchItem & it = items[i];
             uint64_t off = 0;
-            HANDLE h = buf[j] ? resolve(it.src, off) : INVALID_HANDLE_VALUE;
+            HANDLE h = bbuf_[j] ? resolve(it.src, off) : INVALID_HANDLE_VALUE;
             if (h == INVALID_HANDLE_VALUE) { n_rf++; memcpy(it.dst, it.src, it.bytes); return false; }
             const uint64_t aoff = off & ~(A - 1);
-            head[j] = (size_t) (off - aoff); item_of[j] = i;
-            const size_t alen = (size_t) (((head[j] + it.bytes) + A - 1) & ~(A - 1));
-            ov[j] = {}; ov[j].Offset = (DWORD)(aoff & 0xFFFFFFFF); ov[j].OffsetHigh = (DWORD)(aoff >> 32); ov[j].hEvent = ev[j];
+            head_[j] = (size_t) (off - aoff); item_of_[j] = i;
+            const size_t alen = (size_t) (((head_[j] + it.bytes) + A - 1) & ~(A - 1));
+            ov_[j] = {}; ov_[j].Offset = (DWORD)(aoff & 0xFFFFFFFF); ov_[j].OffsetHigh = (DWORD)(aoff >> 32); ov_[j].hEvent = bev_[j];
             DWORD got = 0;
-            if (ReadFile(h, buf[j], (DWORD) alen, &got, &ov[j]) || GetLastError() == ERROR_IO_PENDING) { hs[j] = h; return true; }
+            if (ReadFile(h, bbuf_[j], (DWORD) alen, &got, &ov_[j]) || GetLastError() == ERROR_IO_PENDING) { hs_[j] = h; return true; }
             n_if++; memcpy(it.dst, it.src, it.bytes); return false;
         };
         auto reap = [&](size_t j) {
-            const FetchItem & it = items[item_of[j]];
+            const FetchItem & it = items[item_of_[j]];
             DWORD got = 0;
-            if (GetOverlappedResult(hs[j], &ov[j], &got, TRUE) && got >= head[j] + it.bytes) {
-                n_ok++; memcpy(it.dst, (uint8_t *) buf[j] + head[j], it.bytes);
+            if (GetOverlappedResult(hs_[j], &ov_[j], &got, TRUE) && got >= head_[j] + it.bytes) {
+                n_ok++; memcpy(it.dst, (uint8_t *) bbuf_[j] + head_[j], it.bytes);
             } else { n_pf++; memcpy(it.dst, it.src, it.bytes); }
         };
 
         size_t next = 0;
-        std::vector<size_t> active;                             // slot indices with a read in flight
-        active.reserve(W);
+        active_.clear();                                        // slot indices with a read in flight (persistent)
         for (size_t j = 0; j < W; j++) {                        // prime the window
             while (next < n && !issue(j, next)) { next++; }
-            if (next < n) { active.push_back(j); next++; }
+            if (next < n) { active_.push_back(j); next++; }
         }
-        while (!active.empty()) {                               // slide: wait-any, reap, refill
-            std::vector<HANDLE> evs; evs.reserve(active.size());
-            for (size_t s : active) { evs.push_back(ev[s]); }
-            const DWORD r = WaitForMultipleObjects((DWORD) evs.size(), evs.data(), FALSE, INFINITE);
-            const size_t wi = (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + evs.size()) ? (size_t)(r - WAIT_OBJECT_0) : 0;
-            const size_t j = active[wi];
+        while (!active_.empty()) {                              // slide: wait-any, reap, refill
+            evs_.clear();
+            for (size_t s : active_) { evs_.push_back(bev_[s]); }
+            const DWORD r = WaitForMultipleObjects((DWORD) evs_.size(), evs_.data(), FALSE, INFINITE);
+            const size_t wi = (r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + evs_.size()) ? (size_t)(r - WAIT_OBJECT_0) : 0;
+            const size_t j = active_[wi];
             reap(j);
             bool refilled = false;
             while (next < n) { if (issue(j, next++)) { refilled = true; break; } }
-            if (!refilled) { active.erase(active.begin() + wi); }
+            if (!refilled) { active_.erase(active_.begin() + wi); }
         }
 
-        for (size_t j = 0; j < W; j++) { _aligned_free(buf[j]); CloseHandle(ev[j]); }
         if (getenv("GGML_MOE_OFFLOAD_STATS")) {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
             const double mbps = ms > 0 ? (n * (double) esz / (1024.0 * 1024.0)) / (ms / 1000.0) : 0;
