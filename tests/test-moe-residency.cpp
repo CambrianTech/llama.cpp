@@ -40,6 +40,7 @@ extern "C" {
 #include "ggml-moe-container-fetcher.h"
 #include "ggml-moe-packer.h"
 #include "ggml-moe-wexp.h"
+#include "ggml-moe-iq2-source.h"
 
 #include <cstdio>
 #include <cstdint>
@@ -459,6 +460,53 @@ static void test_activated_per_token_is_total_not_per_layer() {
     CHECK(accepted, "packer accepts the correct total");
 }
 
+// what this catches: rung-1 IQ2 packing — Iq2ExpertSource byte-copies gate/up/down into a record with
+// the WEXP ident header + fmt threaded (not guessed), correction_off=0. Pack via moec_pack_dir, read
+// each record back through ContainerFetcher, and verify the header identity AND that gate/up/down bytes
+// land at their declared offsets. This is the fast path's framing proven end-to-end; only the GGUF byte
+// source (real IQ2 tensors) plugs into the provider next. fmt is a placeholder here (M5 owns the value).
+static void test_iq2_source_packs_and_reads_back() {
+    const uint8_t IQ2_FMT_PLACEHOLDER = 6;                 // M5 confirms the real WEXP-enum value
+    const size_t gate_len = 300, up_len = 300, down_len = 300;   // small IQ2-ish blocks
+    // provider fills each matrix with a distinct per-(layer,expert,which) marker byte
+    auto provider = [&](uint32_t L, uint32_t E, ggml_moe::Iq2Bytes & b) -> bool {
+        static thread_local std::vector<uint8_t> g, u, d;
+        g.assign(gate_len, (uint8_t)(0x10 + L * 3 + E));
+        u.assign(up_len,   (uint8_t)(0x40 + L * 3 + E));
+        d.assign(down_len, (uint8_t)(0x70 + L * 3 + E));
+        b = { g.data(), g.size(), u.data(), u.size(), d.data(), d.size() };
+        return true;
+    };
+    ggml_moe::Iq2ExpertSource src(IQ2_FMT_PLACEHOLDER, provider);
+
+    const uint64_t record_bytes = 4096;                    // header(32)+900 payload fits, 4KiB-aligned
+    const uint32_t layers = 3, experts = 4, top_k = 8;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "moec_iq2_test";
+    fs::remove_all(dir); fs::create_directories(dir);
+    CHECK(ggml_moe::moec_pack_dir(dir.string().c_str(), "kimi-k3-iq2", ggml_moe::MOEC_Q_IQ2,
+          layers, experts, record_bytes, top_k * layers, top_k, src), "pack IQ2 container");
+
+    ggml_moe::ContainerHeader h = make_header(layers, experts, record_bytes);
+    bool ok = true;
+    for (uint32_t L = 0; L < layers && ok; L++) {
+        std::ifstream in(dir / ("experts-L" + std::to_string(L) + ".bin"), std::ios::binary);
+        std::vector<uint8_t> buf((size_t) record_bytes);
+        for (uint32_t E = 0; E < experts; E++) {
+            in.seekg((std::streamoff) (E * record_bytes));
+            in.read(reinterpret_cast<char *>(buf.data()), (std::streamsize) record_bytes);
+            ggml_moe::WexpRecord r;
+            if (!ggml_moe::wexp_read_header(buf.data(), r) || r.layer != L || r.expert_id != E ||
+                r.fmt != IQ2_FMT_PLACEHOLDER || r.correction_off != 0) { ok = false; break; }
+            if (buf[r.gate_off] != (uint8_t)(0x10 + L * 3 + E) ||    // gate/up/down at declared offsets
+                buf[r.up_off]   != (uint8_t)(0x40 + L * 3 + E) ||
+                buf[r.down_off] != (uint8_t)(0x70 + L * 3 + E)) { ok = false; break; }
+        }
+    }
+    fs::remove_all(dir);
+    CHECK(ok, "IQ2 records: ident + fmt + gate/up/down bytes read back correct at declared offsets");
+}
+
 // ================================================================================================
 // VDD — reference LFRU cache + replay of a captured expert-selection trace
 // ================================================================================================
@@ -608,6 +656,7 @@ int main(int argc, char ** argv) {
     test_wexp_header_byte_exact();
     test_wexp_source_packs_valid_records();
     test_pack_dir_matches_reader_geometry();
+    test_iq2_source_packs_and_reads_back();
     test_activated_per_token_is_total_not_per_layer();
     test_refcache_reuse_with_locality();
     test_refcache_lfru_retains_hot_above_cliff();
