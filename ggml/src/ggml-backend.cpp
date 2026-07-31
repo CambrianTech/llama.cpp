@@ -1592,6 +1592,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // the real K3 routing against ANY cache policy/budget (LRU vs LFU vs a learned predictor) to measure
     // achievable hit-rate BEFORE building the predictor — the make-or-break input. GGML_MOE_TRACE_FILE=path.
     static FILE * k3_trace = []{ const char * p = getenv("GGML_MOE_TRACE_FILE"); return p ? fopen(p, "wb") : nullptr; }();
+    // [K3-CAPTURE] structured PagerCaptureEvent JSONL for Positron (graph-control performance fields; the
+    // policy fields — chosen_decay/per_arm_reward/tier_counts — are filled by the Rust ServingExpertPager).
+    // One line per decode token; Positron tails it. GGML_MOE_CAPTURE_FILE=path enables it.
+    static FILE * k3_capture = []{ const char * p = getenv("GGML_MOE_CAPTURE_FILE"); return p ? fopen(p, "wb") : nullptr; }();
+    static uint64_t k3_capture_token = 0;
     // host-side expert residency cache (the module; budget from GGML_MOE_HOST_CACHE_GB, 0 => disabled).
     ggml_moe::ResidencyCache & k3_host_cache = moe_expert_cache();
     const bool k3_host_cache_on = k3_host_cache.enabled();
@@ -1881,10 +1886,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     // [K3-EXPERT-PAGING] per-compute MoE-stream summary (opt-in). On a decode step (batch=1) this is the
     // per-token host->VRAM expert working set: the number the persistent VRAM slot cache must shrink.
-    if (k3_moe_stats && k3_moe_experts_streamed > 0) {
-        // per-token (per graph-compute) seam breakdown. stderr (not GGML_LOG_INFO) so it survives the
-        // server's log-level filtering. total_ms is this call's wall time; fault_ms is the synchronous
-        // mmap page-in (NVMe stall) on cache misses - the number that must fall as hit-rate climbs.
+    if ((k3_moe_stats || k3_capture) && k3_moe_experts_streamed > 0) {
+        // per-token (per graph-compute) seam breakdown. total_ms is this call's wall time; fault_ms is the
+        // synchronous NVMe stall on cache misses - the number that must fall as hit-rate climbs.
         const uint64_t hits   = k3_host_cache.n_hits()   - k3_hits0;
         const uint64_t misses = k3_host_cache.n_misses() - k3_misses0;
         const double   fault_ms = (k3_host_cache.admit_micros() - k3_admit0) / 1000.0;
@@ -1892,10 +1896,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const double   fetch_mbps = fault_ms > 0.0 ? (fetch_mb / (fault_ms / 1000.0)) : 0.0;
         const double   total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - k3_t_start).count();
         const double   hit_rate = (hits + misses) ? (100.0 * hits / (hits + misses)) : 0.0;
-        fprintf(stderr,
-            "[K3PAGER] moe_stream: experts=%lld bytes=%.1f MiB | hits=%llu miss=%llu hit_rate=%.1f%% | fetch=%.0f MB/s fault_wait=%.1f ms total=%.1f ms\n",
-            (long long) k3_moe_experts_streamed, (double) k3_moe_bytes_streamed / (1024.0 * 1024.0),
-            (unsigned long long) hits, (unsigned long long) misses, hit_rate, fetch_mbps, fault_ms, total_ms);
+        if (k3_moe_stats) {   // stderr (not GGML_LOG_INFO) so it survives the server's log-level filtering.
+            fprintf(stderr,
+                "[K3PAGER] moe_stream: experts=%lld bytes=%.1f MiB | hits=%llu miss=%llu hit_rate=%.1f%% | fetch=%.0f MB/s fault_wait=%.1f ms total=%.1f ms\n",
+                (long long) k3_moe_experts_streamed, (double) k3_moe_bytes_streamed / (1024.0 * 1024.0),
+                (unsigned long long) hits, (unsigned long long) misses, hit_rate, fetch_mbps, fault_ms, total_ms);
+        }
+        if (k3_capture) {   // structured PagerCaptureEvent (graph-control fields) — Positron tails this JSONL.
+            fprintf(k3_capture,
+                "{\"token\":%llu,\"hit_rate\":%.4f,\"fault_wait_ms\":%.1f,\"tok_per_s\":%.4f,"
+                "\"bytes_fetched_mb\":%.1f,\"fetch_mb_s\":%.0f,\"resident_experts\":%llu,"
+                "\"experts\":%lld,\"misses\":%llu}\n",
+                (unsigned long long) k3_capture_token++, hit_rate / 100.0, fault_ms,
+                total_ms > 0.0 ? 1000.0 / total_ms : 0.0, fetch_mb, fetch_mbps,
+                (unsigned long long) hits, (long long) k3_moe_experts_streamed, (unsigned long long) misses);
+            fflush(k3_capture);
+        }
     }
 
     return GGML_STATUS_SUCCESS;
