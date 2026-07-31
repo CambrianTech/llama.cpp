@@ -88,34 +88,57 @@ int main(int argc, char ** argv) {
                 (resident_bytes - budget) / GB);
     if (resident_bytes <= budget) { std::printf("no down-quant needed.\n"); return 0; }
 
-    // greedy plan: down-quant the largest resident tensors first to `target` until under budget.
-    // bytes at target ~ elements * bits(target)/8; approximate elements from current bytes/type.
-    std::sort(resident.begin(), resident.end(), [](const T & a, const T & b){ return a.bytes > b.bytes; });
-    const double tgt_bpw =  // approx bits-per-weight of the target type (coarse; the requant is exact)
-        target == "q8_0" ? 8.5 : target == "q6_K" ? 6.6 : target == "q5_K" ? 5.5 :
-        target == "q4_K" ? 4.5 : target == "q3_K" ? 3.4 : target == "iq3_xxs" ? 3.1 :
-        target == "iq2_xxs" ? 2.1 : 4.5;
-    std::vector<std::string> plan;
-    uint64_t saved = 0;
-    for (const auto & t : resident) {
-        if (resident_bytes - saved <= budget) break;
-        const double cur_bpw = (double) ggml_type_size(t.type) * 8.0 / (double) ggml_blck_size(t.type);  // exact bpw of the type
-        if (tgt_bpw >= cur_bpw) continue;   // target isn't smaller than current — skip
-        const uint64_t new_bytes = (uint64_t) (t.bytes * (tgt_bpw / cur_bpw));
-        saved += (t.bytes - new_bytes);
-        plan.push_back(std::string(t.name) + "=" + target);
-    }
-    std::printf("\nplan: down-quant %zu resident tensors to %s, saving ~%.1f GB -> resident ~%.1f GB\n",
-                plan.size(), target.c_str(), saved / GB, (resident_bytes - saved) / GB);
-    if (resident_bytes - saved > budget) std::printf("  WARNING: still over budget at %s; need a smaller target-type\n", target.c_str());
-
-    if (!out.empty()) {
-        FILE * f = std::fopen(out.c_str(), "wb");
-        if (f) { for (auto & l : plan) std::fprintf(f, "%s\n", l.c_str()); std::fclose(f);
-                 std::printf("wrote llama-quantize --tensor-type-file: %s (%zu overrides)\n", out.c_str(), plan.size()); }
-    } else {
-        std::printf("\n--tensor-type-file lines (feed to llama-quantize):\n");
-        for (auto & l : plan) std::printf("  %s\n", l.c_str());
+    // SENSITIVITY-AWARE MIXED PRECISION — "some high fidelity, others low" (Joel). NOT a uniform
+    // down-quant: keep the SENSITIVE tensors sharp and spend the bit-savings on the insensitive bulk.
+    // Rate-distortion / the all-star-cruft principle applied to the RESIDENT tier. v1 = a NAME heuristic
+    // (the known sensitivity ordering); v2 feeds MEASURED per-tensor sensitivity (perturb -> perplexity/KL
+    // delta — the same sensor the expert allocator uses). --target-type is now just the LOW-class floor.
+    (void) target;
+    auto sens_class = [](const std::string & n) -> int {   // 2=HIGH keep sharp, 1=MED, 0=LOW = the bulk
+        if (n.find("norm") != std::string::npos) return 2;                          // tiny + very sensitive
+        if (n.find("token_embd") != std::string::npos || n.find("output") != std::string::npos) return 2;
+        if (n.find("attn_output") != std::string::npos || n.find("attn_v") != std::string::npos) return 2;
+        if (n.find("attn_q") != std::string::npos || n.find("attn_k") != std::string::npos ||
+            n.find("ffn_down") != std::string::npos) return 1;
+        return 0;                                                                    // ffn_gate/up + misc
+    };
+    auto bpw_of = [](const std::string & ty) -> double {
+        return ty == "keep" ? 99.0 : ty == "q8_0" ? 8.5 : ty == "q6_K" ? 6.6 : ty == "q5_K" ? 5.5 :
+               ty == "q4_K" ? 4.5 : ty == "q3_K" ? 3.4 : ty == "iq3_xxs" ? 3.1 : ty == "iq2_xxs" ? 2.1 : 4.5;
+    };
+    // per-class target LADDERS (sharpest first). Successive steps squeeze the LOW class first, then MED,
+    // and only nudge HIGH as a last resort — so fidelity is preserved where it matters.
+    const char * ladders[3][4] = {
+        { "q4_K", "q3_K", "iq3_xxs", "iq2_xxs" },   // LOW  (0): the bulk, most aggressive
+        { "q5_K", "q4_K", "q3_K",    "q3_K"    },   // MED  (1)
+        { "keep", "q6_K", "q6_K",    "q5_K"    },   // HIGH (2): keep sharp; only nudge if desperate
+    };
+    for (int step = 0; step < 4; step++) {
+        std::vector<std::string> plan;
+        uint64_t projected = 0, kept_hi = 0;
+        for (const auto & t : resident) {
+            const int c = sens_class(t.name);
+            const std::string tgt = ladders[c][step];
+            const double cur_bpw = (double) ggml_type_size(t.type) * 8.0 / (double) ggml_blck_size(t.type);
+            if (tgt == "keep" || bpw_of(tgt) >= cur_bpw) { projected += t.bytes; if (c == 2) kept_hi += t.bytes; continue; }
+            projected += (uint64_t) (t.bytes * (bpw_of(tgt) / cur_bpw));
+            plan.push_back(t.name + "=" + tgt);
+        }
+        const bool fits = projected <= budget;
+        if (fits || step == 3) {
+            std::printf("\nMIXED plan (step %d, %s): %zu tensors down-quant, ~%.1f GB HIGH-class kept sharp, resident ~%.1f GB (budget %.1f GB)%s\n",
+                        step, fits ? "FITS" : "best-effort", plan.size(), kept_hi / GB, projected / GB, vram_gb,
+                        fits ? "" : "  [still over — raise --vram-gb or lower the HIGH class]");
+            if (!out.empty()) {
+                FILE * f = std::fopen(out.c_str(), "wb");
+                if (f) { for (auto & l : plan) std::fprintf(f, "%s\n", l.c_str()); std::fclose(f);
+                         std::printf("wrote --tensor-type-file: %s (%zu overrides; unlisted tensors keep their type)\n", out.c_str(), plan.size()); }
+            } else {
+                std::printf("\n--tensor-type-file lines:\n");
+                for (auto & l : plan) std::printf("  %s\n", l.c_str());
+            }
+            break;
+        }
     }
     return 0;
 }
