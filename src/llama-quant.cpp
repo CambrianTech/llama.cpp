@@ -1046,7 +1046,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             metadata[i].target_type = tensor->type;
         }
 
-        metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
+        // A same-type target is a COPY, not a quantization (see `quantize = cur_type != new_type` in the
+        // write loop) — so it can never need an importance matrix. Exempt it from the upfront gate, else
+        // copying a model whose tensors are already low-bit (e.g. K3's iq1_m/iq2/iq3 UD experts) spuriously
+        // demands an imatrix. (M5 diagnosis; upstream-worthy.)
+        metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype)
+                                     && metadata[i].target_type != tensor->type;
 
         if (params->imatrix) {
             metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);
