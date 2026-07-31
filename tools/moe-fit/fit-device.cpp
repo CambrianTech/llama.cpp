@@ -52,7 +52,7 @@ int main(int argc, char ** argv) {
 
     // one row per RESIDENT tensor: name, current type, bytes
     struct T { std::string name; ggml_type type; uint64_t bytes; };
-    std::vector<T> resident;
+    std::vector<T> resident, experts;   // experts are MIXED types under a UD quant — copy each at its own
     uint64_t resident_bytes = 0, paged_bytes = 0;
     uint64_t by_type_bytes[GGML_TYPE_COUNT] = {0};
 
@@ -64,8 +64,8 @@ int main(int argc, char ** argv) {
         for (int64_t t = 0; t < n; t++) {
             const char * nm = gguf_get_tensor_name(ctx, t);
             const uint64_t sz = gguf_get_tensor_size(ctx, t);
-            if (is_expert(nm)) { paged_bytes += sz; continue; }
             const ggml_type ty = gguf_get_tensor_type(ctx, t);
+            if (is_expert(nm)) { paged_bytes += sz; experts.push_back({ nm, ty, sz }); continue; }  // copy at own type
             resident.push_back({ nm, ty, sz });
             resident_bytes += sz;
             by_type_bytes[ty] += sz;
@@ -141,8 +141,15 @@ int main(int argc, char ** argv) {
                         fits ? "" : "  [still over — raise --vram-gb or lower the HIGH class]");
             if (!out.empty()) {
                 FILE * f = std::fopen(out.c_str(), "wb");
-                if (f) { for (auto & l : plan) std::fprintf(f, "%s\n", l.c_str()); std::fclose(f);
-                         std::printf("wrote --tensor-type-file: %s (%zu overrides; unlisted tensors keep their type)\n", out.c_str(), plan.size()); }
+                if (f) {
+                    for (auto & l : plan) std::fprintf(f, "%s\n", l.c_str());
+                    // COPY every expert at its OWN (mixed UD) type so none falls to the base ftype and
+                    // gets re-quantized (which for iq2 would need an imatrix). new_type==cur_type => copy.
+                    for (auto & e : experts) std::fprintf(f, "%s=%s\n", e.name.c_str(), ggml_type_name(e.type));
+                    std::fclose(f);
+                    std::printf("wrote --tensor-type-file: %s (%zu resident overrides + %zu expert copies)\n",
+                                out.c_str(), plan.size(), experts.size());
+                }
             } else {
                 std::printf("\n--tensor-type-file lines:\n");
                 for (auto & l : plan) std::printf("  %s\n", l.c_str());
