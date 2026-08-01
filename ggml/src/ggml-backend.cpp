@@ -1610,10 +1610,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static const uint64_t moe_capture_cap = ggml_moe::moe_config().capture_cap_bytes;
     // host-side expert residency cache (the module; budget from GGML_MOE_HOST_CACHE_GB, 0 => disabled).
     ggml_moe::ResidencyCache & host_cache = moe_expert_cache();
+    // [MOE-RECENCY] one compute-splits call == one token (decode) / one prefill batch. Poll the governor's
+    // plan-file and advance the recency clock EVERY call, BEFORE reading enabled() - so a governed budget
+    // arriving via the plan (which starts the cache at budget 0) can turn it ON. Cheap mtime check; a
+    // no-op when no plan file is configured. Advancing the clock also protects whole recent tokens' sets.
+    host_cache.advance_generation();
     const bool host_cache_on = host_cache.enabled();
-    // [MOE-RECENCY] one compute-splits call == one token (decode) / one prefill batch. Advance the cache's
-    // token-generation clock so recency-window eviction protects whole recent tokens' expert sets.
-    if (host_cache_on) { host_cache.advance_generation(); }
     size_t  moe_bytes_streamed  = 0;
     int64_t moe_experts_streamed = 0;
     // per-token deltas snapshot the cumulative cache counters at entry
