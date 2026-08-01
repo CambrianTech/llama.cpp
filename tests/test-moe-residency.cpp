@@ -756,11 +756,60 @@ static int replay_trace(const char * path) {
     return g_fail ? 1 : 0;
 }
 
+static void moe_test_set_env(const char * k, const char * v) {
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+static void moe_test_unset_env(const char * k) {
+#ifdef _WIN32
+    _putenv_s(k, "");
+#else
+    unsetenv(k);
+#endif
+}
+
+// what this catches: the single-config-manager parse. MoeServingConfig::from_env() is the ONE place
+// every GGML_MOE_* knob is read; a wrong unit or default here silently mis-budgets the whole serving
+// path (host cache disabled, GiB read as bytes, a flag stuck on). Regression guard for the config
+// cleanup that replaced the scattered getenv() calls.
+static void test_serving_config_from_env() {
+    moe_test_set_env("GGML_MOE_HOST_CACHE_GB", "2");
+    moe_test_set_env("GGML_MOE_VRAM_CACHE_GB", "1");
+    moe_test_set_env("GGML_MOE_DIRECT_READ", "1");
+    moe_test_set_env("GGML_MOE_PREFETCH", "1");
+    moe_test_set_env("GGML_MOE_OFFLOAD_STATS", "1");
+    moe_test_set_env("GGML_MOE_CAPTURE_MB", "8");
+    moe_test_set_env("GGML_MOE_PLAN_FILE", "plan.json");
+    const ggml_moe::MoeServingConfig c = ggml_moe::MoeServingConfig::from_env();
+    CHECK(c.host_cache_bytes == 2ull * 1024 * 1024 * 1024, "host cache GiB -> bytes");
+    CHECK(c.vram_cache_bytes == 1ull * 1024 * 1024 * 1024, "vram cache GiB -> bytes");
+    CHECK(c.direct_read && c.prefetch && c.stats, "presence flags set when env present");
+    CHECK(c.capture_cap_bytes == 8ull * 1024 * 1024, "capture MB -> bytes");
+    CHECK(c.plan_path == "plan.json", "plan path captured");
+
+    moe_test_unset_env("GGML_MOE_HOST_CACHE_GB");
+    moe_test_unset_env("GGML_MOE_VRAM_CACHE_GB");
+    moe_test_unset_env("GGML_MOE_DIRECT_READ");
+    moe_test_unset_env("GGML_MOE_PREFETCH");
+    moe_test_unset_env("GGML_MOE_OFFLOAD_STATS");
+    moe_test_unset_env("GGML_MOE_CAPTURE_MB");
+    moe_test_unset_env("GGML_MOE_PLAN_FILE");
+    const ggml_moe::MoeServingConfig d = ggml_moe::MoeServingConfig::from_env();
+    CHECK(d.host_cache_bytes == 0 && d.vram_cache_bytes == 0, "unset budgets => 0 (disabled)");
+    CHECK(!d.direct_read && !d.prefetch && !d.stats, "unset flags => false");
+    CHECK(d.capture_cap_bytes == 32ull * 1024 * 1024, "unset capture => 32 MB default");
+    CHECK(d.plan_path.empty(), "unset plan path => empty");
+}
+
 int main(int argc, char ** argv) {
     // VDD mode: replay a captured trace if a path is given.
     if (argc > 1) { int rc = replay_trace(argv[1]); std::printf("%d passed, %d failed\n", g_pass, g_fail); return rc; }
 
     // TDD suite
+    test_serving_config_from_env();
     test_key_stable_across_tokens();
     test_key_distinct_axes();
     test_canonical_strips_decoration();
