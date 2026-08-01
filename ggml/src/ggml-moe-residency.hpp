@@ -466,6 +466,18 @@ class ResidencyCache {
         p.slot_gen.assign(p.max_slots, 0);
     }
 
+    // Free every pinned pool buffer, returning its RAM to the OS. Pools re-allocate lazily at the
+    // current budget on next access. Called when the governor LOWERS the budget: a cache that honors
+    // growth but not shrink cannot flex down under memory pressure and would hold committed RAM past
+    // the new lease. Safe here because it runs from advance_generation (top of a compute call, under
+    // the mutex), after the prior token's async H2D copies out of these buffers have completed.
+    void release_pools_locked() {
+        for (auto & kv : pools) {
+            if (kv.second.buf) { ggml_backend_buffer_free(kv.second.buf); }
+        }
+        pools.clear();
+    }
+
     // pick a slot: next free one, else evict the OLDEST token-generation (tie-break: oldest access tick),
     // dropping its key mapping. Generation-primary = recency window at token granularity (see class doc).
     size_t reserve_slot(Pool & p) {
@@ -513,7 +525,12 @@ public:
         buf.resize(got);
         PagerPlan plan;
         if (!parse_pager_plan(buf.c_str(), plan)) { return; }
+        const size_t prev_budget = budget_bytes;
         if (plan.budget_bytes > 0) { budget_bytes = plan.budget_bytes; }
+        // Governor lowered the lease -> free the pools so the RAM actually returns (honor shrink, not
+        // just growth). Re-allocated lazily at the new budget. Partial-evict-keeping-hottest is a future
+        // refinement; freeing fully is the correct floor for flex-under-pressure.
+        if (budget_bytes < prev_budget) { release_pools_locked(); }
         window_k_ = plan.window_k;
         // retention bias for a hinted expert = 2x the recency window: a hint survives ~2 windows longer
         // than an unhinted expert of the same age, but a COLD hint still ages out (recency stays in charge).

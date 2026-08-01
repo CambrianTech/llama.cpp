@@ -33,6 +33,7 @@ typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
 extern "C" {
     ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t, size_t);
     void *                ggml_backend_buffer_get_base(ggml_backend_buffer_t);
+    void                  ggml_backend_buffer_free(ggml_backend_buffer_t);
 }
 
 #include "ggml-moe-residency.hpp"
