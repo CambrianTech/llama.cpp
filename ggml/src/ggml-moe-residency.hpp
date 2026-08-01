@@ -401,8 +401,9 @@ class ResidencyCache {
     uint64_t tick = 0, token_gen = 0, hits = 0, misses = 0;
 
     // [RUNG-2] controller actuator state (set via the GGML_MOE_PLAN_FILE control file; see PagerPlan).
-    std::unordered_set<uint64_t> pinned_;   // expert cache-keys that are evict-EXEMPT (always resident)
+    std::unordered_set<uint64_t> pinned_;   // hinted expert cache-keys — a RETENTION BIAS, not evict-exempt
     uint32_t     window_k_    = 0;          // recency window depth in tokens (0 = budget-implicit, legacy)
+    uint64_t     pin_bias_    = 0;          // generations of retention bias a hinted expert gets in eviction
     std::string  plan_path_;                // GGML_MOE_PLAN_FILE (empty => no controller; pure legacy)
     int64_t      plan_mtime_  = 0;          // last-seen mtime; reload on change (atomic-rename by writer)
     double   admit_us = 0.0;   // accumulated fetch time on misses
@@ -428,23 +429,18 @@ class ResidencyCache {
     // dropping its key mapping. Generation-primary = recency window at token granularity (see class doc).
     size_t reserve_slot(Pool & p) {
         if (p.used < p.max_slots) { return p.used++; }
-        // evict OLDEST token-generation (tie: oldest tick) among NON-PINNED slots — pins (the
-        // controller's always-hot set, e.g. the shared experts) are evict-exempt guaranteed hits.
-        size_t slot = SIZE_MAX;
-        uint64_t og = UINT64_MAX, ot = UINT64_MAX;
+        // SCORE-HINT eviction: evict the slot with the oldest EFFECTIVE generation, where a hinted expert
+        // (in pinned_) gets a +pin_bias_ retention boost — it is treated as if that many generations more
+        // recent. The policy thus BIASES what to keep without a hard partition: recency still governs, and
+        // a COLD hint (older than the bias) still ages out. Replaces evict-exempt pinning, which taxed
+        // recency the very slots it needs to be good (RUN-1/RUN-2 convicted the hard actuator).
         const bool have_pins = !pinned_.empty();
+        size_t slot = 0;
+        uint64_t oeff = UINT64_MAX, ot = UINT64_MAX;
         for (size_t i = 0; i < p.max_slots; i++) {
-            if (have_pins && pinned_.count(p.slot_key[i])) { continue; }   // never evict a pinned expert
-            if (p.slot_gen[i] < og || (p.slot_gen[i] == og && p.slot_tick[i] < ot)) {
-                og = p.slot_gen[i]; ot = p.slot_tick[i]; slot = i;
-            }
-        }
-        if (slot == SIZE_MAX) {   // pin_list oversized for this budget: fall back to oldest overall
-            og = UINT64_MAX; ot = UINT64_MAX; slot = 0;
-            for (size_t i = 0; i < p.max_slots; i++) {
-                if (p.slot_gen[i] < og || (p.slot_gen[i] == og && p.slot_tick[i] < ot)) {
-                    og = p.slot_gen[i]; ot = p.slot_tick[i]; slot = i;
-                }
+            const uint64_t eff = p.slot_gen[i] + ((have_pins && pinned_.count(p.slot_key[i])) ? pin_bias_ : 0);
+            if (eff < oeff || (eff == oeff && p.slot_tick[i] < ot)) {
+                oeff = eff; ot = p.slot_tick[i]; slot = i;
             }
         }
         p.key2slot.erase(p.slot_key[slot]);
@@ -478,14 +474,18 @@ public:
         if (!parse_pager_plan(buf.c_str(), plan)) { return; }
         if (plan.budget_bytes > 0) { budget_bytes = plan.budget_bytes; }
         window_k_ = plan.window_k;
+        // retention bias for a hinted expert = 2x the recency window: a hint survives ~2 windows longer
+        // than an unhinted expert of the same age, but a COLD hint still ages out (recency stays in charge).
+        pin_bias_ = window_k_ ? (uint64_t) window_k_ * 2 : 4;
         pinned_.clear();
         for (const auto & pe : plan.pins) {
             uint64_t k3[3]; expert_pin_keys(pe.first, pe.second, k3);
             pinned_.insert(k3[0]); pinned_.insert(k3[1]); pinned_.insert(k3[2]);
         }
         if (getenv("GGML_MOE_OFFLOAD_STATS")) {
-            fprintf(stderr, "[PLAN] reloaded: budget=%zuMB window_k=%u pins=%zu (keys=%zu)\n",
-                    budget_bytes / (1024*1024), window_k_, plan.pins.size(), pinned_.size());
+            fprintf(stderr, "[PLAN] reloaded: budget=%zuMB window_k=%u hints=%zu (keys=%zu, bias=%llu gens)\n",
+                    budget_bytes / (1024*1024), window_k_, plan.pins.size(), pinned_.size(),
+                    (unsigned long long) pin_bias_);
         }
     }
 
