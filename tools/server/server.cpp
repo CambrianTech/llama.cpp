@@ -88,9 +88,6 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
-    // [K3-EXPERT-PAGING] build/run-loop marker — proves the fresh fork binary shipped.
-    fprintf(stderr, "[K3PAGER] llama-server-k3 build marker: expert-paging-scaffold-v1\n");
-
 #ifndef _WIN32
     // Ignore SIGPIPE so the server does not crash if an MCP child exits while we are writing to its stdin
     signal(SIGPIPE, SIG_IGN);

@@ -1544,7 +1544,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-// [K3-EXPERT-PAGING] MoE expert residency (task #23/#28) lives in ggml-moe-residency.hpp as a clean
+// [MOE-EXPERT-PAGING] MoE expert residency (task #23/#28) lives in ggml-moe-residency.hpp as a clean
 // module — ExpertId (semantic identity), ExpertFetcher (mmap-fault / direct-NVMe adapter), and
 // ResidencyCache (pinned LRU). Here we just pick the fetcher and hold the cache. See the call site
 // in ggml_backend_sched_compute_splits for how the op-offload seam feeds it.
@@ -1555,17 +1555,14 @@ static ggml_moe::DirectReadFetcher moe_direct_fetcher;
 static ggml_moe::MmapFaultFetcher  moe_mmap_fetcher;
 static ggml_moe::ExpertFetcher &   moe_pick_fetcher() {
 #ifdef _WIN32
-    if (getenv("GGML_MOE_DIRECT_READ") != nullptr) { return moe_direct_fetcher; }
+    if (ggml_moe::moe_config().direct_read) { return moe_direct_fetcher; }
 #endif
     return moe_mmap_fetcher;
 }
-// budget in GiB via GGML_MOE_HOST_CACHE_GB (0/unset => disabled). Cache holds a mutex, so it is a
-// plain function-local static, constructed once with the chosen fetcher; budget applied idempotently.
+// budget from moe_config().host_cache_bytes (0 => disabled). Cache holds a mutex, so it is a plain
+// function-local static, constructed once with the chosen fetcher; budget applied idempotently.
 static ggml_moe::ResidencyCache & moe_expert_cache() {
-    static ggml_moe::ResidencyCache cache([] {
-        const char * gb = getenv("GGML_MOE_HOST_CACHE_GB");
-        return gb ? (size_t) (atof(gb) * 1024.0 * 1024.0 * 1024.0) : (size_t) 0;
-    }(), moe_pick_fetcher());
+    static ggml_moe::ResidencyCache cache(ggml_moe::moe_config().host_cache_bytes, moe_pick_fetcher());
     return cache;
 }
 
@@ -1578,45 +1575,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
-    // [K3-EXPERT-PAGING] measure the host->VRAM MoE expert stream per graph-compute (per decode token).
+    // [MOE-EXPERT-PAGING] measure the host->VRAM MoE expert stream per graph-compute (per decode token).
     // Values feed the design's residency negotiation: working_set_size (distinct experts streamed) and
     // bytes streamed (basis for pcie_h2d_bps). Zero-cost by default: accumulation is a couple of int
     // adds; the summary log is emitted only when GGML_MOE_OFFLOAD_STATS is set.
-    static const bool k3_moe_stats = getenv("GGML_MOE_OFFLOAD_STATS") != nullptr;
-    // [K3-EXPERT-PAGING] read-based residency (task #28): batched OS prefetch of the selected experts'
+    static const bool moe_stats = ggml_moe::moe_config().stats;
+    // [MOE-EXPERT-PAGING] read-based residency (task #28): batched OS prefetch of the selected experts'
     // mmap ranges, turning cold random demand-faults into concurrent sequential NVMe reads. Opt-in so
     // before/after is a single binary (A/B by env).
-    static const bool k3_moe_prefetch = getenv("GGML_MOE_PREFETCH") != nullptr;
-    // [K3-TRACE] optional ordered expert-access trace for OFFLINE residency-policy simulation. One binary
+    static const bool moe_prefetch = ggml_moe::moe_config().prefetch;
+    // [MOE-TRACE] optional ordered expert-access trace for OFFLINE residency-policy simulation. One binary
     // record (u64 tensor_key, u32 expert_id) per activated expert, in true access order. Lets us replay
-    // the real K3 routing against ANY cache policy/budget (LRU vs LFU vs a learned predictor) to measure
+    // the real MoE routing against ANY cache policy/budget (LRU vs LFU vs a learned predictor) to measure
     // achievable hit-rate BEFORE building the predictor — the make-or-break input. GGML_MOE_TRACE_FILE=path.
-    static FILE * k3_trace = []{ const char * p = getenv("GGML_MOE_TRACE_FILE"); return p ? fopen(p, "wb") : nullptr; }();
-    // [K3-CAPTURE] structured PagerCaptureEvent JSONL for Positron (graph-control performance fields; the
+    static FILE * moe_trace = []{ const char * p = ggml_moe::moe_config().trace_path; return p ? fopen(p, "wb") : nullptr; }();
+    // [MOE-CAPTURE] structured PagerCaptureEvent JSONL for Positron (graph-control performance fields; the
     // policy fields — chosen_decay/per_arm_reward/tier_counts — are filled by the Rust ServingExpertPager).
     // One line per decode token; Positron tails it. GGML_MOE_CAPTURE_FILE=path enables it.
-    static const char * k3_capture_path = getenv("GGML_MOE_CAPTURE_FILE");
-    static FILE * k3_capture = k3_capture_path ? fopen(k3_capture_path, "wb") : nullptr;
-    static uint64_t k3_capture_token = 0, k3_capture_bytes = 0;
+    static const char * moe_capture_path = ggml_moe::moe_config().capture_path;
+    static FILE * moe_capture = moe_capture_path ? fopen(moe_capture_path, "wb") : nullptr;
+    static uint64_t moe_capture_token = 0, moe_capture_bytes = 0;
     // DRAIN: bound the JSONL so it can't grow unbounded — recent data is what matters. At the cap we
     // rotate (path -> path.1, reopen fresh), keeping ~2x cap of recent capture cleanly. This is the raw
     // guard; the proper drain is the facility layer (Rust CaptureSink ring/rotation, as TrackedDir does
     // for other capture). GGML_MOE_CAPTURE_MB overrides the cap (default 32 MB ~ 200k tokens).
-    static const uint64_t k3_capture_cap = (uint64_t)(getenv("GGML_MOE_CAPTURE_MB") ? atoi(getenv("GGML_MOE_CAPTURE_MB")) : 32) * 1024 * 1024;
+    static const uint64_t moe_capture_cap = ggml_moe::moe_config().capture_cap_bytes;
     // host-side expert residency cache (the module; budget from GGML_MOE_HOST_CACHE_GB, 0 => disabled).
-    ggml_moe::ResidencyCache & k3_host_cache = moe_expert_cache();
-    const bool k3_host_cache_on = k3_host_cache.enabled();
-    // [K3-RECENCY] one compute-splits call == one token (decode) / one prefill batch. Advance the cache's
+    ggml_moe::ResidencyCache & host_cache = moe_expert_cache();
+    const bool host_cache_on = host_cache.enabled();
+    // [MOE-RECENCY] one compute-splits call == one token (decode) / one prefill batch. Advance the cache's
     // token-generation clock so recency-window eviction protects whole recent tokens' expert sets.
-    if (k3_host_cache_on) { k3_host_cache.advance_generation(); }
-    size_t  k3_moe_bytes_streamed  = 0;
-    int64_t k3_moe_experts_streamed = 0;
+    if (host_cache_on) { host_cache.advance_generation(); }
+    size_t  moe_bytes_streamed  = 0;
+    int64_t moe_experts_streamed = 0;
     // per-token deltas snapshot the cumulative cache counters at entry
-    const uint64_t k3_hits0   = k3_host_cache.n_hits();
-    const uint64_t k3_misses0 = k3_host_cache.n_misses();
-    const double   k3_admit0  = k3_host_cache.admit_micros();
-    const size_t   k3_bytes0  = k3_host_cache.admit_bytes_n();
-    const auto     k3_t_start = std::chrono::steady_clock::now();
+    const uint64_t hits0   = host_cache.n_hits();
+    const uint64_t misses0 = host_cache.n_misses();
+    const double   admit0  = host_cache.admit_micros();
+    const size_t   bytes0  = host_cache.admit_bytes_n();
+    const auto     t_start = std::chrono::steady_clock::now();
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1699,8 +1696,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
-                        k3_moe_experts_streamed += (last_id - first_id + 1);
-                        k3_moe_bytes_streamed   += expert_size_copy + padding_end;
+                        moe_experts_streamed += (last_id - first_id + 1);
+                        moe_bytes_streamed   += expert_size_copy + padding_end;
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
@@ -1712,7 +1709,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // collect the grouped consecutive expert ranges once, so we can prefetch them all
                     // as a batch before copying (read-based residency), then copy.
-                    std::vector<std::pair<int32_t, int32_t>> k3_groups;
+                    std::vector<std::pair<int32_t, int32_t>> groups;
                     {
                         int id = 0;
                         while (!ggml_bitset_get(used_ids.data(), id)) {
@@ -1731,34 +1728,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 continue;
                             }
 
-                            k3_groups.emplace_back(first_id, last_id);
+                            groups.emplace_back(first_id, last_id);
 
                             first_id = id;
                             last_id = id;
                         }
-                        k3_groups.emplace_back(first_id, last_id);
+                        groups.emplace_back(first_id, last_id);
                     }
 
-                    // [K3-TRACE] record the selected experts for this (layer,matrix) tensor in access order.
-                    if (k3_trace) {
+                    // [MOE-TRACE] record the selected experts for this (layer,matrix) tensor in access order.
+                    if (moe_trace) {
                         const uint64_t tkey = ggml_moe::canonical_name_key(ggml_get_name(input));
-                        for (const auto & g : k3_groups) {
+                        for (const auto & g : groups) {
                             for (int32_t id = g.first; id <= g.second; ++id) {
                                 const uint32_t e = (uint32_t) id;
-                                fwrite(&tkey, sizeof(tkey), 1, k3_trace);
-                                fwrite(&e,    sizeof(e),    1, k3_trace);
+                                fwrite(&tkey, sizeof(tkey), 1, moe_trace);
+                                fwrite(&e,    sizeof(e),    1, moe_trace);
                             }
                         }
                     }
 
 #ifdef _WIN32
-                    // [K3-EXPERT-PAGING] one batched PrefetchVirtualMemory over every selected expert
+                    // [MOE-EXPERT-PAGING] one batched PrefetchVirtualMemory over every selected expert
                     // range kicks off concurrent sequential NVMe reads for the whole layer's working set,
                     // instead of the copy loop demand-faulting one page at a time (~564 MB/s, GPU-starved).
-                    if (k3_moe_prefetch && !k3_groups.empty()) {
+                    if (moe_prefetch && !groups.empty()) {
                         std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
-                        ranges.reserve(k3_groups.size());
-                        for (const auto & g : k3_groups) {
+                        ranges.reserve(groups.size());
+                        for (const auto & g : groups) {
                             WIN32_MEMORY_RANGE_ENTRY e;
                             e.VirtualAddress = (void *) ((const uint8_t *) input->data + (size_t) g.first * expert_size);
                             e.NumberOfBytes  = (size_t) (g.second - g.first + 1) * expert_size;
@@ -1768,7 +1765,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 #endif
 
-                    if (k3_host_cache_on) {
+                    if (host_cache_on) {
                         // serve each selected expert from the pinned host cache (RAM-resident, no re-fault),
                         // admitting on miss; then DMA the resident copy host->VRAM. Per-expert so scattered
                         // cache slots map back to the expert's natural offset in input_cpy.
@@ -1777,16 +1774,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(split_backend));
                         // SEMANTIC identity of this expert weight (blk.N.ffn_*_exps.weight): stable across
                         // tokens and universal across MoEs. Hashed once per weight tensor, not per expert.
-                        const char * k3_tname = ggml_get_name(input);
+                        const char * tname = ggml_get_name(input);
                         // DISCRIMINATOR (M5): print the RAW seam name + the canonical key it produces,
                         // for the first N calls, so we SEE what the name actually is across tokens
                         // instead of assuming the "BACKEND#leaf#C" shape. Same (layer,tensor) two tokens
                         // apart must show the SAME canon key; if not, the raw string tells us why.
                         {
                             static int _nm = 0;
-                            if (k3_moe_stats && _nm++ < 40) {
+                            if (moe_stats && _nm++ < 40) {
                                 fprintf(stderr, "[NAME] raw='%s' canon_key=%llu\n",
-                                        k3_tname, (unsigned long long) ggml_moe::canonical_name_key(k3_tname));
+                                        tname, (unsigned long long) ggml_moe::canonical_name_key(tname));
                             }
                         }
                         // Prefetch this layer's whole selected-expert set concurrently (overlapped NVMe
@@ -1797,24 +1794,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         {
                             std::vector<ggml_moe::ExpertId> pf_ids;
                             std::vector<const uint8_t *>    pf_srcs;
-                            for (const auto & g : k3_groups) {
+                            for (const auto & g : groups) {
                                 for (int32_t id = g.first; id <= g.second; ++id) {
                                     const uint8_t * src = (const uint8_t *) input->data + (size_t) id * expert_size;
-                                    pf_ids.push_back(ggml_moe::expert_id_for(src, k3_tname, id));
+                                    pf_ids.push_back(ggml_moe::expert_id_for(src, tname, id));
                                     pf_srcs.push_back(src);
                                 }
                             }
-                            k3_host_cache.prefetch(host_buft, pf_ids.data(), pf_srcs.data(), pf_ids.size(), expert_size, pad);
+                            host_cache.prefetch(host_buft, pf_ids.data(), pf_srcs.data(), pf_ids.size(), expert_size, pad);
                         }
-                        for (const auto & g : k3_groups) {
+                        for (const auto & g : groups) {
                             for (int32_t id = g.first; id <= g.second; ++id) {
                                 const size_t   dst_off = (size_t) id * expert_size;
                                 const uint8_t * mmap_src = (const uint8_t *) input->data + dst_off;
                                 const size_t   pad_end = id < n_expert - 1 ? pad : 0;
-                                uint8_t * host = k3_host_cache.get(host_buft, ggml_moe::expert_id_for(mmap_src, k3_tname, id),
+                                uint8_t * host = host_cache.get(host_buft, ggml_moe::expert_id_for(mmap_src, tname, id),
                                                                    mmap_src, expert_size, pad);
-                                k3_moe_experts_streamed += 1;
-                                k3_moe_bytes_streamed   += expert_size + pad_end;
+                                moe_experts_streamed += 1;
+                                moe_bytes_streamed   += expert_size + pad_end;
                                 if (host) {
                                     ggml_backend_tensor_set_async(split_backend, input_cpy, host, dst_off, expert_size + pad_end);
                                 } else {
@@ -1823,7 +1820,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
                     } else {
-                        for (const auto & g : k3_groups) {
+                        for (const auto & g : groups) {
                             copy_experts(g.first, g.second);
                         }
                     }
@@ -1890,40 +1887,40 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
-    // [K3-EXPERT-PAGING] per-compute MoE-stream summary (opt-in). On a decode step (batch=1) this is the
+    // [MOE-EXPERT-PAGING] per-compute MoE-stream summary (opt-in). On a decode step (batch=1) this is the
     // per-token host->VRAM expert working set: the number the persistent VRAM slot cache must shrink.
-    if ((k3_moe_stats || k3_capture) && k3_moe_experts_streamed > 0) {
+    if ((moe_stats || moe_capture) && moe_experts_streamed > 0) {
         // per-token (per graph-compute) seam breakdown. total_ms is this call's wall time; fault_ms is the
         // synchronous NVMe stall on cache misses - the number that must fall as hit-rate climbs.
-        const uint64_t hits   = k3_host_cache.n_hits()   - k3_hits0;
-        const uint64_t misses = k3_host_cache.n_misses() - k3_misses0;
-        const double   fault_ms = (k3_host_cache.admit_micros() - k3_admit0) / 1000.0;
-        const double   fetch_mb = (double) (k3_host_cache.admit_bytes_n() - k3_bytes0) / (1024.0 * 1024.0);
+        const uint64_t hits   = host_cache.n_hits()   - hits0;
+        const uint64_t misses = host_cache.n_misses() - misses0;
+        const double   fault_ms = (host_cache.admit_micros() - admit0) / 1000.0;
+        const double   fetch_mb = (double) (host_cache.admit_bytes_n() - bytes0) / (1024.0 * 1024.0);
         const double   fetch_mbps = fault_ms > 0.0 ? (fetch_mb / (fault_ms / 1000.0)) : 0.0;
-        const double   total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - k3_t_start).count();
+        const double   total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
         const double   hit_rate = (hits + misses) ? (100.0 * hits / (hits + misses)) : 0.0;
-        if (k3_moe_stats) {   // stderr (not GGML_LOG_INFO) so it survives the server's log-level filtering.
+        if (moe_stats) {   // stderr (not GGML_LOG_INFO) so it survives the server's log-level filtering.
             fprintf(stderr,
-                "[K3PAGER] moe_stream: experts=%lld bytes=%.1f MiB | hits=%llu miss=%llu hit_rate=%.1f%% | fetch=%.0f MB/s fault_wait=%.1f ms total=%.1f ms\n",
-                (long long) k3_moe_experts_streamed, (double) k3_moe_bytes_streamed / (1024.0 * 1024.0),
+                "[MOE-PAGER] moe_stream: experts=%lld bytes=%.1f MiB | hits=%llu miss=%llu hit_rate=%.1f%% | fetch=%.0f MB/s fault_wait=%.1f ms total=%.1f ms\n",
+                (long long) moe_experts_streamed, (double) moe_bytes_streamed / (1024.0 * 1024.0),
                 (unsigned long long) hits, (unsigned long long) misses, hit_rate, fetch_mbps, fault_ms, total_ms);
         }
-        if (k3_capture) {   // structured PagerCaptureEvent (graph-control fields) — Positron tails this JSONL.
-            const int nw = fprintf(k3_capture,
+        if (moe_capture) {   // structured PagerCaptureEvent (graph-control fields) — Positron tails this JSONL.
+            const int nw = fprintf(moe_capture,
                 "{\"token\":%llu,\"hit_rate\":%.4f,\"fault_wait_ms\":%.1f,\"tok_per_s\":%.4f,"
                 "\"bytes_fetched_mb\":%.1f,\"fetch_mb_s\":%.0f,\"resident_experts\":%llu,"
                 "\"experts\":%lld,\"misses\":%llu}\n",
-                (unsigned long long) k3_capture_token++, hit_rate / 100.0, fault_ms,
+                (unsigned long long) moe_capture_token++, hit_rate / 100.0, fault_ms,
                 total_ms > 0.0 ? 1000.0 / total_ms : 0.0, fetch_mb, fetch_mbps,
-                (unsigned long long) hits, (long long) k3_moe_experts_streamed, (unsigned long long) misses);
-            fflush(k3_capture);
-            if (nw > 0) { k3_capture_bytes += (uint64_t) nw; }
-            if (k3_capture_bytes >= k3_capture_cap) {   // DRAIN: rotate to path.1, reopen fresh (keep recent)
-                fclose(k3_capture);
-                std::string rot = std::string(k3_capture_path) + ".1";
-                std::remove(rot.c_str()); std::rename(k3_capture_path, rot.c_str());
-                k3_capture = fopen(k3_capture_path, "wb");
-                k3_capture_bytes = 0;
+                (unsigned long long) hits, (long long) moe_experts_streamed, (unsigned long long) misses);
+            fflush(moe_capture);
+            if (nw > 0) { moe_capture_bytes += (uint64_t) nw; }
+            if (moe_capture_bytes >= moe_capture_cap) {   // DRAIN: rotate to path.1, reopen fresh (keep recent)
+                fclose(moe_capture);
+                std::string rot = std::string(moe_capture_path) + ".1";
+                std::remove(rot.c_str()); std::rename(moe_capture_path, rot.c_str());
+                moe_capture = fopen(moe_capture_path, "wb");
+                moe_capture_bytes = 0;
             }
         }
     }

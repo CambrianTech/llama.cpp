@@ -141,6 +141,47 @@ static inline bool parse_pager_plan(const char * text, PagerPlan & plan) {
 }
 
 // ------------------------------------------------------------------------------------------
+// serving config — the ONE place the MoE serving env contract is read (config-single-manager)
+// ------------------------------------------------------------------------------------------
+// Every GGML_MOE_* knob is parsed once, here, into typed fields. Code reads moe_config().<field>
+// instead of scattering getenv() through the hot path and the cache. Reusable modules
+// (ResidencyCache, the fetchers) take what they need from this struct rather than reaching into
+// global env themselves. Model-agnostic: nothing here is K3-specific; any offloaded MoE uses it.
+struct MoeServingConfig {
+    size_t       host_cache_bytes = 0;                    // GGML_MOE_HOST_CACHE_GB (0 => host cache off)
+    size_t       vram_cache_bytes = 0;                    // GGML_MOE_VRAM_CACHE_GB (0 => device cache off, task #23)
+    bool         direct_read      = false;                // GGML_MOE_DIRECT_READ  (Windows unbuffered NVMe)
+    bool         prefetch         = false;                // GGML_MOE_PREFETCH     (batched OS read-ahead)
+    bool         stats            = false;                // GGML_MOE_OFFLOAD_STATS(per-token stderr breakdown)
+    bool         mem_probe        = false;                // GGML_MOE_MEM_PROBE    (per-buffer residency print)
+    const char * trace_path       = nullptr;              // GGML_MOE_TRACE_FILE   (expert-access trace)
+    const char * capture_path     = nullptr;              // GGML_MOE_CAPTURE_FILE (structured JSONL capture)
+    size_t       capture_cap_bytes = 32ull * 1024 * 1024; // GGML_MOE_CAPTURE_MB   (capture rotate threshold)
+    std::string  plan_path;                               // GGML_MOE_PLAN_FILE    (controller actuator plan)
+
+    static MoeServingConfig from_env() {
+        MoeServingConfig c;
+        if (const char * v = getenv("GGML_MOE_HOST_CACHE_GB")) { c.host_cache_bytes = (size_t) (atof(v) * 1024.0 * 1024.0 * 1024.0); }
+        if (const char * v = getenv("GGML_MOE_VRAM_CACHE_GB")) { c.vram_cache_bytes = (size_t) (atof(v) * 1024.0 * 1024.0 * 1024.0); }
+        c.direct_read  = getenv("GGML_MOE_DIRECT_READ")   != nullptr;
+        c.prefetch     = getenv("GGML_MOE_PREFETCH")      != nullptr;
+        c.stats        = getenv("GGML_MOE_OFFLOAD_STATS") != nullptr;
+        c.mem_probe    = getenv("GGML_MOE_MEM_PROBE")     != nullptr;
+        c.trace_path   = getenv("GGML_MOE_TRACE_FILE");
+        c.capture_path = getenv("GGML_MOE_CAPTURE_FILE");
+        if (const char * v = getenv("GGML_MOE_CAPTURE_MB")) { c.capture_cap_bytes = (size_t) atoi(v) * 1024 * 1024; }
+        if (const char * v = getenv("GGML_MOE_PLAN_FILE"))  { c.plan_path = v; }
+        return c;
+    }
+};
+
+// Process-wide singleton: env is read exactly once, on first access.
+inline const MoeServingConfig & moe_config() {
+    static const MoeServingConfig cfg = MoeServingConfig::from_env();
+    return cfg;
+}
+
+// ------------------------------------------------------------------------------------------
 // fetch adapter — how expert bytes are pulled into a slot
 // ------------------------------------------------------------------------------------------
 struct FetchItem {
@@ -360,7 +401,7 @@ public:
             if (!refilled) { active_.erase(active_.begin() + wi); }
         }
 
-        if (getenv("GGML_MOE_OFFLOAD_STATS")) {
+        if (moe_config().stats) {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
             const double mbps = ms > 0 ? (n * (double) esz / (1024.0 * 1024.0)) / (ms / 1000.0) : 0;
             fprintf(stderr, "[FETCH] batch=%zu win=%zu unbuf_ok=%zu resolve_fail=%zu issue_fail=%zu reap_fail=%zu | %.0f ms %.0f MB/s\n",
@@ -449,7 +490,7 @@ class ResidencyCache {
 
 public:
     ResidencyCache(size_t budget, ExpertFetcher & f) : budget_bytes(budget), fetcher(f) {
-        if (const char * pf = getenv("GGML_MOE_PLAN_FILE")) { plan_path_ = pf; }
+        plan_path_ = moe_config().plan_path;   // injected via the single config manager, not a raw getenv
     }
 
     void        set_budget(size_t b)   { budget_bytes = b; }   // idempotent; apply the env budget once
@@ -482,7 +523,7 @@ public:
             uint64_t k3[3]; expert_pin_keys(pe.first, pe.second, k3);
             pinned_.insert(k3[0]); pinned_.insert(k3[1]); pinned_.insert(k3[2]);
         }
-        if (getenv("GGML_MOE_OFFLOAD_STATS")) {
+        if (moe_config().stats) {
             fprintf(stderr, "[PLAN] reloaded: budget=%zuMB window_k=%u hints=%zu (keys=%zu, bias=%llu gens)\n",
                     budget_bytes / (1024*1024), window_k_, plan.pins.size(), pinned_.size(),
                     (unsigned long long) pin_bias_);
@@ -571,7 +612,7 @@ public:
         // RETENTION probe: sel=selected this layer, resident=reused from prior tokens (the signal),
         // fetch=new reads, evict=experts kicked out to fit. resident~0 => no locality/thrashing;
         // evict>0 => cache too small for the working set. pool shows fill vs capacity.
-        if (getenv("GGML_MOE_OFFLOAD_STATS")) {
+        if (moe_config().stats) {
             fprintf(stderr, "[RETAIN] sel=%zu resident=%zu fetch=%zu evict=%zu | pool=%zu/%zu\n",
                     n, n_resident, batch.size(), n_evict, p.used, p.max_slots);
         }

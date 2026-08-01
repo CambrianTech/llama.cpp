@@ -1636,10 +1636,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // print memory requirements per buffer type
+    const bool moe_mem_probe = getenv("GGML_MOE_MEM_PROBE") != nullptr;   // stderr, survives server log filter
     for (auto & [_, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf: bufs) {
             LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
                 __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
+            if (moe_mem_probe) {   // [MOE-MEM] name distinguishes CPU_Mapped (mmap, not private) vs CPU (PRIVATE commit) vs CUDA0 (VRAM)
+                fprintf(stderr, "[MOE-MEM] model buffer %s = %.1f MiB\n",
+                        ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
+            }
         }
     }
 
