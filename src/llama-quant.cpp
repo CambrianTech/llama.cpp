@@ -1050,7 +1050,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // write loop) — so it can never need an importance matrix. Exempt it from the upfront gate, else
         // copying a model whose tensors are already low-bit (e.g. K3's iq1_m/iq2/iq3 UD experts) spuriously
         // demands an imatrix. (M5 diagnosis; upstream-worthy.)
-        metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype)
+        // LLAMA_QUANT_FORCE_NO_IMATRIX: for SPEED-ONLY benchmarking, force a low-bit requant to proceed
+        // WITHOUT an importance matrix (produces poor-quality weights, valid only to measure fetched-bytes
+        // -> tok/s scaling; never ship the output). Gates the imatrix requirement off entirely.
+        static const bool force_no_imatrix = getenv("LLAMA_QUANT_FORCE_NO_IMATRIX") != nullptr;
+        metadata[i].requires_imatrix = !force_no_imatrix
+                                     && tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype)
                                      && metadata[i].target_type != tensor->type;
 
         if (params->imatrix) {
