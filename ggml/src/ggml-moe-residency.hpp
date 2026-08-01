@@ -25,15 +25,19 @@
 // ggml-backend.cpp, after ggml-backend-impl.h (for the backend-buffer API it allocates through).
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
+#include <sys/stat.h>   // stat() for plan-file mtime polling (portable)
 
 #ifdef _WIN32
-#include <string>
 #include <malloc.h>   // _aligned_malloc / _aligned_free for unbuffered (sector-aligned) direct I/O
 #endif
 
@@ -78,6 +82,62 @@ static inline uint64_t canonical_name_key(const char * name) {
 // unused now (the per-eval pointer/file-offset are NOT token-stable — that was the bug).
 static inline ExpertId expert_id_for(const void * /*mmap_src*/, const char * tensor_name, int32_t index) {
     return ExpertId{ canonical_name_key(tensor_name), index };
+}
+
+// Cache keys for one ROUTED expert (layer, expert): a MoE expert is 3 weight tensors (gate/up/down),
+// each its own canonical-name key — so pinning one expert pins three cache keys. Names match the
+// universal llama.cpp MoE convention the offload seam hashes (blk.N.ffn_{gate,up,down}_exps.weight).
+// This is how a controller's (layer,expert) pin_list maps onto ResidencyCache identity.
+static inline void expert_pin_keys(uint32_t layer, uint32_t expert, uint64_t out[3]) {
+    static const char * mats[3] = { "gate", "up", "down" };
+    for (int m = 0; m < 3; m++) {
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "blk.%u.ffn_%s_exps.weight", layer, mats[m]);
+        out[m] = ExpertId{ canonical_name_key(nm), (int32_t) expert }.key();
+    }
+}
+
+// The v1 actuator plan the controller (continuum-core ServingExpertPager) writes to GGML_MOE_PLAN_FILE:
+//   {"version":1,"budget_bytes":<u64>,"window_k":<u32>,"pin_list":[{"layer":0,"expert":7},...]}
+// Atomic-rename control file; the cache polls its mtime per token and reloads on change. Minimal
+// hand-parse (no JSON dep at the ggml layer): tolerant scan for the three known keys + the pin array.
+struct PagerPlan {
+    uint64_t budget_bytes = 0;
+    uint32_t window_k     = 0;
+    std::vector<std::pair<uint32_t,uint32_t>> pins;   // (layer, expert)
+    bool     ok           = false;
+};
+static inline bool parse_pager_plan(const char * text, PagerPlan & plan) {
+    if (!text) { return false; }
+    auto num_after = [&](const char * key) -> long long {
+        const char * p = std::strstr(text, key);
+        if (!p) { return -1; }
+        p += std::strlen(key);
+        while (*p && (*p == '"' || *p == ':' || *p == ' ' || *p == '\t')) { p++; }
+        return std::strtoll(p, nullptr, 10);
+    };
+    long long b = num_after("\"budget_bytes\"");
+    long long k = num_after("\"window_k\"");
+    if (b >= 0) { plan.budget_bytes = (uint64_t) b; }
+    if (k >= 0) { plan.window_k     = (uint32_t) k; }
+    // pin_list: scan {"layer":L,"expert":E} objects inside the "pin_list" array
+    const char * pl = std::strstr(text, "\"pin_list\"");
+    if (pl) {
+        const char * p = std::strchr(pl, '[');
+        const char * end = p ? std::strchr(p, ']') : nullptr;
+        for (const char * q = p; q && end && q < end; ) {
+            const char * lq = std::strstr(q, "\"layer\"");
+            if (!lq || lq > end) { break; }
+            const char * eq = std::strstr(lq, "\"expert\"");
+            if (!eq || eq > end) { break; }
+            const char * lp = lq + std::strlen("\"layer\""); while (*lp && (*lp==':'||*lp==' '||*lp=='"')) lp++;
+            const char * ep = eq + std::strlen("\"expert\""); while (*ep && (*ep==':'||*ep==' '||*ep=='"')) ep++;
+            plan.pins.emplace_back((uint32_t) std::strtoul(lp, nullptr, 10), (uint32_t) std::strtoul(ep, nullptr, 10));
+            q = ep;
+        }
+    }
+    plan.ok = (b >= 0 || k >= 0 || !plan.pins.empty());
+    return plan.ok;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -339,6 +399,12 @@ class ResidencyCache {
     size_t         budget_bytes;
     ExpertFetcher& fetcher;
     uint64_t tick = 0, token_gen = 0, hits = 0, misses = 0;
+
+    // [RUNG-2] controller actuator state (set via the GGML_MOE_PLAN_FILE control file; see PagerPlan).
+    std::unordered_set<uint64_t> pinned_;   // expert cache-keys that are evict-EXEMPT (always resident)
+    uint32_t     window_k_    = 0;          // recency window depth in tokens (0 = budget-implicit, legacy)
+    std::string  plan_path_;                // GGML_MOE_PLAN_FILE (empty => no controller; pure legacy)
+    int64_t      plan_mtime_  = 0;          // last-seen mtime; reload on change (atomic-rename by writer)
     double   admit_us = 0.0;   // accumulated fetch time on misses
     size_t   admit_bytes = 0;  // bytes fetched on misses  -> fetch MB/s = admit_bytes / admit_us
     std::unordered_map<size_t, Pool> pools;
@@ -362,11 +428,23 @@ class ResidencyCache {
     // dropping its key mapping. Generation-primary = recency window at token granularity (see class doc).
     size_t reserve_slot(Pool & p) {
         if (p.used < p.max_slots) { return p.used++; }
-        size_t slot = 0;
+        // evict OLDEST token-generation (tie: oldest tick) among NON-PINNED slots — pins (the
+        // controller's always-hot set, e.g. the shared experts) are evict-exempt guaranteed hits.
+        size_t slot = SIZE_MAX;
         uint64_t og = UINT64_MAX, ot = UINT64_MAX;
+        const bool have_pins = !pinned_.empty();
         for (size_t i = 0; i < p.max_slots; i++) {
+            if (have_pins && pinned_.count(p.slot_key[i])) { continue; }   // never evict a pinned expert
             if (p.slot_gen[i] < og || (p.slot_gen[i] == og && p.slot_tick[i] < ot)) {
                 og = p.slot_gen[i]; ot = p.slot_tick[i]; slot = i;
+            }
+        }
+        if (slot == SIZE_MAX) {   // pin_list oversized for this budget: fall back to oldest overall
+            og = UINT64_MAX; ot = UINT64_MAX; slot = 0;
+            for (size_t i = 0; i < p.max_slots; i++) {
+                if (p.slot_gen[i] < og || (p.slot_gen[i] == og && p.slot_tick[i] < ot)) {
+                    og = p.slot_gen[i]; ot = p.slot_tick[i]; slot = i;
+                }
             }
         }
         p.key2slot.erase(p.slot_key[slot]);
@@ -374,10 +452,44 @@ class ResidencyCache {
     }
 
 public:
-    ResidencyCache(size_t budget, ExpertFetcher & f) : budget_bytes(budget), fetcher(f) {}
+    ResidencyCache(size_t budget, ExpertFetcher & f) : budget_bytes(budget), fetcher(f) {
+        if (const char * pf = getenv("GGML_MOE_PLAN_FILE")) { plan_path_ = pf; }
+    }
 
     void        set_budget(size_t b)   { budget_bytes = b; }   // idempotent; apply the env budget once
-    void        advance_generation()   { std::lock_guard<std::mutex> lk(mtx); ++token_gen; }  // once per token (compute call)
+
+    // Reload the controller's actuator plan if the control file changed (atomic-rename by the writer, so
+    // a size/mtime bump is a complete new plan — never a torn read). Called once per token from
+    // advance_generation under the cache mutex. Applies budget_bytes / window_k / pin_list live.
+    void reload_plan_locked() {
+        if (plan_path_.empty()) { return; }
+        struct stat st;
+        if (stat(plan_path_.c_str(), &st) != 0) { return; }
+        const int64_t mt = (int64_t) st.st_mtime;
+        if (mt == plan_mtime_ || st.st_size <= 0) { return; }
+        plan_mtime_ = mt;
+        FILE * f = fopen(plan_path_.c_str(), "rb");
+        if (!f) { return; }
+        std::string buf; buf.resize((size_t) st.st_size);
+        const size_t got = fread(&buf[0], 1, buf.size(), f);
+        fclose(f);
+        buf.resize(got);
+        PagerPlan plan;
+        if (!parse_pager_plan(buf.c_str(), plan)) { return; }
+        if (plan.budget_bytes > 0) { budget_bytes = plan.budget_bytes; }
+        window_k_ = plan.window_k;
+        pinned_.clear();
+        for (const auto & pe : plan.pins) {
+            uint64_t k3[3]; expert_pin_keys(pe.first, pe.second, k3);
+            pinned_.insert(k3[0]); pinned_.insert(k3[1]); pinned_.insert(k3[2]);
+        }
+        if (getenv("GGML_MOE_OFFLOAD_STATS")) {
+            fprintf(stderr, "[PLAN] reloaded: budget=%zuMB window_k=%u pins=%zu (keys=%zu)\n",
+                    budget_bytes / (1024*1024), window_k_, plan.pins.size(), pinned_.size());
+        }
+    }
+
+    void        advance_generation()   { std::lock_guard<std::mutex> lk(mtx); ++token_gen; reload_plan_locked(); }  // once per token (compute call)
     bool        enabled()        const { return budget_bytes > 0; }
     uint64_t    n_hits()         const { return hits; }
     uint64_t    n_misses()       const { return misses; }
