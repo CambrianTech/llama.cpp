@@ -1562,7 +1562,15 @@ static ggml_moe::ExpertFetcher &   moe_pick_fetcher() {
 // budget from moe_config().host_cache_bytes (0 => disabled). Cache holds a mutex, so it is a plain
 // function-local static, constructed once with the chosen fetcher; budget applied idempotently.
 static ggml_moe::ResidencyCache & moe_expert_cache() {
-    static ggml_moe::ResidencyCache cache(ggml_moe::moe_config().host_cache_bytes, moe_pick_fetcher());
+    // Budget is GOVERNED. When a plan file is configured (GGML_MOE_PLAN_FILE), the governor's
+    // plan_file.budget_bytes is the ONLY budget source - the env is ignored so a hardcoded value can
+    // never overcommit RAM behind the governor's back (the 40 GB-on-a-63 GB-box thrash). The env budget
+    // applies ONLY in ungoverned standalone (no plan file), as a fallback. See
+    // docs/architecture/MOE-SERVING-GOVERNED-BUDGET.md.
+    const size_t initial_budget = ggml_moe::moe_config().plan_path.empty()
+        ? ggml_moe::moe_config().host_cache_bytes   // ungoverned standalone fallback
+        : 0;                                        // governed: plan-file sets the budget on first tick
+    static ggml_moe::ResidencyCache cache(initial_budget, moe_pick_fetcher());
     return cache;
 }
 
