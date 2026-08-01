@@ -90,6 +90,11 @@ struct llama_model_loader {
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
+    // [CONTAINER-SERVE] file indices whose mmap must NOT be prefetched: the resident-override GGUF
+    // (LLAMA_RESIDENT_OVERRIDE) may be a full device-fitted model on cold storage — only its ~33GB of
+    // resident tensors are ever faulted in; a whole-file WILLNEED would drag the entire 600GB+ off disk.
+    std::vector<size_t> no_prefetch_files;
+
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;

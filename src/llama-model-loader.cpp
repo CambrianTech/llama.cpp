@@ -693,6 +693,51 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // [CONTAINER-SERVE] resident-tensor override (task #29). Serve the routed EXPERTS from the primary
+    // model (which lives on fast NVMe) but source the RESIDENT (non-`_exps`) tensors from a second,
+    // device-fitted GGUF whose resident tensors are down-quantized to fit VRAM. One full expert copy on
+    // NVMe + a small per-device resident override => no full-model clone per fit. The override supplies
+    // ONLY non-expert tensors; experts keep pointing at the primary. Its mmap is marked no-prefetch so a
+    // fitted full model on cold storage only faults its ~33GB resident, never the expert bulk.
+    if (const char * ov_first = getenv("LLAMA_RESIDENT_OVERRIDE")) {
+        // resolve the override's shard list (same "-of-" scheme as the primary)
+        std::vector<std::string> ov_splits;
+        {
+            struct ggml_context * octx = NULL;
+            struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &octx };
+            gguf_context_ptr og { gguf_init_from_file(ov_first, gp) };
+            if (!og) { throw std::runtime_error(format("resident-override: failed to open %s", ov_first)); }
+            uint16_t on_split = 0;
+            { const int kid = gguf_find_key(og.get(), llm_kv(LLM_KV_SPLIT_COUNT).c_str());
+              if (kid >= 0) { on_split = gguf_get_val_u16(og.get(), kid); } }
+            ov_splits = (on_split > 1) ? llama_get_list_splits(ov_first, 0, on_split)
+                                       : std::vector<std::string>{ ov_first };
+            ggml_free(octx);   // metadata-only probe context; the per-shard loop re-opens what it keeps
+        }
+        size_t n_overridden = 0;
+        for (const auto & ov_path : ov_splits) {
+            struct ggml_context * octx = NULL;
+            struct gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &octx };
+            gguf_context_ptr og { gguf_init_from_file(ov_path.c_str(), gp) };
+            if (!og) { throw std::runtime_error(format("resident-override: failed to open shard %s", ov_path.c_str())); }
+            const size_t ov_idx = files.size();
+            files.emplace_back(new llama_file(ov_path.c_str(), "rb", use_direct_io));
+            no_prefetch_files.push_back(ov_idx);   // never WILLNEED the whole (possibly 600GB+) file
+            for (ggml_tensor * cur = ggml_get_first_tensor(octx); cur; cur = ggml_get_next_tensor(octx, cur)) {
+                const std::string nm = cur->name;
+                if (nm.find("_exps.") != std::string::npos) { continue; }   // experts stay on the primary (NVMe)
+                auto it = weights_map.find(nm);
+                if (it == weights_map.end()) { continue; }                  // only override tensors the model has
+                weights_map.erase(it);
+                weights_map.emplace(nm, llama_tensor_weight(files[ov_idx].get(), (uint16_t) ov_idx, og.get(), cur));
+                n_overridden++;
+            }
+            contexts.emplace_back(octx);   // keep the override tensor metadata alive for the whole load
+        }
+        LLAMA_LOG_INFO("%s: resident-override: %zu resident tensors sourced from %s (experts stay on primary)\n",
+                       __func__, n_overridden, ov_first);
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -1330,7 +1375,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
-        for (const auto & file : files) {
+        for (size_t fi = 0; fi < files.size(); fi++) {
+            const auto & file = files[fi];
             bool is_numa = false;
 
             auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1342,7 +1388,10 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            // [CONTAINER-SERVE] resident-override files are mapped lazily (prefetch 0): a device-fitted
+            // full model on cold storage must only fault its resident tensors, never WILLNEED the bulk.
+            const bool no_pf = std::find(no_prefetch_files.begin(), no_prefetch_files.end(), fi) != no_prefetch_files.end();
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), (prefetch && !no_pf) ? -1 : 0, is_numa);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

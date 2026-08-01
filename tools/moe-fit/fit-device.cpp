@@ -9,7 +9,13 @@
 // requant is a separate llama-quantize invocation fed the emitted file (and, done properly, sources the
 // full-precision model + a compensation-LoRA — this planner is quant-source-agnostic).
 //
-// Usage: llama-fit-device --gguf FIRST_SHARD --vram-gb N [--target-type q4_K] [--out plan.txt]
+// Usage: llama-fit-device --gguf FIRST_SHARD --vram-gb N [--reserve-gb R] [--target-type q4_K] [--out plan.txt]
+//
+// --reserve-gb R holds back VRAM the MODEL doesn't own but the RUNTIME needs: KV cache + compute graph
+// buffers + the backend context. The planner targets resident <= (vram_gb - reserve_gb), so the loaded
+// model leaves headroom and ALL resident layers fit on the device (-ngl 99) instead of the auto-fitter
+// shedding layers to CPU. Learned the hard way: targeting the full 32 GB planned a 33 GB resident that
+// overshot by ~1 GB once KV+compute were allocated, forcing -ngl 82. Default reserve = max(2, 10% of VRAM).
 
 #include "ggml.h"
 #include "gguf.h"
@@ -39,16 +45,21 @@ static std::vector<std::string> shard_paths(const std::string & first) {
 
 int main(int argc, char ** argv) {
     std::string gguf, out, target = "q4_K";
-    double vram_gb = 0.0;
+    double vram_gb = 0.0, reserve_gb = -1.0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto nx = [&]{ return (i + 1 < argc) ? argv[++i] : ""; };
         if      (a == "--gguf")        gguf = nx();
         else if (a == "--vram-gb")     vram_gb = std::atof(nx());
+        else if (a == "--reserve-gb")  reserve_gb = std::atof(nx());
         else if (a == "--target-type") target = nx();
         else if (a == "--out")         out = nx();
     }
-    if (gguf.empty() || vram_gb <= 0) { std::fprintf(stderr, "usage: --gguf FIRST_SHARD --vram-gb N [--target-type q4_K] [--out plan.txt]\n"); return 2; }
+    if (gguf.empty() || vram_gb <= 0) { std::fprintf(stderr, "usage: --gguf FIRST_SHARD --vram-gb N [--reserve-gb R] [--target-type q4_K] [--out plan.txt]\n"); return 2; }
+    // reserve VRAM for KV cache + compute buffers + backend context (not owned by the model weights).
+    if (reserve_gb < 0.0) reserve_gb = std::max(2.0, vram_gb * 0.10);   // sensible default; override for big -c
+    const double usable_gb = vram_gb - reserve_gb;
+    if (usable_gb <= 0) { std::fprintf(stderr, "fit-device: --reserve-gb %.1f >= --vram-gb %.1f leaves no room\n", reserve_gb, vram_gb); return 2; }
 
     // one row per RESIDENT tensor: name, current type, bytes
     struct T { std::string name; ggml_type type; uint64_t bytes; };
@@ -82,9 +93,11 @@ int main(int argc, char ** argv) {
         if (by_type_bytes[ty]) std::printf("    %-10s %.2f GB\n", ggml_type_name((ggml_type) ty), by_type_bytes[ty] / GB);
     }
 
-    const double budget = vram_gb * GB;
-    std::printf("\nVRAM budget: %.1f GB  =>  resident %s by %.1f GB\n",
-                vram_gb, resident_bytes <= budget ? "FITS, under" : "OVER, must shrink",
+    const double budget = usable_gb * GB;   // resident must fit VRAM MINUS runtime reserve (KV+compute+ctx)
+    std::printf("\nVRAM %.1f GB - reserve %.1f GB (KV+compute+ctx) = %.1f GB usable for resident\n",
+                vram_gb, reserve_gb, usable_gb);
+    std::printf("resident %s by %.1f GB\n",
+                resident_bytes <= budget ? "FITS, under" : "OVER, must shrink",
                 (resident_bytes - budget) / GB);
     if (resident_bytes <= budget) { std::printf("no down-quant needed.\n"); return 0; }
 
@@ -136,9 +149,9 @@ int main(int argc, char ** argv) {
         }
         const bool fits = projected <= budget;
         if (fits || step == 3) {
-            std::printf("\nMIXED plan (step %d, %s): %zu tensors down-quant, ~%.1f GB HIGH-class kept sharp, resident ~%.1f GB (budget %.1f GB)%s\n",
-                        step, fits ? "FITS" : "best-effort", plan.size(), kept_hi / GB, projected / GB, vram_gb,
-                        fits ? "" : "  [still over — raise --vram-gb or lower the HIGH class]");
+            std::printf("\nMIXED plan (step %d, %s): %zu tensors down-quant, ~%.1f GB HIGH-class kept sharp, resident ~%.1f GB (usable budget %.1f GB = %.1f VRAM - %.1f reserve)%s\n",
+                        step, fits ? "FITS" : "best-effort", plan.size(), kept_hi / GB, projected / GB, usable_gb, vram_gb, reserve_gb,
+                        fits ? "" : "  [still over — raise --vram-gb, lower --reserve-gb, or lower the HIGH class]");
             if (!out.empty()) {
                 FILE * f = std::fopen(out.c_str(), "wb");
                 if (f) {
