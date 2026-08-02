@@ -17,9 +17,11 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #if defined(_WIN32)
 #  define MOEC_FSEEK64(f, off) (_fseeki64((f), (long long)(off), SEEK_SET))
@@ -121,6 +123,47 @@ public:
                 std::memset(items[i].dst, 0, items[i].bytes);
             }
         }
+    }
+};
+
+// DEVICE-RESIDENT expert upload adapter — the LiveUploadPager mechanism (#23), the H2D KILL.
+// A ResidencyCache built on a DEVICE (VRAM) buffer type turns its slots into VRAM. This fetcher fills a
+// MISS: it reads the record HOST-side via an inner ExpertFetcher (a DirContainerFetcher), then does ONE
+// host->device copy into the VRAM slot. The win is what does NOT happen — on a cache HIT the ResidencyCache
+// returns the resident device slot with NO fetch, so the serving loop's per-op H2D (ggml-backend.cpp:1857,
+// ~11GB/token over PCIe) is SKIPPED for every recency-resident expert. A miss pays one PCIe copy; a hot
+// token pays ~none. That is the 0.32-tok/s (H2D-bound) -> 1-10-tok/s lever: UMA gets residency for free, a
+// discrete GPU only by keeping experts on the card. The bandit's pin_list (plan file) drives WHICH experts
+// stay resident (M5's policy via ResidencyCache::pinned_); THIS is the pure upload mechanism.
+//
+// Backend-neutral by construction: the host->device copy is INJECTED — the CUDA-aware serving caller
+// supplies cudaMemcpyAsync / a ggml_backend device copy — so this header keeps ZERO CUDA dependency, the
+// same adapter discipline as every other fetcher. `dst` in fetch() is a DEVICE pointer (a VRAM slot).
+class DeviceUploadFetcher final : public ExpertFetcher {
+    ExpertFetcher & inner_;                                                    // reads the record HOST-side
+    std::function<bool(void * dst_dev, const void * src_host, size_t)> h2d_;   // ONE host->device copy, injected
+    std::vector<uint8_t> bounce_;                                             // host staging, grows to the largest record
+    std::mutex mtx_;
+
+public:
+    DeviceUploadFetcher(ExpertFetcher & inner,
+                        std::function<bool(void *, const void *, size_t)> h2d)
+        : inner_(inner), h2d_(std::move(h2d)) {}
+    const char * name() const override { return "device-upload"; }
+
+    // MISS path: read the record host-side via `inner_`, then ONE H2D into the VRAM slot `dst`. false =>
+    // the inner read or the device copy failed (cache leaves the slot unfilled; container mode fails loud
+    // downstream). Serialized by `mtx_` so the single `bounce_` is reused, never reallocated per fetch —
+    // the same churn-avoidance the DirectReadFetcher learned the hard way. (Overlapped multi-buffer H2D
+    // is the v2 optimization; correctness first.)
+    bool fetch(void * dst, const void * src, size_t bytes) override {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (bounce_.size() < bytes) { bounce_.resize(bytes); }
+        if (!inner_.fetch(bounce_.data(), src, bytes)) { return false; }
+        return h2d_ && h2d_(dst, bounce_.data(), bytes);
+    }
+    void fetch_many(const FetchItem * items, size_t n) override {
+        for (size_t i = 0; i < n; i++) { fetch(items[i].dst, items[i].src, items[i].bytes); }
     }
 };
 
