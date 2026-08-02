@@ -58,6 +58,72 @@ public:
     }
 };
 
+// V1 MULTI-FILE container fetcher: the packer (moec_pack_dir) writes a DIRECTORY of one bank per MoE
+// layer — `experts-L{n}.bin` — with expert e of layer L at byte offset `e * record_bytes` (contiguous,
+// 16KiB-aligned by construction). Unlike single-file ContainerFetcher (one FILE, `src` = a flat offset)
+// a multi-file container needs the LAYER too, so the caller packs BOTH into the opaque `src`:
+//
+//     src = ((uint64_t) layer << SHIFT) | byte_offset      // byte_offset = expert * record_bytes
+//
+// SHIFT = 48: layer < 2^16 (K3 has 92), offset < 2^48 (256 TiB) — no real container overflows it. The
+// ResidencyCache still passes `src` opaquely (NO interface change); only the SERVING caller in
+// ggml-backend computes this packed value instead of an mmap address when a container fetcher is active
+// (that caller-side offset is the serving-graph seam — M5's half). Banks open LAZILY and are cached per
+// layer (a node holding only some layers' shards never stats the rest — the grid shard unit), exactly
+// like TieredContainerFetcher minus the tier dimension.
+class DirContainerFetcher final : public ExpertFetcher {
+public:
+    static const int      LAYER_SHIFT = 48;
+    static const uint64_t OFF_MASK    = (uint64_t(1) << LAYER_SHIFT) - 1;
+    // Pack a (layer, byte_offset) pair into the opaque `src` the serving caller hands the cache.
+    static uint64_t pack_src(uint32_t layer, uint64_t byte_offset) {
+        return (uint64_t(layer) << LAYER_SHIFT) | (byte_offset & OFF_MASK);
+    }
+
+private:
+    std::string dir_;
+    std::mutex  mtx_;
+    std::unordered_map<uint32_t, FILE *> banks_;   // layer -> lazily-opened experts-L{layer}.bin (nullptr cached)
+
+    FILE * bank(uint32_t layer) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = banks_.find(layer);
+        if (it != banks_.end()) { return it->second; }
+        const std::string bp = dir_ + "/experts-L" + std::to_string(layer) + ".bin";
+        FILE * f = std::fopen(bp.c_str(), "rb");    // nullptr cached too, so a missing shard isn't re-stat'd
+        banks_.emplace(layer, f);
+        return f;
+    }
+
+public:
+    explicit DirContainerFetcher(const char * dir) : dir_(dir) {}
+    ~DirContainerFetcher() override {
+        for (auto & kv : banks_) { if (kv.second) { std::fclose(kv.second); } }
+    }
+    const char * name() const override { return "container-dir"; }
+
+    // Decode `src` -> (layer, offset); one positional read of the record from that layer's bank.
+    // false => bank missing or short read (the cache then streams the fallback source).
+    bool fetch(void * dst, const void * src, size_t bytes) override {
+        const uint64_t s   = (uint64_t) (uintptr_t) src;
+        const uint32_t L   = (uint32_t) (s >> LAYER_SHIFT);
+        const uint64_t off = s & OFF_MASK;
+        FILE * f = bank(L);
+        if (!f) { return false; }
+        if (MOEC_FSEEK64(f, off) != 0) { return false; }
+        return std::fread(dst, 1, bytes, f) == bytes;
+    }
+    // Batch: sequential positional reads (the serving direct-I/O variant overlaps these — same offset
+    // contract, swaps in without touching the cache). A failed record zeroes so it fails validation LOUD.
+    void fetch_many(const FetchItem * items, size_t n) override {
+        for (size_t i = 0; i < n; i++) {
+            if (!fetch(items[i].dst, items[i].src, items[i].bytes)) {
+                std::memset(items[i].dst, 0, items[i].bytes);
+            }
+        }
+    }
+};
+
 // TIERED read primitive: reads an expert from a specific PRECISION TIER of a tiered container (manifest
 // v2, per-(layer,tier) banks). The pager selects the tier per expert (all-star … cruft, rate-distortion
 // under budget); this reads that tier's bank at offset = expert_id * tier_record_bytes (one positional

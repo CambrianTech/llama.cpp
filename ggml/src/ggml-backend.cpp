@@ -13,6 +13,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-moe-residency.hpp"   // universal MoE expert residency (ExpertId / ExpertFetcher / ResidencyCache)
+#include "ggml-moe-container-fetcher.h" // DirContainerFetcher — the aligned container read path (#268)
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -1554,6 +1555,16 @@ static ggml_moe::DirectReadFetcher moe_direct_fetcher;
 #endif
 static ggml_moe::MmapFaultFetcher  moe_mmap_fetcher;
 static ggml_moe::ExpertFetcher &   moe_pick_fetcher() {
+    // Container-serve (#268): when a packed per-layer expert container is configured, read from it.
+    // Its records are contiguous + 16KiB-aligned, so this is the honest ~GB/s sequential path — vs
+    // DirectRead scraping scattered offsets out of the raw GGUF's mmap. The serving caller packs
+    // (layer, byte_offset) into `src` via DirContainerFetcher::pack_src; the cache passes it opaquely.
+    // Constructed once with the configured dir (banks open lazily); a bad dir opens no banks and every
+    // fetch fails LOUD (zeroed record -> downstream validation), never a silent wrong-source serve.
+    if (const char * cdir = ggml_moe::moe_config().container_dir) {
+        static ggml_moe::DirContainerFetcher container_fetcher(cdir);
+        return container_fetcher;
+    }
 #ifdef _WIN32
     if (ggml_moe::moe_config().direct_read) { return moe_direct_fetcher; }
 #endif

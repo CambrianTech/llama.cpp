@@ -158,6 +158,7 @@ struct MoeServingConfig {
     const char * capture_path     = nullptr;              // GGML_MOE_CAPTURE_FILE (structured JSONL capture)
     size_t       capture_cap_bytes = 32ull * 1024 * 1024; // GGML_MOE_CAPTURE_MB   (capture rotate threshold)
     std::string  plan_path;                               // GGML_MOE_PLAN_FILE    (controller actuator plan)
+    const char * container_dir    = nullptr;              // GGML_MOE_CONTAINER    (v1 per-layer expert container dir -> DirContainerFetcher)
 
     static MoeServingConfig from_env() {
         MoeServingConfig c;
@@ -171,6 +172,7 @@ struct MoeServingConfig {
         c.capture_path = getenv("GGML_MOE_CAPTURE_FILE");
         if (const char * v = getenv("GGML_MOE_CAPTURE_MB")) { c.capture_cap_bytes = (size_t) atoi(v) * 1024 * 1024; }
         if (const char * v = getenv("GGML_MOE_PLAN_FILE"))  { c.plan_path = v; }
+        c.container_dir = getenv("GGML_MOE_CONTAINER");
         return c;
     }
 };
