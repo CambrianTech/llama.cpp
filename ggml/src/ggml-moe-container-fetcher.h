@@ -124,6 +124,33 @@ public:
     }
 };
 
+// The container's record stride, read ONCE from `<dir>/manifest.json` (the moec_pack_dir
+// manifest — tolerant key scan, same no-JSON-dep style as PagerPlan). This is the number the
+// SERVING CALLER needs to compute byte_offset = expert * record_bytes for pack_src(); the
+// fetcher itself never needs it (offsets arrive pre-computed). 0 => no/unreadable manifest —
+// the caller must then treat the container as ABSENT (fall back to the mmap path wholesale),
+// never guess a stride: a wrong stride reads the wrong expert's bytes silently.
+static inline uint64_t dir_container_record_bytes(const char * dir) {
+    if (!dir) { return 0; }
+    const std::string mp = std::string(dir) + "/manifest.json";
+    FILE * f = std::fopen(mp.c_str(), "rb");
+    if (!f) { return 0; }
+    char buf[4096];
+    const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    buf[n] = 0;
+    const char * k = std::strstr(buf, "\"record_bytes\"");
+    if (!k) { return 0; }
+    k = std::strchr(k, ':');
+    if (!k) { return 0; }
+    unsigned long long v = 0;
+    if (std::sscanf(k + 1, " %llu", &v) != 1) { return 0; }
+    // The packer refuses non-4KiB-multiple records; mirror that here so a hand-edited
+    // manifest can't smuggle an unaligned stride past the aligned-read contract.
+    if (v == 0 || v % 4096 != 0) { return 0; }
+    return (uint64_t) v;
+}
+
 // TIERED read primitive: reads an expert from a specific PRECISION TIER of a tiered container (manifest
 // v2, per-(layer,tier) banks). The pager selects the tier per expert (all-star … cruft, rate-distortion
 // under budget); this reads that tier's bank at offset = expert_id * tier_record_bytes (one positional

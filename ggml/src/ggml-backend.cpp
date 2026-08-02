@@ -1812,6 +1812,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // RAM and DMAs it to VRAM. Turns the QD1 per-expert crawl into one batched read.
                         // Identity is the expert's STABLE FILE-KEY (expert_id_for) so it matches across
                         // tokens — the name-based key gave exactly 0 cross-token reuse (name is per-eval).
+                        // Container-serve caller side (#268): when a packed container is active, the
+                        // fetch `src` handed to the cache is the PACKED (layer, byte-offset) token
+                        // DirContainerFetcher decodes — NEVER the mmap address. record_bytes comes from
+                        // the container manifest (read once per process); 0 ⇒ manifest unreadable ⇒ the
+                        // container is treated as ABSENT (mmap path), never a guessed stride. The layer
+                        // parses from the tensor name's `blk.N.` (names may be backend-prefixed, so
+                        // anchor on the substring, not the string start).
+                        static const uint64_t moec_record_bytes =
+                            ggml_moe::dir_container_record_bytes(ggml_moe::moe_config().container_dir);
+                        uint32_t moec_layer = 0;
+                        const char * moec_blk = std::strstr(tname, "blk.");
+                        const bool moec_active = moec_record_bytes > 0 && moec_blk != nullptr &&
+                            std::sscanf(moec_blk, "blk.%u.", &moec_layer) == 1;
                         {
                             std::vector<ggml_moe::ExpertId> pf_ids;
                             std::vector<const uint8_t *>    pf_srcs;
@@ -1819,7 +1832,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 for (int32_t id = g.first; id <= g.second; ++id) {
                                     const uint8_t * src = (const uint8_t *) input->data + (size_t) id * expert_size;
                                     pf_ids.push_back(ggml_moe::expert_id_for(src, tname, id));
-                                    pf_srcs.push_back(src);
+                                    pf_srcs.push_back(moec_active
+                                        ? (const uint8_t *) (uintptr_t) ggml_moe::DirContainerFetcher::pack_src(
+                                              moec_layer, (uint64_t) id * moec_record_bytes)
+                                        : src);
                                 }
                             }
                             host_cache.prefetch(host_buft, pf_ids.data(), pf_srcs.data(), pf_ids.size(), expert_size, pad);
@@ -1829,14 +1845,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 const size_t   dst_off = (size_t) id * expert_size;
                                 const uint8_t * mmap_src = (const uint8_t *) input->data + dst_off;
                                 const size_t   pad_end = id < n_expert - 1 ? pad : 0;
+                                const uint8_t * fetch_src = moec_active
+                                    ? (const uint8_t *) (uintptr_t) ggml_moe::DirContainerFetcher::pack_src(
+                                          moec_layer, (uint64_t) id * moec_record_bytes)
+                                    : mmap_src;
                                 uint8_t * host = host_cache.get(host_buft, ggml_moe::expert_id_for(mmap_src, tname, id),
-                                                                   mmap_src, expert_size, pad);
+                                                                   fetch_src, expert_size, pad);
                                 moe_experts_streamed += 1;
                                 moe_bytes_streamed   += expert_size + pad_end;
                                 if (host) {
                                     ggml_backend_tensor_set_async(split_backend, input_cpy, host, dst_off, expert_size + pad_end);
-                                } else {
+                                } else if (!moec_active) {
                                     ggml_backend_tensor_set_async(split_backend, input_cpy, mmap_src, dst_off, expert_size + pad_end);
+                                } else {
+                                    // Container mode has NO mmap fallback: the packed token is not a
+                                    // dereferenceable address, and streaming it would ship garbage weights
+                                    // silently. A missed fetch here is a broken/incomplete container —
+                                    // fail LOUD (the #268 safety invariant, pinned on both sides).
+                                    GGML_ABORT("[MOE-CONTAINER] fetch failed for %s expert %d "
+                                               "(bank missing or short read) — no mmap fallback in container mode",
+                                               tname, id);
                                 }
                             }
                         }
