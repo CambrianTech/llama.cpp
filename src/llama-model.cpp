@@ -2392,6 +2392,18 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
     return model->hparams.n_head_kv();
 }
 
+int32_t llama_model_n_head_kv_il(const llama_model * model, int32_t il) {
+    return model->hparams.n_head_kv(il);
+}
+
+int32_t llama_model_n_embd_head_k_il(const llama_model * model, int32_t il) {
+    return model->hparams.n_embd_head_k(il);
+}
+
+int32_t llama_model_n_embd_head_v_il(const llama_model * model, int32_t il) {
+    return model->hparams.n_embd_head_v(il);
+}
+
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here

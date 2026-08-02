@@ -580,6 +580,19 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
+    // continuum (private fork): per-layer KV head count. 0 marks a recurrent
+    // (SSM/KDA) layer that holds NO per-token KV cache; hybrid models
+    // (kimi-linear, kimi-k3, jamba) vary this per layer, so sizing KV from the
+    // scalar accessor above times n_layer overestimates their cache ~4-20x and
+    // strangles the derived context window. Callers sum per-layer instead.
+    LLAMA_API int32_t llama_model_n_head_kv_il (const struct llama_model * model, int32_t il);
+    // continuum (private fork): per-layer K/V head widths (elements per head per
+    // token). For MLA models these are the COMPRESSED cache widths (e.g. kimi-k3
+    // stores kv_lora+rope = 576-wide K), which is why sizing from n_embd/n_head
+    // misprices them. Together with n_head_kv_il these three give a caller the
+    // exact per-layer KV cost: n_head_kv(il) * (k_width + v_width) * elem_bytes.
+    LLAMA_API int32_t llama_model_n_embd_head_k_il(const struct llama_model * model, int32_t il);
+    LLAMA_API int32_t llama_model_n_embd_head_v_il(const struct llama_model * model, int32_t il);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 
     // continuum (private fork; K3 slice-2 per-expert paging): fetch a named model weight
