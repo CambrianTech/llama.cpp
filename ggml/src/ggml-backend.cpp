@@ -2141,6 +2141,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     // [MOE-EXPERT-PAGING] per-compute MoE-stream summary (opt-in). On a decode step (batch=1) this is the
     // per-token host->VRAM expert working set: the number the persistent VRAM slot cache must shrink.
+    // [MOE-PAGER] fail LOUD when paging is configured but never engages. Three silent killers cost a
+    // day of debugging (2026-08-03): CPU-repacked expert buffers (ops on transformed layouts never
+    // offload — use --no-repack), the op-offload min-batch default keeping decode on CPU, and a
+    // CPU-only device selection. Each produced ZERO pager lines and ZERO errors — indistinguishable
+    // from "pager off". One warning after a stable window of compute calls names all three.
+    {
+        static int      moe_engage_probe_calls = 0;
+        static int64_t  moe_engage_total       = 0;
+        moe_engage_total += moe_experts_streamed;
+        if (host_cache.enabled() && moe_engage_probe_calls >= 0) {
+            moe_engage_probe_calls++;
+        }
+        if (moe_engage_probe_calls == 32 && moe_engage_total == 0) {
+            fprintf(stderr,
+                "[MOE-PAGER] WARNING: expert cache is configured (GGML_MOE_*_CACHE_GB) but NO expert "
+                "stream engaged in the first 32 compute calls. Likely causes: (1) CPU repack captured "
+                "the expert tensors — relaunch with --no-repack; (2) decode never offloads — see "
+                "GGML_OP_OFFLOAD_MIN_BATCH; (3) model loaded CPU-only — check 'offloaded N/N layers' "
+                "and --device. Paging is currently doing NOTHING.\n");
+            moe_engage_probe_calls = -1;   // fired once; never re-arm
+        }
+    }
     if ((moe_stats || moe_capture) && moe_experts_streamed > 0) {
         // per-token (per graph-compute) seam breakdown. total_ms is this call's wall time; fault_ms is the
         // synchronous NVMe stall on cache misses - the number that must fall as hit-rate climbs.
