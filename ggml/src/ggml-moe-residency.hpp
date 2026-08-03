@@ -102,7 +102,11 @@ static inline void expert_pin_keys(uint32_t layer, uint32_t expert, uint64_t out
 // Atomic-rename control file; the cache polls its mtime per token and reloads on change. Minimal
 // hand-parse (no JSON dep at the ggml layer): tolerant scan for the three known keys + the pin array.
 struct PagerPlan {
-    uint64_t budget_bytes = 0;
+    uint64_t budget_bytes        = 0;
+    uint64_t device_budget_bytes = 0;   // GOVERNED VRAM cache budget (task #23 LiveUploadPager). serving_daemon
+                                        // emits it = governed_vram_ceiling - device-fit - placement margin,
+                                        // sticky-leased. The DEVICE-backed ResidencyCache uses THIS, not the env,
+                                        // exactly as the host cache uses budget_bytes (governor-arbitrated day one).
     uint32_t window_k     = 0;
     std::vector<std::pair<uint32_t,uint32_t>> pins;   // (layer, expert)
     bool     ok           = false;
@@ -116,10 +120,12 @@ static inline bool parse_pager_plan(const char * text, PagerPlan & plan) {
         while (*p && (*p == '"' || *p == ':' || *p == ' ' || *p == '\t')) { p++; }
         return std::strtoll(p, nullptr, 10);
     };
-    long long b = num_after("\"budget_bytes\"");
-    long long k = num_after("\"window_k\"");
-    if (b >= 0) { plan.budget_bytes = (uint64_t) b; }
-    if (k >= 0) { plan.window_k     = (uint32_t) k; }
+    long long b  = num_after("\"budget_bytes\"");
+    long long db = num_after("\"device_budget_bytes\"");
+    long long k  = num_after("\"window_k\"");
+    if (b  >= 0) { plan.budget_bytes        = (uint64_t) b;  }
+    if (db >= 0) { plan.device_budget_bytes = (uint64_t) db; }
+    if (k  >= 0) { plan.window_k            = (uint32_t) k;  }
     // pin_list: scan {"layer":L,"expert":E} objects inside the "pin_list" array
     const char * pl = std::strstr(text, "\"pin_list\"");
     if (pl) {
@@ -425,6 +431,18 @@ public:
 // mid-token (its ticks go stale as this token's experts stream in) before the next token reuses it;
 // generation-primary ordering protects whole recent tokens. The controller (continuum-core
 // ServingExpertPager) sets budget_bytes (and later per-expert precision); this is the mechanism.
+// A resident expert slot, backend-neutral (task #23 LiveUploadPager seam contract, agreed w/ M5).
+// The DEVICE-resident consumer needs {which buffer, offset} to issue a device-side copy (or a zero-copy
+// alias) without ever dereferencing VRAM as host memory. `host_ptr` is the fast path: non-null ONLY when
+// the slot buffer is host-visible (host RAM cache, or a UMA/Metal shared buft — `ggml_backend_buffer_is_host`
+// decides, so this is correct on CUDA (null -> D2D) and Metal (non-null -> copy-elision) with no #ifdef).
+struct ExpertSlot {
+    ggml_backend_buffer_t buffer  = nullptr;  // the pool buffer holding the slot (device or host)
+    size_t                offset  = 0;        // byte offset of the slot within `buffer`
+    uint8_t *             host_ptr = nullptr; // host-visible slot pointer, or nullptr if device-only
+    bool ok() const { return buffer != nullptr; }
+};
+
 class ResidencyCache {
     // one pinned buffer per distinct expert byte-size (gate/up/down can differ), split into slots.
     // Pinned => non-pageable (hits never swap to pagefile) AND DMA-fast H2D (~25 vs ~6 GB/s pageable).
@@ -443,6 +461,12 @@ class ResidencyCache {
     ExpertFetcher& fetcher;
     uint64_t tick = 0, token_gen = 0, hits = 0, misses = 0;
 
+    // [DEVICE-RESIDENT #23] when enabled, pools allocate through `device_buft_` (VRAM) instead of the
+    // caller's host_buft, and the budget authority switches to the plan's device_budget_bytes (governed).
+    // Off by default => the host cache path is byte-for-byte unchanged. Set once via enable_device().
+    bool                          device_backed_ = false;
+    ggml_backend_buffer_type_t    device_buft_   = nullptr;
+
     // [RUNG-2] controller actuator state (set via the GGML_MOE_PLAN_FILE control file; see PagerPlan).
     std::unordered_set<uint64_t> pinned_;   // hinted expert cache-keys — a RETENTION BIAS, not evict-exempt
     uint32_t     window_k_    = 0;          // recency window depth in tokens (0 = budget-implicit, legacy)
@@ -460,9 +484,16 @@ class ResidencyCache {
         const size_t share = budget_bytes / MAX_POOLS;
         p.max_slots = need ? (share / need) : 0;
         if (p.max_slots == 0 || pools.size() > MAX_POOLS) { p.failed = true; return; }
-        p.buf = host_buft ? ggml_backend_buft_alloc_buffer(host_buft, p.max_slots * need) : nullptr;
+        // DEVICE-resident (#23): allocate VRAM slots through device_buft_; else the caller's host_buft.
+        ggml_backend_buffer_type_t buft = device_backed_ ? device_buft_ : host_buft;
+        p.buf = buft ? ggml_backend_buft_alloc_buffer(buft, p.max_slots * need) : nullptr;
         if (p.buf == nullptr) { p.failed = true; return; }
         p.base = (uint8_t *) ggml_backend_buffer_get_base(p.buf);
+        // Pad correctness on device: the per-miss `memset(dst+expert_size, 0, pad)` cannot run on VRAM
+        // (host memset of a device pointer). Pad regions are constant per size-class and `fetch` only
+        // writes expert_size bytes, so zero the whole buffer ONCE here and they stay 0 across reuse.
+        // Host-visible buffers keep the per-miss memset path (cheaper than clearing the whole pool).
+        if (!ggml_backend_buffer_is_host(p.buf)) { ggml_backend_buffer_clear(p.buf, 0); }
         p.slot_key.assign(p.max_slots, 0);
         p.slot_tick.assign(p.max_slots, 0);
         p.slot_gen.assign(p.max_slots, 0);
@@ -509,6 +540,21 @@ public:
 
     void        set_budget(size_t b)   { budget_bytes = b; }   // idempotent; apply the env budget once
 
+    // [DEVICE-RESIDENT #23] Flip the cache to VRAM-backed slots. Idempotent + safe under concurrent
+    // first-call (the mutex + the device_backed_ guard make a second call a no-op — M5's call_once shape).
+    // Releases any host pools so they re-alloc as device slots. Budget authority: the GOVERNED
+    // plan.device_budget_bytes (reload_plan applies it each tick when a plan file is configured), else the
+    // env fallback (GGML_MOE_VRAM_CACHE_GB via moe_config) for ungoverned standalone — mirrors the host
+    // pattern exactly. The h2d mechanism lives on the DeviceUploadFetcher (wired at moe_pick_fetcher).
+    void        enable_device(ggml_backend_buffer_type_t vram_buft) {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (device_backed_ || vram_buft == nullptr) { return; }   // idempotent; ignore a null buft
+        device_backed_ = true;
+        device_buft_   = vram_buft;
+        budget_bytes   = plan_path_.empty() ? moe_config().vram_cache_bytes : 0;  // env fallback vs governed
+        release_pools_locked();   // drop any host pools; re-alloc lazily as VRAM at the device budget
+    }
+
     // Reload the controller's actuator plan if the control file changed (atomic-rename by the writer, so
     // a size/mtime bump is a complete new plan — never a torn read). Called once per token from
     // advance_generation under the cache mutex. Applies budget_bytes / window_k / pin_list live.
@@ -528,7 +574,10 @@ public:
         PagerPlan plan;
         if (!parse_pager_plan(buf.c_str(), plan)) { return; }
         const size_t prev_budget = budget_bytes;
-        if (plan.budget_bytes > 0) { budget_bytes = plan.budget_bytes; }
+        // Budget authority mirrors the tier: a DEVICE-backed cache is governed by device_budget_bytes
+        // (serving_daemon = vram_ceiling - device-fit - margin), a host cache by budget_bytes.
+        const uint64_t plan_budget = device_backed_ ? plan.device_budget_bytes : plan.budget_bytes;
+        if (plan_budget > 0) { budget_bytes = plan_budget; }
         // Governor lowered the lease -> free the pools so the RAM actually returns (honor shrink, not
         // just growth). Re-allocated lazily at the new budget. Partial-evict-keeping-hottest is a future
         // refinement; freeing fully is the correct floor for flex-under-pressure.
@@ -562,13 +611,23 @@ public:
     // Pinned host pointer holding (expert_size + pad) bytes for `id`: the expert weight then zeroed
     // padding. On miss, fetches expert_size bytes via the adapter into a pinned slot. Returns nullptr
     // if this size-class cannot be cached (caller then streams straight from the mmap).
-    uint8_t * get(ggml_backend_buffer_type_t host_buft, ExpertId id,
-                  const uint8_t * src, size_t expert_size, size_t pad) {
+    // DEVICE-AWARE slot resolve (#23 seam contract). Returns {buffer, offset, host_ptr-or-null} so a
+    // device-resident consumer can copy/alias VRAM without dereferencing it as host memory. On a HIT the
+    // slot needs no copy at all (its bytes are already resident); on a MISS the fetcher fills it (the
+    // DeviceUploadFetcher does the one H2D for a VRAM slot; host fetchers memcpy). Returns a slot with
+    // ok()==false (null buffer) if this size-class cannot be cached (caller streams from mmap).
+    ExpertSlot get_slot(ggml_backend_buffer_type_t host_buft, ExpertId id,
+                        const uint8_t * src, size_t expert_size, size_t pad) {
         std::lock_guard<std::mutex> lk(mtx);
         const size_t need = expert_size + pad;
         Pool & p = pools[need];
         ensure_pool(p, host_buft, need);
-        if (p.failed) { return nullptr; }
+        if (p.failed) { return ExpertSlot{}; }
+        const bool host_visible = ggml_backend_buffer_is_host(p.buf);
+        auto make = [&](size_t slot) -> ExpertSlot {
+            const size_t off = slot * p.slot_size;
+            return ExpertSlot{ p.buf, off, host_visible ? (p.base + off) : nullptr };
+        };
 
         const uint64_t key = id.key();   // SEMANTIC identity — stable across tokens, universal across MoEs
         auto it = p.key2slot.find(key);
@@ -576,22 +635,32 @@ public:
             hits++;
             p.slot_tick[it->second] = ++tick;
             p.slot_gen[it->second]  = token_gen;   // refresh generation on reuse
-            return p.base + it->second * p.slot_size;
+            return make(it->second);
         }
         misses++;
         const size_t slot = reserve_slot(p);
         uint8_t * dst = p.base + slot * p.slot_size;
         const auto t0 = std::chrono::steady_clock::now();
-        fetcher.fetch(dst, src, expert_size);            // adapter: mmap-fault or direct NVMe read
+        fetcher.fetch(dst, src, expert_size);            // adapter: mmap-fault / NVMe read / device-upload
         const auto t1 = std::chrono::steady_clock::now();
         admit_us    += std::chrono::duration<double, std::micro>(t1 - t0).count();
         admit_bytes += expert_size;
-        if (pad) { memset(dst + expert_size, 0, pad); }
+        // Host-visible slots zero the pad per-miss; device slots were zeroed once at ensure_pool (a host
+        // memset of a VRAM pointer would fault), so their pad stays 0 across reuse without touching it here.
+        if (pad && host_visible) { memset(dst + expert_size, 0, pad); }
         p.slot_key[slot]  = key;
         p.slot_tick[slot] = ++tick;
         p.slot_gen[slot]  = token_gen;
         p.key2slot[key]   = slot;
-        return dst;
+        return make(slot);
+    }
+
+    // Back-compat host fast path: the pinned host pointer, or nullptr when the slot is device-only (the
+    // legacy caller then streams from mmap; the device-aware caller uses get_slot()). Unchanged for the
+    // host cache — get_slot's host_visible branch returns exactly the old pointer.
+    uint8_t * get(ggml_backend_buffer_type_t host_buft, ExpertId id,
+                  const uint8_t * src, size_t expert_size, size_t pad) {
+        return get_slot(host_buft, id, src, expert_size, pad).host_ptr;
     }
 
     // Concurrently admit a whole layer's selected experts before they are consumed. Already-resident

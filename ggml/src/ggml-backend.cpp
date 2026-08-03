@@ -1554,7 +1554,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 static ggml_moe::DirectReadFetcher moe_direct_fetcher;
 #endif
 static ggml_moe::MmapFaultFetcher  moe_mmap_fetcher;
-static ggml_moe::ExpertFetcher &   moe_pick_fetcher() {
+static ggml_moe::ExpertFetcher &   moe_pick_base_fetcher() {
     // Container-serve (#268): when a packed per-layer expert container is configured, read from it.
     // Its records are contiguous + 16KiB-aligned, so this is the honest ~GB/s sequential path — vs
     // DirectRead scraping scattered offsets out of the raw GGUF's mmap. The serving caller packs
@@ -1570,6 +1570,14 @@ static ggml_moe::ExpertFetcher &   moe_pick_fetcher() {
 #endif
     return moe_mmap_fetcher;
 }
+// [DEVICE-RESIDENT #23] set once by the serving caller via moe_expert_cache_enable_device(): a
+// DeviceUploadFetcher wrapping the base fetcher, so a VRAM-slot MISS reads host-side then does ONE H2D.
+// Null => host cache (the base fetcher fills host slots directly). moe_expert_cache() reads this at its
+// first construction, so enable_device MUST run before the cache's first use (first-token call_once).
+static ggml_moe::ExpertFetcher *   g_moe_device_fetcher = nullptr;
+static ggml_moe::ExpertFetcher &   moe_pick_fetcher() {
+    return g_moe_device_fetcher ? *g_moe_device_fetcher : moe_pick_base_fetcher();
+}
 // budget from moe_config().host_cache_bytes (0 => disabled). Cache holds a mutex, so it is a plain
 // function-local static, constructed once with the chosen fetcher; budget applied idempotently.
 static ggml_moe::ResidencyCache & moe_expert_cache() {
@@ -1583,6 +1591,26 @@ static ggml_moe::ResidencyCache & moe_expert_cache() {
         : 0;                                        // governed: plan-file sets the budget on first tick
     static ggml_moe::ResidencyCache cache(initial_budget, moe_pick_fetcher());
     return cache;
+}
+
+// [DEVICE-RESIDENT #23 LiveUploadPager] The ONE bridge the serving expert loop calls (its own call_once)
+// to make the expert cache VRAM-resident so hits kill the per-op H2D. It owns the CUDA backend, so it
+// supplies the split backend's VRAM buffer type + an h2d closure (one host->device copy for a slot miss).
+// Wires the DeviceUploadFetcher over the base fetcher and flips the cache device-backed BEFORE its first
+// pool alloc — hence this must run before the cache's first use. Idempotent (call_once) + null-safe.
+// Off unless called: the host path is byte-for-byte unchanged. Budget is GOVERNED (plan.device_budget_bytes)
+// or the GGML_MOE_VRAM_CACHE_GB env fallback in ungoverned standalone — the cache decides, per the host mirror.
+// [[maybe_unused]] until M5's expert-loop caller wires the enable-call (same TU); keeps -Werror happy.
+[[maybe_unused]] static void moe_expert_cache_enable_device(ggml_backend_buffer_type_t vram_buft,
+                                           std::function<bool(void *, const void *, size_t)> h2d) {
+    if (vram_buft == nullptr || !h2d) { return; }
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+        // DeviceUploadFetcher lives for process lifetime; g_moe_device_fetcher then steers moe_pick_fetcher.
+        static ggml_moe::DeviceUploadFetcher duf(moe_pick_base_fetcher(), std::move(h2d));
+        g_moe_device_fetcher = &duf;
+        moe_expert_cache().enable_device(vram_buft);   // constructs (if first) with the device fetcher, flips buft
+    });
 }
 
 
