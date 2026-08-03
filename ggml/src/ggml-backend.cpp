@@ -1614,6 +1614,60 @@ static ggml_moe::ResidencyCache & moe_expert_cache() {
 }
 
 
+// [MOE-GATHER #23 — consume arm] persistent pool of expert-offset tables (ggml_mul_mat_id's src[3]).
+// Process-global like moe_expert_cache(): the pager serves one llama instance per process. Tables are
+// claimed in order per compute call and reset where the recency clock ticks; their device buffers and
+// host staging live for the process lifetime because a node's src[3] (and the staging an async upload
+// reads) must stay valid until that graph's compute completes. Sub-pooled by sched->cur_copy so
+// pipeline-parallel copies never overwrite a table an in-flight copy's kernels still read — the same
+// hazard the input_cpy event_wait guards, solved the same per-copy way.
+struct MoeGatherTables {
+    struct Entry {
+        struct ggml_tensor    tens {};
+        ggml_backend_buffer_t buf      = nullptr;
+        int64_t               capacity = 0;      // experts the device buffer can hold
+        std::vector<int64_t>  staging;           // host mirror; outlives the async upload
+    };
+    std::vector<std::unique_ptr<Entry>> entries[GGML_SCHED_MAX_COPIES];
+    size_t next[GGML_SCHED_MAX_COPIES] = {};
+
+    void reset(int copy) { next[copy] = 0; }
+
+    // claim the next table sized for n_expert on `backend`'s default buffer type; nullptr on alloc failure
+    Entry * claim(ggml_backend_t backend, int copy, int64_t n_expert) {
+        auto & pool = entries[copy];
+        if (next[copy] == pool.size()) { pool.emplace_back(new Entry()); }
+        Entry * e = pool[next[copy]].get();
+        if (e->capacity < n_expert) {
+            if (e->buf) { ggml_backend_buffer_free(e->buf); e->buf = nullptr; e->capacity = 0; }
+            e->buf = ggml_backend_alloc_buffer(backend, (size_t) n_expert * sizeof(int64_t));
+            if (e->buf == nullptr) { return nullptr; }
+            e->capacity = n_expert;
+        }
+        struct ggml_tensor * t = &e->tens;
+        memset(t, 0, sizeof(*t));
+        t->type  = GGML_TYPE_I64;
+        t->ne[0] = n_expert; t->ne[1] = t->ne[2] = t->ne[3] = 1;
+        t->nb[0] = sizeof(int64_t);
+        t->nb[1] = t->nb[2] = t->nb[3] = (size_t) n_expert * sizeof(int64_t);
+        t->op     = GGML_OP_NONE;
+        t->buffer = e->buf;
+        t->data   = ggml_backend_buffer_get_base(e->buf);
+        snprintf(t->name, sizeof(t->name), "moe_eptrs");
+        e->staging.assign((size_t) n_expert, 0);
+        next[copy]++;
+        return e;
+    }
+};
+static MoeGatherTables g_moe_gather_tables;
+
+// per-backend entry-builder proc ("ggml_backend_moe_gather_entry"); nullptr = backend has no gather repr
+static ggml_backend_moe_gather_entry_t moe_gather_entry_fn(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? (ggml_backend_moe_gather_entry_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_gather_entry") : nullptr;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1630,7 +1684,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // [MOE-EXPERT-PAGING] read-based residency (task #28): batched OS prefetch of the selected experts'
     // mmap ranges, turning cold random demand-faults into concurrent sequential NVMe reads. Opt-in so
     // before/after is a single binary (A/B by env).
-    static const bool moe_prefetch = ggml_moe::moe_config().prefetch;
+    [[maybe_unused]] static const bool moe_prefetch = ggml_moe::moe_config().prefetch; // consumed under _WIN32 only
     // [MOE-TRACE] optional ordered expert-access trace for OFFLINE residency-policy simulation. One binary
     // record (u64 tensor_key, u32 expert_id) per activated expert, in true access order. Lets us replay
     // the real MoE routing against ANY cache policy/budget (LRU vs LFU vs a learned predictor) to measure
@@ -1690,8 +1744,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // no-op when no plan file is configured. Advancing the clock also protects whole recent tokens' sets.
     host_cache.advance_generation();
     const bool host_cache_on = host_cache.enabled();
+    // [MOE-GATHER #23] opt-in consume-arm; tables recycle at the same per-call cadence as the clock
+    static const bool moe_gather_on = ggml_moe::moe_config().gather;
+    if (moe_gather_on) { g_moe_gather_tables.reset(sched->cur_copy); }
     size_t  moe_bytes_streamed  = 0;
     int64_t moe_experts_streamed = 0;
+    int64_t moe_experts_gathered = 0;
     // per-token deltas snapshot the cumulative cache counters at entry
     const uint64_t hits0   = host_cache.n_hits();
     const uint64_t misses0 = host_cache.n_misses();
@@ -1856,6 +1914,46 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t pad = std::min<size_t>(expert_size, 512);
                         // pinned host memory from the compute (CUDA) backend's host buffer type
                         ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(split_backend));
+
+                        // [MOE-GATHER #23 — consume arm] publish an expert base table (src[3]) so the
+                        // MUL_MAT_ID kernel reads cache slots IN PLACE — no per-expert copy at all.
+                        // Every entry defaults to the expert's natural offset inside input_cpy (in the
+                        // BACKEND's repr, built by the same proc), so unused experts stay valid and any
+                        // per-expert fallback below needs no bookkeeping. The node's src[3] is reset
+                        // first: a stale table from a prior call must never survive a bail-out.
+                        node->src[3] = nullptr;
+                        MoeGatherTables::Entry *          gtab   = nullptr;
+                        ggml_backend_moe_gather_entry_t   gentry = nullptr;
+                        if (moe_gather_on) {
+                            gentry = moe_gather_entry_fn(split_backend);
+                            if (gentry != nullptr) {
+                                gtab = g_moe_gather_tables.claim(split_backend, sched->cur_copy, n_expert);
+                            }
+                            if (gtab != nullptr) {
+                                node->src[3] = &gtab->tens;
+                                if (!ggml_backend_supports_op(split_backend, node)) {
+                                    node->src[3] = nullptr;   // kernel family not gather-capable here
+                                    gtab = nullptr;
+                                }
+                            }
+                            if (gtab != nullptr) {
+                                // slots referenced by this table are read at COMPUTE time — evicting a
+                                // current-generation slot would dangle an entry. Sticky by design (doc
+                                // on set_gather_fence).
+                                host_cache.set_gather_fence(true);
+                                const size_t input_cpy_buf_off =
+                                    (size_t) ((char *) input_cpy->data - (char *) ggml_backend_buffer_get_base(input_cpy->buffer));
+                                for (int64_t i = 0; i < n_expert && gtab != nullptr; i++) {
+                                    int64_t ent = 0;
+                                    if (gentry(input_cpy, input_cpy->buffer, input_cpy_buf_off + (size_t) i * expert_size, &ent)) {
+                                        gtab->staging[(size_t) i] = ent;
+                                    } else {
+                                        node->src[3] = nullptr;   // repr can't express even identity — bail this node
+                                        gtab = nullptr;
+                                    }
+                                }
+                            }
+                        }
                         // SEMANTIC identity of this expert weight (blk.N.ffn_*_exps.weight): stable across
                         // tokens and universal across MoEs. Hashed once per weight tensor, not per expert.
                         const char * tname = ggml_get_name(input);
@@ -1915,10 +2013,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 ggml_moe::ExpertSlot slot = host_cache.get_slot(host_buft, ggml_moe::expert_id_for(mmap_src, tname, id),
                                                                    fetch_src, expert_size, pad);
                                 moe_experts_streamed += 1;
-                                moe_bytes_streamed   += expert_size + pad_end;
-                                if (slot.host_ptr) {
+                                int64_t gent = 0;
+                                if (gtab != nullptr && slot.ok() &&
+                                    gentry(input_cpy, slot.buffer, slot.offset, &gent)) {
+                                    // [MOE-GATHER #23] the kernel reads the slot IN PLACE through the
+                                    // table — zero bytes moved for this expert (hit or freshly-admitted
+                                    // miss alike; the fetcher already filled the slot). Slot lifetime
+                                    // across the async compute is the gather fence's contract.
+                                    gtab->staging[(size_t) id] = gent;
+                                    moe_experts_gathered += 1;
+                                } else if (slot.host_ptr) {
+                                    moe_bytes_streamed += expert_size + pad_end;
                                     ggml_backend_tensor_set_async(split_backend, input_cpy, slot.host_ptr, dst_off, expert_size + pad_end);
                                 } else if (slot.ok() && slot.buffer != nullptr) {
+                                    moe_bytes_streamed += expert_size + pad_end;
                                     // [DEVICE-RESIDENT #23 — the H2D kill] The slot lives in VRAM (host_ptr
                                     // null => not host-visible): copy device-to-device into the graph's
                                     // staging tensor instead of streaming expert_size bytes over PCIe.
@@ -1943,6 +2051,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                         ggml_backend_tensor_copy(&src_t, &dst_t);
                                     }
                                 } else if (!moec_active) {
+                                    moe_bytes_streamed += expert_size + pad_end;
                                     ggml_backend_tensor_set_async(split_backend, input_cpy, mmap_src, dst_off, expert_size + pad_end);
                                 } else {
                                     // Container mode has NO mmap fallback: the packed token is not a
@@ -1954,6 +2063,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                                tname, id);
                                 }
                             }
+                        }
+                        // [MOE-GATHER #23] ONE table upload per node per ubatch. Enqueued inside the same
+                        // event-guarded region as the input_cpy writes, so it inherits exactly their
+                        // ordering contract w.r.t. the prior graph's in-flight compute.
+                        if (gtab != nullptr) {
+                            ggml_backend_tensor_set_async(split_backend, &gtab->tens, gtab->staging.data(), 0,
+                                                          (size_t) n_expert * sizeof(int64_t));
                         }
                     } else {
                         for (const auto & g : groups) {
@@ -2037,18 +2153,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const double   hit_rate = (hits + misses) ? (100.0 * hits / (hits + misses)) : 0.0;
         if (moe_stats) {   // stderr (not GGML_LOG_INFO) so it survives the server's log-level filtering.
             fprintf(stderr,
-                "[MOE-PAGER] moe_stream: experts=%lld bytes=%.1f MiB | hits=%llu miss=%llu hit_rate=%.1f%% | fetch=%.0f MB/s fault_wait=%.1f ms total=%.1f ms\n",
-                (long long) moe_experts_streamed, (double) moe_bytes_streamed / (1024.0 * 1024.0),
+                "[MOE-PAGER] moe_stream: experts=%lld gather=%lld bytes=%.1f MiB | hits=%llu miss=%llu hit_rate=%.1f%% | fetch=%.0f MB/s fault_wait=%.1f ms total=%.1f ms\n",
+                (long long) moe_experts_streamed, (long long) moe_experts_gathered, (double) moe_bytes_streamed / (1024.0 * 1024.0),
                 (unsigned long long) hits, (unsigned long long) misses, hit_rate, fetch_mbps, fault_ms, total_ms);
         }
         if (moe_capture) {   // structured PagerCaptureEvent (graph-control fields) — Positron tails this JSONL.
             const int nw = fprintf(moe_capture,
                 "{\"token\":%llu,\"hit_rate\":%.4f,\"fault_wait_ms\":%.1f,\"tok_per_s\":%.4f,"
                 "\"bytes_fetched_mb\":%.1f,\"fetch_mb_s\":%.0f,\"resident_experts\":%llu,"
-                "\"experts\":%lld,\"misses\":%llu}\n",
+                "\"experts\":%lld,\"misses\":%llu,\"gathered\":%lld}\n",
                 (unsigned long long) moe_capture_token++, hit_rate / 100.0, fault_ms,
                 total_ms > 0.0 ? 1000.0 / total_ms : 0.0, fetch_mb, fetch_mbps,
-                (unsigned long long) hits, (long long) moe_experts_streamed, (unsigned long long) misses);
+                (unsigned long long) hits, (long long) moe_experts_streamed, (unsigned long long) misses,
+                (long long) moe_experts_gathered);
             fflush(moe_capture);
             if (nw > 0) { moe_capture_bytes += (uint64_t) nw; }
             if (moe_capture_bytes >= moe_capture_cap) {   // DRAIN: rotate to path.1, reopen fresh (keep recent)

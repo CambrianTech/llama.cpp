@@ -1931,3 +1931,15 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
 
     return res;
 }
+
+uint64_t ggml_metal_buffer_gpu_va(ggml_metal_buffer_t buf, const void * ptr) {
+    if (@available(macOS 13.0, iOS 16.0, *)) {
+        for (int i = 0; i < buf->n_buffers; ++i) {
+            const int64_t ioffs = (int64_t) ptr - (int64_t) buf->buffers[i].data;
+            if (ioffs >= 0 && ioffs < (int64_t) buf->buffers[i].size) {
+                return [buf->buffers[i].metal gpuAddress] + (uint64_t) ioffs;
+            }
+        }
+    }
+    return 0;
+}

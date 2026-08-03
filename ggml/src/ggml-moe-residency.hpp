@@ -165,6 +165,7 @@ struct MoeServingConfig {
     size_t       capture_cap_bytes = 32ull * 1024 * 1024; // GGML_MOE_CAPTURE_MB   (capture rotate threshold)
     std::string  plan_path;                               // GGML_MOE_PLAN_FILE    (controller actuator plan)
     const char * container_dir    = nullptr;              // GGML_MOE_CONTAINER    (v1 per-layer expert container dir -> DirContainerFetcher)
+    bool         gather           = false;                // GGML_MOE_GATHER       (pointer-table MUL_MAT_ID consume-arm, task #23 Cut 2 — opt-in until measured)
 
     static MoeServingConfig from_env() {
         MoeServingConfig c;
@@ -179,6 +180,7 @@ struct MoeServingConfig {
         if (const char * v = getenv("GGML_MOE_CAPTURE_MB")) { c.capture_cap_bytes = (size_t) atoi(v) * 1024 * 1024; }
         if (const char * v = getenv("GGML_MOE_PLAN_FILE"))  { c.plan_path = v; }
         c.container_dir = getenv("GGML_MOE_CONTAINER");
+        c.gather        = getenv("GGML_MOE_GATHER")       != nullptr;
         return c;
     }
 };
@@ -467,6 +469,17 @@ class ResidencyCache {
     bool                          device_backed_ = false;
     ggml_backend_buffer_type_t    device_buft_   = nullptr;
 
+    // [MOE-GATHER #23] gather-epoch eviction fence. While the consume-arm is publishing offset tables
+    // (ggml_mul_mat_id src[3]) for the CURRENT compute call, every slot touched this token_gen may be
+    // referenced by an already-uploaded table whose kernel has not run yet — the read window extends
+    // from "during copy enqueue" to "until graph compute completes". Evicting + refilling such a slot
+    // (the [RETAIN] evict>0 case: token working set > pool) would make that table entry read the WRONG
+    // expert's bytes, silently. With the fence up, reserve_slot refuses current-generation victims and
+    // the caller falls back to the copy path for that expert. Flag-gated (NOT unconditional): under the
+    // pure copy arm intra-token eviction is only churn, and container mode relies on the cache admitting
+    // (no mmap fallback) — an unconditional refusal would turn pool-too-small into an abort there.
+    bool gather_fence_ = false;
+
     // [RUNG-2] controller actuator state (set via the GGML_MOE_PLAN_FILE control file; see PagerPlan).
     std::unordered_set<uint64_t> pinned_;   // hinted expert cache-keys — a RETENTION BIAS, not evict-exempt
     uint32_t     window_k_    = 0;          // recency window depth in tokens (0 = budget-implicit, legacy)
@@ -513,6 +526,9 @@ class ResidencyCache {
 
     // pick a slot: next free one, else evict the OLDEST token-generation (tie-break: oldest access tick),
     // dropping its key mapping. Generation-primary = recency window at token granularity (see class doc).
+    // sentinel: no slot could be reserved (gather fence refused every current-generation victim)
+    static const size_t NO_SLOT = (size_t) -1;
+
     size_t reserve_slot(Pool & p) {
         if (p.used < p.max_slots) { return p.used++; }
         // SCORE-HINT eviction: evict the slot with the oldest EFFECTIVE generation, where a hinted expert
@@ -521,14 +537,18 @@ class ResidencyCache {
         // a COLD hint (older than the bias) still ages out. Replaces evict-exempt pinning, which taxed
         // recency the very slots it needs to be good (RUN-1/RUN-2 convicted the hard actuator).
         const bool have_pins = !pinned_.empty();
-        size_t slot = 0;
+        size_t slot = NO_SLOT;
         uint64_t oeff = UINT64_MAX, ot = UINT64_MAX;
         for (size_t i = 0; i < p.max_slots; i++) {
+            // [MOE-GATHER #23] fence: a slot touched THIS generation may be referenced by an in-flight
+            // offset table — never a victim while the gather epoch is active (see gather_fence_ doc).
+            if (gather_fence_ && p.slot_gen[i] == token_gen) { continue; }
             const uint64_t eff = p.slot_gen[i] + ((have_pins && pinned_.count(p.slot_key[i])) ? pin_bias_ : 0);
             if (eff < oeff || (eff == oeff && p.slot_tick[i] < ot)) {
                 oeff = eff; ot = p.slot_tick[i]; slot = i;
             }
         }
+        if (slot == NO_SLOT) { return NO_SLOT; }   // only reachable with the fence up
         p.key2slot.erase(p.slot_key[slot]);
         return slot;
     }
@@ -539,6 +559,12 @@ public:
     }
 
     void        set_budget(size_t b)   { budget_bytes = b; }   // idempotent; apply the env budget once
+
+    // [MOE-GATHER #23] arm/disarm the gather-epoch eviction fence (see gather_fence_ doc). The consume-arm
+    // arms it once when it starts publishing offset tables; it stays up for the lifetime of the gather
+    // consumer (per-compute-call disarm would race the NEXT call's prefetch against this call's in-flight
+    // kernels). Copy-arm-only runs never arm it and keep today's eviction semantics exactly.
+    void        set_gather_fence(bool on) { std::lock_guard<std::mutex> lk(mtx); gather_fence_ = on; }
 
     // [DEVICE-RESIDENT #23] Flip the cache to VRAM-backed slots. Idempotent + safe under concurrent
     // first-call (the mutex + the device_backed_ guard make a second call a no-op — M5's call_once shape).
@@ -665,6 +691,7 @@ public:
         }
         misses++;
         const size_t slot = reserve_slot(p);
+        if (slot == NO_SLOT) { return ExpertSlot{}; }   // fence refusal — caller streams from mmap
         uint8_t * dst = p.base + slot * p.slot_size;
         const auto t0 = std::chrono::steady_clock::now();
         fetcher.fetch(dst, src, expert_size);            // adapter: mmap-fault / NVMe read / device-upload
@@ -714,8 +741,10 @@ public:
                 p.slot_tick[rit->second] = ++tick;
                 n_resident++; continue;
             }
-            if (p.used >= p.max_slots) { n_evict++; }                    // this reserve will evict oldest generation
+            const bool was_full = p.used >= p.max_slots;                 // a successful reserve now = eviction
             const size_t slot = reserve_slot(p);
+            if (slot == NO_SLOT) { continue; }                           // fence refusal — not admitted this token
+            if (was_full) { n_evict++; }
             uint8_t * dst = p.base + slot * p.slot_size;
             p.slot_key[slot]  = key;
             p.slot_tick[slot] = ++tick;
