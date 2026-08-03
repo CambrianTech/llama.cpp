@@ -2446,6 +2446,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             /*.ne1  =*/ ne1,
             /*.nb1  =*/ nb1,
             /*.nr0  =*/ nr0,
+            /*.use_eptrs =*/ op->src[3] != nullptr ? 1 : 0,
         };
 
         if (ggml_is_quantized(op->src[0]->type)) {
@@ -2458,6 +2459,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst,  3);
         ggml_metal_encoder_set_buffer(enc, bid_src2, 4);
+        // [MOE-GATHER #23] expert base-offset table (I64, src0-tensor-relative).
+        // Absent → bind src0 as an inert placeholder; the kernel never reads
+        // buffer 5 when args.use_eptrs == 0.
+        ggml_metal_encoder_set_buffer(
+            enc, op->src[3] != nullptr ? ggml_metal_get_buffer_id(op->src[3]) : bid_src0, 5);
 
         const int64_t _ne1 = 1;
         const int64_t ne123 = ne20*ne21;

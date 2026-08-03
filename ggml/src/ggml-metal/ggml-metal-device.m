@@ -1285,13 +1285,20 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-            // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-pointer
-            // table, docs/serving/MOE-GATHER-MULMATID.md): Metal is the first target
-            // backend — flip this gate when the gather kernel lands; until then
-            // reject so the scheduler falls back rather than compute a wrong
-            // contiguous-stride result.
+            // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-offset
+            // table, docs/serving/MOE-GATHER-MULMATID.md): implemented on the
+            // matrix-VECTOR family (decode). Ops that would take the matrix-matrix
+            // path (the same predicate the dispatcher uses: simdgroup_mm && ne00>=64
+            // && n_tokens>=32) still reject until that kernel gains the table.
             if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != NULL) {
-                return false;
+                const bool would_take_mm = has_simdgroup_mm &&
+                    op->src[0]->ne[0] >= 64 && op->src[2]->ne[1] >= 32;
+                if (would_take_mm) {
+                    return false;
+                }
+                if (op->src[3]->type != GGML_TYPE_I64) {
+                    return false;
+                }
             }
             return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET:

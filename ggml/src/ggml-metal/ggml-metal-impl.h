@@ -547,6 +547,11 @@ typedef struct {
     int32_t  ne1;
     uint64_t nb1;
     int32_t  nr0;
+    // [MOE-GATHER #23] when nonzero, the kernel reads expert i02's base offset
+    // from the eptrs table (buffer 5, I64 byte-offsets relative to the src0
+    // tensor start) instead of computing i02*nb02 — recency-scattered cache
+    // slots and open expert populations consume zero-copy.
+    int32_t  use_eptrs;
 } ggml_metal_kargs_mul_mv_id;
 
 // NORM
