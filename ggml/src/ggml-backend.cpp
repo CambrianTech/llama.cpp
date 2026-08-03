@@ -1938,10 +1938,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     struct ggml_tensor dst_t = src_t;
                                     dst_t.buffer = input_cpy->buffer;
                                     dst_t.data   = (char *) input_cpy->data + dst_off;
-                                    if (!split_backend->iface.cpy_tensor_async ||
-                                        !split_backend->iface.cpy_tensor_async(split_backend, split_backend, &src_t, &dst_t)) {
-                                        ggml_backend_tensor_copy(&src_t, &dst_t);
-                                    }
+                                    // [DEVICE-RESIDENT #23 — EXPERIMENT A, BigMama's 5090 trace 2026-08-03]
+                                    // The raw cpy_tensor_async IFACE call crashed on CUDA with our
+                                    // zero-init stack views (suspected deref of a field real graph
+                                    // tensors carry, e.g. extra). Force the SYNC public copy — it
+                                    // validates layouts and takes the buffer-iface path with full
+                                    // checks. Metal/UMA never reaches this arm (host_ptr short-circuit),
+                                    // so this is CUDA-only in practice; async overlap returns once the
+                                    // crashing field is identified and the views carry it.
+                                    ggml_backend_tensor_copy(&src_t, &dst_t);
                                 } else if (!moec_active) {
                                     ggml_backend_tensor_set_async(split_backend, input_cpy, mmap_src, dst_off, expert_size + pad_end);
                                 } else {
