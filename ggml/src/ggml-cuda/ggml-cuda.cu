@@ -4729,11 +4729,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         const ggml_tensor * gsrc0 = op->src[0];
         const ggml_tensor * gsrc1 = op->src[1];
         const int gcc = ggml_cuda_info().devices[dev_ctx->device].cc;
-        const bool mv_path = op->ne[2] <= 16; // ncols_dst<=16 -> mul_mat_f (mv), not mul_mat_f_ids (mm)
-        if (!(mv_path && ggml_cuda_should_use_mmf(gsrc0->type, gcc, WARP_SIZE, gsrc0->ne, gsrc0->nb, gsrc1->ne[2], /*mul_mat_id=*/true))) {
+        // MV/decode kernels are gathered: mmf (mul_mat_f, non-quantized) and mmvq (mul_mat_vec_q,
+        // quantized = the real V4-Flash IQ2 serving path). mm/prefill (mul_mat_f_ids / mmq) is NOT yet
+        // gathered -> reject so the scheduler falls back (designed partial rollout, one family at a time).
+        const bool mv_path = op->ne[2] <= 16; // ncols_dst<=16 -> mv kernels
+        const bool mmf_mv  = ggml_cuda_should_use_mmf(gsrc0->type, gcc, WARP_SIZE, gsrc0->ne, gsrc0->nb, gsrc1->ne[2], /*mul_mat_id=*/true);
+        const bool mmvq_mv = ggml_is_quantized(gsrc0->type); // quantized mv routes to mul_mat_vec_q (gathered)
+        if (!(mv_path && (mmf_mv || mmvq_mv))) {
             return false;
         }
-        // fall through: the mmf-MV gather kernel handles src[3].
+        // fall through: the mmf-MV / mmvq-MV gather kernels handle src[3].
     }
 
     // check if all the sources are allocated on this device
@@ -5331,6 +5336,25 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// [MOE-GATHER #23] CUDA repr of an expert-table entry: SIGNED byte delta of the resident slot
+// relative to src0_cpy's data pointer. CUDA device pointers are directly comparable under unified
+// virtual addressing, so — unlike Metal, which must resolve MTLBuffer.gpuAddress — the raw pointer
+// delta IS the transferable entry the gather kernel adds to vx. Delta is signed (a slot may live
+// below src0 in the VA space). false => sources aren't CUDA buffers => consume-arm copies as before.
+static bool ggml_backend_cuda_moe_gather_entry(const struct ggml_tensor * src0_cpy,
+        ggml_backend_buffer_t slot_buf, size_t slot_off, int64_t * entry) {
+    if (src0_cpy == nullptr || src0_cpy->buffer == nullptr || slot_buf == nullptr || entry == nullptr) {
+        return false;
+    }
+    if (!ggml_backend_buffer_is_cuda(src0_cpy->buffer) || !ggml_backend_buffer_is_cuda(slot_buf)) {
+        return false;
+    }
+    const char * p_src0 = (const char *) src0_cpy->data;
+    const char * p_slot = (const char *) ggml_backend_buffer_get_base(slot_buf) + slot_off;
+    *entry = (int64_t) (p_slot - p_src0);
+    return true;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5350,6 +5374,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_moe_gather_entry") == 0) {
+        return (void *)ggml_backend_cuda_moe_gather_entry;
     }
     return nullptr;
 }
