@@ -552,7 +552,33 @@ public:
         device_backed_ = true;
         device_buft_   = vram_buft;
         budget_bytes   = plan_path_.empty() ? moe_config().vram_cache_bytes : 0;  // env fallback vs governed
+        clamp_device_budget_to_free_vram();   // NEVER oversubscribe (the #23 crash conviction)
         release_pools_locked();   // drop any host pools; re-alloc lazily as VRAM at the device budget
+    }
+
+    // The device cache must NEVER exceed ACTUAL free VRAM. If it does, cudaMalloc still "succeeds" via
+    // lazy VMM and the fault DEFERS to first touch = a raw SIGSEGV mid-decode (MEASURED on K3: 33.2GB
+    // resident on a 32GB card + a 1GB env cache -> crash after the pool clear, before the first fetch).
+    // The governed plan.device_budget_bytes is safe by construction; the env GGML_MOE_VRAM_CACHE_GB is
+    // not. So cap the budget to the REAL free VRAM measured HERE — the resident is already placed at
+    // enable time, so this is ground truth, not an estimate. K3 (no free VRAM) -> cap ~0 -> cache safely
+    // DISABLES instead of crashing; V4-Flash (tiny resident) -> the whole card is cache. Un-crashable
+    // by construction, on any card, from any budget source.
+    void        clamp_device_budget_to_free_vram() {
+        if (device_buft_ == nullptr) { return; }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(device_buft_);
+        if (dev == nullptr) { return; }
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_dev_memory(dev, &free_b, &total_b);
+        if (free_b == 0) { return; }   // can't query -> leave as-is (governed path already safe)
+        const size_t margin = 512ull * 1024 * 1024;   // graph scratch / fragmentation headroom
+        const size_t cap = free_b > margin ? (free_b - margin) : 0;
+        if (budget_bytes > cap) {
+            fprintf(stderr, "[MOE] device cache budget %zuMB -> clamped to free-VRAM %zuMB (avoid oversubscribe)\n",
+                    budget_bytes / (1024 * 1024), cap / (1024 * 1024));
+            fflush(stderr);
+            budget_bytes = cap;   // cap == 0 => enabled() stays false => cache never allocates => no crash
+        }
     }
 
     // Reload the controller's actuator plan if the control file changed (atomic-rename by the writer, so
