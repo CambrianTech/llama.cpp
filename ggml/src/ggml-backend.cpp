@@ -1647,6 +1647,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // guard; the proper drain is the facility layer (Rust CaptureSink ring/rotation, as TrackedDir does
     // for other capture). GGML_MOE_CAPTURE_MB overrides the cap (default 32 MB ~ 200k tokens).
     static const uint64_t moe_capture_cap = ggml_moe::moe_config().capture_cap_bytes;
+    // [DEVICE-RESIDENT #23 — caller half] Flip the expert cache VRAM-resident BEFORE the
+    // moe_expert_cache() reference below constructs it (the fetcher is bound at construction, so
+    // this MUST win the first-token race — the ordering contract on enable_device). Opt-in via
+    // GGML_MOE_VRAM_CACHE_GB for the A/B (governed auto-enable via plan.device_budget_bytes is the
+    // follow-up once the cache can request a buft). The h2d closure is backend-neutral: every
+    // buffer iface addresses writes by tensor->data (+offset), so a data-only stack tensor over the
+    // raw slot pointer is a legal handle, and a tiny probe buffer from the same buft supplies the
+    // iface + device context for slots that live in OTHER buffers of that buft.
+    {
+        static std::once_flag moe_dev_once;
+        std::call_once(moe_dev_once, [&]() {
+            if (ggml_moe::moe_config().vram_cache_bytes == 0) { return; }
+            ggml_backend_t gpu = nullptr;
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    gpu = sched->backends[b];
+                    break;
+                }
+            }
+            if (gpu == nullptr) { return; } // CPU-only box: host cache stays as-is
+            ggml_backend_buffer_type_t vbuft = ggml_backend_get_default_buffer_type(gpu);
+            static ggml_backend_buffer_t h2d_probe = ggml_backend_buft_alloc_buffer(vbuft, 16);
+            if (h2d_probe == nullptr) { return; }
+            moe_expert_cache_enable_device(vbuft, [](void * dst, const void * src, size_t n) -> bool {
+                struct ggml_tensor t = {};
+                t.type  = GGML_TYPE_I8;
+                t.ne[0] = (int64_t) n; t.ne[1] = t.ne[2] = t.ne[3] = 1;
+                t.nb[0] = 1; t.nb[1] = t.nb[2] = t.nb[3] = n;
+                t.buffer = h2d_probe;  // iface + device ctx; impls write to t.data, not the probe
+                t.data   = dst;
+                ggml_backend_tensor_set(&t, src, 0, n);
+                return true;
+            });
+        });
+    }
     // host-side expert residency cache (the module; budget from GGML_MOE_HOST_CACHE_GB, 0 => disabled).
     ggml_moe::ResidencyCache & host_cache = moe_expert_cache();
     // [MOE-RECENCY] one compute-splits call == one token (decode) / one prefill batch. Poll the governor's
@@ -1877,12 +1912,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     ? (const uint8_t *) (uintptr_t) ggml_moe::DirContainerFetcher::pack_src(
                                           moec_layer, (uint64_t) id * moec_record_bytes)
                                     : mmap_src;
-                                uint8_t * host = host_cache.get(host_buft, ggml_moe::expert_id_for(mmap_src, tname, id),
+                                ggml_moe::ExpertSlot slot = host_cache.get_slot(host_buft, ggml_moe::expert_id_for(mmap_src, tname, id),
                                                                    fetch_src, expert_size, pad);
                                 moe_experts_streamed += 1;
                                 moe_bytes_streamed   += expert_size + pad_end;
-                                if (host) {
-                                    ggml_backend_tensor_set_async(split_backend, input_cpy, host, dst_off, expert_size + pad_end);
+                                if (slot.host_ptr) {
+                                    ggml_backend_tensor_set_async(split_backend, input_cpy, slot.host_ptr, dst_off, expert_size + pad_end);
+                                } else if (slot.ok()) {
+                                    // [DEVICE-RESIDENT #23 — the H2D kill] The slot lives in VRAM (host_ptr
+                                    // null => not host-visible): copy device-to-device into the graph's
+                                    // staging tensor instead of streaming expert_size bytes over PCIe.
+                                    // Data-only stack tensor views make the raw regions legal copy handles
+                                    // (impls address by tensor->data); async on the split backend when the
+                                    // iface supports it, generic tensor_copy (iface cpy_tensor / bounce)
+                                    // otherwise. Cut 2 — aliasing MUL_MAT_ID's src at the slot to skip even
+                                    // this D2D — only after this measures.
+                                    struct ggml_tensor src_t = {};
+                                    src_t.type  = GGML_TYPE_I8;
+                                    src_t.ne[0] = (int64_t) (expert_size + pad_end);
+                                    src_t.ne[1] = src_t.ne[2] = src_t.ne[3] = 1;
+                                    src_t.nb[0] = 1;
+                                    src_t.nb[1] = src_t.nb[2] = src_t.nb[3] = expert_size + pad_end;
+                                    src_t.buffer = slot.buffer;
+                                    src_t.data   = (uint8_t *) ggml_backend_buffer_get_base(slot.buffer) + slot.offset;
+                                    struct ggml_tensor dst_t = src_t;
+                                    dst_t.buffer = input_cpy->buffer;
+                                    dst_t.data   = (char *) input_cpy->data + dst_off;
+                                    if (!split_backend->iface.cpy_tensor_async ||
+                                        !split_backend->iface.cpy_tensor_async(split_backend, split_backend, &src_t, &dst_t)) {
+                                        ggml_backend_tensor_copy(&src_t, &dst_t);
+                                    }
                                 } else if (!moec_active) {
                                     ggml_backend_tensor_set_async(split_backend, input_cpy, mmap_src, dst_off, expert_size + pad_end);
                                 } else {
