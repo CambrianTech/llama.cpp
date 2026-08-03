@@ -21,7 +21,7 @@
 int main(int argc, char ** argv) {
     std::string gguf, out;
     uint32_t layers = 0, experts = 0, top_k = 0, layer_base = 0;
-    uint8_t  fmt = 6;   // IQ2 placeholder until M5 confirms the WEXP-enum value (metadata-only for CUDA serve)
+    uint8_t  fmt = 2;   // MOEC_Q_IQ2 — confirmed against MoecQuant in ggml-moe-container.h (M5, 2026-08-03)
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&]() -> const char * { return (i + 1 < argc) ? argv[++i] : ""; };
