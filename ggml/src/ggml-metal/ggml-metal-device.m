@@ -1285,6 +1285,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+            // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-pointer
+            // table, docs/serving/MOE-GATHER-MULMATID.md): Metal is the first target
+            // backend — flip this gate when the gather kernel lands; until then
+            // reject so the scheduler falls back rather than compute a wrong
+            // contiguous-stride result.
+            if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != NULL) {
+                return false;
+            }
             return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
         case GGML_OP_SET:
         case GGML_OP_CPY:

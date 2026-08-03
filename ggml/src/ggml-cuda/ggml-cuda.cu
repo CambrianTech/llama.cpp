@@ -4719,6 +4719,13 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-pointer table,
+    // docs/serving/MOE-GATHER-MULMATID.md) is not implemented on CUDA yet — reject so
+    // the scheduler falls back rather than compute a wrong contiguous-stride result.
+    if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != NULL) {
+        return false;
+    }
+
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda(op->src[i]->buffer->buft)) {

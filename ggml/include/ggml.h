@@ -1448,6 +1448,19 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // [MOE-GATHER] gather-capable variant: `expert_ptrs` is an I64 device tensor of
+    // n_expert base addresses; the kernel reads expert i02's weights at ptrs[i02]
+    // instead of as->data + i02*as->nb[2], so recency-scattered device-cache slots
+    // (and experts beyond as->ne[2] — open expert populations) are consumed
+    // zero-copy. Backends that do not implement the gather MUST reject the op in
+    // supports_op (design: docs/serving/MOE-GATHER-MULMATID.md, continuum #23).
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * expert_ptrs);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

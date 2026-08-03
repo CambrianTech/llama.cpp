@@ -424,6 +424,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
+    // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-pointer table,
+    // docs/serving/MOE-GATHER-MULMATID.md) is not implemented on CPU — reject so the
+    // scheduler falls back rather than compute a wrong contiguous-stride result.
+    if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != NULL) {
+        return false;
+    }
+
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
     }
