@@ -984,6 +984,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             ggml_set_name(it.second.tensor, remapped_name.c_str());
             LLAMA_LOG_DEBUG("%s: tensor %s remapped to %s\n", __func__, it.first.c_str(), ggml_get_name(it.second.tensor));
         }
+        // [DEVICE-FIT #40] --resident-only: emit ONLY the resident (non-expert) tensors. The routed
+        // experts (`*_exps.*`) are served from the container/primary at run time — the
+        // LLAMA_RESIDENT_OVERRIDE loader takes ONLY non-`_exps.` tensors from the override — so a
+        // device-fit override needs just the ~25 GB resident, not a 684 GB full clone. Skip experts here
+        // so they never enter the output gguf (nor the write loop, which iterates the output).
+        if (params->resident_only && remapped_name.find("_exps.") != std::string::npos) {
+            LLAMA_LOG_DEBUG("%s: resident-only, skipping expert tensor %s\n", __func__, it.first.c_str());
+            continue;
+        }
         tensors.push_back(&it.second);
     }
     if (!prune_list.empty()) {
@@ -1289,6 +1298,25 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_new/1024.0/1024.0, total_size_new*8.0/ml.n_elements);
 
+    // [DEVICE-FIT #40] resident-only sidecar manifest: `<out>.resident.json` carries (tier_label,
+    // resident_bytes) so the governor can co-optimize the VRAM division (resident precision vs expert-
+    // cache size) by comparing tiers WITHOUT loading each GGUF. total_size_new is the resident footprint
+    // (experts were skipped from the output). PagerPlan-style minimal JSON: valid JSON AND a tolerant
+    // key-scan target, no JSON dep either side.
+    if (params->resident_only) {
+        const std::string manifest_path = fname_out + ".resident.json";
+        const char * tier = ggml_type_name(llama_ftype_get_default_type(params->ftype));
+        if (FILE * mf = fopen(manifest_path.c_str(), "wb")) {
+            fprintf(mf, "{\"resident_only\":1,\"tier_label\":\"%s\",\"resident_bytes\":%zu}\n",
+                    tier, (size_t) total_size_new);
+            fclose(mf);
+            LLAMA_LOG_INFO("%s: resident-only manifest -> %s (tier_label=%s, resident_bytes=%zu)\n",
+                           __func__, manifest_path.c_str(), tier, (size_t) total_size_new);
+        } else {
+            LLAMA_LOG_WARN("%s: resident-only: could not write manifest %s\n", __func__, manifest_path.c_str());
+        }
+    }
+
     if (!params->imatrix && params->dry_run && will_require_imatrix) {
         LLAMA_LOG_WARN("%s: WARNING: dry run completed successfully, but actually completing this quantization will require an imatrix!\n",
                        __func__
@@ -1317,6 +1345,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.pure                        =*/ false,
         /*.keep_split                  =*/ false,
         /*.dry_run                     =*/ false,
+        /*.resident_only               =*/ false,
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
