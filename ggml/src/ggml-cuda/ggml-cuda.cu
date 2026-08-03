@@ -4719,11 +4719,21 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
-    // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-pointer table,
-    // docs/serving/MOE-GATHER-MULMATID.md) is not implemented on CUDA yet — reject so
-    // the scheduler falls back rather than compute a wrong contiguous-stride result.
+    // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-OFFSET table,
+    // docs/serving/MOE-GATHER-MULMATID.md). CUDA implements the gather for the mmf
+    // (non-quantized) MV/decode path so far; accept ONLY shapes that route there and
+    // reject the rest (mm/prefill via mul_mat_f_ids, and quantized mmvq) so the
+    // scheduler falls back rather than compute a wrong contiguous-stride result.
+    // Partial rollout is the designed state (mirrors the Metal gate).
     if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != NULL) {
-        return false;
+        const ggml_tensor * gsrc0 = op->src[0];
+        const ggml_tensor * gsrc1 = op->src[1];
+        const int gcc = ggml_cuda_info().devices[dev_ctx->device].cc;
+        const bool mv_path = op->ne[2] <= 16; // ncols_dst<=16 -> mul_mat_f (mv), not mul_mat_f_ids (mm)
+        if (!(mv_path && ggml_cuda_should_use_mmf(gsrc0->type, gcc, WARP_SIZE, gsrc0->ne, gsrc0->nb, gsrc1->ne[2], /*mul_mat_id=*/true))) {
+            return false;
+        }
+        // fall through: the mmf-MV gather kernel handles src[3].
     }
 
     // check if all the sources are allocated on this device
