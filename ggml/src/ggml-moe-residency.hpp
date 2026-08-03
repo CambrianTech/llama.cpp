@@ -496,11 +496,29 @@ class ResidencyCache {
         p.slot_size = need;
         const size_t share = budget_bytes / MAX_POOLS;
         p.max_slots = need ? (share / need) : 0;
-        if (p.max_slots == 0 || pools.size() > MAX_POOLS) { p.failed = true; return; }
+        if (p.max_slots == 0 || pools.size() > MAX_POOLS) {
+            p.failed = true;
+            // Fail LOUD: a failed size-class silently downgrades EVERY expert of that byte-size to the
+            // copy/mmap arm forever, with counters that skip it entirely (get_slot returns before
+            // hit/miss). Measured shape: 924/936 gathered with 12 unaccounted on the 5090 — one starved
+            // pool. One line names it.
+            fprintf(stderr,
+                "[MOE-PAGER] WARNING: expert size-class %zu B gets NO cache pool (%s) — every expert of "
+                "this size takes the copy/mmap path, uncounted. Raise the cache budget.\n",
+                need, p.max_slots == 0 ? "budget share too small for even one slot" : "size-class limit exceeded");
+            return;
+        }
         // DEVICE-resident (#23): allocate VRAM slots through device_buft_; else the caller's host_buft.
         ggml_backend_buffer_type_t buft = device_backed_ ? device_buft_ : host_buft;
         p.buf = buft ? ggml_backend_buft_alloc_buffer(buft, p.max_slots * need) : nullptr;
-        if (p.buf == nullptr) { p.failed = true; return; }
+        if (p.buf == nullptr) {
+            p.failed = true;
+            fprintf(stderr,
+                "[MOE-PAGER] WARNING: pool allocation FAILED for expert size-class %zu B "
+                "(%zu slots x %zu B) — every expert of this size takes the copy/mmap path, uncounted.\n",
+                need, p.max_slots, need);
+            return;
+        }
         p.base = (uint8_t *) ggml_backend_buffer_get_base(p.buf);
         // Pad correctness on device: the per-miss `memset(dst+expert_size, 0, pad)` cannot run on VRAM
         // (host memset of a device pointer). Pad regions are constant per size-class and `fetch` only
