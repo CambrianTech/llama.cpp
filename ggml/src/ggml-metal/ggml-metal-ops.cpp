@@ -2400,6 +2400,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 /*.ne1   =*/ ne1,
                 /*.r2    =*/ r2,
                 /*.r3    =*/ r3,
+                /*.use_eptrs =*/ op->src[3] != nullptr ? 1 : 0,
             };
 
             ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -2409,6 +2410,9 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  3);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
             ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+            // [MOE-GATHER #23] expert offset table; src0 placebo-bound when absent.
+            ggml_metal_encoder_set_buffer(
+                enc, op->src[3] != nullptr ? ggml_metal_get_buffer_id(op->src[3]) : bid_src0, 6);
 
             const size_t smem = pipeline.smem;
 

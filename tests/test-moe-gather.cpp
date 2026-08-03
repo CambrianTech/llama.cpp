@@ -31,13 +31,13 @@ struct graph_out {
 };
 
 // build + run one MUL_MAT_ID graph on `backend`; gather=true uses the identity
-// table. Returns the dst contents.
-static graph_out run_case(ggml_backend_t backend, bool gather) {
+// table. n_tokens selects the kernel family on Metal: < 32 → mv_id (decode),
+// >= 32 → mm_id (prefill). Returns the dst contents.
+static graph_out run_case(ggml_backend_t backend, bool gather, int64_t n_tokens) {
     const int64_t ne00     = 64; // cols (must be >= simdgroup mins)
     const int64_t ne01     = 32; // rows per expert
     const int64_t n_expert = 8;
     const int64_t n_used   = 2;
-    const int64_t n_tokens = 4;  // < 32 → mv path (the implemented family)
 
     graph_out out;
 
@@ -129,24 +129,36 @@ int main() {
         }
         const char * name = ggml_backend_name(backend);
 
-        graph_out plain  = run_case(backend, /*gather=*/false);
-        graph_out gather = run_case(backend, /*gather=*/true);
+        // both Metal families: mv_id (decode, n_tokens < 32) and mm_id (prefill)
+        const struct { const char * label; int64_t n_tokens; } cases[] = {
+            { "mv/decode",  4  },
+            { "mm/prefill", 40 },
+        };
 
-        if (!plain.ran) {
-            printf("%-12s SKIP (plain mul_mat_id unsupported)\n", name);
-        } else if (!gather.ran) {
-            printf("%-12s SKIP (gather rejected by supports_op — designed partial rollout)\n", name);
-        } else {
-            const bool same = plain.data.size() == gather.data.size() &&
-                memcmp(plain.data.data(), gather.data.data(), plain.data.size()*sizeof(float)) == 0;
-            printf("%-12s %s (%zu values)\n", name, same ? "OK bit-identical" : "FAIL divergent", plain.data.size());
-            if (!same) {
-                ggml_backend_free(backend);
-                return 1;
+        bool failed = false;
+        for (const auto & c : cases) {
+            graph_out plain  = run_case(backend, /*gather=*/false, c.n_tokens);
+            graph_out gather = run_case(backend, /*gather=*/true,  c.n_tokens);
+
+            if (!plain.ran) {
+                printf("%-12s %-10s SKIP (plain mul_mat_id unsupported)\n", name, c.label);
+            } else if (!gather.ran) {
+                printf("%-12s %-10s SKIP (gather rejected by supports_op — designed partial rollout)\n", name, c.label);
+            } else {
+                const bool same = plain.data.size() == gather.data.size() &&
+                    memcmp(plain.data.data(), gather.data.data(), plain.data.size()*sizeof(float)) == 0;
+                printf("%-12s %-10s %s (%zu values)\n", name, c.label, same ? "OK bit-identical" : "FAIL divergent", plain.data.size());
+                if (!same) {
+                    failed = true;
+                    break;
+                }
+                n_checked++;
             }
-            n_checked++;
         }
         ggml_backend_free(backend);
+        if (failed) {
+            return 1;
+        }
     }
 
     if (n_checked == 0) {

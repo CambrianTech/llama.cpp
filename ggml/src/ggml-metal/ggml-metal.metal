@@ -10378,6 +10378,7 @@ kernel void kernel_mul_mm_id(
         device const char * htpe,
         device const char * hids,
         device       char * dst,
+        device const ulong * eptrs,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -10428,7 +10429,11 @@ kernel void kernel_mul_mm_id(
     const short i12 = (id / args.ne20);
     const short i13 = 0;
 
-    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    // [MOE-GATHER #23] expert im's base from the offset table when present
+    // (i13 is always 0 on this path — ne13 folded); identity table == stride.
+    const uint64_t offset0 = args.use_eptrs
+        ? eptrs[im]
+        : im*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/nl;
 
     device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;

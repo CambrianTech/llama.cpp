@@ -1286,16 +1286,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-offset
-            // table, docs/serving/MOE-GATHER-MULMATID.md): implemented on the
-            // matrix-VECTOR family (decode). Ops that would take the matrix-matrix
-            // path (the same predicate the dispatcher uses: simdgroup_mm && ne00>=64
-            // && n_tokens>=32) still reject until that kernel gains the table.
+            // table, docs/serving/MOE-GATHER-MULMATID.md): implemented on BOTH
+            // Metal families (mv_id decode + mm_id prefill). Table must be I64.
             if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != NULL) {
-                const bool would_take_mm = has_simdgroup_mm &&
-                    op->src[0]->ne[0] >= 64 && op->src[2]->ne[1] >= 32;
-                if (would_take_mm) {
-                    return false;
-                }
                 if (op->src[3]->type != GGML_TYPE_I64) {
                     return false;
                 }

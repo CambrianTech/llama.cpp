@@ -524,6 +524,9 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    // [MOE-GATHER #23] same contract as mul_mv_id: nonzero → expert im's base
+    // comes from the eptrs table (buffer 6, I64 src0-relative byte offsets).
+    int32_t  use_eptrs;
 } ggml_metal_kargs_mul_mm_id;
 
 typedef struct {
