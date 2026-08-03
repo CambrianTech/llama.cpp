@@ -731,13 +731,18 @@ public:
                     n, n_resident, batch.size(), n_evict, p.used, p.max_slots);
         }
         if (batch.empty()) { return; }
+        // Device slots CANNOT take a host memset of their pad (b.dst is a VRAM pointer) — the single-fetch
+        // get_slot() path guards this with host_visible, and ensure_pool zeroes the whole device buffer ONCE
+        // (ggml_backend_buffer_clear); the batched path must mirror that guard or it faults writing device
+        // memory from the host. [#43 root cause: silent access-violation right after fetch_many on CUDA.]
+        const bool host_visible = ggml_backend_buffer_is_host(p.buf);
         const auto t0 = std::chrono::steady_clock::now();
         fetcher.fetch_many(batch.data(), batch.size());  // concurrent — the saturated-bandwidth path
         const auto t1 = std::chrono::steady_clock::now();
         admit_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
         for (const auto & b : batch) {
             admit_bytes += b.bytes;
-            if (pad) { memset((uint8_t *) b.dst + expert_size, 0, pad); }
+            if (pad && host_visible) { memset((uint8_t *) b.dst + expert_size, 0, pad); }
         }
     }
 };
