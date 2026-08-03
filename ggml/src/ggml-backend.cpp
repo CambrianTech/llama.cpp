@@ -1918,7 +1918,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 moe_bytes_streamed   += expert_size + pad_end;
                                 if (slot.host_ptr) {
                                     ggml_backend_tensor_set_async(split_backend, input_cpy, slot.host_ptr, dst_off, expert_size + pad_end);
-                                } else if (slot.ok()) {
+                                } else if (slot.ok() && slot.buffer != nullptr) {
                                     // [DEVICE-RESIDENT #23 — the H2D kill] The slot lives in VRAM (host_ptr
                                     // null => not host-visible): copy device-to-device into the graph's
                                     // staging tensor instead of streaming expert_size bytes over PCIe.
