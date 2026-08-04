@@ -717,6 +717,7 @@ template <ggml_type type, int c_rows_per_block>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
+        const int64_t * __restrict__ expert_ptrs_ptr,
         float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
@@ -750,7 +751,12 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    // [MOE-GATHER #23] table-driven expert base (byte offset from src0) when present, else the classic
+    // contiguous channel stride. This is the MULTI-TOKEN MoE kernel — the one whose absence from the
+    // gather made every ncols_dst>1 shape read stale input_cpy.
+    const void * GGML_CUDA_RESTRICT vx_expert = (expert_ptrs_ptr != nullptr)
+        ? (const void *) ((const char *) vx + expert_ptrs_ptr[channel_x]) : vx;
+    const int kbx_offset  = (expert_ptrs_ptr != nullptr ? 0 : channel_x*stride_channel_x) + row0*stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -761,7 +767,7 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            tmp[i] += vec_dot_q_cuda(vx_expert, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
         }
     }
 
@@ -825,7 +831,7 @@ static void mul_mat_vec_q_switch_fusion(
 
 template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
-        const void * vx, const void * vy, const int32_t * ids, float * dst,
+        const void * vx, const void * vy, const int32_t * ids, const int64_t * expert_ptrs, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
@@ -839,7 +845,7 @@ static void mul_mat_vec_q_moe_launch(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
 
     ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block>, launch_params,
-        vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+        vx, vy, ids, expert_ptrs, dst, ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
         ncols_dst, ids_stride);
@@ -914,7 +920,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
-            vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
+            vx, vy, ids, expert_ptrs, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
