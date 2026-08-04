@@ -1980,6 +1980,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 // slots referenced by this table are read at COMPUTE time — evicting a
                                 // current-generation slot would dangle an entry. Sticky by design (doc
                                 // on set_gather_fence).
+                                // [MOE-GATHER #23] MULTI-CONSUMER CHECK. The consume-arm publishes src[3] on
+                                // nodes[0] only — upstream's own partial-copy logic makes the same
+                                // assumption. If ANY other node in this split also reads input_cpy, that
+                                // node sees staging we deliberately did not populate for aliased experts:
+                                // stale bytes, DETERMINISTICALLY, on whichever experts were gathered — which
+                                // is exactly the shape left standing after content, addressing and timing
+                                // were all cleared. Warn once so the assumption is verified, not trusted.
+                                {
+                                    static bool warned = false;
+                                    int consumers = 0;
+                                    for (int gi = 0; gi < split->graph.n_nodes; gi++) {
+                                        ggml_tensor * gn = split->graph.nodes[gi];
+                                        for (int si = 0; si < GGML_MAX_SRC; si++) {
+                                            if (gn->src[si] == input_cpy) { consumers++; break; }
+                                        }
+                                    }
+                                    if (consumers > 1 && !warned) {
+                                        warned = true;
+                                        fprintf(stderr,
+                                            "[MOE-GATHER] WARNING: %d nodes in this split consume the same staging "
+                                            "tensor, but the offset table is published on nodes[0] only — every other "
+                                            "consumer reads UNPOPULATED staging for gathered experts. Real corruption "
+                                            "source; gather must not engage for such splits.\n", consumers);
+                                    }
+                                }
                                 moe_gather_backend = split_backend;   // event ring records here
                                 host_cache.set_gather_fence(true);
                                 const size_t input_cpy_buf_off =
