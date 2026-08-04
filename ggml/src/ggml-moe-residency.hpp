@@ -493,9 +493,19 @@ class ResidencyCache {
     // lazily create this size-class's pinned pool, sharing the budget across up to MAX_POOLS classes
     void ensure_pool(Pool & p, ggml_backend_buffer_type_t host_buft, size_t need) {
         if (p.slot_size != 0 || p.failed) { return; }
-        p.slot_size = need;
+        // [MOE-GATHER #23] SLOT BASES MUST CARRY A TENSOR-GRADE ALIGNMENT. Under gather the kernel reads
+        // weights IN PLACE at (pool_base + slot*slot_size) instead of at a tensor base, and quantized
+        // kernels issue vectorized (16 B+) loads. `need` = expert_size + pad, and expert_size is only
+        // BLOCK-aligned — e.g. IQ2_XXS is 66 B/block, so expert_size need not be a multiple of 16 and
+        // every subsequent slot base drifts off the load alignment => garbage reads => NaN logits =>
+        // the sampler assert. (5090 V4-Flash IQ2, BigMama 2026-08-03. Metal never showed it: Q4_K is
+        // 144 B/block = 9x16, already 16-aligned, so its slot bases happened to stay aligned.) Rounding
+        // slot_size up to SLOT_ALIGN makes every slot base congruent to the pool base, which is exactly
+        // the guarantee the copy path inherited for free from the tensor allocator.
+        static const size_t SLOT_ALIGN = 256;   // >= CUDA/Metal vector-load alignment and ggml's 32 B
+        p.slot_size = need ? ((need + SLOT_ALIGN - 1) / SLOT_ALIGN) * SLOT_ALIGN : 0;
         const size_t share = budget_bytes / MAX_POOLS;
-        p.max_slots = need ? (share / need) : 0;
+        p.max_slots = p.slot_size ? (share / p.slot_size) : 0;
         if (p.max_slots == 0 || pools.size() > MAX_POOLS) {
             p.failed = true;
             // Fail LOUD: a failed size-class silently downgrades EVERY expert of that byte-size to the
@@ -510,7 +520,7 @@ class ResidencyCache {
         }
         // DEVICE-resident (#23): allocate VRAM slots through device_buft_; else the caller's host_buft.
         ggml_backend_buffer_type_t buft = device_backed_ ? device_buft_ : host_buft;
-        p.buf = buft ? ggml_backend_buft_alloc_buffer(buft, p.max_slots * need) : nullptr;
+        p.buf = buft ? ggml_backend_buft_alloc_buffer(buft, p.max_slots * p.slot_size) : nullptr;
         if (p.buf == nullptr) {
             p.failed = true;
             fprintf(stderr,
