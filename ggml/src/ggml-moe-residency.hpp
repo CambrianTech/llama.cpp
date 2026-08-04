@@ -479,10 +479,10 @@ class ResidencyCache {
     // 4456960 B class), so an entire size-class got NO pool and took the mmap path on every token —
     // uncached, re-read per token, invisible except through the fail-loud warning. Sized for real
     // MoEs (gate/up/down can each differ, and shared vs routed experts differ again).
-    // NOTE (follow-up, not this change): `share = budget_bytes / MAX_POOLS` divides the budget by the
-    // CAP rather than by the classes actually present, so raising the cap under-uses the budget when
-    // a model has fewer classes. The right shape is demand-proportional allocation across observed
-    // classes; this constant is the stop-gap that keeps a class from being starved entirely.
+    // MAX_POOLS is now only the sanity ceiling on distinct classes; it is NOT the budget divisor.
+    // Dividing by the cap left (cap - observed)/cap of the budget permanently unspent — 33% of the VRAM
+    // cache idle on V4-Flash's four classes — on a workload measured to be residency/fetch-bound, where
+    // idle cache is exactly the thing that costs tok/s. See sizing_divisor_ for what replaced it.
     static const size_t MAX_POOLS = 6;
 
     std::mutex mtx;
@@ -525,6 +525,24 @@ class ResidencyCache {
     size_t   admit_bytes = 0;  // bytes fetched on misses  -> fetch MB/s = admit_bytes / admit_us
     std::unordered_map<size_t, Pool> pools;
 
+    // ---- budget division across expert size-classes -------------------------------------------
+    // How many classes a model presents is not knowable when the FIRST pool is built: classes are
+    // discovered lazily, one per distinct expert byte-size, over the first token. Two failure modes
+    // bracket the problem, and this state exists to sit between them:
+    //   under-use   — divide by a fixed cap (the old `budget / MAX_POOLS`): a 4-class model leaves a
+    //                 third of the cache permanently unallocated.
+    //   over-commit — divide by classes-seen-so-far: the first class takes the whole budget, then the
+    //                 second allocates on top of it and the total exceeds the governed VRAM lease.
+    // So: sizing stays CONSERVATIVE while the class set is still being discovered (and never exceeds
+    // the remaining budget, so over-commit is impossible by construction), and the divisor is corrected
+    // to the true class count at a token boundary where releasing pool memory is provably safe. The
+    // class set stabilizes within the first token, so this converges once and then never fires again.
+    std::unordered_set<size_t> seen_classes_;             // every distinct expert byte-size ever presented;
+                                                          // survives release_pools_locked (that is the point)
+    size_t committed_bytes_ = 0;                           // bytes actually allocated across live pools
+    size_t sizing_divisor_  = MAX_POOLS;                   // divisor the LIVE pools were sized with
+    bool   resize_pending_  = false;                       // a re-division would use the budget better
+
     // lazily create this size-class's pinned pool, sharing the budget across up to MAX_POOLS classes
     void ensure_pool(Pool & p, ggml_backend_buffer_type_t host_buft, size_t need) {
         if (p.slot_size != 0 || p.failed) { return; }
@@ -539,10 +557,37 @@ class ResidencyCache {
         // the guarantee the copy path inherited for free from the tensor allocator.
         static const size_t SLOT_ALIGN = 256;   // >= CUDA/Metal vector-load alignment and ggml's 32 B
         p.slot_size = need ? ((need + SLOT_ALIGN - 1) / SLOT_ALIGN) * SLOT_ALIGN : 0;
-        const size_t share = budget_bytes / MAX_POOLS;
-        p.max_slots = p.slot_size ? (share / p.slot_size) : 0;
+        // Divide by the larger of (divisor the live pools were sized with) and (classes seen). A class
+        // discovered AFTER the last re-division must not assume the earlier, larger share, and is then
+        // additionally clamped to what is actually left — so the sum of pools can never exceed the
+        // budget even mid-discovery. The clamp is why the conservative case degrades to "smaller pool",
+        // never to "over the VRAM lease".
+        seen_classes_.insert(need);
+        // Explicit <size_t> is load-bearing on Windows: `std::max(` would expand the windows.h max()
+        // macro, `std::max<size_t>(` cannot (the macro needs `max` followed by `(`). Same as line ~380.
+        const size_t divisor   = std::max<size_t>(1, std::max<size_t>(sizing_divisor_, seen_classes_.size()));
+        const size_t remaining = budget_bytes > committed_bytes_ ? budget_bytes - committed_bytes_ : 0;
+        const size_t share     = std::min<size_t>(budget_bytes / divisor, remaining);
+        if (seen_classes_.size() != sizing_divisor_) { resize_pending_ = true; }
+        // The tail guard slot (see the allocation below) is real committed memory, so it comes OUT of
+        // this class's share rather than on top of it — otherwise the sum of pools overshoots the
+        // governed budget by one slot per class, which for an 8 MB expert is a 12% breach of a VRAM
+        // lease that was sized to leave exactly enough room for the rest of the model.
+        const size_t slots_in_share = p.slot_size ? (share / p.slot_size) : 0;
+        p.max_slots = slots_in_share ? slots_in_share - 1 : 0;
         if (p.max_slots == 0 || pools.size() > MAX_POOLS) {
             p.failed = true;
+            if (resize_pending_ && pools.size() <= MAX_POOLS) {
+                // Still discovering size-classes: the budget is divided more ways than the model turned
+                // out to need, and the next token boundary re-divides it. Starving this class is
+                // TEMPORARY, so do not raise the permanent warning below -- "raise the cache budget"
+                // would be advice for a condition that is about to fix itself.
+                if (moe_config().stats) {
+                    fprintf(stderr, "[MOE-PAGER] size-class %zu B deferred: budget still split %zu ways, "
+                            "re-division pending at the next token boundary\n", need, sizing_divisor_);
+                }
+                return;
+            }
             // Fail LOUD: a failed size-class silently downgrades EVERY expert of that byte-size to the
             // copy/mmap arm forever, with counters that skip it entirely (get_slot returns before
             // hit/miss). Measured shape: 924/936 gathered with 12 unaccounted on the 5090 — one starved
@@ -572,6 +617,8 @@ class ResidencyCache {
                 need, p.max_slots, need);
             return;
         }
+        // Count the guard slot: it is real committed memory and must be inside the governed lease.
+        committed_bytes_ += (p.max_slots + 1) * p.slot_size;
         p.base = (uint8_t *) ggml_backend_buffer_get_base(p.buf);
         // Pad correctness on device: the per-miss `memset(dst+expert_size, 0, pad)` cannot run on VRAM
         // (host memset of a device pointer). Pad regions are constant per size-class and `fetch` only
@@ -601,6 +648,33 @@ class ResidencyCache {
             if (kv.second.buf) { ggml_backend_buffer_free(kv.second.buf); }
         }
         pools.clear();
+        committed_bytes_ = 0;   // seen_classes_ deliberately survives: it is what the re-division uses
+    }
+
+    // Re-divide the budget across the classes actually present. Runs only from advance_generation.
+    //
+    // SAFETY: this frees pool buffers. Under the copy arm the bytes a graph needs were staged at
+    // enqueue, so a token boundary is safe (the same argument release_pools_locked already relies on).
+    // Under the GATHER arm a kernel reads a slot in place at COMPUTE time, so the previous graph must
+    // be PROVEN complete first — the same condition the eviction fence uses. Without proven retirement
+    // (a backend with no usable events) the re-division simply never fires and sizing stays at today's
+    // conservative divisor: less of the budget used, but never a use-after-free.
+    void maybe_resize_pools_locked() {
+        if (!resize_pending_) { return; }
+        // No early-out on classes == sizing_divisor_: the flag is set only by events that actually
+        // invalidate the current sizing (a newly discovered class, or a budget change), and a budget
+        // GROW leaves the divisor unchanged while every live pool is still sized for the old budget.
+        const size_t classes = seen_classes_.size();
+        if (classes == 0) { resize_pending_ = false; return; }
+        if (gather_fence_ && !(retirement_on_ && retired_gen_ + 1 >= token_gen)) { return; }  // retry next token
+        release_pools_locked();
+        if (moe_config().stats) {
+            fprintf(stderr, "[MOE-PAGER] re-dividing %zu MB cache budget across %zu observed expert "
+                    "size-class(es) (was 1/%zu each)\n",
+                    budget_bytes / (1024*1024), classes, sizing_divisor_);
+        }
+        sizing_divisor_ = classes;
+        resize_pending_ = false;
     }
 
     // pick a slot: next free one, else evict the OLDEST token-generation (tie-break: oldest access tick),
@@ -753,6 +827,10 @@ public:
         // just growth). Re-allocated lazily at the new budget. Partial-evict-keeping-hottest is a future
         // refinement; freeing fully is the correct floor for flex-under-pressure.
         if (budget_bytes < prev_budget) { release_pools_locked(); }
+        // A budget change makes every live pool the wrong size (a grow leaves the new headroom unused,
+        // a shrink already dropped the pools). Ask for a re-division; maybe_resize_pools_locked applies
+        // it only where freeing pool memory is provably safe.
+        if (budget_bytes != prev_budget) { resize_pending_ = true; }
         window_k_ = plan.window_k;
         // retention bias for a hinted expert = 2x the recency window: a hint survives ~2 windows longer
         // than an unhinted expert of the same age, but a COLD hint still ages out (recency stays in charge).
@@ -769,12 +847,20 @@ public:
         }
     }
 
-    void        advance_generation()   { std::lock_guard<std::mutex> lk(mtx); ++token_gen; reload_plan_locked(); }  // once per token (compute call)
+    // once per token (top of a compute call)
+    void        advance_generation()   {
+        std::lock_guard<std::mutex> lk(mtx);
+        ++token_gen;
+        reload_plan_locked();
+        maybe_resize_pools_locked();
+    }
     bool        enabled()        const { return budget_bytes > 0; }
     uint64_t    n_hits()         const { return hits; }
     uint64_t    n_misses()       const { return misses; }
     double      hit_rate()       const { const uint64_t t = hits + misses; return t ? (double) hits / t : 0.0; }
     double      fetch_mb_s()     const { return admit_us > 0 ? (admit_bytes / admit_us) : 0.0; } // bytes/us == MB/s
+    size_t      committed_bytes()const { return committed_bytes_; }  // bytes actually allocated across pools
+    size_t      size_classes()   const { return seen_classes_.size(); } // distinct expert byte-sizes seen
     double      admit_micros()   const { return admit_us; }     // cumulative fetch time (for per-token deltas)
     size_t      admit_bytes_n()  const { return admit_bytes; }  // cumulative bytes fetched
     const char* fetcher_name()   const { return fetcher.name(); }

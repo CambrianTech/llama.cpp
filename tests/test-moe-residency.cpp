@@ -46,6 +46,10 @@ extern "C" {
     bool                  ggml_backend_buffer_is_host(ggml_backend_buffer_t);
     void                  ggml_backend_buffer_clear(ggml_backend_buffer_t, uint8_t);
     ggml_backend_dev_t    ggml_backend_buft_get_device(ggml_backend_buffer_type_t);
+    // Real CPU-backend buffer type: the pool-division test instantiates the PRODUCTION
+    // ResidencyCache and lets it allocate for real, so these stop being declared-not-defined
+    // and link against ggml proper.
+    ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
     void                  ggml_backend_dev_memory(ggml_backend_dev_t, size_t *, size_t *);
 }
 
@@ -880,6 +884,64 @@ static void test_serving_config_from_env() {
     CHECK(d.plan_path.empty(), "unset plan path => empty");
 }
 
+// ================================================================================================
+// Pool budget division — the PRODUCTION ResidencyCache, allocating real CPU-backend buffers.
+// ================================================================================================
+
+// Minimal fetcher: the division test cares about how much memory the pools claim, not about bytes.
+struct CountingFetcher : ggml_moe::ExpertFetcher {
+    size_t fetches = 0;
+    const char * name() const override { return "counting"; }
+    bool fetch(void * dst, const void * src, size_t bytes) override {
+        fetches++;
+        std::memcpy(dst, src, bytes);
+        return true;
+    }
+};
+
+// what this catches: the cache must spend its WHOLE governed budget on the size-classes the model
+// actually presents, and must never claim more than the budget while it is still discovering them.
+// The old sizing divided by the MAX_POOLS cap, so a model with four expert byte-sizes left a third of
+// the cache permanently unallocated -- idle cache on a workload measured to be residency/fetch-bound,
+// where idle cache is precisely what costs tok/s. The over-commit half matters just as much: the
+// device budget is a VRAM LEASE sized to leave room for the resident model, and exceeding it is the
+// deferred-fault crash from #23, not a soft overrun.
+static void test_pool_budget_divides_over_observed_classes() {
+    CountingFetcher fetcher;
+    const size_t MB     = 1024 * 1024;
+    const size_t budget = 64 * MB;
+    const size_t sizes[4] = { 1 * MB, 2 * MB, 4 * MB, 8 * MB };   // four distinct expert byte-sizes
+    std::vector<uint8_t> src(8 * MB, 0x5A);
+
+    ggml_moe::ResidencyCache cache(budget, fetcher);
+    ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+
+    // Token 1 = discovery. The class count is not knowable yet, so sizing stays conservative -- but
+    // the running total must never exceed the budget at ANY point during it.
+    for (int c = 0; c < 4; c++) {
+        cache.get_slot(buft, ggml_moe::ExpertId{ (uint64_t) (c + 1) * 1000, 0 }, src.data(), sizes[c], 0);
+        CHECK(cache.committed_bytes() <= budget, "pools must never exceed the budget mid-discovery");
+    }
+    CHECK(cache.size_classes() == 4, "four distinct expert byte-sizes => four size-classes");
+
+    // Token boundary: re-divide across the classes actually observed, then refill.
+    cache.advance_generation();
+    for (int c = 0; c < 4; c++) {
+        cache.get_slot(buft, ggml_moe::ExpertId{ (uint64_t) (c + 1) * 1000, 0 }, src.data(), sizes[c], 0);
+    }
+    CHECK(cache.committed_bytes() <= budget, "re-divided pools must still fit inside the budget");
+    CHECK(cache.committed_bytes() > budget - 4 * MB,
+          "re-divided pools must spend the budget, not a cap-derived fraction of it");
+
+    // Idempotent: with the divisor already correct, another token must not churn the pools.
+    const size_t settled = cache.committed_bytes();
+    cache.advance_generation();
+    for (int c = 0; c < 4; c++) {
+        cache.get_slot(buft, ggml_moe::ExpertId{ (uint64_t) (c + 1) * 1000, 0 }, src.data(), sizes[c], 0);
+    }
+    CHECK(cache.committed_bytes() == settled, "sizing must converge -- no re-division once it is correct");
+}
+
 int main(int argc, char ** argv) {
     // VDD mode: replay a captured trace if a path is given.
     if (argc > 1) { int rc = replay_trace(argv[1]); std::printf("%d passed, %d failed\n", g_pass, g_fail); return rc; }
@@ -907,6 +969,7 @@ int main(int argc, char ** argv) {
     test_refcache_reuse_with_locality();
     test_refcache_lfru_retains_hot_above_cliff();
     test_reuse_cliff_around_one_token_working_set();
+    test_pool_budget_divides_over_observed_classes();
 
     std::printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
