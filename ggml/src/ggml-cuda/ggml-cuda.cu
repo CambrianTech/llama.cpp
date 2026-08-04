@@ -4729,16 +4729,31 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         const ggml_tensor * gsrc0 = op->src[0];
         const ggml_tensor * gsrc1 = op->src[1];
         const int gcc = ggml_cuda_info().devices[dev_ctx->device].cc;
-        // MV/decode kernels are gathered: mmf (mul_mat_f, non-quantized) and mmvq (mul_mat_vec_q,
-        // quantized = the real V4-Flash IQ2 serving path). mm/prefill (mul_mat_f_ids / mmq) is NOT yet
-        // gathered -> reject so the scheduler falls back (designed partial rollout, one family at a time).
-        const bool mv_path = op->ne[2] <= 16; // ncols_dst<=16 -> mv kernels
-        const bool mmf_mv  = ggml_cuda_should_use_mmf(gsrc0->type, gcc, WARP_SIZE, gsrc0->ne, gsrc0->nb, gsrc1->ne[2], /*mul_mat_id=*/true);
-        const bool mmvq_mv = ggml_is_quantized(gsrc0->type); // quantized mv routes to mul_mat_vec_q (gathered)
-        if (!(mv_path && (mmf_mv || mmvq_mv))) {
-            return false;
+        // Only TWO CUDA kernels implement the gather: mul_mat_vec_q (mmvq) and mul_mat_f (mmf, MV
+        // shape). This predicate must MIRROR ggml_cuda_mul_mat_id's dispatch EXACTLY — accepting a
+        // shape the dispatcher then routes to a non-gather kernel (mmq / mul_mat_f_ids / the sorted
+        // path) is silently fatal: the consume-arm skips the copy for gathered experts, so that kernel
+        // reads never-written input_cpy => garbage => NaN logits => sampler assert. That mismatch was
+        // the real #23 Cut-2 NaN: the gate said "ne2<=16 && quantized" but mmvq only claims
+        // ne2 <= get_mmvq_mmid_max_batch() (4-6 for IQ2/Q4!), so mid-size batches fell through to MMQ.
+        bool gathered = false;
+        if (gsrc1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
+            bool took_mmvq = false;
+            if (op->ne[2] <= MMVQ_MAX_BATCH_SIZE && ggml_is_quantized(gsrc0->type)) {
+                took_mmvq = op->ne[2] <= get_mmvq_mmid_max_batch(gsrc0->type, gcc);
+            }
+            if (took_mmvq) {
+                gathered = true;                                  // mul_mat_vec_q — gathered
+            } else if (ggml_cuda_should_use_mmq(gsrc0->type, gcc, gsrc1->ne[2], /*n_experts=*/gsrc0->ne[2])) {
+                gathered = false;                                 // mul_mat_q — NOT gathered
+            } else if (ggml_cuda_should_use_mmf(gsrc0->type, gcc, WARP_SIZE, gsrc0->ne, gsrc0->nb, gsrc1->ne[2], /*mul_mat_id=*/true)) {
+                gathered = op->ne[2] <= 16;                       // mul_mat_f (MV) gathered; >16 = mul_mat_f_ids, not
+            }
         }
-        // fall through: the mmf-MV / mmvq-MV gather kernels handle src[3].
+        if (!gathered) {
+            return false;   // scheduler falls back / consume-arm copies as before
+        }
+        // fall through: a gather-capable kernel will consume src[3].
     }
 
     // check if all the sources are allocated on this device
