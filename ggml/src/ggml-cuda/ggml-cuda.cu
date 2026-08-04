@@ -4740,7 +4740,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         if (gsrc1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
             bool took_mmvq = false;
             if (op->ne[2] <= MMVQ_MAX_BATCH_SIZE && ggml_is_quantized(gsrc0->type)) {
-                took_mmvq = op->ne[2] <= get_mmvq_mmid_max_batch(gsrc0->type, gcc);
+                // ncols_dst>1 with ids routes to mul_mat_vec_q_MOE (mmvq.cu:914) — a SEPARATE kernel
+                // that is NOT gather-capable. Only ncols_dst==1 reaches the gathered mul_mat_vec_q.
+                // (Same class of mistake as the mmvq_mmid_max miss: the gate must track the kernel
+                // that ACTUALLY runs. Gathering mul_mat_vec_q_moe is the follow-up that restores the
+                // multi-token decode shapes; until then they correctly fall back to copying.)
+                took_mmvq = op->ne[2] == 1 && op->ne[2] <= get_mmvq_mmid_max_batch(gsrc0->type, gcc);
             }
             if (took_mmvq) {
                 gathered = true;                                  // mul_mat_vec_q — gathered
