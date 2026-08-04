@@ -16,10 +16,29 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <vector>
+#include <memory>
 #include <filesystem>
+
+// [TIERED PACK] One GGUF per precision TIER, descending fidelity. Each tier gets its own
+// GgufMoeSource (its own record_stride — an IQ1 record is smaller than an IQ2 one) and its own
+// Iq2ExpertSource framing. Kept alive for the whole pack because moec_pack_dir_tiered's
+// `source_for` hands back a REFERENCE per tier.
+namespace {
+struct TierSources {
+    std::vector<std::unique_ptr<ggml_moe::GgufMoeSource>>   gguf;
+    std::vector<std::unique_ptr<ggml_moe::Iq2ExpertSource>> framed;
+};
+ggml_moe::ExpertSource & tier_source_for(uint32_t tier, void * user) {
+    TierSources * ts = (TierSources *) user;
+    return *ts->framed[tier];
+}
+} // namespace
 
 int main(int argc, char ** argv) {
     std::string gguf, out;
+    std::vector<std::string> tier_gguf;   // descending fidelity: tier 0 = all-star
+    std::vector<uint8_t>     tier_fmt;
     uint32_t layers = 0, experts = 0, top_k = 0, layer_base = 0;
     uint8_t  fmt = 2;   // MOEC_Q_IQ2 — confirmed against MoecQuant in ggml-moe-container.h (M5, 2026-08-03)
     for (int i = 1; i < argc; i++) {
@@ -32,10 +51,62 @@ int main(int argc, char ** argv) {
         else if (a == "--top-k")      top_k = (uint32_t) std::atoi(next());
         else if (a == "--layer-base") layer_base = (uint32_t) std::atoi(next());
         else if (a == "--fmt")        fmt = (uint8_t) std::atoi(next());
+        else if (a == "--tier")       tier_gguf.emplace_back(next());
+        else if (a == "--tier-fmt")   tier_fmt.push_back((uint8_t) std::atoi(next()));
     }
-    if (gguf.empty() || out.empty() || !layers || !experts || !top_k) {
-        std::fprintf(stderr, "usage: llama-moe-pack --gguf FIRST_SHARD --out DIR --layers N --experts M --top-k K [--layer-base B] [--fmt V]\n");
+    if ((gguf.empty() && tier_gguf.empty()) || out.empty() || !layers || !experts || !top_k) {
+        std::fprintf(stderr,
+            "usage: llama-moe-pack --gguf FIRST_SHARD --out DIR --layers N --experts M --top-k K [--layer-base B] [--fmt V]\n"
+            "   tiered: llama-moe-pack --tier HI_FIDELITY_SHARD --tier LOWER_SHARD [--tier ...] \\\n"
+            "                          --tier-fmt V0 --tier-fmt V1 [...] --out DIR --layers N --experts M --top-k K\n"
+            "   Tiers are DESCENDING fidelity (tier 0 = all-star). Emits a v2 manifest with per-(layer,tier)\n"
+            "   banks so the pager SELECTS a precision per expert at serve time — no runtime re-quant.\n");
         return 2;
+    }
+
+    // TIERED path: one source per tier, then the general tiered container write.
+    if (tier_gguf.size() > 1) {
+        if (!tier_fmt.empty() && tier_fmt.size() != tier_gguf.size()) {
+            std::fprintf(stderr, "moe-pack: --tier-fmt count (%zu) must match --tier count (%zu)\n",
+                         tier_fmt.size(), tier_gguf.size());
+            return 2;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(out, ec);
+        if (ec) { std::fprintf(stderr, "moe-pack: cannot create out dir %s: %s\n", out.c_str(), ec.message().c_str()); return 1; }
+
+        TierSources ts;
+        std::vector<ggml_moe::TierSpec> specs;
+        for (size_t t = 0; t < tier_gguf.size(); t++) {
+            auto src = std::make_unique<ggml_moe::GgufMoeSource>(tier_gguf[t], layers, experts, layer_base);
+            if (!src->ok()) { std::fprintf(stderr, "moe-pack: tier %zu source init failed (%s)\n", t, tier_gguf[t].c_str()); return 1; }
+            const uint8_t  q  = tier_fmt.empty() ? fmt : tier_fmt[t];
+            const uint64_t rb = src->record_stride();
+            std::fprintf(stderr, "moe-pack: tier %zu quant=%u record=%llu (%.1f MB) <- %s\n",
+                         t, (unsigned) q, (unsigned long long) rb, rb / (1024.0 * 1024.0), tier_gguf[t].c_str());
+            ggml_moe::GgufMoeSource * raw = src.get();
+            ts.gguf.emplace_back(std::move(src));
+            ts.framed.emplace_back(std::make_unique<ggml_moe::Iq2ExpertSource>(
+                q, [raw](uint32_t L, uint32_t E, ggml_moe::Iq2Bytes & b) { return raw->read(L, E, b); }));
+            specs.push_back(ggml_moe::TierSpec{ (uint32_t) t, (uint32_t) q, rb });
+        }
+        // Fidelity must DESCEND: a coarser tier cannot have a larger record than a sharper one.
+        for (size_t t = 1; t < specs.size(); t++) {
+            if (specs[t].record_bytes > specs[t-1].record_bytes) {
+                std::fprintf(stderr, "moe-pack: tier %zu record (%llu) > tier %zu (%llu) — pass --tier in DESCENDING fidelity\n",
+                             t, (unsigned long long) specs[t].record_bytes,
+                             t-1, (unsigned long long) specs[t-1].record_bytes);
+                return 2;
+            }
+        }
+        std::fprintf(stderr, "moe-pack: packing %zu tiers -> %s ...\n", specs.size(), out.c_str());
+        const bool ok = ggml_moe::moec_pack_dir_tiered(out.c_str(), "tiered", fmt, layers, experts,
+                                                       top_k * layers, top_k,
+                                                       specs.data(), (uint32_t) specs.size(),
+                                                       tier_source_for, &ts);
+        if (!ok) { std::fprintf(stderr, "moe-pack: TIERED PACK FAILED\n"); return 1; }
+        std::fprintf(stderr, "moe-pack: done. tiered container in %s (manifest v2 + experts-L{n}-T{t}.bin)\n", out.c_str());
+        return 0;
     }
 
     // ADAPTER: read experts out of the (sharded) GGUF; MAX-scans for the UD-variable record size.
