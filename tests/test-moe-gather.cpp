@@ -33,7 +33,7 @@ struct graph_out {
 // build + run one MUL_MAT_ID graph on `backend`; gather=true uses the identity
 // table. n_tokens selects the kernel family on Metal: < 32 → mv_id (decode),
 // >= 32 → mm_id (prefill). Returns the dst contents.
-enum gather_mode { GM_OFF, GM_IDENTITY, GM_CROSS };
+enum gather_mode { GM_OFF, GM_IDENTITY, GM_CROSS, GM_MIXED };
 
 static ggml_backend_moe_gather_entry_t entry_proc(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -124,6 +124,12 @@ static graph_out run_case(ggml_backend_t backend, gather_mode mode, int64_t n_to
         if (mode == GM_IDENTITY) {
             for (int64_t i = 0; i < n_expert; ++i) h[(size_t) i] = i*(int64_t) as->nb[2];
         } else {
+            // GM_MIXED reproduces the SHAPE OF A REAL SERVE that no homogeneous table has: some entries
+            // point into the separate pool-like allocation (aliased experts) while the rest point at
+            // natural offsets in the staging tensor (experts that fell back to the copy arm because
+            // their size-class had no pool). Both regions hold identical bytes, so a correct kernel
+            // must still be bit-identical — any divergence means the kernel cannot handle a table whose
+            // entries straddle two regions, which is exactly the state a live cache produces.
             ggml_backend_moe_gather_entry_t proc = entry_proc(backend);
             if (proc == nullptr) { ggml_backend_buffer_free(buf); ggml_free(ctx); return out; }
             const size_t nb_as = ggml_nbytes(as);
@@ -136,6 +142,11 @@ static graph_out run_case(ggml_backend_t backend, gather_mode mode, int64_t n_to
             t.data   = ggml_backend_buffer_get_base(alt);
             ggml_backend_tensor_set(&t, mirror.data(), 0, nb_as);
             for (int64_t i = 0; i < n_expert; ++i) {
+                if (mode == GM_MIXED && (i % 3) == 0) {
+                    // this expert "fell back to the copy arm": natural offset in the staging tensor
+                    h[(size_t) i] = i*(int64_t) as->nb[2];
+                    continue;
+                }
                 if (!proc(as, alt, (size_t) i*as->nb[2], &h[(size_t) i])) {
                     ggml_backend_buffer_free(alt); ggml_backend_buffer_free(buf);
                     ggml_free(ctx); return out;
@@ -190,7 +201,9 @@ int main() {
         for (const auto & c : cases) {
             graph_out plain = run_case(backend, GM_OFF, c.n_tokens, c.wt);
             const struct { const char * tag; gather_mode m; } modes[] = {
-                { "identity", GM_IDENTITY }, { "cross", GM_CROSS },
+                { "identity", GM_IDENTITY },   // all entries in src0's own buffer
+                { "cross",    GM_CROSS    },   // all entries in a separate allocation
+                { "mixed",    GM_MIXED    },   // BOTH at once — the live-cache shape
             };
             for (const auto & mo : modes) {
             graph_out gather = run_case(backend, mo.m, c.n_tokens, c.wt);
@@ -210,6 +223,11 @@ int main() {
                                "                 VALUE reaches the kernel wrong. Audit every link from the\n"
                                "                 gather-entry proc to the kernel address computation for a\n"
                                "                 type narrower than int64_t.\n");
+                    } else if (mo.m == GM_MIXED) {
+                        printf("               ^ MIXED diverges while identity AND cross both pass => the kernel\n"
+                               "                 cannot handle a table whose entries straddle two regions. That is\n"
+                               "                 the exact shape a live cache produces (most experts aliased, a few\n"
+                               "                 fallen back to the copy arm) and no homogeneous test can see it.\n");
                     }
                     failed = true;
                     break;
