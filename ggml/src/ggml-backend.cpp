@@ -1784,6 +1784,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // lifetime are wrong, not the kernel.
     static const bool moe_gather_identity = ggml_moe::moe_config().gather_identity;
     static const bool moe_gather_verify   = ggml_moe::moe_config().gather_verify;
+    static const bool moe_gather_sync     = ggml_moe::moe_config().gather_sync;
     if (moe_gather_on) { g_moe_gather_tables.reset(sched->cur_copy); }
     ggml_backend_t moe_gather_backend = nullptr;   // backend the tables were published to this call
     size_t  moe_bytes_streamed  = 0;
@@ -2149,6 +2150,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (gtab != nullptr) {
                             ggml_backend_tensor_set_async(split_backend, &gtab->tens, gtab->staging.data(), 0,
                                                           (size_t) n_expert * sizeof(int64_t));
+                            // [MOE-GATHER #23 SYNC] the ordering discriminator. Blocks the host until every
+                            // slot fill and this table upload have LANDED before any compute is enqueued,
+                            // which removes concurrency from the picture entirely. If a fault survives
+                            // cross-allocation PASS and VERIFY MATCH but disappears here, it is ordering —
+                            // and GGML_MOE_GATHER_RETIRE=1 is the principled fix. If it survives even this,
+                            // nothing about WHEN memory is touched explains it and the fault is elsewhere.
+                            if (moe_gather_sync) {
+                                ggml_backend_synchronize(split_backend);
+                            }
                         }
                     } else {
                         for (const auto & g : groups) {

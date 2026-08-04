@@ -169,6 +169,7 @@ struct MoeServingConfig {
     bool         gather_identity  = false;                // GGML_MOE_GATHER_IDENTITY (BISECT: publish the table with NATURAL offsets AND keep every copy — exercises the kernel's table path on bytes identical to the copy path)
     bool         gather_retire    = false;                // GGML_MOE_GATHER_RETIRE (event-proven fence retirement; costs a per-call event sync — only worth it when graphs really overlap, e.g. n_copies>1)
     bool         gather_verify    = false;                // GGML_MOE_GATHER_VERIFY (read every aliased slot back off the device and compare to the source bytes — splits "slot content wrong" from "address wrong")
+    bool         gather_sync      = false;                // GGML_MOE_GATHER_SYNC (fully serialize: block the host until every table upload and slot fill has landed before compute is enqueued — if this clears a fault, the fault is ORDERING)
 
     static MoeServingConfig from_env() {
         MoeServingConfig c;
@@ -187,6 +188,7 @@ struct MoeServingConfig {
         c.gather_identity = getenv("GGML_MOE_GATHER_IDENTITY") != nullptr;
         c.gather_retire   = getenv("GGML_MOE_GATHER_RETIRE")   != nullptr;
         c.gather_verify   = getenv("GGML_MOE_GATHER_VERIFY")   != nullptr;
+        c.gather_sync     = getenv("GGML_MOE_GATHER_SYNC")     != nullptr;
         if (c.gather_identity) { c.gather = true; }   // identity mode implies the table is built
         return c;
     }
