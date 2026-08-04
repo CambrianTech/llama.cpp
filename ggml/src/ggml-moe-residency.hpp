@@ -482,6 +482,9 @@ class ResidencyCache {
     // pure copy arm intra-token eviction is only churn, and container mode relies on the cache admitting
     // (no mmap fallback) — an unconditional refusal would turn pool-too-small into an abort there.
     bool gather_fence_ = false;
+    // Generations of eviction protection under the gather fence. 2 = the current call plus the one
+    // still possibly in flight. Raise with pipeline depth (sched n_copies) if that ever exceeds 1.
+    static const uint64_t GATHER_FENCE_GENS = 2;
 
     // [RUNG-2] controller actuator state (set via the GGML_MOE_PLAN_FILE control file; see PagerPlan).
     std::unordered_set<uint64_t> pinned_;   // hinted expert cache-keys — a RETENTION BIAS, not evict-exempt
@@ -571,9 +574,15 @@ class ResidencyCache {
         size_t slot = NO_SLOT;
         uint64_t oeff = UINT64_MAX, ot = UINT64_MAX;
         for (size_t i = 0; i < p.max_slots; i++) {
-            // [MOE-GATHER #23] fence: a slot touched THIS generation may be referenced by an in-flight
-            // offset table — never a victim while the gather epoch is active (see gather_fence_ doc).
-            if (gather_fence_ && p.slot_gen[i] == token_gen) { continue; }
+            // [MOE-GATHER #23] fence: a slot referenced by a table that an IN-FLIGHT graph may still
+            // read must never be a victim. The window is IN-FLIGHT GRAPHS, not "this call": the clock
+            // advances at the TOP of a compute call, but the PREVIOUS call's graph was enqueued
+            // asynchronously and its kernels may not have run yet. A one-generation fence therefore
+            // freed slots the previous graph was about to read in place — the copy arm never cared
+            // (bytes were already staged at enqueue), the gather arm reads them at COMPUTE time.
+            // Hence: copy clean, gather NaN, and ONLY on runs whose working set actually evicts
+            // (V4-Flash/5090). A pool that never evicts — OLMoE/Metal at 100% hit — cannot expose it.
+            if (gather_fence_ && p.slot_gen[i] + (GATHER_FENCE_GENS - 1) >= token_gen) { continue; }
             const uint64_t eff = p.slot_gen[i] + ((have_pins && pinned_.count(p.slot_key[i])) ? pin_bias_ : 0);
             if (eff < oeff || (eff == oeff && p.slot_tick[i] < ot)) {
                 oeff = eff; ot = p.slot_tick[i]; slot = i;
