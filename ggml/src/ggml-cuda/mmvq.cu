@@ -594,6 +594,11 @@ static __global__ void mul_mat_vec_q(
     const void * GGML_CUDA_RESTRICT vx_expert = (expert_ptrs_ptr != nullptr)
         ? (const void *) ((const char *) vx + expert_ptrs_ptr[channel_x]) : vx;
     const int kbx_offset = sample_x*stride_sample_x + (expert_ptrs_ptr != nullptr ? 0 : channel_x*stride_channel_x) + row0*stride_row_x;
+    // [MOE-GATHER #23] The FUSED GATE weight (fusion.gate) is a DIFFERENT tensor that the consume-arm
+    // does NOT alias — it stays contiguous, so it still needs the channel stride that the gathered x
+    // dropped. Reusing the gathered offset for it made every expert's gate matmul read expert 0's
+    // weights => silently wrong dot products => NaN logits. Gate keeps the classic addressing.
+    const int kbx_offset_gate = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -610,7 +615,7 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            vgate, &y[j*stride_col_y + kby], kbx_offset_gate + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
