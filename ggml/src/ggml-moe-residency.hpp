@@ -474,7 +474,16 @@ class ResidencyCache {
         // in-flight kernel, so only they need the fence. Copy-served slots stay freely evictable.
         std::vector<uint64_t> slot_ref_gen;
     };
-    static const size_t MAX_POOLS = 3; // a MoE has at most a few distinct expert byte-sizes
+    // Distinct expert byte-sizes a MoE can present. 3 was too low and it FAILED CLOSED in the worst
+    // way: DeepSeek-V4-Flash has FOUR (measured pools at 1598/1337/1985 slots plus a rejected
+    // 4456960 B class), so an entire size-class got NO pool and took the mmap path on every token —
+    // uncached, re-read per token, invisible except through the fail-loud warning. Sized for real
+    // MoEs (gate/up/down can each differ, and shared vs routed experts differ again).
+    // NOTE (follow-up, not this change): `share = budget_bytes / MAX_POOLS` divides the budget by the
+    // CAP rather than by the classes actually present, so raising the cap under-uses the budget when
+    // a model has fewer classes. The right shape is demand-proportional allocation across observed
+    // classes; this constant is the stop-gap that keeps a class from being starved entirely.
+    static const size_t MAX_POOLS = 6;
 
     std::mutex mtx;
     size_t         budget_bytes;
