@@ -42,9 +42,9 @@ static ggml_backend_moe_gather_entry_t entry_proc(ggml_backend_t backend) {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_gather_entry") : nullptr;
 }
 
-static graph_out run_case(ggml_backend_t backend, gather_mode mode, int64_t n_tokens) {
+static graph_out run_case(ggml_backend_t backend, gather_mode mode, int64_t n_tokens, ggml_type wtype) {
     const bool gather = mode != GM_OFF;
-    const int64_t ne00     = 64; // cols (must be >= simdgroup mins)
+    const int64_t ne00     = 256; // cols — a multiple of 256 so K-quant blocks (256) are legal too
     const int64_t ne01     = 32; // rows per expert
     const int64_t n_expert = 8;
     const int64_t n_used   = 2;
@@ -58,7 +58,7 @@ static graph_out run_case(ggml_backend_t backend, gather_mode mode, int64_t n_to
     };
     ggml_context * ctx = ggml_init(ip);
 
-    ggml_tensor * as  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne00, ne01, n_expert);
+    ggml_tensor * as  = ggml_new_tensor_3d(ctx, wtype, ne00, ne01, n_expert);
     ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne00, 1, n_tokens);
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
 
@@ -92,12 +92,20 @@ static graph_out run_case(ggml_backend_t backend, gather_mode mode, int64_t n_to
     // chain narrower than 64 bits truncates and the kernel reads garbage.
     ggml_backend_buffer_t alt = nullptr;
 
-    // deterministic fills
+    // deterministic fills. A QUANTIZED weight tensor is what routes the op to the quantized kernel
+    // families (mmvq / MMQ on CUDA) — an F32 tensor only ever exercises mmf, so an F32-only test can
+    // pass while the quantized path is broken. That is the whole point of sweeping wtype here.
     {
         std::vector<float> h((size_t) ne00*ne01*n_expert);
         uint32_t s = 42;
         for (auto & v : h) v = frand(s);
-        ggml_backend_tensor_set(as, h.data(), 0, h.size()*sizeof(float));
+        if (wtype == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(as, h.data(), 0, h.size()*sizeof(float));
+        } else {
+            std::vector<uint8_t> q(ggml_nbytes(as));
+            ggml_quantize_chunk(wtype, h.data(), q.data(), 0, ne01*n_expert, ne00, nullptr);
+            ggml_backend_tensor_set(as, q.data(), 0, q.size());
+        }
     }
     {
         std::vector<float> h((size_t) ne00*n_tokens);
@@ -164,20 +172,28 @@ int main() {
         }
         const char * name = ggml_backend_name(backend);
 
-        // both Metal families: mv_id (decode, n_tokens < 32) and mm_id (prefill)
-        const struct { const char * label; int64_t n_tokens; } cases[] = {
-            { "mv/decode",  4  },
-            { "mm/prefill", 40 },
+        // Sweep BOTH kernel families (mv/decode vs mm/prefill) AND weight types. The type axis is the
+        // one that matters most: quantized weights route to entirely different kernels (mmvq / MMQ)
+        // than F32 (mmf), and a gather can be correct in one family while broken in the other.
+        const struct { const char * label; int64_t n_tokens; ggml_type wt; } cases[] = {
+            { "mv/f32",   4,  GGML_TYPE_F32  },
+            { "mm/f32",   40, GGML_TYPE_F32  },
+            { "mv/q8_0",  4,  GGML_TYPE_Q8_0 },
+            { "mm/q8_0",  40, GGML_TYPE_Q8_0 },
+            { "mv/q4_0",  4,  GGML_TYPE_Q4_0 },
+            { "mm/q4_0",  40, GGML_TYPE_Q4_0 },
+            { "mv/q4_K",  4,  GGML_TYPE_Q4_K },
+            { "mm/q4_K",  40, GGML_TYPE_Q4_K },
         };
 
         bool failed = false;
         for (const auto & c : cases) {
-            graph_out plain = run_case(backend, GM_OFF, c.n_tokens);
+            graph_out plain = run_case(backend, GM_OFF, c.n_tokens, c.wt);
             const struct { const char * tag; gather_mode m; } modes[] = {
                 { "identity", GM_IDENTITY }, { "cross", GM_CROSS },
             };
             for (const auto & mo : modes) {
-            graph_out gather = run_case(backend, mo.m, c.n_tokens);
+            graph_out gather = run_case(backend, mo.m, c.n_tokens, c.wt);
 
             if (!plain.ran) {
                 printf("%-12s %-10s %-9s SKIP (plain mul_mat_id unsupported)\n", name, c.label, mo.tag);
