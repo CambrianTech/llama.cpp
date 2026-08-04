@@ -167,6 +167,7 @@ struct MoeServingConfig {
     const char * container_dir    = nullptr;              // GGML_MOE_CONTAINER    (v1 per-layer expert container dir -> DirContainerFetcher)
     bool         gather           = false;                // GGML_MOE_GATHER       (pointer-table MUL_MAT_ID consume-arm, task #23 Cut 2 — opt-in until measured)
     bool         gather_identity  = false;                // GGML_MOE_GATHER_IDENTITY (BISECT: publish the table with NATURAL offsets AND keep every copy — exercises the kernel's table path on bytes identical to the copy path)
+    bool         gather_retire    = false;                // GGML_MOE_GATHER_RETIRE (event-proven fence retirement; costs a per-call event sync — only worth it when graphs really overlap, e.g. n_copies>1)
 
     static MoeServingConfig from_env() {
         MoeServingConfig c;
@@ -183,6 +184,7 @@ struct MoeServingConfig {
         c.container_dir = getenv("GGML_MOE_CONTAINER");
         c.gather        = getenv("GGML_MOE_GATHER")       != nullptr;
         c.gather_identity = getenv("GGML_MOE_GATHER_IDENTITY") != nullptr;
+        c.gather_retire   = getenv("GGML_MOE_GATHER_RETIRE")   != nullptr;
         if (c.gather_identity) { c.gather = true; }   // identity mode implies the table is built
         return c;
     }
@@ -458,6 +460,10 @@ class ResidencyCache {
         bool      failed = false;
         std::unordered_map<uint64_t, size_t> key2slot;
         std::vector<uint64_t> slot_key, slot_tick, slot_gen;
+        // [MOE-GATHER #23] generation in which a published offset table last REFERENCED this slot.
+        // Distinct from slot_gen (merely touched): only referenced slots can be read in place by an
+        // in-flight kernel, so only they need the fence. Copy-served slots stay freely evictable.
+        std::vector<uint64_t> slot_ref_gen;
     };
     static const size_t MAX_POOLS = 3; // a MoE has at most a few distinct expert byte-sizes
 
@@ -485,6 +491,11 @@ class ResidencyCache {
     // Generations of eviction protection under the gather fence. 2 = the current call plus the one
     // still possibly in flight. Raise with pipeline depth (sched n_copies) if that ever exceeds 1.
     static const uint64_t GATHER_FENCE_GENS = 2;
+    // Generations PROVEN complete on the device (a recorded event was synchronized). Slots referenced
+    // by any later generation may still be read in place. 0 = nothing proven yet -> the conservative
+    // GATHER_FENCE_GENS window is used instead, so a backend without usable events still stays correct.
+    uint64_t retired_gen_  = 0;
+    bool     retirement_on_ = false;
 
     // [RUNG-2] controller actuator state (set via the GGML_MOE_PLAN_FILE control file; see PagerPlan).
     std::unordered_set<uint64_t> pinned_;   // hinted expert cache-keys — a RETENTION BIAS, not evict-exempt
@@ -544,6 +555,7 @@ class ResidencyCache {
         p.slot_key.assign(p.max_slots, 0);
         p.slot_tick.assign(p.max_slots, 0);
         p.slot_gen.assign(p.max_slots, 0);
+        p.slot_ref_gen.assign(p.max_slots, 0);
     }
 
     // Free every pinned pool buffer, returning its RAM to the OS. Pools re-allocate lazily at the
@@ -582,7 +594,17 @@ class ResidencyCache {
             // (bytes were already staged at enqueue), the gather arm reads them at COMPUTE time.
             // Hence: copy clean, gather NaN, and ONLY on runs whose working set actually evicts
             // (V4-Flash/5090). A pool that never evicts — OLMoE/Metal at 100% hit — cannot expose it.
-            if (gather_fence_ && p.slot_gen[i] + (GATHER_FENCE_GENS - 1) >= token_gen) { continue; }
+            if (gather_fence_) {
+                // Refuse ONLY slots an in-flight table may still read in place. With proven retirement
+                // the window is exact (referenced after the last completed generation); without it we
+                // fall back to the conservative GATHER_FENCE_GENS window. Either way, copy-served
+                // slots — the majority under pressure — remain evictable, which is what keeps the
+                // gather rate up when the pool is smaller than 2x the per-token working set.
+                const bool may_be_in_flight = retirement_on_
+                    ? (p.slot_ref_gen[i] >  retired_gen_)
+                    : (p.slot_ref_gen[i] + (GATHER_FENCE_GENS - 1) >= token_gen);
+                if (may_be_in_flight && p.slot_ref_gen[i] != 0) { continue; }
+            }
             const uint64_t eff = p.slot_gen[i] + ((have_pins && pinned_.count(p.slot_key[i])) ? pin_bias_ : 0);
             if (eff < oeff || (eff == oeff && p.slot_tick[i] < ot)) {
                 oeff = eff; ot = p.slot_tick[i]; slot = i;
@@ -605,6 +627,30 @@ public:
     // consumer (per-compute-call disarm would race the NEXT call's prefetch against this call's in-flight
     // kernels). Copy-arm-only runs never arm it and keep today's eviction semantics exactly.
     void        set_gather_fence(bool on) { std::lock_guard<std::mutex> lk(mtx); gather_fence_ = on; }
+
+    // [MOE-GATHER #23] the consume-arm calls this for every slot it publishes into an offset table.
+    // Only these slots are fenced — precision is what preserves eviction headroom under pressure.
+    void        mark_table_ref(const ExpertSlot & s) {
+        if (!s.ok()) { return; }
+        std::lock_guard<std::mutex> lk(mtx);
+        for (auto & kv : pools) {
+            Pool & p = kv.second;
+            if (p.buf == s.buffer && p.slot_size != 0) {
+                const size_t idx = s.offset / p.slot_size;
+                if (idx < p.slot_ref_gen.size()) { p.slot_ref_gen[idx] = token_gen; }
+                return;
+            }
+        }
+    }
+
+    // Declare every generation <= g PROVEN complete on the device (caller synchronized a recorded
+    // event). Turns the fence from a conservative guess into an exact in-flight set.
+    void        retire_generations_through(uint64_t g) {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (g > retired_gen_) { retired_gen_ = g; }
+        retirement_on_ = true;
+    }
+    uint64_t    current_generation() { std::lock_guard<std::mutex> lk(mtx); return token_gen; }
 
     // [DEVICE-RESIDENT #23] Flip the cache to VRAM-backed slots. Idempotent + safe under concurrent
     // first-call (the mutex + the device_backed_ guard make a second call a no-op — M5's call_once shape).

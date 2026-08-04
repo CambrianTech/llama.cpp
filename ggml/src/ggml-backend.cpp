@@ -1661,6 +1661,37 @@ struct MoeGatherTables {
 };
 static MoeGatherTables g_moe_gather_tables;
 
+// [MOE-GATHER #23] TRUE retirement: a generation's slots stay fenced until the graph that read their
+// table has PROVABLY finished on the device. A ring of recorded events is synchronized RING calls
+// later — by then the work is long done, so the sync is free, but it is a fact rather than the
+// assumption a generation-window makes. Without usable events the cache keeps its conservative
+// window, so a backend that cannot supply them is still correct, just less precise.
+struct MoeGatherRetire {
+    // Depth 2 == the true in-flight set: at call N we synchronize the event recorded at call N-2,
+    // which retires everything through that generation and leaves exactly the current + previous
+    // generation protected. Deeper rings PROVE completion later, over-protect, and collapse the hit
+    // rate (measured: RING=4 took OLMoE full-fit from 100% to 67.7%).
+    static const int RING = 2;
+    ggml_backend_event_t ev[RING]  = {};
+    uint64_t             gen[RING] = {};
+    int                  head      = 0;
+    bool                 usable    = false;
+    bool                 tried     = false;
+
+    void ensure(ggml_backend_t backend) {
+        if (tried) { return; }
+        tried = true;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr) { return; }
+        for (int i = 0; i < RING; i++) {
+            ev[i] = ggml_backend_event_new(dev);
+            if (ev[i] == nullptr) { return; }   // partial ring => stay unusable; freed at process exit
+        }
+        usable = true;
+    }
+};
+static MoeGatherRetire g_moe_gather_retire;
+
 // per-backend entry-builder proc ("ggml_backend_moe_gather_entry"); nullptr = backend has no gather repr
 static ggml_backend_moe_gather_entry_t moe_gather_entry_fn(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -1753,6 +1784,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // lifetime are wrong, not the kernel.
     static const bool moe_gather_identity = ggml_moe::moe_config().gather_identity;
     if (moe_gather_on) { g_moe_gather_tables.reset(sched->cur_copy); }
+    ggml_backend_t moe_gather_backend = nullptr;   // backend the tables were published to this call
     size_t  moe_bytes_streamed  = 0;
     int64_t moe_experts_streamed = 0;
     int64_t moe_experts_gathered = 0;
@@ -1946,6 +1978,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 // slots referenced by this table are read at COMPUTE time — evicting a
                                 // current-generation slot would dangle an entry. Sticky by design (doc
                                 // on set_gather_fence).
+                                moe_gather_backend = split_backend;   // event ring records here
                                 host_cache.set_gather_fence(true);
                                 const size_t input_cpy_buf_off =
                                     (size_t) ((char *) input_cpy->data - (char *) ggml_backend_buffer_get_base(input_cpy->buffer));
@@ -2027,6 +2060,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     // miss alike; the fetcher already filled the slot). Slot lifetime
                                     // across the async compute is the gather fence's contract.
                                     gtab->staging[(size_t) id] = gent;
+                                    // fence ONLY what a table actually publishes (precision keeps
+                                    // eviction headroom for copy-served experts under pressure)
+                                    host_cache.mark_table_ref(slot);
                                     moe_experts_gathered += 1;
                                 } else if (slot.host_ptr) {
                                     moe_bytes_streamed += expert_size + pad_end;
@@ -2142,6 +2178,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
+        }
+    }
+
+    // [MOE-GATHER #23] close the retirement cycle for this call: synchronize the ring's OLDEST event
+    // (recorded RING calls ago — long finished, so this does not stall), which PROVES every generation
+    // up to that point completed and lets the fence release those slots; then record a fresh event for
+    // this call's generation. Ordered completion on one queue makes "<= that generation" sound.
+    // Event-proven retirement is OPT-IN: measured on Metal it costs ~9% decode and a few percent hit
+    // rate (the per-call event sync), while the conservative generation window measured free and is
+    // sound wherever the frontend synchronizes per token — which llama.cpp does. Turn it on for
+    // genuinely overlapping graphs (pipeline parallel / n_copies > 1), where the guess stops holding.
+    static const bool moe_gather_retire = ggml_moe::moe_config().gather_retire;
+    if (moe_gather_retire && moe_gather_on && moe_gather_backend != nullptr) {
+        g_moe_gather_retire.ensure(moe_gather_backend);
+        if (g_moe_gather_retire.usable) {
+            const int h = g_moe_gather_retire.head;
+            if (g_moe_gather_retire.gen[h] != 0) {
+                ggml_backend_event_synchronize(g_moe_gather_retire.ev[h]);
+                host_cache.retire_generations_through(g_moe_gather_retire.gen[h]);
+            }
+            ggml_backend_event_record(g_moe_gather_retire.ev[h], moe_gather_backend);
+            g_moe_gather_retire.gen[h] = host_cache.current_generation();
+            g_moe_gather_retire.head   = (h + 1) % MoeGatherRetire::RING;
         }
     }
 
