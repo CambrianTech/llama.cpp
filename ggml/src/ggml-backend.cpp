@@ -1964,7 +1964,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         node->src[3] = nullptr;
                         MoeGatherTables::Entry *          gtab   = nullptr;
                         ggml_backend_moe_gather_entry_t   gentry = nullptr;
-                        if (moe_gather_on) {
+                        // [MOE-GATHER #23 BISECT] GGML_MOE_GATHER_ONLY=<substr> engages the gather for ONLY
+                        // the weight tensors whose name contains <substr>. Everything else takes the copy
+                        // arm, unchanged. That turns "somewhere in the gather path" into a NAMED tensor in
+                        // log2(N) runs: try ffn_up_exps, then ffn_gate_exps, then ffn_down_exps, then a
+                        // layer prefix like blk.7. — whichever subset reproduces the fault owns it, and
+                        // whichever subset is clean is exonerated. This is the bisect that property probes
+                        // (content / address / timing / type / shape) cannot do, because it localizes by
+                        // WHERE rather than by WHAT.
+                        static const char * moe_gather_only = ggml_moe::moe_config().gather_only;
+                        const bool moe_gather_this_node = moe_gather_on &&
+                            (moe_gather_only == nullptr || strstr(ggml_get_name(input), moe_gather_only) != nullptr);
+                        if (moe_gather_this_node) {
                             gentry = moe_gather_entry_fn(split_backend);
                             if (gentry != nullptr) {
                                 gtab = g_moe_gather_tables.claim(split_backend, sched->cur_copy, n_expert);

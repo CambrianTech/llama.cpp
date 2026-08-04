@@ -172,6 +172,7 @@ struct MoeServingConfig {
     bool         gather_sync      = false;                // GGML_MOE_GATHER_SYNC (fully serialize: block the host until every table upload and slot fill has landed before compute is enqueued — if this clears a fault, the fault is ORDERING)
     bool         gather_poison_on = false;                // GGML_MOE_GATHER_POISON=<byte> — fill every slot's PAD + the pool guard with this byte instead of zero
     uint8_t      gather_poison    = 0;
+    const char * gather_only      = nullptr;              // GGML_MOE_GATHER_ONLY=<substr> — engage gather ONLY for weight tensors whose name contains this (bisect the surface: ffn_gate_exps / ffn_up_exps / ffn_down_exps / blk.7.)
 
     static MoeServingConfig from_env() {
         MoeServingConfig c;
@@ -192,6 +193,7 @@ struct MoeServingConfig {
         c.gather_verify   = getenv("GGML_MOE_GATHER_VERIFY")   != nullptr;
         c.gather_sync     = getenv("GGML_MOE_GATHER_SYNC")     != nullptr;
         if (const char * v = getenv("GGML_MOE_GATHER_POISON")) { c.gather_poison = (uint8_t) atoi(v); c.gather_poison_on = true; }
+        c.gather_only = getenv("GGML_MOE_GATHER_ONLY");
         if (c.gather_identity) { c.gather = true; }   // identity mode implies the table is built
         return c;
     }
