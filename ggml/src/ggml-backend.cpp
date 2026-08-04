@@ -1783,6 +1783,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // kernel's table arithmetic is wrong at real shapes/quants; clean => the addresses or the slot
     // lifetime are wrong, not the kernel.
     static const bool moe_gather_identity = ggml_moe::moe_config().gather_identity;
+    static const bool moe_gather_verify   = ggml_moe::moe_config().gather_verify;
     if (moe_gather_on) { g_moe_gather_tables.reset(sched->cur_copy); }
     ggml_backend_t moe_gather_backend = nullptr;   // backend the tables were published to this call
     size_t  moe_bytes_streamed  = 0;
@@ -2064,6 +2065,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     // eviction headroom for copy-served experts under pressure)
                                     host_cache.mark_table_ref(slot);
                                     moe_experts_gathered += 1;
+                                    // [MOE-GATHER #23 VERIFY] read the aliased slot back off the
+                                    // device and compare to the source bytes. Identity mode proved the
+                                    // kernel's table math but never touched a REAL pool slot, so this
+                                    // is the missing discriminator: a mismatch means the slot's
+                                    // CONTENT is wrong (fetch, ordering, or lifetime) and no amount of
+                                    // address work will fix it; a match means the bytes are right and
+                                    // the fault is purely how the kernel reaches them.
+                                    if (moe_gather_verify && !moec_active) {
+                                        static uint64_t n_bad = 0, n_ok = 0;
+                                        std::vector<uint8_t> back(expert_size), want(expert_size);
+                                        struct ggml_tensor v = {};
+                                        v.type  = GGML_TYPE_I8;
+                                        v.ne[0] = (int64_t) expert_size;
+                                        v.ne[1] = v.ne[2] = v.ne[3] = 1;
+                                        v.nb[0] = 1;
+                                        v.nb[1] = v.nb[2] = v.nb[3] = expert_size;
+                                        v.buffer = slot.buffer;
+                                        v.data   = (uint8_t *) ggml_backend_buffer_get_base(slot.buffer) + slot.offset;
+                                        ggml_backend_tensor_get(&v, back.data(), 0, expert_size);
+                                        memcpy(want.data(), mmap_src, expert_size);
+                                        if (memcmp(back.data(), want.data(), expert_size) != 0) {
+                                            if (n_bad++ < 8) {
+                                                size_t first = 0;
+                                                while (first < expert_size && back[first] == want[first]) { first++; }
+                                                fprintf(stderr,
+                                                    "[MOE-GATHER-VERIFY] MISMATCH %s expert %d: slot bytes differ from source "
+                                                    "at byte %zu of %zu (slot=%p off=%zu). The SLOT CONTENT is wrong — this is "
+                                                    "fetch/ordering/lifetime, not addressing.\n",
+                                                    tname, id, first, expert_size, (void *) slot.buffer, slot.offset);
+                                            }
+                                        } else if (n_ok++ == 0) {
+                                            fprintf(stderr,
+                                                "[MOE-GATHER-VERIFY] slot contents match source bytes — the cache holds the RIGHT "
+                                                "data, so any remaining corruption is in how the kernel reaches it.\n");
+                                        }
+                                    }
                                 } else if (slot.host_ptr) {
                                     moe_bytes_streamed += expert_size + pad_end;
                                     ggml_backend_tensor_set_async(split_backend, input_cpy, slot.host_ptr, dst_off, expert_size + pad_end);
