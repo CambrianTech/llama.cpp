@@ -33,7 +33,17 @@ struct graph_out {
 // build + run one MUL_MAT_ID graph on `backend`; gather=true uses the identity
 // table. n_tokens selects the kernel family on Metal: < 32 → mv_id (decode),
 // >= 32 → mm_id (prefill). Returns the dst contents.
-static graph_out run_case(ggml_backend_t backend, bool gather, int64_t n_tokens) {
+enum gather_mode { GM_OFF, GM_IDENTITY, GM_CROSS };
+
+static ggml_backend_moe_gather_entry_t entry_proc(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? (ggml_backend_moe_gather_entry_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_gather_entry") : nullptr;
+}
+
+static graph_out run_case(ggml_backend_t backend, gather_mode mode, int64_t n_tokens) {
+    const bool gather = mode != GM_OFF;
     const int64_t ne00     = 64; // cols (must be >= simdgroup mins)
     const int64_t ne01     = 32; // rows per expert
     const int64_t n_expert = 8;
@@ -76,6 +86,11 @@ static graph_out run_case(ggml_backend_t backend, bool gather, int64_t n_tokens)
         ggml_free(ctx);
         return out;
     }
+    // GM_CROSS puts the expert bytes in a SEPARATE backend buffer and points the table there — the
+    // case a same-buffer identity table can never reach. The entry becomes the distance between two
+    // independent allocations (multi-GB, often negative in a real serve), so any link in a backend's
+    // chain narrower than 64 bits truncates and the kernel reads garbage.
+    ggml_backend_buffer_t alt = nullptr;
 
     // deterministic fills
     {
@@ -97,9 +112,28 @@ static graph_out run_case(ggml_backend_t backend, bool gather, int64_t n_tokens)
         ggml_backend_tensor_set(ids, h.data(), 0, h.size()*sizeof(int32_t));
     }
     if (eptrs != nullptr) {
-        // THE identity table: expert i lives exactly where the stride says.
         std::vector<int64_t> h((size_t) n_expert);
-        for (int64_t i = 0; i < n_expert; ++i) h[(size_t) i] = i*(int64_t) as->nb[2];
+        if (mode == GM_IDENTITY) {
+            for (int64_t i = 0; i < n_expert; ++i) h[(size_t) i] = i*(int64_t) as->nb[2];
+        } else {
+            ggml_backend_moe_gather_entry_t proc = entry_proc(backend);
+            if (proc == nullptr) { ggml_backend_buffer_free(buf); ggml_free(ctx); return out; }
+            const size_t nb_as = ggml_nbytes(as);
+            alt = ggml_backend_alloc_buffer(backend, nb_as);
+            if (alt == nullptr) { ggml_backend_buffer_free(buf); ggml_free(ctx); return out; }
+            std::vector<uint8_t> mirror(nb_as);
+            ggml_backend_tensor_get(as, mirror.data(), 0, nb_as);
+            ggml_tensor t = *as;
+            t.buffer = alt;
+            t.data   = ggml_backend_buffer_get_base(alt);
+            ggml_backend_tensor_set(&t, mirror.data(), 0, nb_as);
+            for (int64_t i = 0; i < n_expert; ++i) {
+                if (!proc(as, alt, (size_t) i*as->nb[2], &h[(size_t) i])) {
+                    ggml_backend_buffer_free(alt); ggml_backend_buffer_free(buf);
+                    ggml_free(ctx); return out;
+                }
+            }
+        }
         ggml_backend_tensor_set(eptrs, h.data(), 0, h.size()*sizeof(int64_t));
     }
 
@@ -113,6 +147,7 @@ static graph_out run_case(ggml_backend_t backend, bool gather, int64_t n_tokens)
     ggml_backend_tensor_get(dst, out.data.data(), 0, out.data.size()*sizeof(float));
     out.ran = true;
 
+    if (alt != nullptr) { ggml_backend_buffer_free(alt); }
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return out;
@@ -137,22 +172,35 @@ int main() {
 
         bool failed = false;
         for (const auto & c : cases) {
-            graph_out plain  = run_case(backend, /*gather=*/false, c.n_tokens);
-            graph_out gather = run_case(backend, /*gather=*/true,  c.n_tokens);
+            graph_out plain = run_case(backend, GM_OFF, c.n_tokens);
+            const struct { const char * tag; gather_mode m; } modes[] = {
+                { "identity", GM_IDENTITY }, { "cross", GM_CROSS },
+            };
+            for (const auto & mo : modes) {
+            graph_out gather = run_case(backend, mo.m, c.n_tokens);
 
             if (!plain.ran) {
-                printf("%-12s %-10s SKIP (plain mul_mat_id unsupported)\n", name, c.label);
+                printf("%-12s %-10s %-9s SKIP (plain mul_mat_id unsupported)\n", name, c.label, mo.tag);
             } else if (!gather.ran) {
-                printf("%-12s %-10s SKIP (gather rejected by supports_op — designed partial rollout)\n", name, c.label);
+                printf("%-12s %-10s %-9s SKIP (unsupported/entry-proc absent — designed partial rollout)\n", name, c.label, mo.tag);
             } else {
                 const bool same = plain.data.size() == gather.data.size() &&
                     memcmp(plain.data.data(), gather.data.data(), plain.data.size()*sizeof(float)) == 0;
-                printf("%-12s %-10s %s (%zu values)\n", name, c.label, same ? "OK bit-identical" : "FAIL divergent", plain.data.size());
+                printf("%-12s %-10s %-9s %s (%zu values)\n", name, c.label, mo.tag,
+                       same ? "OK bit-identical" : "FAIL divergent", plain.data.size());
                 if (!same) {
+                    if (mo.m == GM_CROSS) {
+                        printf("               ^ cross-allocation diverges while identity passes => the table\n"
+                               "                 VALUE reaches the kernel wrong. Audit every link from the\n"
+                               "                 gather-entry proc to the kernel address computation for a\n"
+                               "                 type narrower than int64_t.\n");
+                    }
                     failed = true;
                     break;
                 }
                 n_checked++;
+            }
+            if (failed) { break; }
             }
         }
         ggml_backend_free(backend);
