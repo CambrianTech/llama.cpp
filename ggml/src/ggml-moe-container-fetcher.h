@@ -173,6 +173,13 @@ public:
 // fetcher itself never needs it (offsets arrive pre-computed). 0 => no/unreadable manifest —
 // the caller must then treat the container as ABSENT (fall back to the mmap path wholesale),
 // never guess a stride: a wrong stride reads the wrong expert's bytes silently.
+//
+// v2 (TIERED) manifests: this scan finds the FIRST "record_bytes", which the packer emits as
+// tiers[0]'s — and tier 0's stride IS the one the caller must pack with (TieredDirFetcher derives
+// expert_id = offset / stride0, then reads the selected tier at its own record_bytes). That makes
+// v2 work here without a special case, but it is LOAD-BEARING, not luck: if the manifest ever
+// stops emitting tier 0 first, this must gain an explicit v2 branch or every offset silently
+// decodes to the wrong expert.
 static inline uint64_t dir_container_record_bytes(const char * dir) {
     if (!dir) { return 0; }
     const std::string mp = std::string(dir) + "/manifest.json";
@@ -201,6 +208,60 @@ static inline uint64_t dir_container_record_bytes(const char * dir) {
 // holding only some (layer,tier) shards never stats the rest (the grid shard unit). This is the read
 // side that pairs with moec_pack_dir_tiered; the serving direct-I/O variant swaps in the same way as
 // ContainerFetcher (identical offset contract). record_bytes comes from the manifest tier row.
+// [TIERED WIRE] One tier row as the serving side needs it. Mirrors TierSpec in the packer; kept
+// here so the READ path has no dependency on the packer header.
+struct DirTier {
+    uint32_t id;
+    uint32_t quant;
+    uint64_t record_bytes;
+};
+
+// Parse the tiers[] array out of a v2 manifest. Returns how many were read (0 => not a v2
+// container, or unreadable — caller falls back to the v1 single-tier path). Same tolerant
+// no-JSON-dep scan as dir_container_record_bytes: a hand-edited manifest cannot smuggle an
+// unaligned stride past the aligned-read contract, because each row is validated.
+static inline uint32_t dir_container_tiers(const char * dir, DirTier * out, uint32_t max_out) {
+    if (!dir || !out || max_out == 0) { return 0; }
+    const std::string mp = std::string(dir) + "/manifest.json";
+    FILE * f = std::fopen(mp.c_str(), "rb");
+    if (!f) { return 0; }
+    std::vector<char> buf(1 << 16);
+    const size_t n = std::fread(buf.data(), 1, buf.size() - 1, f);
+    std::fclose(f);
+    buf[n] = 0;
+    const char * p = buf.data();
+    // v2 only: the reader gates on version==2 exactly as the packer's doc specifies.
+    const char * v = std::strstr(p, "\"version\"");
+    if (!v) { return 0; }
+    { const char * c = std::strchr(v, ':'); if (!c || std::strtol(c + 1, nullptr, 10) != 2) { return 0; } }
+    const char * arr = std::strstr(p, "\"tiers\"");
+    if (!arr) { return 0; }
+    const char * end = std::strchr(arr, ']');
+    uint32_t got = 0;
+    for (const char * q = arr; q && end && q < end && got < max_out; ) {
+        const char * idk = std::strstr(q, "\"id\"");
+        if (!idk || idk > end) { break; }
+        const char * qk = std::strstr(idk, "\"quant\"");
+        const char * rk = std::strstr(idk, "\"record_bytes\"");
+        if (!qk || !rk || qk > end || rk > end) { break; }
+        auto num = [](const char * k, const char * key) -> unsigned long long {
+            const char * c = std::strchr(k + std::strlen(key), ':');
+            return c ? std::strtoull(c + 1, nullptr, 10) : 0ull;
+        };
+        const unsigned long long rb = num(rk, "\"record_bytes\"");
+        // Same invariant the packer enforces: 4KiB-multiple records, so offset = expert*record
+        // is a single aligned positional read. A bad row invalidates the whole table (fail loud,
+        // never serve a wrong-stride record silently — the #268 safety invariant).
+        if (rb == 0 || rb % 4096 != 0) { return 0; }
+        out[got].id           = (uint32_t) num(idk, "\"id\"");
+        out[got].quant        = (uint32_t) num(qk,  "\"quant\"");
+        out[got].record_bytes = (uint64_t) rb;
+        got++;
+        q = rk + 1;
+    }
+    return got;
+}
+
 class TieredContainerFetcher {
     std::string dir_;
     std::mutex  mtx_;
@@ -228,6 +289,62 @@ public:
         const uint64_t off = (uint64_t) expert * record_bytes;
         if (MOEC_FSEEK64(f, off) != 0) { return false; }
         return std::fread(dst, 1, (size_t) record_bytes, f) == (size_t) record_bytes;
+    }
+};
+
+// [TIERED WIRE] The serving adapter: makes a v2 tiered container readable through the ordinary
+// ExpertFetcher seam, so the ResidencyCache and the whole offload path need to know NOTHING about
+// tiers. Decodes the same packed (layer, byte_offset) `src` DirContainerFetcher uses — the offset
+// was packed with tier 0's stride, so expert_id = offset / stride0 — then reads that expert from
+// the SELECTED tier's bank at expert_id * tier.record_bytes.
+//
+// TIER SELECTION IS DELIBERATELY NOT HERE. This reads tier 0 for everything: a dumb, honest
+// default that proves the read path end to end. Choosing a tier per expert is a POLICY (a
+// rate-distortion call under budget) and belongs in the governor beside the residency budget —
+// as a DivisionBandit arm gated on a quality guard, M5's lane. When that lands it replaces
+// `select_tier` and nothing else in the serving path changes.
+class TieredDirFetcher final : public ExpertFetcher {
+    TieredContainerFetcher inner_;
+    std::vector<DirTier>   tiers_;
+    uint64_t               stride0_ = 0;   // tier 0 record bytes == the stride the caller packed with
+
+public:
+    TieredDirFetcher(const char * dir, const DirTier * tiers, uint32_t n_tiers)
+        : inner_(dir), tiers_(tiers, tiers + n_tiers) {
+        if (!tiers_.empty()) { stride0_ = tiers_[0].record_bytes; }
+    }
+    const char * name() const override { return "container-tiered"; }
+    bool ok() const { return stride0_ != 0; }
+
+    // The policy seam. Constant today (see class doc); the governor replaces it.
+    uint32_t select_tier(uint32_t /*layer*/, uint32_t /*expert*/) const { return 0; }
+
+    bool fetch(void * dst, const void * src, size_t bytes) override {
+        if (stride0_ == 0) { return false; }
+        const uint64_t s   = (uint64_t) (uintptr_t) src;
+        const uint32_t L   = (uint32_t) (s >> DirContainerFetcher::LAYER_SHIFT);
+        const uint64_t off = s & DirContainerFetcher::OFF_MASK;
+        const uint32_t E   = (uint32_t) (off / stride0_);
+        const uint32_t T   = select_tier(L, E);
+        if (T >= tiers_.size()) { return false; }
+        const uint64_t rb = tiers_[T].record_bytes;
+        // The cache sized this slot for the CALLER's stride; a tier record must fit it. A coarser
+        // tier is smaller (that is the point), so this only rejects a malformed table.
+        if (rb > (uint64_t) bytes) { return false; }
+        if (!inner_.read(L, E, tiers_[T].id, rb, dst)) { return false; }
+        // Zero the tail when a coarser tier under-fills the slot, so no stale bytes from a prior
+        // occupant are read as weights (the #43 class of bug: never hand the kernel garbage).
+        if (rb < (uint64_t) bytes) {
+            std::memset((uint8_t *) dst + rb, 0, (size_t) ((uint64_t) bytes - rb));
+        }
+        return true;
+    }
+    void fetch_many(const FetchItem * items, size_t n) override {
+        for (size_t i = 0; i < n; i++) {
+            if (!fetch(items[i].dst, items[i].src, items[i].bytes)) {
+                std::memset(items[i].dst, 0, items[i].bytes);   // fail LOUD downstream, never silent wrong weights
+            }
+        }
     }
 };
 

@@ -1562,6 +1562,21 @@ static ggml_moe::ExpertFetcher &   moe_pick_base_fetcher() {
     // Constructed once with the configured dir (banks open lazily); a bad dir opens no banks and every
     // fetch fails LOUD (zeroed record -> downstream validation), never a silent wrong-source serve.
     if (const char * cdir = ggml_moe::moe_config().container_dir) {
+        // [TIERED WIRE] A v2 (tiered) container is read through TieredDirFetcher — same opaque
+        // (layer, offset) src contract, but the record comes from the SELECTED precision tier's
+        // bank. This is what lets a hot-IQ2 / cold-IQ1 pack actually serve: the whole point is
+        // shrinking the expert bank so the working set FITS, since decode here is residency- and
+        // fetch-bound (measured: 4-concurrent aggregate is flat => not launch-bound; the gather's
+        // 37x fewer D2D bytes changed nothing => the cost is the host->device FETCH). v1 manifests
+        // and unreadable/short tier tables fall through to the single-tier path unchanged.
+        static ggml_moe::DirTier tiers[8];
+        static const uint32_t n_tiers = ggml_moe::dir_container_tiers(cdir, tiers, 8);
+        if (n_tiers > 0) {
+            static ggml_moe::TieredDirFetcher tiered_fetcher(cdir, tiers, n_tiers);
+            if (tiered_fetcher.ok()) {
+                return tiered_fetcher;
+            }
+        }
         static ggml_moe::DirContainerFetcher container_fetcher(cdir);
         return container_fetcher;
     }

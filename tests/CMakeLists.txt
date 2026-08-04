@@ -265,6 +265,15 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 llama_build_and_test(test-moe-gather.cpp)
+# test-moe-residency.cpp existed (54 KB: container framing, packer, tiered pack/read, residency
+# cache) but was never REGISTERED here — so none of it compiled or ran in this build. Registering
+# it is what turns that coverage back on, including the tiered-container tests the precision-tier
+# work depends on.
+llama_build_and_test(test-moe-residency.cpp)
+# It tests INTERNAL ggml headers (ggml-moe-residency.hpp, the container/packer/fetcher family),
+# which are not on the public include path — that missing include dir is why it was never
+# registered and quietly stopped being built.
+target_include_directories(test-moe-residency PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

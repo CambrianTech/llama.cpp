@@ -26,14 +26,27 @@
 #include <psapi.h>     // GetMappedFileNameW (declaration only — DirectReadFetcher is never instantiated)
 #endif
 
+#include <cstdint>     // the stub block below uses uint8_t/size_t — must precede it
+#include <cstddef>
+
 // --- ggml stubs so the header parses standalone (ResidencyCache is never instantiated here, so these
 //     are declared-not-defined: name lookup succeeds, nothing is ODR-used, nothing to link). ---
 typedef struct ggml_backend_buffer      * ggml_backend_buffer_t;
 typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
+typedef struct ggml_backend_device      * ggml_backend_dev_t;
 extern "C" {
     ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t, size_t);
     void *                ggml_backend_buffer_get_base(ggml_backend_buffer_t);
     void                  ggml_backend_buffer_free(ggml_backend_buffer_t);
+    // Added as ggml-moe-residency.hpp grew a DEVICE-resident path (#23): the cache now asks
+    // whether a buffer is host-visible, clears device pools, and clamps its budget to real free
+    // VRAM. This block must track that surface — it went stale and the file stopped compiling,
+    // which nobody saw because the test was never registered in tests/CMakeLists.txt.
+    size_t                ggml_backend_buffer_get_size(ggml_backend_buffer_t);
+    bool                  ggml_backend_buffer_is_host(ggml_backend_buffer_t);
+    void                  ggml_backend_buffer_clear(ggml_backend_buffer_t, uint8_t);
+    ggml_backend_dev_t    ggml_backend_buft_get_device(ggml_backend_buffer_type_t);
+    void                  ggml_backend_dev_memory(ggml_backend_dev_t, size_t *, size_t *);
 }
 
 #include "ggml-moe-residency.hpp"
@@ -598,6 +611,68 @@ static void test_tiered_fetcher_reads_selected_tier() {
     CHECK(missing_false, "TieredContainerFetcher: missing (layer,tier) shard returns false, no crash");
 }
 
+// what this catches: the SERVING WIRE for tiered containers. The tiered packer and reader were both
+// implemented and tested, but nothing could read a v2 container through the ordinary ExpertFetcher
+// seam — so a hot-IQ2/cold-IQ1 pack could be BUILT and never SERVED. This drives TieredDirFetcher
+// exactly as the serving path does: pack a 2-tier container, parse the tier table off the manifest,
+// then fetch with the same opaque (layer, byte_offset) src DirContainerFetcher uses (offset packed
+// with tier 0's stride) and require the SELECTED tier's bytes back. Also pins the two invariants the
+// #43 class taught us: a coarser tier that under-fills the cache slot must ZERO the tail (never hand
+// the kernel a previous occupant's bytes), and dir_container_record_bytes must report tier 0's
+// stride for a v2 manifest (0 would make the serving caller treat the container as ABSENT).
+static void test_tiered_dir_fetcher_serving_wire() {
+    using namespace ggml_moe;
+    static SyntheticTierSource w0(0), w1(1);
+    auto source_for = [](uint32_t t, void *) -> ExpertSource & { return t == 0 ? (ExpertSource &) w0 : (ExpertSource &) w1; };
+    const TierSpec tiers[2] = { { 0, MOEC_Q_RVQ3, 8192 }, { 1, MOEC_Q_IQ2, 4096 } };
+    const uint32_t layers = 3, experts = 4, top_k = 8;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "moec_tierwire_test";
+    fs::remove_all(dir); fs::create_directories(dir);
+    CHECK(moec_pack_dir_tiered(dir.string().c_str(), "tiered-wire", MOEC_Q_UNKNOWN,
+          layers, experts, top_k * layers, top_k, tiers, 2, source_for, nullptr), "pack tiered for wire");
+
+    // 1) the manifest v2 tier table parses, and reports what the serving path needs
+    DirTier parsed[8];
+    const uint32_t n = dir_container_tiers(dir.string().c_str(), parsed, 8);
+    CHECK(n == 2, "dir_container_tiers parses both tiers off a v2 manifest");
+    CHECK(parsed[0].record_bytes == 8192 && parsed[1].record_bytes == 4096,
+          "tier table carries each tier's own record_bytes, descending");
+    CHECK(dir_container_record_bytes(dir.string().c_str()) == 8192,
+          "v2 manifest reports tier 0's stride (0 would read as 'container absent')");
+
+    bool served = true, tail_zeroed = true;
+    {   // SCOPE: bank handles must close before remove_all on Windows
+        TieredDirFetcher f(dir.string().c_str(), parsed, n);
+        CHECK(f.ok(), "TieredDirFetcher initialises from the manifest tier table");
+        // 2) fetch through the ExpertFetcher seam with a DirContainerFetcher-packed src
+        for (uint32_t L = 0; L < layers && served; L++) {
+            for (uint32_t E = 0; E < experts && served; E++) {
+                std::vector<uint8_t> slot((size_t) parsed[0].record_bytes, 0xCD);   // pre-dirty the slot
+                const uint64_t src = DirContainerFetcher::pack_src(L, (uint64_t) E * parsed[0].record_bytes);
+                if (!f.fetch(slot.data(), (const void *) (uintptr_t) src, slot.size())) { served = false; break; }
+                // tier 0 is selected today (policy is the governor's) => tier 0's marker
+                if (slot[0] != (uint8_t)(0x10 + 0 * 0x40 + L * 4 + E)) { served = false; break; }
+            }
+        }
+        // 3) a coarser tier under-filling the slot must zero the tail, not leave stale bytes
+        DirTier coarse_only[1] = { parsed[1] };            // tier 1 (4096) as the only tier
+        TieredDirFetcher f2(dir.string().c_str(), coarse_only, 1);
+        std::vector<uint8_t> slot(8192, 0xCD);
+        const uint64_t src = DirContainerFetcher::pack_src(0, 0);
+        if (f2.fetch(slot.data(), (const void *) (uintptr_t) src, slot.size())) {
+            for (size_t i = 4096; i < slot.size(); i++) {
+                if (slot[i] != 0) { tail_zeroed = false; break; }
+            }
+        } else {
+            tail_zeroed = false;
+        }
+    }
+    fs::remove_all(dir);
+    CHECK(served, "TieredDirFetcher serves the selected tier through the ExpertFetcher seam");
+    CHECK(tail_zeroed, "a coarser tier zero-fills the slot tail — no stale bytes reach the kernel");
+}
+
 // what this catches: the GGUF expert-slice math — the crux of extracting one expert's IQ2 bytes from a
 // blk.N.ffn_*_exps.weight tensor. Slices must be equal-size, contiguous, non-overlapping, and cover the
 // whole tensor (or the byte-copy grabs a neighbour's weights — a silent wrong-expert bug). Also rejects
@@ -826,6 +901,7 @@ int main(int argc, char ** argv) {
     test_iq2_source_packs_and_reads_back();
     test_tiered_container_packs_and_reads_back();
     test_tiered_fetcher_reads_selected_tier();
+    test_tiered_dir_fetcher_serving_wire();
     test_gguf_expert_slice_math();
     test_activated_per_token_is_total_not_per_layer();
     test_refcache_reuse_with_locality();
