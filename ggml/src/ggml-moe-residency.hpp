@@ -166,6 +166,7 @@ struct MoeServingConfig {
     std::string  plan_path;                               // GGML_MOE_PLAN_FILE    (controller actuator plan)
     const char * container_dir    = nullptr;              // GGML_MOE_CONTAINER    (v1 per-layer expert container dir -> DirContainerFetcher)
     bool         gather           = false;                // GGML_MOE_GATHER       (pointer-table MUL_MAT_ID consume-arm, task #23 Cut 2 — opt-in until measured)
+    bool         gather_identity  = false;                // GGML_MOE_GATHER_IDENTITY (BISECT: publish the table with NATURAL offsets AND keep every copy — exercises the kernel's table path on bytes identical to the copy path)
 
     static MoeServingConfig from_env() {
         MoeServingConfig c;
@@ -181,6 +182,8 @@ struct MoeServingConfig {
         if (const char * v = getenv("GGML_MOE_PLAN_FILE"))  { c.plan_path = v; }
         c.container_dir = getenv("GGML_MOE_CONTAINER");
         c.gather        = getenv("GGML_MOE_GATHER")       != nullptr;
+        c.gather_identity = getenv("GGML_MOE_GATHER_IDENTITY") != nullptr;
+        if (c.gather_identity) { c.gather = true; }   // identity mode implies the table is built
         return c;
     }
 };

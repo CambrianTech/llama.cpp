@@ -1746,6 +1746,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     const bool host_cache_on = host_cache.enabled();
     // [MOE-GATHER #23] opt-in consume-arm; tables recycle at the same per-call cadence as the clock
     static const bool moe_gather_on = ggml_moe::moe_config().gather;
+    // [MOE-GATHER #23 BISECT] identity mode: publish the table (all entries = the expert's NATURAL
+    // offset in input_cpy) but keep EVERY copy, so the kernel's table path runs over bytes byte-for-byte
+    // identical to the copy path. Splits a gather-only failure cleanly in two: still broken => the
+    // kernel's table arithmetic is wrong at real shapes/quants; clean => the addresses or the slot
+    // lifetime are wrong, not the kernel.
+    static const bool moe_gather_identity = ggml_moe::moe_config().gather_identity;
     if (moe_gather_on) { g_moe_gather_tables.reset(sched->cur_copy); }
     size_t  moe_bytes_streamed  = 0;
     int64_t moe_experts_streamed = 0;
@@ -2014,7 +2020,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                                                    fetch_src, expert_size, pad);
                                 moe_experts_streamed += 1;
                                 int64_t gent = 0;
-                                if (gtab != nullptr && slot.ok() &&
+                                if (gtab != nullptr && !moe_gather_identity && slot.ok() &&
                                     gentry(input_cpy, slot.buffer, slot.offset, &gent)) {
                                     // [MOE-GATHER #23] the kernel reads the slot IN PLACE through the
                                     // table — zero bytes moved for this expert (hit or freshly-admitted
