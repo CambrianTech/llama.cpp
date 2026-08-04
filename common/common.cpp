@@ -392,6 +392,17 @@ void common_init() {
     common_log_set_timestamps(common_log_main(), true);
 
     llama_log_set(common_log_default_callback, NULL);
+
+#if !defined(NDEBUG) || (defined(_MSC_VER) && defined(_DEBUG)) || (!defined(_MSC_VER) && !defined(__OPTIMIZE__))
+    // Straight to stderr, before any verbosity filtering. common_params_print_info() does carry a
+    // "(debug)" marker, but at COM_TRC -- which the default verbosity hides, so it is invisible in
+    // exactly the situation that matters. llama-bench has warned about this on stderr for years;
+    // llama-server and perplexity, the tools most likely to be producing a number someone will act
+    // on, had no signal at all. Cost of that gap: hours of MoE decode measurements taken against a
+    // Debug build before anyone noticed. Release builds print nothing.
+    fprintf(stderr, "warning: DEBUG BUILD (asserts enabled) -- performance numbers from this "
+                    "process are not valid\n");
+#endif
 }
 
 void common_params_print_info(const common_params & params, bool print_devices) {
