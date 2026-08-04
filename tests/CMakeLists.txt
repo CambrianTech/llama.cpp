@@ -342,3 +342,19 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# -----------------------------------------------------------------------------
+# Registration guard: every tests/test-*.cpp must be named above, or a fully
+# written test file silently never compiles and never runs. See
+# ${CMAKE_SOURCE_DIR}/cmake/check-tests-registered.cmake for what this catches and why.
+# -----------------------------------------------------------------------------
+
+# Deliberately not built. One entry per file, with the reason.
+set(LLAMA_TESTS_UNREGISTERED
+    test-double-float.cpp   # upstream-disabled: too slow for the default suite
+)
+
+set(CHECK_TESTS_DIR                "${CMAKE_CURRENT_SOURCE_DIR}")
+set(CHECK_TESTS_MANIFEST           "${CMAKE_CURRENT_LIST_FILE}")
+set(CHECK_TESTS_ALLOW_UNREGISTERED ${LLAMA_TESTS_UNREGISTERED})
+include(${CMAKE_SOURCE_DIR}/cmake/check-tests-registered.cmake)
