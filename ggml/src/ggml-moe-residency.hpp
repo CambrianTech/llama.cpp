@@ -541,7 +541,15 @@ class ResidencyCache {
         }
         // DEVICE-resident (#23): allocate VRAM slots through device_buft_; else the caller's host_buft.
         ggml_backend_buffer_type_t buft = device_backed_ ? device_buft_ : host_buft;
-        p.buf = buft ? ggml_backend_buft_alloc_buffer(buft, p.max_slots * p.slot_size) : nullptr;
+        // [MOE-GATHER #23] TAIL GUARD. Quantized matmul kernels (CUDA MMQ especially) READ PAST the end
+        // of a row — upstream's copy arm exists precisely to feed them: it copies expert_size + pad so
+        // the tail lands on the NEXT expert's real bytes inside the staging tensor, always in-bounds.
+        // Under gather the kernel reads a POOL SLOT instead, so a tail read from the LAST slot runs off
+        // the end of the pool allocation entirely — an out-of-bounds device read whose contents are
+        // undefined and can carry NaN/Inf bit patterns. Rare (needs the routed expert to sit in the
+        // final slot), which matches a fault that appears only after many coherent tokens. One extra
+        // slot of guard makes every tail read in-bounds for the cost of one slot.
+        p.buf = buft ? ggml_backend_buft_alloc_buffer(buft, p.max_slots * p.slot_size + p.slot_size) : nullptr;
         if (p.buf == nullptr) {
             p.failed = true;
             fprintf(stderr,
