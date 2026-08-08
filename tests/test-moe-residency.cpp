@@ -677,6 +677,49 @@ static void test_tiered_dir_fetcher_serving_wire() {
     CHECK(tail_zeroed, "a coarser tier zero-fills the slot tail — no stale bytes reach the kernel");
 }
 
+// what this catches: an UNPRICED node reading as a FREE one. lambda is the price of a byte of
+// residency, and the whole point of putting it on the wire is that a peer's governor compares its
+// price against ours to decide where work runs. 0 means "the controller has not published a price",
+// which must stay distinguishable from "priced at zero" — because a node that looks free is a node
+// every peer routes work to. An old plan file with no lambda key must parse to UNPRICED, not to a
+// price of zero, or the first grid that mixes binary versions silently stampedes the stale node.
+//
+// Also pins that lambda is ADDITIVE: a plan written by a controller that never heard of it still
+// parses its budget and window correctly.
+static void test_lambda_is_unpriced_not_free() {
+    using namespace ggml_moe;
+
+    // An OLD plan — no lambda key at all.
+    PagerPlan old_plan;
+    CHECK(parse_pager_plan("{\"version\":1,\"budget_bytes\":4096,\"window_k\":3}", old_plan),
+          "a pre-lambda plan still parses");
+    CHECK(old_plan.budget_bytes == 4096, "budget survives on a pre-lambda plan");
+    CHECK(old_plan.window_k == 3, "window survives on a pre-lambda plan");
+    CHECK(!old_plan.priced(), "no lambda key => UNPRICED, never a price of zero");
+
+    // A priced plan.
+    PagerPlan priced_plan;
+    CHECK(parse_pager_plan(
+              "{\"version\":1,\"budget_bytes\":8192,\"window_k\":2,\"lambda_micro_per_byte\":250}",
+              priced_plan),
+          "a priced plan parses");
+    CHECK(priced_plan.lambda_micro_per_byte == 250, "lambda round-trips off the wire");
+    CHECK(priced_plan.priced(), "a published price reads as priced");
+
+    // The fetcher carries the price without acting on it yet: select_tier is
+    // deliberately still constant, because choosing FROM the price is a learned
+    // policy under a quality guard, not a units decision. If someone later makes
+    // select_tier read lambda with a hand-tuned rule, this assertion is the
+    // tripwire that says the policy arrived without its guard.
+    const DirTier tiers[2] = { { 0, MOEC_Q_RVQ3, 8192 }, { 1, MOEC_Q_IQ2, 4096 } };
+    TieredDirFetcher f("/nonexistent-dir-for-price-check", tiers, 2);
+    CHECK(!f.priced(), "a fetcher starts UNPRICED");
+    f.set_lambda_micro_per_byte(priced_plan.lambda_micro_per_byte);
+    CHECK(f.priced() && f.lambda_micro_per_byte() == 250, "the fetcher carries the published price");
+    CHECK(f.select_tier(0, 0) == 0 && f.select_tier(2, 3) == 0,
+          "tier choice is STILL constant — the price is wired, the policy is the governor's");
+}
+
 // what this catches: the GGUF expert-slice math — the crux of extracting one expert's IQ2 bytes from a
 // blk.N.ffn_*_exps.weight tensor. Slices must be equal-size, contiguous, non-overlapping, and cover the
 // whole tensor (or the byte-copy grabs a neighbour's weights — a silent wrong-expert bug). Also rejects
@@ -964,6 +1007,7 @@ int main(int argc, char ** argv) {
     test_tiered_container_packs_and_reads_back();
     test_tiered_fetcher_reads_selected_tier();
     test_tiered_dir_fetcher_serving_wire();
+    test_lambda_is_unpriced_not_free();
     test_gguf_expert_slice_math();
     test_activated_per_token_is_total_not_per_layer();
     test_refcache_reuse_with_locality();

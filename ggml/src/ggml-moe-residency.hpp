@@ -108,8 +108,40 @@ struct PagerPlan {
                                         // sticky-leased. The DEVICE-backed ResidencyCache uses THIS, not the env,
                                         // exactly as the host cache uses budget_bytes (governor-arbitrated day one).
     uint32_t window_k     = 0;
+    // λ — THE PRICE OF A BYTE OF RESIDENCY, in micro-units of value per byte.
+    //
+    // Residency under a budget is rate-distortion under a constraint, and its
+    // Lagrange multiplier is a price: the marginal value the controller is
+    // willing to pay for one more resident byte. Keeping a byte is worth it iff
+    // (expected value of keeping it) >= lambda * (its bytes). That is the same
+    // object a congestion-priced network computes at a link, which is why it is
+    // spelled as a price here rather than folded into an internal score.
+    //
+    // Why it is ON THE WIRE instead of internal to the cache: a price is the
+    // entire interface between two nodes that want to trade work. If this stays
+    // a private number, one machine can tune itself and nothing else can read
+    // what its capacity is WORTH; published, a peer's governor compares its own
+    // lambda against this one and decides where work should run without either
+    // machine seeing the other's internals. Costs nothing today with one node,
+    // and is the whole difference at n=2 and beyond.
+    //
+    // 0 = unpriced (the controller has not set a price): every consumer falls
+    // back to today's behaviour. NOT "free" — an unset price must never read as
+    // a zero cost, or an unpriced node looks infinitely cheap to a peer.
+    //
+    // The NUMERAIRE is deliberately not defined here. lambda is a leaf price
+    // set by willingness-to-pay flowing DOWN from the activity that wants the
+    // tokens; hit-rate is the pager's local gradient, not the unit of account.
+    // Denominating this in hit-rate would make two nodes' prices incomparable —
+    // the one way this seam could silently fork.
+    uint64_t lambda_micro_per_byte = 0;
     std::vector<std::pair<uint32_t,uint32_t>> pins;   // (layer, expert)
     bool     ok           = false;
+
+    // True when the controller published a price. Distinguishes "priced at
+    // zero" from "never priced" for any consumer that must not treat an
+    // unpriced node as a free one.
+    bool priced() const { return lambda_micro_per_byte != 0; }
 };
 static inline bool parse_pager_plan(const char * text, PagerPlan & plan) {
     if (!text) { return false; }
@@ -123,9 +155,14 @@ static inline bool parse_pager_plan(const char * text, PagerPlan & plan) {
     long long b  = num_after("\"budget_bytes\"");
     long long db = num_after("\"device_budget_bytes\"");
     long long k  = num_after("\"window_k\"");
+    // Absent key => num_after returns -1 => field untouched, so an OLD plan file
+    // (no lambda) parses to unpriced rather than to a price of zero. Additive by
+    // construction: a controller that has never heard of lambda keeps working.
+    long long lam = num_after("\"lambda_micro_per_byte\"");
     if (b  >= 0) { plan.budget_bytes        = (uint64_t) b;  }
     if (db >= 0) { plan.device_budget_bytes = (uint64_t) db; }
     if (k  >= 0) { plan.window_k            = (uint32_t) k;  }
+    if (lam > 0) { plan.lambda_micro_per_byte = (uint64_t) lam; }
     // pin_list: scan {"layer":L,"expert":E} objects inside the "pin_list" array
     const char * pl = std::strstr(text, "\"pin_list\"");
     if (pl) {

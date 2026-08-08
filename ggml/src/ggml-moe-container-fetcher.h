@@ -307,6 +307,7 @@ class TieredDirFetcher final : public ExpertFetcher {
     TieredContainerFetcher inner_;
     std::vector<DirTier>   tiers_;
     uint64_t               stride0_ = 0;   // tier 0 record bytes == the stride the caller packed with
+    uint64_t               lambda_  = 0;   // λ price of a resident byte; 0 = UNPRICED (see set_lambda_micro_per_byte)
 
 public:
     TieredDirFetcher(const char * dir, const DirTier * tiers, uint32_t n_tiers)
@@ -316,7 +317,33 @@ public:
     const char * name() const override { return "container-tiered"; }
     bool ok() const { return stride0_ != 0; }
 
-    // The policy seam. Constant today (see class doc); the governor replaces it.
+    // [λ SEAM] The price of a byte of residency, in micro-units of value per
+    // byte, as published by the controller on the plan wire
+    // (`PagerPlan::lambda_micro_per_byte`). 0 = UNPRICED, which is not the same
+    // as free: an unpriced node must not read as infinitely cheap.
+    //
+    // Set here rather than derived here on purpose. A tier choice is a
+    // rate-distortion call — spend bytes where they buy the most value — and
+    // the multiplier that makes "value" and "bytes" commensurable is a PRICE
+    // that belongs to the governor, because it is also the number a peer reads
+    // to decide where work should run. The fetcher's job is to consult it, not
+    // to invent it.
+    void set_lambda_micro_per_byte(uint64_t lambda) { lambda_ = lambda; }
+    uint64_t lambda_micro_per_byte() const { return lambda_; }
+    bool priced() const { return lambda_ != 0; }
+
+    // [POLICY SEAM] Which precision to read for this expert.
+    //
+    // STILL CONSTANT — and deliberately so. Wiring the price in is a UNITS
+    // decision (free today, and what lets two nodes compare); choosing tiers
+    // from it is a LEARNED POLICY gated on a quality guard, which is the
+    // governor's (M5's) lane and lands as a DivisionBandit arm. Writing a
+    // hand-tuned rule here would be worse than leaving it constant: it would
+    // present as a working policy while contributing nothing learned, and a
+    // heuristic that LOOKS counted is harder to remove than an honest stub.
+    //
+    // When the governed selector lands it replaces this body and reads
+    // `lambda_`; nothing else in the serving path changes.
     uint32_t select_tier(uint32_t /*layer*/, uint32_t /*expert*/) const { return 0; }
 
     bool fetch(void * dst, const void * src, size_t bytes) override {
