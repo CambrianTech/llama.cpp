@@ -58,6 +58,11 @@ logger = logging.getLogger("hf-to-gguf")
 AnyModel = TypeVar("AnyModel", bound="type[ModelBase]")
 
 
+# for checkpoints that ship no config.json, we will try to provide a synthetic one
+HparamsMatcher = Callable[[Path], bool]
+HparamsLoader = Callable[[Path], dict[str, Any]]
+
+
 class SentencePieceTokenTypes(IntEnum):
     NORMAL = 1
     UNKNOWN = 2
@@ -120,6 +125,7 @@ class ModelBase:
         ModelType.TEXT: {},
         ModelType.MMPROJ: {},
     }
+    _hparams_loaders: list[tuple[HparamsMatcher, HparamsLoader]] = []
 
     dir_model: Path
     ftype: gguf.LlamaFileType
@@ -696,6 +702,43 @@ class ModelBase:
         return ()
 
     @staticmethod
+    def repack_mxfp4_blocks(packed: Tensor, scale: Tensor) -> np.ndarray:
+        """
+        Repack 4-bit MX weights into ggml `block_mxfp4`. Lossless - only moves bits.
+
+        Source (compressed-tensors "mxfp4-pack-quantized", also used by DeepSeek-V4):
+          packed  uint8 [rows, cols/2]  element 2i in the low nibble, 2i+1 in the high one
+          scale   uint8 [rows, cols/32] one E8M0 biased exponent per 32-element group
+
+        Destination, per group: one scale byte then 16 code bytes, where byte j holds
+        element j in the low nibble and element j+16 in the high one.
+
+        The 4-bit codes need no remapping: both sides index into ggml's kvalues_mxfp4
+        order. ggml doubles the kvalues and halves the scale, so the value is the same.
+        """
+        p = packed.contiguous().view(torch.uint8)
+        s = scale.contiguous().view(torch.uint8)
+
+        rows, packed_cols = p.shape
+        cols = packed_cols * 2
+        if cols % 32 != 0:
+            raise ValueError(f"MXFP4 source row has {cols} values, expected a multiple of 32")
+
+        n_blocks = cols // 32
+        if tuple(s.shape) != (rows, n_blocks):
+            raise ValueError(f"MXFP4 scale shape {tuple(s.shape)} does not match {(rows, n_blocks)}")
+
+        src = p.reshape(rows, n_blocks, 16)
+        lo = src & 0x0F           # elements 0, 2, 4, ...
+        hi = (src >> 4) & 0x0F    # elements 1, 3, 5, ...
+
+        vals = torch.stack((lo, hi), dim=-1).reshape(rows, n_blocks, 32)
+        qs = vals[:, :, :16] | (vals[:, :, 16:] << 4)
+
+        raw = torch.cat((s.unsqueeze(-1), qs.to(torch.uint8)), dim=-1)
+        return raw.reshape(rows, n_blocks * 17).cpu().numpy()
+
+    @staticmethod
     def _nvfp4_pack(weight: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
         """Repack NVFP4 ModelOpt tensors into ggml super-block layout.
         Preserves original E4M3 scale bits as UE4M3 (strip sign bit).
@@ -866,7 +909,7 @@ class ModelBase:
             elif any(str(v.get("quant_algo")).endswith("NVFP4") for v in quant_layers.values() if isinstance(v, dict)):
                 quant_algo = "NVFP4"
 
-        self._is_nvfp4 = quant_algo == "NVFP4"
+        self._is_nvfp4 = quant_algo in ("NVFP4", "W4A16_NVFP4")
         self._is_mxfp4 = quant_method == "mxfp4"
 
         # NVFP4 weights are repacked and written directly to gguf_writer.
@@ -1084,6 +1127,24 @@ class ModelBase:
         return part_names
 
     @staticmethod
+    def load_hparams_guess(dir_model: Path) -> dict[str, Any] | None:
+        # some models ship no config.json, will try to guess them
+        from conversion import load_all_models
+        load_all_models()
+
+        for matcher, loader in ModelBase._hparams_loaders:
+            if matcher(dir_model):
+                return loader(dir_model)
+        return None
+
+    @classmethod
+    def register_hparams_loader(cls, matcher: HparamsMatcher) -> Callable[[HparamsLoader], HparamsLoader]:
+        def inner(loader: HparamsLoader) -> HparamsLoader:
+            cls._hparams_loaders.append((matcher, loader))
+            return loader
+        return inner
+
+    @staticmethod
     def load_hparams(dir_model: Path, is_mistral_format: bool):
         if is_mistral_format:
             with open(dir_model / "params.json", "r", encoding="utf-8") as f:
@@ -1096,6 +1157,10 @@ class ModelBase:
             config = AutoConfig.from_pretrained(dir_model, trust_remote_code=False).to_dict()
         except Exception as e:
             logger.warning(f"Failed to load model config from {dir_model}: {e}")
+            if not (dir_model / "config.json").is_file():
+                config = ModelBase.load_hparams_guess(dir_model)
+                if config is not None:
+                    return config
             logger.warning("Trying to load config.json instead")
             with open(dir_model / "config.json", "r", encoding="utf-8") as f:
                 config = json.load(f)
@@ -1124,6 +1189,14 @@ class ModelBase:
             model_type = ModelType.MMPROJ if modelcls.model_arch == gguf.MODEL_ARCH.MMPROJ else ModelType.TEXT
             for name in names:
                 cls._model_classes[model_type][name] = modelcls
+            return modelcls
+        return func
+
+    @classmethod
+    def example(cls, *hf_repos: str) -> Callable[[AnyModel], AnyModel]:
+        del hf_repos  # unused
+
+        def func(modelcls: AnyModel) -> AnyModel:
             return modelcls
         return func
 

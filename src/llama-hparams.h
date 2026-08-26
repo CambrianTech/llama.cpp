@@ -48,11 +48,16 @@ struct llama_hparams {
     bool use_par_res;
     bool swin_norm;
     bool norm_before_residual = false;
+    bool norm_before_fc       = false;
 
     uint32_t n_ctx_train; // context size the model was trained on
     uint32_t n_embd;
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
+
+    // granite-switch: index of the single-head "router" KV layer that encodes
+    // per-token adapter selection. -1 when the model has no such layer.
+    int32_t  router_layer = -1;
     uint32_t n_expert = 0;
     uint32_t n_expert_used = 0;
     uint32_t n_rel_attn_bkts = 0;
@@ -95,6 +100,11 @@ struct llama_hparams {
     uint32_t n_expert_groups    = 0;
     uint32_t n_group_used       = 0;
     uint32_t n_group_experts    = 0;
+
+    // MLA + SWA (i.e. dots3note)
+    uint32_t n_lora_kv_swa           = 0;
+    uint32_t n_embd_head_k_mla_swa   = 0;
+    uint32_t n_embd_head_v_mla_swa   = 0;
 
     float    expert_group_scale   = 0.05f;
     float    expert_weights_scale = 0.0f;
@@ -139,6 +149,10 @@ struct llama_hparams {
 
     std::array<int, 4> rope_sections;
 
+    // Per-layer RoPE enable flags (1 = use RoPE, 0 = NoPE)
+    // by default, all layers use RoPE (controlled by rope_finetuned)
+    std::array<uint32_t, LLAMA_MAX_LAYERS> rope_pattern;
+
     // Sliding Window Attention (SWA)
     llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
     // the size of the sliding window (0 - no SWA)
@@ -160,8 +174,19 @@ struct llama_hparams {
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
 
+    // for MiniMax-Text-01 linear attention
+    uint32_t n_embd_head_la = 0;
+
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
+    bool     kda_safe_gate = false;
+
+    // kimi-k3
+    uint32_t n_expert_latent      = 0;      // routed_expert_hidden_size (0 = experts run at n_embd)
+    uint32_t attn_res_block_size  = 0;      // 0 = no cross-layer attention residuals
+    float    kda_gate_lower_bound = -INFINITY;
+    float    situ_beta            = 1.0f;
+    float    situ_linear_beta     = 0.0f;   // 0 = no linear-beta transform on the up branch
 
     // kimi-k3
     uint32_t n_expert_latent      = 0;      // routed_expert_hidden_size (0 = experts run at n_embd)
@@ -237,8 +262,6 @@ struct llama_hparams {
     // MSA
     uint32_t indexer_block_size  = 0;
     uint32_t indexer_local_blocks = 0;
-    // MSA stores its indexer keys in the main KV cache (k_idx tensors);
-    bool indexer_kv = false;
 
     // Indexer is "full" (1) or "shared" (0)
     // Shared indexers reuse top-k from previous full layer
@@ -363,9 +386,6 @@ struct llama_hparams {
     uint32_t n_embd_k_gqa_max() const;
     uint32_t n_embd_v_gqa_max() const;
 
-    // dimension of the single-head MSA indexer key stream
-    uint32_t n_embd_k_idx(uint32_t il = 0) const;
-
     // dimension of the rolling state embeddings
     // corresponds to Mamba's conv_states size or RWKV's token_shift states size
     uint32_t n_embd_r() const;
@@ -382,6 +402,8 @@ struct llama_hparams {
     uint32_t n_embd_head_v_mla() const;
 
     bool has_kv(uint32_t il) const;
+
+    bool has_rope(uint32_t il) const;
 
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
