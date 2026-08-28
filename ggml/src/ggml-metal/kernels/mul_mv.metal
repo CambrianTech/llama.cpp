@@ -3125,6 +3125,7 @@ kernel void kernel_mul_mv_id(
         device const char * src1,
         device       char * dst,
         device const char * ids,
+        device const ulong * eptrs,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -3143,7 +3144,13 @@ kernel void kernel_mul_mv_id(
     const int64_t i1 = idx;
     const int64_t i2 = i12;
 
-    device const char * src0_cur = src0s + i02*args.nb02;
+    // [MOE-GATHER #23] table-driven expert base: eptrs[i02] is the byte offset of
+    // expert i02's weights relative to the src0 tensor start (identity table:
+    // i02*nb02) — lets recency-scattered cache slots / open expert populations
+    // consume zero-copy. use_eptrs==0 is the classic contiguous stride.
+    device const char * src0_cur = args.use_eptrs
+        ? src0s + eptrs[i02]
+        : src0s + i02*args.nb02;
     device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
 
     device char * dst_cur = dst + (i1*args.ne0 + i2*args.ne1*args.ne0)*sizeof(float);

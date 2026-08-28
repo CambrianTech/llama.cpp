@@ -343,6 +343,12 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
 
+// [MOE-GATHER #23] GPU virtual address of a host pointer inside this Metal buffer (MTLBuffer.gpuAddress
+// + intra-buffer delta), or 0 when the pointer is not covered / the OS lacks gpuAddress. Cross-buffer
+// pointer arithmetic in a kernel is only valid in GPU VA space — CPU deltas do NOT transfer — so the
+// gather offset table must be built from these, never from host pointers.
+uint64_t ggml_metal_buffer_gpu_va(ggml_metal_buffer_t buf, const void * ptr);
+
 #ifdef __cplusplus
 }
 #endif

@@ -4867,6 +4867,43 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-OFFSET table,
+    // docs/serving/MOE-GATHER-MULMATID.md). CUDA implements the gather for the mmf
+    // (non-quantized) MV/decode path so far; accept ONLY shapes that route there and
+    // reject the rest (mm/prefill via mul_mat_f_ids, and quantized mmvq) so the
+    // scheduler falls back rather than compute a wrong contiguous-stride result.
+    // Partial rollout is the designed state (mirrors the Metal gate).
+    if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != NULL) {
+        const ggml_tensor * gsrc0 = op->src[0];
+        const ggml_tensor * gsrc1 = op->src[1];
+        const int gcc = ggml_cuda_info().devices[dev_ctx->device].cc;
+        // Only TWO CUDA kernels implement the gather: mul_mat_vec_q (mmvq) and mul_mat_f (mmf, MV
+        // shape). This predicate must MIRROR ggml_cuda_mul_mat_id's dispatch EXACTLY — accepting a
+        // shape the dispatcher then routes to a non-gather kernel (mmq / mul_mat_f_ids / the sorted
+        // path) is silently fatal: the consume-arm skips the copy for gathered experts, so that kernel
+        // reads never-written input_cpy => garbage => NaN logits => sampler assert. That mismatch was
+        // the real #23 Cut-2 NaN: the gate said "ne2<=16 && quantized" but mmvq only claims
+        // ne2 <= get_mmvq_mmid_max_batch() (4-6 for IQ2/Q4!), so mid-size batches fell through to MMQ.
+        bool gathered = false;
+        if (gsrc1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {
+            bool took_mmvq = false;
+            if (op->ne[2] <= MMVQ_MAX_BATCH_SIZE && ggml_is_quantized(gsrc0->type)) {
+                took_mmvq = op->ne[2] <= get_mmvq_mmid_max_batch(gsrc0->type, gcc);
+            }
+            if (took_mmvq) {
+                gathered = true;                                  // mul_mat_vec_q — gathered
+            } else if (ggml_cuda_should_use_mmq(gsrc0->type, gcc, gsrc1->ne[2], /*n_experts=*/gsrc0->ne[2])) {
+                gathered = false;                                 // mul_mat_q — NOT gathered
+            } else if (ggml_cuda_should_use_mmf(gsrc0->type, gcc, WARP_SIZE, gsrc0->ne, gsrc0->nb, gsrc1->ne[2], /*mul_mat_id=*/true)) {
+                gathered = op->ne[2] <= 16;                       // mul_mat_f (MV) gathered; >16 = mul_mat_f_ids, not
+            }
+        }
+        if (!gathered) {
+            return false;   // scheduler falls back / consume-arm copies as before
+        }
+        // fall through: a gather-capable kernel will consume src[3].
+    }
+
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda(op->src[i]->buffer->buft)) {
@@ -5472,6 +5509,25 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// [MOE-GATHER #23] CUDA repr of an expert-table entry: SIGNED byte delta of the resident slot
+// relative to src0_cpy's data pointer. CUDA device pointers are directly comparable under unified
+// virtual addressing, so — unlike Metal, which must resolve MTLBuffer.gpuAddress — the raw pointer
+// delta IS the transferable entry the gather kernel adds to vx. Delta is signed (a slot may live
+// below src0 in the VA space). false => sources aren't CUDA buffers => consume-arm copies as before.
+static bool ggml_backend_cuda_moe_gather_entry(const struct ggml_tensor * src0_cpy,
+        ggml_backend_buffer_t slot_buf, size_t slot_off, int64_t * entry) {
+    if (src0_cpy == nullptr || src0_cpy->buffer == nullptr || slot_buf == nullptr || entry == nullptr) {
+        return false;
+    }
+    if (!ggml_backend_buffer_is_cuda(src0_cpy->buffer) || !ggml_backend_buffer_is_cuda(slot_buf)) {
+        return false;
+    }
+    const char * p_src0 = (const char *) src0_cpy->data;
+    const char * p_slot = (const char *) ggml_backend_buffer_get_base(slot_buf) + slot_off;
+    *entry = (int64_t) (p_slot - p_src0);
+    return true;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5491,6 +5547,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_moe_gather_entry") == 0) {
+        return (void *)ggml_backend_cuda_moe_gather_entry;
     }
     return nullptr;
 }

@@ -209,6 +209,15 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // [MOE-GATHER #23] "ggml_backend_moe_gather_entry": build ONE entry of the expert base table
+    // (ggml_mul_mat_id_gather's src[3]) for a cache slot living at `slot_off` inside `slot_buf`,
+    // to be consumed by a MUL_MAT_ID whose (device-side) src0 is `src0_cpy`. The REPRESENTATION is
+    // backend-owned: Metal returns a GPU-VA byte delta relative to src0_cpy's tensor start (MSL
+    // addresses through the bound src0 pointer); CUDA returns an absolute device pointer. Returns
+    // false when the slot is not addressable by this backend (caller falls back to the copy path).
+    typedef bool (*ggml_backend_moe_gather_entry_t)(const struct ggml_tensor * src0_cpy,
+        ggml_backend_buffer_t slot_buf, size_t slot_off, int64_t * entry);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

@@ -3352,6 +3352,26 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+// ggml_mul_mat_id_gather
+
+struct ggml_tensor * ggml_mul_mat_id_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * expert_ptrs) {
+    GGML_ASSERT(expert_ptrs != NULL);
+    GGML_ASSERT(expert_ptrs->type == GGML_TYPE_I64);
+    GGML_ASSERT(ggml_is_contiguous(expert_ptrs));
+    // one base address per expert routed over; the table may exceed as->ne[2]
+    // (open expert populations) but never undercover it.
+    GGML_ASSERT(expert_ptrs->ne[0] >= as->ne[2]);
+
+    struct ggml_tensor * result = ggml_mul_mat_id(ctx, as, b, ids);
+    result->src[3] = expert_ptrs;
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

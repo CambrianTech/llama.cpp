@@ -165,6 +165,13 @@ struct MoeServingConfig {
     size_t       capture_cap_bytes = 32ull * 1024 * 1024; // GGML_MOE_CAPTURE_MB   (capture rotate threshold)
     std::string  plan_path;                               // GGML_MOE_PLAN_FILE    (controller actuator plan)
     const char * container_dir    = nullptr;              // GGML_MOE_CONTAINER    (v1 per-layer expert container dir -> DirContainerFetcher)
+    bool         gather           = false;                // GGML_MOE_GATHER       (pointer-table MUL_MAT_ID consume-arm, task #23 Cut 2 — opt-in until measured)
+    bool         gather_identity  = false;                // GGML_MOE_GATHER_IDENTITY (BISECT: publish the table with NATURAL offsets AND keep every copy — exercises the kernel's table path on bytes identical to the copy path)
+    bool         gather_retire    = false;                // GGML_MOE_GATHER_RETIRE (event-proven fence retirement; costs a per-call event sync — only worth it when graphs really overlap, e.g. n_copies>1)
+    bool         gather_verify    = false;                // GGML_MOE_GATHER_VERIFY (read every aliased slot back off the device and compare to the source bytes — splits "slot content wrong" from "address wrong")
+    bool         gather_sync      = false;                // GGML_MOE_GATHER_SYNC (fully serialize: block the host until every table upload and slot fill has landed before compute is enqueued — if this clears a fault, the fault is ORDERING)
+    bool         gather_poison_on = false;                // GGML_MOE_GATHER_POISON=<byte> — fill every slot's PAD + the pool guard with this byte instead of zero
+    uint8_t      gather_poison    = 0;
 
     static MoeServingConfig from_env() {
         MoeServingConfig c;
@@ -179,6 +186,13 @@ struct MoeServingConfig {
         if (const char * v = getenv("GGML_MOE_CAPTURE_MB")) { c.capture_cap_bytes = (size_t) atoi(v) * 1024 * 1024; }
         if (const char * v = getenv("GGML_MOE_PLAN_FILE"))  { c.plan_path = v; }
         c.container_dir = getenv("GGML_MOE_CONTAINER");
+        c.gather        = getenv("GGML_MOE_GATHER")       != nullptr;
+        c.gather_identity = getenv("GGML_MOE_GATHER_IDENTITY") != nullptr;
+        c.gather_retire   = getenv("GGML_MOE_GATHER_RETIRE")   != nullptr;
+        c.gather_verify   = getenv("GGML_MOE_GATHER_VERIFY")   != nullptr;
+        c.gather_sync     = getenv("GGML_MOE_GATHER_SYNC")     != nullptr;
+        if (const char * v = getenv("GGML_MOE_GATHER_POISON")) { c.gather_poison = (uint8_t) atoi(v); c.gather_poison_on = true; }
+        if (c.gather_identity) { c.gather = true; }   // identity mode implies the table is built
         return c;
     }
 };
@@ -453,6 +467,10 @@ class ResidencyCache {
         bool      failed = false;
         std::unordered_map<uint64_t, size_t> key2slot;
         std::vector<uint64_t> slot_key, slot_tick, slot_gen;
+        // [MOE-GATHER #23] generation in which a published offset table last REFERENCED this slot.
+        // Distinct from slot_gen (merely touched): only referenced slots can be read in place by an
+        // in-flight kernel, so only they need the fence. Copy-served slots stay freely evictable.
+        std::vector<uint64_t> slot_ref_gen;
     };
     static const size_t MAX_POOLS = 3; // a MoE has at most a few distinct expert byte-sizes
 
@@ -467,6 +485,25 @@ class ResidencyCache {
     bool                          device_backed_ = false;
     ggml_backend_buffer_type_t    device_buft_   = nullptr;
 
+    // [MOE-GATHER #23] gather-epoch eviction fence. While the consume-arm is publishing offset tables
+    // (ggml_mul_mat_id src[3]) for the CURRENT compute call, every slot touched this token_gen may be
+    // referenced by an already-uploaded table whose kernel has not run yet — the read window extends
+    // from "during copy enqueue" to "until graph compute completes". Evicting + refilling such a slot
+    // (the [RETAIN] evict>0 case: token working set > pool) would make that table entry read the WRONG
+    // expert's bytes, silently. With the fence up, reserve_slot refuses current-generation victims and
+    // the caller falls back to the copy path for that expert. Flag-gated (NOT unconditional): under the
+    // pure copy arm intra-token eviction is only churn, and container mode relies on the cache admitting
+    // (no mmap fallback) — an unconditional refusal would turn pool-too-small into an abort there.
+    bool gather_fence_ = false;
+    // Generations of eviction protection under the gather fence. 2 = the current call plus the one
+    // still possibly in flight. Raise with pipeline depth (sched n_copies) if that ever exceeds 1.
+    static const uint64_t GATHER_FENCE_GENS = 2;
+    // Generations PROVEN complete on the device (a recorded event was synchronized). Slots referenced
+    // by any later generation may still be read in place. 0 = nothing proven yet -> the conservative
+    // GATHER_FENCE_GENS window is used instead, so a backend without usable events still stays correct.
+    uint64_t retired_gen_  = 0;
+    bool     retirement_on_ = false;
+
     // [RUNG-2] controller actuator state (set via the GGML_MOE_PLAN_FILE control file; see PagerPlan).
     std::unordered_set<uint64_t> pinned_;   // hinted expert cache-keys — a RETENTION BIAS, not evict-exempt
     uint32_t     window_k_    = 0;          // recency window depth in tokens (0 = budget-implicit, legacy)
@@ -480,23 +517,67 @@ class ResidencyCache {
     // lazily create this size-class's pinned pool, sharing the budget across up to MAX_POOLS classes
     void ensure_pool(Pool & p, ggml_backend_buffer_type_t host_buft, size_t need) {
         if (p.slot_size != 0 || p.failed) { return; }
-        p.slot_size = need;
+        // [MOE-GATHER #23] SLOT BASES MUST CARRY A TENSOR-GRADE ALIGNMENT. Under gather the kernel reads
+        // weights IN PLACE at (pool_base + slot*slot_size) instead of at a tensor base, and quantized
+        // kernels issue vectorized (16 B+) loads. `need` = expert_size + pad, and expert_size is only
+        // BLOCK-aligned — e.g. IQ2_XXS is 66 B/block, so expert_size need not be a multiple of 16 and
+        // every subsequent slot base drifts off the load alignment => garbage reads => NaN logits =>
+        // the sampler assert. (5090 V4-Flash IQ2, BigMama 2026-08-03. Metal never showed it: Q4_K is
+        // 144 B/block = 9x16, already 16-aligned, so its slot bases happened to stay aligned.) Rounding
+        // slot_size up to SLOT_ALIGN makes every slot base congruent to the pool base, which is exactly
+        // the guarantee the copy path inherited for free from the tensor allocator.
+        static const size_t SLOT_ALIGN = 256;   // >= CUDA/Metal vector-load alignment and ggml's 32 B
+        p.slot_size = need ? ((need + SLOT_ALIGN - 1) / SLOT_ALIGN) * SLOT_ALIGN : 0;
         const size_t share = budget_bytes / MAX_POOLS;
-        p.max_slots = need ? (share / need) : 0;
-        if (p.max_slots == 0 || pools.size() > MAX_POOLS) { p.failed = true; return; }
+        p.max_slots = p.slot_size ? (share / p.slot_size) : 0;
+        if (p.max_slots == 0 || pools.size() > MAX_POOLS) {
+            p.failed = true;
+            // Fail LOUD: a failed size-class silently downgrades EVERY expert of that byte-size to the
+            // copy/mmap arm forever, with counters that skip it entirely (get_slot returns before
+            // hit/miss). Measured shape: 924/936 gathered with 12 unaccounted on the 5090 — one starved
+            // pool. One line names it.
+            fprintf(stderr,
+                "[MOE-PAGER] WARNING: expert size-class %zu B gets NO cache pool (%s) — every expert of "
+                "this size takes the copy/mmap path, uncounted. Raise the cache budget.\n",
+                need, p.max_slots == 0 ? "budget share too small for even one slot" : "size-class limit exceeded");
+            return;
+        }
         // DEVICE-resident (#23): allocate VRAM slots through device_buft_; else the caller's host_buft.
         ggml_backend_buffer_type_t buft = device_backed_ ? device_buft_ : host_buft;
-        p.buf = buft ? ggml_backend_buft_alloc_buffer(buft, p.max_slots * need) : nullptr;
-        if (p.buf == nullptr) { p.failed = true; return; }
+        // [MOE-GATHER #23] TAIL GUARD. Quantized matmul kernels (CUDA MMQ especially) READ PAST the end
+        // of a row — upstream's copy arm exists precisely to feed them: it copies expert_size + pad so
+        // the tail lands on the NEXT expert's real bytes inside the staging tensor, always in-bounds.
+        // Under gather the kernel reads a POOL SLOT instead, so a tail read from the LAST slot runs off
+        // the end of the pool allocation entirely — an out-of-bounds device read whose contents are
+        // undefined and can carry NaN/Inf bit patterns. Rare (needs the routed expert to sit in the
+        // final slot), which matches a fault that appears only after many coherent tokens. One extra
+        // slot of guard makes every tail read in-bounds for the cost of one slot.
+        p.buf = buft ? ggml_backend_buft_alloc_buffer(buft, p.max_slots * p.slot_size + p.slot_size) : nullptr;
+        if (p.buf == nullptr) {
+            p.failed = true;
+            fprintf(stderr,
+                "[MOE-PAGER] WARNING: pool allocation FAILED for expert size-class %zu B "
+                "(%zu slots x %zu B) — every expert of this size takes the copy/mmap path, uncounted.\n",
+                need, p.max_slots, need);
+            return;
+        }
         p.base = (uint8_t *) ggml_backend_buffer_get_base(p.buf);
         // Pad correctness on device: the per-miss `memset(dst+expert_size, 0, pad)` cannot run on VRAM
         // (host memset of a device pointer). Pad regions are constant per size-class and `fetch` only
         // writes expert_size bytes, so zero the whole buffer ONCE here and they stay 0 across reuse.
         // Host-visible buffers keep the per-miss memset path (cheaper than clearing the whole pool).
-        if (!ggml_backend_buffer_is_host(p.buf)) { ggml_backend_buffer_clear(p.buf, 0); }
+        // [MOE-GATHER #23 POISON] Filling the pad + guard with a chosen byte instead of zero turns an
+        // inference into an OBSERVATION: if the kernel never reads past a row, output is invariant to
+        // this byte. If output CHANGES between two poison values, the kernel provably reads the pad —
+        // and the copy arm's pad (the next expert's real bytes) vs the slot's pad is then a real
+        // numerical difference, not a theory.
+        if (!ggml_backend_buffer_is_host(p.buf)) {
+            ggml_backend_buffer_clear(p.buf, moe_config().gather_poison_on ? moe_config().gather_poison : 0);
+        }
         p.slot_key.assign(p.max_slots, 0);
         p.slot_tick.assign(p.max_slots, 0);
         p.slot_gen.assign(p.max_slots, 0);
+        p.slot_ref_gen.assign(p.max_slots, 0);
     }
 
     // Free every pinned pool buffer, returning its RAM to the OS. Pools re-allocate lazily at the
@@ -513,6 +594,9 @@ class ResidencyCache {
 
     // pick a slot: next free one, else evict the OLDEST token-generation (tie-break: oldest access tick),
     // dropping its key mapping. Generation-primary = recency window at token granularity (see class doc).
+    // sentinel: no slot could be reserved (gather fence refused every current-generation victim)
+    static const size_t NO_SLOT = (size_t) -1;
+
     size_t reserve_slot(Pool & p) {
         if (p.used < p.max_slots) { return p.used++; }
         // SCORE-HINT eviction: evict the slot with the oldest EFFECTIVE generation, where a hinted expert
@@ -521,14 +605,34 @@ class ResidencyCache {
         // a COLD hint (older than the bias) still ages out. Replaces evict-exempt pinning, which taxed
         // recency the very slots it needs to be good (RUN-1/RUN-2 convicted the hard actuator).
         const bool have_pins = !pinned_.empty();
-        size_t slot = 0;
+        size_t slot = NO_SLOT;
         uint64_t oeff = UINT64_MAX, ot = UINT64_MAX;
         for (size_t i = 0; i < p.max_slots; i++) {
+            // [MOE-GATHER #23] fence: a slot referenced by a table that an IN-FLIGHT graph may still
+            // read must never be a victim. The window is IN-FLIGHT GRAPHS, not "this call": the clock
+            // advances at the TOP of a compute call, but the PREVIOUS call's graph was enqueued
+            // asynchronously and its kernels may not have run yet. A one-generation fence therefore
+            // freed slots the previous graph was about to read in place — the copy arm never cared
+            // (bytes were already staged at enqueue), the gather arm reads them at COMPUTE time.
+            // Hence: copy clean, gather NaN, and ONLY on runs whose working set actually evicts
+            // (V4-Flash/5090). A pool that never evicts — OLMoE/Metal at 100% hit — cannot expose it.
+            if (gather_fence_) {
+                // Refuse ONLY slots an in-flight table may still read in place. With proven retirement
+                // the window is exact (referenced after the last completed generation); without it we
+                // fall back to the conservative GATHER_FENCE_GENS window. Either way, copy-served
+                // slots — the majority under pressure — remain evictable, which is what keeps the
+                // gather rate up when the pool is smaller than 2x the per-token working set.
+                const bool may_be_in_flight = retirement_on_
+                    ? (p.slot_ref_gen[i] >  retired_gen_)
+                    : (p.slot_ref_gen[i] + (GATHER_FENCE_GENS - 1) >= token_gen);
+                if (may_be_in_flight && p.slot_ref_gen[i] != 0) { continue; }
+            }
             const uint64_t eff = p.slot_gen[i] + ((have_pins && pinned_.count(p.slot_key[i])) ? pin_bias_ : 0);
             if (eff < oeff || (eff == oeff && p.slot_tick[i] < ot)) {
                 oeff = eff; ot = p.slot_tick[i]; slot = i;
             }
         }
+        if (slot == NO_SLOT) { return NO_SLOT; }   // only reachable with the fence up
         p.key2slot.erase(p.slot_key[slot]);
         return slot;
     }
@@ -539,6 +643,36 @@ public:
     }
 
     void        set_budget(size_t b)   { budget_bytes = b; }   // idempotent; apply the env budget once
+
+    // [MOE-GATHER #23] arm/disarm the gather-epoch eviction fence (see gather_fence_ doc). The consume-arm
+    // arms it once when it starts publishing offset tables; it stays up for the lifetime of the gather
+    // consumer (per-compute-call disarm would race the NEXT call's prefetch against this call's in-flight
+    // kernels). Copy-arm-only runs never arm it and keep today's eviction semantics exactly.
+    void        set_gather_fence(bool on) { std::lock_guard<std::mutex> lk(mtx); gather_fence_ = on; }
+
+    // [MOE-GATHER #23] the consume-arm calls this for every slot it publishes into an offset table.
+    // Only these slots are fenced — precision is what preserves eviction headroom under pressure.
+    void        mark_table_ref(const ExpertSlot & s) {
+        if (!s.ok()) { return; }
+        std::lock_guard<std::mutex> lk(mtx);
+        for (auto & kv : pools) {
+            Pool & p = kv.second;
+            if (p.buf == s.buffer && p.slot_size != 0) {
+                const size_t idx = s.offset / p.slot_size;
+                if (idx < p.slot_ref_gen.size()) { p.slot_ref_gen[idx] = token_gen; }
+                return;
+            }
+        }
+    }
+
+    // Declare every generation <= g PROVEN complete on the device (caller synchronized a recorded
+    // event). Turns the fence from a conservative guess into an exact in-flight set.
+    void        retire_generations_through(uint64_t g) {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (g > retired_gen_) { retired_gen_ = g; }
+        retirement_on_ = true;
+    }
+    uint64_t    current_generation() { std::lock_guard<std::mutex> lk(mtx); return token_gen; }
 
     // [DEVICE-RESIDENT #23] Flip the cache to VRAM-backed slots. Idempotent + safe under concurrent
     // first-call (the mutex + the device_backed_ guard make a second call a no-op — M5's call_once shape).
@@ -665,6 +799,7 @@ public:
         }
         misses++;
         const size_t slot = reserve_slot(p);
+        if (slot == NO_SLOT) { return ExpertSlot{}; }   // fence refusal — caller streams from mmap
         uint8_t * dst = p.base + slot * p.slot_size;
         const auto t0 = std::chrono::steady_clock::now();
         fetcher.fetch(dst, src, expert_size);            // adapter: mmap-fault / NVMe read / device-upload
@@ -714,8 +849,10 @@ public:
                 p.slot_tick[rit->second] = ++tick;
                 n_resident++; continue;
             }
-            if (p.used >= p.max_slots) { n_evict++; }                    // this reserve will evict oldest generation
+            const bool was_full = p.used >= p.max_slots;                 // a successful reserve now = eviction
             const size_t slot = reserve_slot(p);
+            if (slot == NO_SLOT) { continue; }                           // fence refusal — not admitted this token
+            if (was_full) { n_evict++; }
             uint8_t * dst = p.base + slot * p.slot_size;
             p.slot_key[slot]  = key;
             p.slot_tick[slot] = ++tick;
