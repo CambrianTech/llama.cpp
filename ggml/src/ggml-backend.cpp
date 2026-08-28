@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <memory>
 #include <vector>
 #include <unordered_map>
 #include <mutex>
