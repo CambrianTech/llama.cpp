@@ -2434,12 +2434,23 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing()) {
-                        // if requested slot is unavailable, we defer this task for processing later
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
-                        queue_tasks.defer(std::move(task));
-                        break;
-                    }
+                    // NOTE (Continuum fork): SLOT_SAVE does NOT defer on a live slot.
+                    // Upstream defers save/restore/erase alike when is_processing(),
+                    // out of conservatism — but for SAVE that defer is both needless
+                    // and harmful. Reaching this arm already guarantees is_yielding ==
+                    // false (the whitelist at the top of process_single_task declines
+                    // every task but METRICS/SLOT_GET while a decode is yielding), so
+                    // we are on the main thread in the task phase with NO llama_decode
+                    // in flight and the sequence's KV at a consistent inter-batch
+                    // boundary. is_processing() here means only "this slot has an
+                    // assigned turn", not "decode is executing". A save is READ-ONLY
+                    // against that KV, so snapshotting a mid-turn slot is safe — and it
+                    // is exactly the warm-restore we want ("don't miss a beat": resume
+                    // mid-thought). Deferring instead bounced the save for the whole
+                    // multi-second generation, so a ~30k-token turn always tripped the
+                    // client's 10s timeout and the KV page was never captured. RESTORE
+                    // and ERASE MUTATE KV a subsequent decode would then read, so THEY
+                    // keep the is_processing() defer.
 
                     const int64_t t_start = ggml_time_us();
 

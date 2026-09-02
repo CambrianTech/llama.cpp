@@ -3,6 +3,8 @@ from utils import *
 import base64
 import requests
 import struct
+import threading
+import time
 
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
 STATE_FILE_HEADER_SIZE = 12
@@ -74,6 +76,80 @@ def test_slot_save_restore():
     assert res.status_code == 200
     assert match_regex("(Jack|said)+", res.body["content"])
     assert res.body["timings"]["prompt_n"] == 1
+
+
+def test_slot_save_while_slot_is_processing():
+    # what this catches (Continuum fork): a SLOT_SAVE against a slot that is
+    # mid-generation must return PROMPTLY instead of being deferred until the
+    # turn ends. Upstream deferred save/restore/erase alike while is_processing();
+    # for SAVE that defer bounced the request for the whole multi-second turn, so
+    # a long turn always tripped the client's 10s timeout and the warm KV page
+    # was never captured (measured on the 35B lane: action=save ok=false ms=10003).
+    # The fork drops the defer for SAVE only — it's safe because the arm is reached
+    # only when is_yielding==false (no llama_decode in flight, KV at a consistent
+    # inter-batch boundary) and the save is read-only. Restore/erase keep the defer.
+    # regression for the KV-save-contention fix (the "seconds, not minutes" seam).
+    global server
+    server.server_slots = True  # /slots GET must be enabled to observe processing
+    server.n_predict = 512      # long enough that generation is clearly in flight
+    server.start()
+
+    stream_done = threading.Event()
+
+    def run_stream():
+        try:
+            for _ in server.make_stream_request("POST", "/completion", data={
+                "prompt": "Tell me a very long and detailed story about a cat.",
+                "id_slot": 1,
+                "n_predict": 512,
+                "cache_prompt": True,
+                "stream": True,
+            }):
+                pass
+        finally:
+            stream_done.set()
+
+    t = threading.Thread(target=run_stream, daemon=True)
+    t.start()
+
+    # Wait until slot 1 is actually processing. SLOT_GET is answered even while a
+    # decode is yielding, so this poll is reliable during live generation.
+    deadline = time.time() + 20
+    processing = False
+    while time.time() < deadline and not processing:
+        res = server.make_request("GET", "/slots")
+        if res.status_code == 200:
+            for s in res.body:
+                if s.get("id") == 1 and s.get("is_processing"):
+                    processing = True
+                    break
+        if not processing:
+            time.sleep(0.02)
+    assert processing, "slot 1 never entered processing state"
+    assert not stream_done.is_set(), "generation finished before a live save could be tested"
+
+    # THE regression: save while the slot is mid-generation. Before the fix this
+    # deferred until the turn ended, so the response could not arrive before the
+    # stream did; after the fix it returns while generation is still running.
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "live_slot1.bin",
+    })
+    assert res.status_code == 200
+    assert res.body["n_saved"] > 0
+    assert not stream_done.is_set(), \
+        "save only returned after generation ended — it deferred instead of snapshotting the live slot"
+
+    # The concurrent generation must still finish cleanly — a live save must not
+    # corrupt, stall, or abort the turn it snapshotted.
+    t.join(timeout=DEFAULT_HTTP_TIMEOUT)
+    assert stream_done.is_set(), "streamed generation did not complete after a concurrent save"
+
+    # And the saved live page must restore into another slot and be reusable.
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "live_slot1.bin",
+    })
+    assert res.status_code == 200
+    assert res.body["n_restored"] > 0
 
 
 def test_slot_restore_legacy_token_list():
