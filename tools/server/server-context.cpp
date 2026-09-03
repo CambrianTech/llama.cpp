@@ -5184,6 +5184,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
     {
         server_task task(SERVER_TASK_TYPE_SLOT_SAVE);
         task.id = rd.get_new_id();
+        // NOTE (Continuum fork): bind the page-op to its slot. pop_deferred_task()
+        // (called from callback_on_release when a slot finishes) matches on
+        // task.id_slot, NOT slot_action.id_slot — leaving it at the -1 default meant
+        // a deferred page-op was invisible to its own slot's release and got popped
+        // out of order behind an unrelated deferred task. Save does not defer, so
+        // this is a no-op for save today; set for consistency with restore/erase.
+        task.id_slot = id_slot;
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
@@ -5220,6 +5227,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     {
         server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
         task.id = rd.get_new_id();
+        // NOTE (Continuum fork): bind the restore to its slot — THIS is the
+        // load-bearing case. RESTORE correctly defers while the slot is_processing()
+        // (it mutates KV a live decode would read). It re-runs when the slot's
+        // generation ends: callback_on_release -> pop_deferred_task(id_slot), which
+        // matches task.id_slot. Without this bind (id_slot == -1) the returner's
+        // restore was NOT the task popped when ITS slot freed — pop_deferred_task
+        // fell through to "first deferred task", so a competition's slot-pinned
+        // completion (which DOES set id_slot) was popped ahead of it and prefilled
+        // COLD, while the orphaned restore landed later on a future occupant. Binding
+        // it makes the returner's restore the task serviced for its slot, in order,
+        // the instant that slot releases — correct and clobber-safe. (Measured
+        // 2026-09-03: 27/27 restores failed status=0 before this; the Rust client's
+        // 10s abandon compounded it — raised to a slot-wait alongside this.)
+        task.id_slot = id_slot;
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
@@ -5249,6 +5270,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
     {
         server_task task(SERVER_TASK_TYPE_SLOT_ERASE);
         task.id = rd.get_new_id();
+        // NOTE (Continuum fork): bind to its slot — erase also defers while
+        // is_processing() and must be serviced for its own slot on release. See the
+        // restore arm above for the pop_deferred_task(id_slot) rationale.
+        task.id_slot = id_slot;
         task.slot_action.id_slot = id_slot;
         rd.post_task(std::move(task));
     }

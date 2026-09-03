@@ -152,6 +152,98 @@ def test_slot_save_while_slot_is_processing():
     assert res.body["n_restored"] > 0
 
 
+def test_deferred_restore_is_bound_to_its_slot():
+    # what this catches (Continuum fork): a RESTORE deferred while its target slot
+    # is mid-generation must be serviced when THAT slot releases — not made to wait
+    # for an unrelated, longer-running slot to finish first. RESTORE correctly defers
+    # while is_processing() (it mutates KV a live decode reads); it re-runs via
+    # callback_on_release -> pop_deferred_task(id_slot), which matches task.id_slot.
+    # The fork bug: the SLOT_RESTORE task set only slot_action.id_slot, leaving
+    # task.id_slot == -1, so pop_deferred_task(freed_slot) never matched the returner's
+    # restore and fell through to "first deferred task" — a restore for a still-busy
+    # slot got popped ahead of it, re-deferred, and the returner's restore starved
+    # until the OTHER (longer) generation ended. Measured live 2026-09-03: 27/27
+    # restores failed status=0 under >lane paging. Binding task.id_slot fixes it.
+    # regression for the KV restore-into-busy-slot fix (fork continuum/kv-live-slot-save).
+    global server
+    server.server_slots = True   # /slots GET to observe processing
+    server.n_slots = 2
+    server.n_predict = 512
+    server.start()
+
+    # A reusable page on disk: process a prompt on slot 0, save it, let slot 0 idle.
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?", "id_slot": 0, "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "page.bin"})
+    assert res.status_code == 200 and res.body["n_saved"] > 0
+
+    done0 = threading.Event()
+    done1 = threading.Event()
+
+    def gen(id_slot, n_predict, done):
+        try:
+            for _ in server.make_stream_request("POST", "/completion", data={
+                "prompt": "Tell me a very long and detailed story about a cat.",
+                "id_slot": id_slot, "n_predict": n_predict, "cache_prompt": True, "stream": True,
+            }):
+                pass
+        finally:
+            done.set()
+
+    # slot 0 finishes QUICKLY (short), slot 1 runs LONG. The returner wants slot 0.
+    t0 = threading.Thread(target=gen, args=(0, 24, done0), daemon=True)
+    t1 = threading.Thread(target=gen, args=(1, 512, done1), daemon=True)
+    t1.start()
+    # ensure slot 1 is processing before slot 0 starts, so the slot-1 op queues first
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        r = server.make_request("GET", "/slots")
+        if r.status_code == 200 and any(s.get("id") == 1 and s.get("is_processing") for s in r.body):
+            break
+        time.sleep(0.02)
+    t0.start()
+    # wait until BOTH slots are processing so both restores must defer
+    deadline = time.time() + 20
+    both = False
+    while time.time() < deadline and not both:
+        r = server.make_request("GET", "/slots")
+        if r.status_code == 200:
+            busy = {s.get("id") for s in r.body if s.get("is_processing")}
+            both = 0 in busy and 1 in busy
+        if not both:
+            time.sleep(0.02)
+    assert both, "both slots never processing concurrently"
+
+    # Queue a restore for the STILL-BUSY long slot 1 FIRST (deferred). Without the
+    # id_slot bind this is the task pop_deferred_task wrongly pops when slot 0 frees.
+    r1_result = {}
+    def restore_slot1():
+        rr = server.make_request("POST", "/slots/1?action=restore", data={"filename": "page.bin"})
+        r1_result["code"] = rr.status_code
+    tr1 = threading.Thread(target=restore_slot1, daemon=True)
+    tr1.start()
+    time.sleep(0.3)  # ensure the slot-1 restore is enqueued (deferred) before the slot-0 one
+
+    # THE regression: restore into slot 0. Slot 0's short gen ends well before slot 1's.
+    started = time.time()
+    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "page.bin"})
+    elapsed = time.time() - started
+
+    assert res.status_code == 200, f"slot-0 restore failed: {res.status_code} {res.body}"
+    assert res.body["n_restored"] > 0
+    # The binding proof: the slot-0 restore returned while slot 1 was STILL generating.
+    # Before the fix it starved until slot 1 finished (done1 set); with the bind it is
+    # serviced the moment its own slot (0) releases.
+    assert not done1.is_set(), \
+        "slot-0 restore only returned after the long slot-1 gen ended — it was not bound to its slot"
+    assert elapsed < 20, f"slot-0 restore took {elapsed:.1f}s — starved behind the long slot"
+
+    t1.join(timeout=DEFAULT_HTTP_TIMEOUT)
+    tr1.join(timeout=DEFAULT_HTTP_TIMEOUT)
+
+
 def test_slot_restore_legacy_token_list():
     global server
     server.start()
