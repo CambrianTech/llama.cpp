@@ -4104,6 +4104,23 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params         */ llama_model_n_params(impl->model_tgt),
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
+        /* model_weight_buffers   */ [&] {
+            // MEASURED placement: where the weights were actually allocated.
+            // Not n_gpu_layers, not the "offloaded N/M" banner — both of those
+            // echo the REQUEST back (the banner is min(n_gpu_layers, n_layer+1)),
+            // so a lane that asked for the GPU and fell back to the CPU prints
+            // numbers identical to one that succeeded.
+            json bufs = json::array();
+            const size_t n = llama_model_n_weight_backends(impl->model_tgt);
+            for (size_t i = 0; i < n; i++) {
+                const char * backend = llama_model_weight_backend_name(impl->model_tgt, i);
+                bufs.push_back(json {
+                    { "backend",    backend ? backend : "" },
+                    { "size_bytes", llama_model_weight_backend_bytes(impl->model_tgt, i) },
+                });
+            }
+            return bufs;
+        }(),
     };
 }
 
@@ -4498,6 +4515,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },
+        { "model_weight_buffers",        meta.model_weight_buffers },
         { "modalities",                  json {
             {"vision", meta.has_inp_image},
             {"video",  meta.has_inp_video},

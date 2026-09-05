@@ -3043,6 +3043,31 @@ uint64_t llama_model_size(const llama_model * model) {
     return model->size();
 }
 
+// Weight residency per backend, over the model's OWN memory_breakdown() — the
+// existing primitive that already walks ctxs_bufs and handles the no_alloc case.
+// Not a second walk of the same data.
+static std::vector<std::pair<const char *, size_t>> llama_model_weight_backends(const llama_model * model) {
+    std::vector<std::pair<const char *, size_t>> out;
+    for (const auto & [buft, bytes] : model->memory_breakdown()) {
+        out.emplace_back(ggml_backend_buft_name(buft), bytes);
+    }
+    return out;
+}
+
+size_t llama_model_n_weight_backends(const llama_model * model) {
+    return llama_model_weight_backends(model).size();
+}
+
+const char * llama_model_weight_backend_name(const llama_model * model, size_t i) {
+    const auto v = llama_model_weight_backends(model);
+    return i < v.size() ? v[i].first : nullptr;
+}
+
+size_t llama_model_weight_backend_bytes(const llama_model * model, size_t i) {
+    const auto v = llama_model_weight_backends(model);
+    return i < v.size() ? v[i].second : 0;
+}
+
 const char * llama_model_chat_template(const llama_model * model, const char * name) {
     const auto key = name ? LLM_KV(model->arch, name)(LLM_KV_TOKENIZER_CHAT_TEMPLATE)
         : LLM_KV(model->arch)(LLM_KV_TOKENIZER_CHAT_TEMPLATE);

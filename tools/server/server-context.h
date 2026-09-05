@@ -52,6 +52,11 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+
+    // Measured weight residency: [{backend, size_bytes}, ...] as ALLOCATED.
+    // Reported on /props so a caller can verify placement over a CHANNEL rather
+    // than by scraping the engine's console.
+    json model_weight_buffers;
 };
 
 enum server_state {

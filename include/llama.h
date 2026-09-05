@@ -653,6 +653,22 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+    // Where the model's weights ACTUALLY LIVE, aggregated per backend, AS
+    // ALLOCATED. A thin C view over `llama_model::memory_breakdown()`.
+    //
+    // Deliberately NOT `n_gpu_layers`, and not the "offloaded N/M layers to GPU"
+    // log line: both report what was REQUESTED (the log line is
+    // `min(n_gpu_layers, n_layer + 1)` — the ask, clamped), so an engine that
+    // asked for the GPU and silently ran on the CPU reports numbers identical to
+    // one that succeeded. A caller that must VERIFY placement — a scheduler
+    // deciding whether a host really is a GPU host — needs the allocation.
+    //
+    // Sum the bytes whose backend is not the CPU to get accelerator-resident
+    // weight bytes. Name returns NULL and bytes returns 0 when `i` is out of range.
+    LLAMA_API size_t       llama_model_n_weight_backends   (const struct llama_model * model);
+    LLAMA_API const char * llama_model_weight_backend_name (const struct llama_model * model, size_t i);
+    LLAMA_API size_t       llama_model_weight_backend_bytes(const struct llama_model * model, size_t i);
+
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
