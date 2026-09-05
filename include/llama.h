@@ -687,12 +687,25 @@ extern "C" {
     // still reports CPU bytes (mapped metadata). Test for ANY accelerator bytes,
     // never for NO host bytes.
     //
-    // LIFETIME: the returned pointer is a string literal owned by the backend
-    // implementation (every ggml `get_name` returns one), NOT by any structure
-    // this call builds, so it outlives the call. That safety is a property of the
-    // CALLEES and is not visible at this signature — a backend that ever returned
-    // a name from an owned std::string would turn this into a use-after-free
-    // silently and at a distance.
+    // LIFETIME: the returned pointer outlives the call — but NOT because it is a
+    // string literal. That is the obvious answer and it is FALSE for the GPU
+    // backends. Verified in-tree, all tiers:
+    //
+    //   CPU   ggml-backend.cpp:3036   return "CPU_Mapped";        literal
+    //   CUDA  ggml-cuda.cu:875        return ctx->name.c_str();   OWNED std::string
+    //
+    // The CUDA name lives in a `ggml_backend_cuda_buffer_type_context` (:870)
+    // holding a std::string, `new`'d once per device into the static
+    // `ggml_backend_cuda_buffer_types[]` table behind an `initialized` guard
+    // (:948) and never freed. So the real guarantee is: THE NAME IS OWNED BY THE
+    // BACKEND'S BUFFER-TYPE REGISTRY, WHICH IS PROCESS-LIFETIME. It is not owned
+    // by the vector this accessor builds; destroying that frees nothing.
+    //
+    // Two consequences. The pointer is safe to hold — but it is NOT a
+    // compile-time constant and must not be treated as one. And the guarantee
+    // rests on backend registries never being torn down, a property of the
+    // CALLEES that this signature cannot express; a backend that freed its buffer
+    // types would break this silently and at a distance.
     //
     // Name returns NULL and bytes returns 0 when `i` is out of range.
     LLAMA_API size_t       llama_model_n_weight_backends   (const struct llama_model * model);
