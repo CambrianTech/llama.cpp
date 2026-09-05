@@ -663,8 +663,38 @@ extern "C" {
     // one that succeeded. A caller that must VERIFY placement — a scheduler
     // deciding whether a host really is a GPU host — needs the allocation.
     //
-    // Sum the bytes whose backend is not the CPU to get accelerator-resident
-    // weight bytes. Name returns NULL and bytes returns 0 when `i` is out of range.
+    // CLASSIFYING THE BACKEND NAME — read this before writing the predicate.
+    //
+    // "Accelerator-resident bytes" = the sum over backends whose name does NOT
+    // start with "CPU". It MUST be a PREFIX test, never an exact match: there is
+    // more than one CPU backend name and which ones appear depends on the host.
+    // Measured across three tiers:
+    //
+    //   Windows + CUDA : "CPU_Mapped", "CUDA0"
+    //   Intel + no GPU : "CPU_Mapped", "CPU_REPACK"   <- SIMD-repacked weights,
+    //                                                    materialises only where
+    //                                                    the CPU does the work,
+    //                                                    so it is INVISIBLE on
+    //                                                    any GPU host
+    //
+    // An exact match on "CPU_Mapped" — the obvious reading if you have only ever
+    // seen a GPU host — classifies CPU_REPACK as an accelerator and makes a
+    // CPU-only machine report GPU residency. That is the exact false claim this
+    // field exists to prevent. (Found by an Intel Mac; neither GPU box could
+    // produce the case.)
+    //
+    // Also note the inverse is NOT equivalent: a healthy fully-offloaded lane
+    // still reports CPU bytes (mapped metadata). Test for ANY accelerator bytes,
+    // never for NO host bytes.
+    //
+    // LIFETIME: the returned pointer is a string literal owned by the backend
+    // implementation (every ggml `get_name` returns one), NOT by any structure
+    // this call builds, so it outlives the call. That safety is a property of the
+    // CALLEES and is not visible at this signature — a backend that ever returned
+    // a name from an owned std::string would turn this into a use-after-free
+    // silently and at a distance.
+    //
+    // Name returns NULL and bytes returns 0 when `i` is out of range.
     LLAMA_API size_t       llama_model_n_weight_backends   (const struct llama_model * model);
     LLAMA_API const char * llama_model_weight_backend_name (const struct llama_model * model, size_t i);
     LLAMA_API size_t       llama_model_weight_backend_bytes(const struct llama_model * model, size_t i);
