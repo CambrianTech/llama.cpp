@@ -691,15 +691,18 @@ extern "C" {
     // string literal. That is the obvious answer and it is FALSE for the GPU
     // backends. Verified in-tree, all tiers:
     //
-    //   CPU   ggml-backend.cpp:3036   return "CPU_Mapped";        literal
-    //   CUDA  ggml-cuda.cu:875        return ctx->name.c_str();   OWNED std::string
+    //   CPU    ggml-backend.cpp:3036          return "CPU_Mapped";       literal
+    //   CUDA   ggml-cuda.cu:875               return ctx->name.c_str();  OWNED std::string
+    //   Metal  ggml-metal.cpp:259,335,410     return ctx->name.c_str();  OWNED std::string
     //
-    // The CUDA name lives in a `ggml_backend_cuda_buffer_type_context` (:870)
-    // holding a std::string, `new`'d once per device into the static
-    // `ggml_backend_cuda_buffer_types[]` table behind an `initialized` guard
-    // (:948) and never freed. So the real guarantee is: THE NAME IS OWNED BY THE
-    // BACKEND'S BUFFER-TYPE REGISTRY, WHICH IS PROCESS-LIFETIME. It is not owned
-    // by the vector this accessor builds; destroying that frees nothing.
+    // Only the CPU backend returns a literal. On BOTH GPU tiers the name is a
+    // std::string living in the buffer-type CONTEXT, and each context is built
+    // once behind an `initialized` guard into a static table that is never freed
+    // (CUDA: `ggml_backend_cuda_buffer_types[]`, guard at :948; Metal: static
+    // `bufts`/`ctxs`, guards at :296 and :372). So the real guarantee is: THE
+    // NAME IS OWNED BY THE BACKEND'S BUFFER-TYPE REGISTRY, WHICH IS
+    // PROCESS-LIFETIME. It is not owned by the vector this accessor builds;
+    // destroying that frees nothing the caller reads.
     //
     // Two consequences. The pointer is safe to hold — but it is NOT a
     // compile-time constant and must not be treated as one. And the guarantee
