@@ -196,8 +196,8 @@ def test_deferred_restore_is_bound_to_its_slot():
         finally:
             done.set()
 
-    # slot 0 finishes QUICKLY (short), slot 1 runs LONG. The returner wants slot 0.
-    t0 = threading.Thread(target=gen, args=(0, 24, done0), daemon=True)
+    # slot 0 finishes FIRST (256 tokens: long enough that a fast runner can observe it busy), slot 1 runs LONG. The returner wants slot 0.
+    t0 = threading.Thread(target=gen, args=(0, 256, done0), daemon=True)
     t1 = threading.Thread(target=gen, args=(1, 4096, done1), daemon=True)
     t1.start()
     # ensure slot 1 is processing before slot 0 starts, so the slot-1 op queues first
