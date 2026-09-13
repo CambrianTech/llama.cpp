@@ -168,7 +168,10 @@ def test_deferred_restore_is_bound_to_its_slot():
     global server
     server.server_slots = True   # /slots GET to observe processing
     server.n_slots = 2
-    server.n_predict = 512
+    # The long slot must OUTLAST the whole restore round-trip on a fast CI runner (a 512-token
+    # gen of the tiny model ends in ~2 s on hosted ubuntu/windows runners — measured 2026-09-13:
+    # the binding assertion then failed for timing, not for binding). 4096 keeps slot 1 busy.
+    server.n_predict = 4096
     server.start()
 
     # A reusable page on disk: process a prompt on slot 0, save it, let slot 0 idle.
@@ -194,7 +197,7 @@ def test_deferred_restore_is_bound_to_its_slot():
 
     # slot 0 finishes QUICKLY (short), slot 1 runs LONG. The returner wants slot 0.
     t0 = threading.Thread(target=gen, args=(0, 24, done0), daemon=True)
-    t1 = threading.Thread(target=gen, args=(1, 512, done1), daemon=True)
+    t1 = threading.Thread(target=gen, args=(1, 4096, done1), daemon=True)
     t1.start()
     # ensure slot 1 is processing before slot 0 starts, so the slot-1 op queues first
     deadline = time.time() + 20
