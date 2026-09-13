@@ -190,6 +190,7 @@ def test_deferred_restore_is_bound_to_its_slot():
             for _ in server.make_stream_request("POST", "/completion", data={
                 "prompt": "Tell me a very long and detailed story about a cat.",
                 "id_slot": id_slot, "n_predict": n_predict, "cache_prompt": True, "stream": True,
+                "ignore_eos": True,  # the tiny model emits EOS within a few tokens: the long slot must really run long
             }):
                 pass
         finally:
