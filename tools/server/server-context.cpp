@@ -2473,6 +2473,42 @@ private:
                         send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
                         break;
                     }
+                    // Continuum fork: the CONTEXT CHECKPOINTS are part of the register file.
+                    // On a hybrid/recurrent (or SWA) cache the next request can only reuse a
+                    // prefix by rolling back to a checkpoint at or before the divergence —
+                    // and even an identical prompt rolls back one token [TAG_PROMPT_LOGITS].
+                    // A restored slot with no checkpoints therefore always hits do_reset:
+                    // "restore ok", then a full re-prefill (measured 2026-09-04, n_restored
+                    // 11298 → cache_n 0). The state file carries KV + tokens only, so the
+                    // checkpoints ride in a sidecar beside it; a missing or unreadable
+                    // sidecar degrades to the pre-fork cold restore, never to an error.
+                    {
+                        const std::string ckpt_path = filepath + ".ckpt";
+                        std::ofstream out(ckpt_path, std::ios::binary | std::ios::trunc);
+                        auto put = [&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); };
+                        const uint32_t magic   = 0x434B5054u; // 'CKPT'
+                        const uint32_t version = 1;
+                        const uint32_t n_ckpt  = (uint32_t) slot->prompt.checkpoints.size();
+                        put(&magic, sizeof(magic)); put(&version, sizeof(version)); put(&n_ckpt, sizeof(n_ckpt));
+                        for (const auto & c : slot->prompt.checkpoints) {
+                            const int64_t  n_tokens = c.n_tokens;
+                            const int32_t  pos_min  = c.pos_min;
+                            const int32_t  pos_max  = c.pos_max;
+                            const uint64_t sz_tgt   = c.data_tgt.size();
+                            const uint64_t sz_dft   = c.data_dft.size();
+                            const uint64_t sz_spec  = c.data_spec.size();
+                            put(&n_tokens, sizeof(n_tokens)); put(&pos_min, sizeof(pos_min)); put(&pos_max, sizeof(pos_max));
+                            put(&sz_tgt, sizeof(sz_tgt)); put(&sz_dft, sizeof(sz_dft)); put(&sz_spec, sizeof(sz_spec));
+                            put(c.data_tgt.data(), c.data_tgt.size());
+                            put(c.data_dft.data(), c.data_dft.size());
+                            put(c.data_spec.data(), c.data_spec.size());
+                        }
+                        if (!out) {
+                            SLT_WRN(*slot, "checkpoint sidecar could not be written: %s (the restore will be cold)\n", ckpt_path.c_str());
+                        } else {
+                            SLT_INF(*slot, "saved %u context checkpoints beside the slot state: %s\n", n_ckpt, ckpt_path.c_str());
+                        }
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -2533,6 +2569,43 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        // Continuum fork: bring the context checkpoints back with the state (see
+                        // SLOT_SAVE). Any defect in the sidecar leaves the slot exactly as a
+                        // pre-fork restore left it — valid tokens + state, no checkpoints.
+                        {
+                            const std::string ckpt_path = filepath + ".ckpt";
+                            std::ifstream in(ckpt_path, std::ios::binary);
+                            std::list<common_prompt_checkpoint> loaded;
+                            bool ok = (bool) in;
+                            auto get = [&](void * ptr, size_t n) { in.read(reinterpret_cast<char *>(ptr), n); ok = ok && (bool) in; };
+                            if (ok) {
+                                uint32_t magic = 0, version = 0, n_ckpt = 0;
+                                get(&magic, sizeof(magic)); get(&version, sizeof(version)); get(&n_ckpt, sizeof(n_ckpt));
+                                ok = ok && magic == 0x434B5054u && version == 1 && n_ckpt <= 4096;
+                                for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
+                                    int64_t n_tokens = 0; int32_t pos_min = 0, pos_max = 0;
+                                    uint64_t sz_tgt = 0, sz_dft = 0, sz_spec = 0;
+                                    get(&n_tokens, sizeof(n_tokens)); get(&pos_min, sizeof(pos_min)); get(&pos_max, sizeof(pos_max));
+                                    get(&sz_tgt, sizeof(sz_tgt)); get(&sz_dft, sizeof(sz_dft)); get(&sz_spec, sizeof(sz_spec));
+                                    // a checkpoint is at most one sequence state; refuse absurd sizes
+                                    ok = ok && sz_tgt < (1ull << 36) && sz_dft < (1ull << 36) && sz_spec < (1ull << 30);
+                                    if (!ok) break;
+                                    auto & c = loaded.emplace_back();
+                                    c.update_pos(n_tokens, pos_min, pos_max);
+                                    c.id_task = -1;
+                                    c.data_tgt.resize(sz_tgt);   get(c.data_tgt.data(),  sz_tgt);
+                                    c.data_dft.resize(sz_dft);   get(c.data_dft.data(),  sz_dft);
+                                    c.data_spec.resize(sz_spec); get(c.data_spec.data(), sz_spec);
+                                }
+                            }
+                            if (ok) {
+                                slot->prompt.checkpoints = std::move(loaded);
+                                SLT_INF(*slot, "restored %zu context checkpoints from the sidecar: %s\n", slot->prompt.checkpoints.size(), ckpt_path.c_str());
+                            } else {
+                                slot->prompt.checkpoints.clear();
+                                SLT_WRN(*slot, "no usable checkpoint sidecar (%s): the restore is cold — the next divergence re-prefills from the head\n", ckpt_path.c_str());
+                            }
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);

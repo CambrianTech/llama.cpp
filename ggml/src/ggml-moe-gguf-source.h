@@ -70,7 +70,7 @@ class GgufMoeSource {
             const int total = std::atoi(first.substr(of + pat.size(), 5).c_str());
             const size_t idx0 = first.rfind('-', of - 1);
             const std::string prefix = first.substr(0, idx0 + 1), suffix = first.substr(of);
-            for (int i = 1; i <= total; i++) { char n[8]; std::snprintf(n, sizeof(n), "%05d", i); files.push_back(prefix + n + suffix); }
+            for (int i = 1; i <= total; i++) { char n[16]; std::snprintf(n, sizeof(n), "%05d", i); files.push_back(prefix + n + suffix); }
         }
         for (const auto & p : files) {
             Shard s; gguf_init_params gp{}; gp.no_alloc = true; gp.ctx = nullptr;

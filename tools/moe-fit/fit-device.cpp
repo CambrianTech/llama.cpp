@@ -39,7 +39,7 @@ static std::vector<std::string> shard_paths(const std::string & first) {
     const int total = std::atoi(first.substr(of + pat.size(), 5).c_str());
     const size_t idx0 = first.rfind('-', of - 1);
     const std::string prefix = first.substr(0, idx0 + 1), suffix = first.substr(of);
-    for (int i = 1; i <= total; i++) { char b[8]; std::snprintf(b, sizeof(b), "%05d", i); files.push_back(prefix + b + suffix); }
+    for (int i = 1; i <= total; i++) { char b[16]; std::snprintf(b, sizeof(b), "%05d", i); files.push_back(prefix + b + suffix); }
     return files;
 }
 

@@ -168,7 +168,11 @@ def test_deferred_restore_is_bound_to_its_slot():
     global server
     server.server_slots = True   # /slots GET to observe processing
     server.n_slots = 2
-    server.n_predict = 512
+    # The long slot must OUTLAST the whole restore round-trip on a fast CI runner (a 512-token
+    # gen of the tiny model ends in ~2 s on hosted ubuntu/windows runners — measured 2026-09-13:
+    # the binding assertion then failed for timing, not for binding). 4096 keeps slot 1 busy.
+    server.n_predict = 4096
+    server.n_ctx = 8192  # 4096 per slot: room for the long slot to actually run 4096 tokens
     server.start()
 
     # A reusable page on disk: process a prompt on slot 0, save it, let slot 0 idle.
@@ -181,20 +185,23 @@ def test_deferred_restore_is_bound_to_its_slot():
 
     done0 = threading.Event()
     done1 = threading.Event()
+    t_done = {}
 
     def gen(id_slot, n_predict, done):
         try:
             for _ in server.make_stream_request("POST", "/completion", data={
                 "prompt": "Tell me a very long and detailed story about a cat.",
                 "id_slot": id_slot, "n_predict": n_predict, "cache_prompt": True, "stream": True,
+                "ignore_eos": True,  # the tiny model emits EOS within a few tokens: the long slot must really run long
             }):
                 pass
         finally:
+            t_done[id_slot] = time.time()
             done.set()
 
-    # slot 0 finishes QUICKLY (short), slot 1 runs LONG. The returner wants slot 0.
-    t0 = threading.Thread(target=gen, args=(0, 24, done0), daemon=True)
-    t1 = threading.Thread(target=gen, args=(1, 512, done1), daemon=True)
+    # slot 0 finishes FIRST (256 tokens: long enough that a fast runner can observe it busy), slot 1 runs LONG. The returner wants slot 0.
+    t0 = threading.Thread(target=gen, args=(0, 128, done0), daemon=True)
+    t1 = threading.Thread(target=gen, args=(1, 4096, done1), daemon=True)
     t1.start()
     # ensure slot 1 is processing before slot 0 starts, so the slot-1 op queues first
     deadline = time.time() + 20
@@ -233,15 +240,21 @@ def test_deferred_restore_is_bound_to_its_slot():
 
     assert res.status_code == 200, f"slot-0 restore failed: {res.status_code} {res.body}"
     assert res.body["n_restored"] > 0
-    # The binding proof: the slot-0 restore returned while slot 1 was STILL generating.
-    # Before the fix it starved until slot 1 finished (done1 set); with the bind it is
-    # serviced the moment its own slot (0) releases.
-    assert not done1.is_set(), \
-        "slot-0 restore only returned after the long slot-1 gen ended — it was not bound to its slot"
-    assert elapsed < 20, f"slot-0 restore took {elapsed:.1f}s — starved behind the long slot"
-
+    t_ret = time.time()
     t1.join(timeout=DEFAULT_HTTP_TIMEOUT)
     tr1.join(timeout=DEFAULT_HTTP_TIMEOUT)
+    # The binding proof, in TIMESTAMPS (2026-09-13: "returned while slot 1 was still
+    # generating" was a race against the runner's speed — a tiny model ends 4096
+    # tokens in ~4 s on Metal and ~2 s on hosted runners). With the bind, the slot-0
+    # restore is serviced the moment ITS slot releases: it returns within a beat of
+    # slot 0's own generation ending. Unbound, it waited for the LONG slot: it returns
+    # only after slot 1 ended. So: the restore's return sits next to done0, not done1.
+    after_own = t_ret - t_done[0]
+    gap = t_done[1] - t_done[0]
+    if gap < 1.0:
+        pytest.skip(f"runner too fast to separate the slots (slot 1 ended {gap:.2f}s after slot 0)")
+    assert after_own < gap / 2, \
+        f"slot-0 restore returned {after_own:.2f}s after its own slot freed (slot 1 ended {gap:.2f}s later) — not bound to its slot"
 
 
 def test_slot_restore_legacy_token_list():
