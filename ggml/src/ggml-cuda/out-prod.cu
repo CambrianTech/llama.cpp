@@ -1,6 +1,12 @@
 #include "out-prod.cuh"
 #include "convert.cuh"
 
+#include <algorithm>
+
+// The F32 transient a row-blocked dequantized out_prod holds at once. 256 MiB is far below
+// any device this backend serves and large enough that the per-block GEMM is not launch-bound.
+static constexpr int64_t OUT_PROD_DEQUANT_BLOCK_BYTES = 256ll * 1024 * 1024;
+
 #include <cstdint>
 
 static __global__ void k_compute_out_prod_ptrs(
@@ -56,6 +62,44 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         GGML_ASSERT(ggml_is_contiguous(src0));
         const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
         GGML_ASSERT(to_fp32 != nullptr);
+        if (ne02 == 1 && ne03 == 1 && ne2 == 1 && ne3 == 1) {
+            // THE WEIGHT CASE, ROW-BLOCKED. out_prod sums over src0's rows (ne01), so the
+            // dequantized transient never has to be the whole W: dequantize a block of rows,
+            // GEMM it with beta = 0 for the first block and beta = 1 after, and the peak is
+            // one block of F32 instead of W in F32. For a 27B's output head (5120 x 152k,
+            // ~3.1 GB in F32) beside the resident model that is the difference between a
+            // dream step that fits and one that does not (Cormac on llama.cpp#3).
+            const int64_t row_bytes_f32 = ne00 * (int64_t) sizeof(float);
+            int64_t rows_per_block = OUT_PROD_DEQUANT_BLOCK_BYTES / row_bytes_f32;
+            rows_per_block = std::max<int64_t>(1, std::min<int64_t>(rows_per_block, ne01));
+            float * tmp = src0_f32_alloc.alloc(rows_per_block * ne00);
+            const float * src1_d = (const float *) src1->data;
+            float       *  dst_d = (float       *)  dst->data;
+            cublasHandle_t handle = ctx.cublas_handle();
+            const float alpha = 1.0f;
+            const int64_t ldc = nb1 / sizeof(float);
+            const bool src1_T = ggml_is_transposed(src1);
+            const cublasOperation_t src1_cublas_op = src1_T ? CUBLAS_OP_N : CUBLAS_OP_T;
+            const int64_t ldb = (src1_T ? nb10 : nb11) / sizeof(float);
+            GGML_ASSERT((src1_T ? nb11 : nb10) == sizeof(float));
+            for (int64_t r0 = 0; r0 < ne01; r0 += rows_per_block) {
+                const int64_t rows = std::min<int64_t>(rows_per_block, ne01 - r0);
+                to_fp32((const char *) src0->data + r0 * nb01, tmp, rows * ne00, stream);
+                CUDA_CHECK(cudaGetLastError());
+                // The k offset into src1: op(B) = B^T reads B as n x k with ldb, so k
+                // advances by ldb elements; op(B) = B reads k x n, so k advances by one.
+                const float * src1_block = src1_d + (src1_T ? r0 : r0 * ldb);
+                const float beta = r0 == 0 ? 0.0f : 1.0f;
+                CUBLAS_CHECK(
+                    cublasSgemm(handle, CUBLAS_OP_N, src1_cublas_op,
+                            ne0, ne1, rows,
+                            &alpha, tmp,        ne00,
+                                    src1_block, ldb,
+                            &beta,  dst_d,      ldc));
+            }
+            return;
+        }
+        // Batched or broadcast src0 (the attention/GQA shapes): the dense copy of all of it.
         const int64_t n = ggml_nelements(src0);
         float * tmp = src0_f32_alloc.alloc(n);
         to_fp32(src0->data, tmp, n, stream);
