@@ -9,6 +9,9 @@
 
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
+    // set by llama_opt_init: the graph is built for a backward pass, so attention reads K/V
+    // from this ubatch directly rather than through the KV cache (see build_attn)
+    bool     training = false;
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;

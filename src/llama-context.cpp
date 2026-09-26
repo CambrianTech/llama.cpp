@@ -2334,6 +2334,11 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
+    if (cparams.training) {
+        // ggml_opt duplicates the forward graph at its own size, then appends the backward
+        // pass and the optimizer step: room for the forward three times over.
+        res *= 3;
+    }
     return res;
 }
 
@@ -3290,20 +3295,22 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
 // training
 //
 
-static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter param_filter, void * userdata) {
+// Returns whether the tensor was made a trainable parameter.
+static bool llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter param_filter, void * userdata) {
     if (!tensor || tensor->type != GGML_TYPE_F32) {
-        return;
+        return false;
     }
     if (!param_filter(tensor, userdata)) {
-        return;
+        return false;
     }
     if (strcmp(tensor->name, "token_embd.weight") == 0) {
-        return; // FIXME
+        return false; // FIXME
     }
     if (strcmp(tensor->name, "rope_freqs.weight") == 0) {
-        return; // FIXME
+        return false; // FIXME
     }
     ggml_set_param(tensor);
+    return true;
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
@@ -3313,6 +3320,21 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
+    // A training graph cannot backprop through the KV cache (SET_ROWS writes in place and
+    // attention reads the cache as a leaf), so attention consumes this ubatch's K/V
+    // directly; that is exact only when one ubatch is the whole context.
+    GGML_ASSERT(n_ubatch == model->hparams.n_ctx_train && "training needs one ubatch per context: set -ub = -b = -c");
+    GGML_ASSERT(!cparams.flash_attn && "training needs flash attention off: FLASH_ATTN_EXT has no backward");
+    cparams.training = true;
+    // The graph result and the scheduler were sized at context creation: before training
+    // (no backward pass) and before any adapter attached since (its nodes uncounted).
+    // Size both again for the training graph, from the same number.
+    {
+        const size_t max_nodes = graph_max_nodes(n_ubatch);
+        gf_res_prev.reset(new llm_graph_result(max_nodes));
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    }
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
@@ -3323,6 +3345,23 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
+
+    if (lopt_params.adapter) {
+        // LoRA-only: the adapter's A/B are the parameters, the base is frozen. An adapter
+        // that is not attached is not in the graph, so it would train nothing while every
+        // epoch reported a loss: refuse it here instead.
+        const auto it = loras->find(lopt_params.adapter);
+        GGML_ASSERT(it != loras->end() && it->second != 0.0f && "the LoRA to train must be attached with a non-zero scale");
+        int64_t n_params = 0;
+        for (auto & [name, ab] : lopt_params.adapter->ab_map) {
+            GGML_ASSERT(ab.a->type == GGML_TYPE_F32 && ab.b->type == GGML_TYPE_F32 && "a trainable LoRA holds F32 A/B tensors");
+            n_params += llama_set_param(ab.a, param_filter, param_filter_ud);
+            n_params += llama_set_param(ab.b, param_filter, param_filter_ud);
+        }
+        GGML_ASSERT(n_params > 0 && "the param filter selected none of the adapter's tensors");
+        LLAMA_LOG_INFO("%s: LoRA-only training: %lld adapter tensors trainable, base frozen\n", __func__, (long long) n_params);
+        return;
+    }
 
   //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
     llama_set_param(model->type_embd,       param_filter, param_filter_ud);

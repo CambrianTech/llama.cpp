@@ -4411,6 +4411,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) { params.diffusion.add_gumbel_noise = std::stof(value); }
     ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
     add_opt(common_arg(
+        { "--lora-rank" }, "N",
+        string_format("LoRA-only training: rank of a fresh adapter (default: %d)", params.lora_train_rank),
+        [](common_params & params, int value) { params.lora_train_rank = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        { "--lora-alpha" }, "F",
+        string_format("LoRA-only training: alpha of a fresh adapter (default: %.1f)", (double) params.lora_train_alpha),
+        [](common_params & params, const std::string & value) { params.lora_train_alpha = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        { "--lora-targets" }, "LIST",
+        string_format("LoRA-only training: comma-separated module names a fresh adapter covers (default: %s)", params.lora_train_targets.c_str()),
+        [](common_params & params, const std::string & value) { params.lora_train_targets = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
         { "-lr", "--learning-rate" }, "ALPHA",
         string_format("adamw or sgd optimizer alpha (default: %.2g); note: sgd alpha recommended ~10x (no momentum)", (double) params.lr.lr0),
         [](common_params & params, const std::string & value) { params.lr.lr0 = std::stof(value); }

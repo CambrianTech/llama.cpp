@@ -592,6 +592,12 @@ struct common_params {
     // finetune
     struct lr_opt lr;
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+
+    // LoRA-only training (llama-finetune-lora): a fresh adapter of this rank/alpha on these
+    // module names, unless --lora names an existing one to continue.
+    int32_t     lora_train_rank    = 16;
+    float       lora_train_alpha   = 32.0f;
+    std::string lora_train_targets = "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down";
     float val_split = 0.05f; // fraction of the data used for the validation set
 
     // embedding

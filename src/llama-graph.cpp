@@ -468,8 +468,14 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
-    mctx->set_input_k_idxs(self_k_idxs, ubatch);
-    mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    // the store indices are left unallocated when the graph attends without storing K/V
+    // (a training graph reads this ubatch's K/V directly, see build_attn)
+    if (self_k_idxs && self_k_idxs->buffer) {
+        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    }
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    }
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
@@ -2816,20 +2822,33 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
-    // store to KV cache
-    {
+    ggml_tensor * kq_mask = inp->get_kq_mask();
+
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k;
+    ggml_tensor * v;
+    if (cparams.training) {
+        // A backward pass cannot go through the cache: the write is an in-place SET_ROWS
+        // and the read is a view of a leaf, so K/V would get no gradient. Training runs one
+        // ubatch per context (llama_context::opt_init asserts it), so this ubatch's K/V ARE
+        // the whole context: attend to them directly, as the no-cache path does.
+        k = k_cur;
+        v = v_cur;
+        if (kq_mask->ne[0] > k_cur->ne[2]) {
+            kq_mask = ggml_view_4d(ctx0, kq_mask, k_cur->ne[2], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0);
+        }
+    } else {
+        // store to KV cache
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+
+        k = mctx_cur->get_k(ctx0, il);
+        v = mctx_cur->get_v(ctx0, il);
     }
-
-    ggml_tensor * kq_mask = inp->get_kq_mask();
-
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
