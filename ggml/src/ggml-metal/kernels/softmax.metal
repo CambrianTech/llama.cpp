@@ -339,3 +339,111 @@ kernel void kernel_cross_entropy_loss_back_f32(
         d[i] = (exp(s0[i] - max_val)*inv_sum - s1[i])*d_by_nr;
     }
 }
+
+
+// RMS_NORM_BACK: dx = (dz - x * sum(x*dz)/(sum(x*x) + eps*n)) / sqrt(sum(x*x)/n + eps)
+// (the CPU reference, ggml-cpu ops.cpp rms_norm_back_f32). src0 = dz, src1 = x.
+kernel void kernel_rms_norm_back_f32(
+        constant ggml_metal_kargs_row_back & args,
+        device const  char * src0,
+        device const  char * src1,
+        device        char * dst,
+        threadgroup  float * buf [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint3  tptg[[threads_per_threadgroup]]) {
+    const int32_t row = tgpig.x;
+
+    device const float * dz = (device const float *) (src0 + row*args.nb01);
+    device const float * x  = (device const float *) (src1 + row*args.nb11);
+    device       float * dx = (device       float *) (dst  + row*args.nb1);
+
+    float lxx = 0.0f;
+    float lxdz = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lxx  += x[i]*x[i];
+        lxdz += x[i]*dz[i];
+    }
+    const float sum_xx  = ce_reduce_sum(lxx,  buf, sgitg, tiisg, tptg);
+    const float sum_xdz = ce_reduce_sum(lxdz, buf, sgitg, tiisg, tptg);
+
+    const float mean_eps = sum_xx/(float) args.ne00 + args.param;
+    const float sum_eps  = sum_xx + args.param*(float) args.ne00;
+    const float rrms     = 1.0f/sqrt(mean_eps);
+    const float scale_x  = -sum_xdz/sum_eps;
+
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        dx[i] = (dz[i] + x[i]*scale_x)*rrms;
+    }
+}
+
+// SOFT_MAX_BACK: dx = scale * y * (dy - dot(y, dy)); src0 = dy, src1 = y (the forward output).
+kernel void kernel_soft_max_back_f32(
+        constant ggml_metal_kargs_row_back & args,
+        device const  char * src0,
+        device const  char * src1,
+        device        char * dst,
+        threadgroup  float * buf [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint3  tptg[[threads_per_threadgroup]]) {
+    const int32_t row = tgpig.x;
+
+    device const float * dy = (device const float *) (src0 + row*args.nb01);
+    device const float * y  = (device const float *) (src1 + row*args.nb11);
+    device       float * dx = (device       float *) (dst  + row*args.nb1);
+
+    float ldot = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        ldot += y[i]*dy[i];
+    }
+    const float dot_y_dy = ce_reduce_sum(ldot, buf, sgitg, tiisg, tptg);
+
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        dx[i] = (dy[i] - dot_y_dy)*y[i]*args.param;
+    }
+}
+
+// REPEAT_BACK: dst[k0..k3] = sum over the nr0..nr3 repeats of src0 — the gradient of a
+// broadcast. One thread per dst element, the repeats gathered in registers; src0 is read
+// through its strides, so a non-contiguous view is exact.
+kernel void kernel_repeat_back_f32(
+        constant ggml_metal_kargs_repeat & args,
+        device const char * src0,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int k3 = tgpig.z;
+    const int k2 = tgpig.y;
+    const int k1 = tgpig.x;
+
+    const int nr0 = args.ne00/args.ne0;
+    const int nr1 = args.ne01/args.ne1;
+    const int nr2 = args.ne02/args.ne2;
+    const int nr3 = args.ne03/args.ne3;
+
+    device float * d = (device float *) (dst + k3*args.nb3 + k2*args.nb2 + k1*args.nb1);
+
+    for (int k0 = tpitg.x; k0 < args.ne0; k0 += ntg.x) {
+        float acc = 0.0f;
+        for (int i3 = 0; i3 < nr3; i3++) {
+            for (int i2 = 0; i2 < nr2; i2++) {
+                for (int i1 = 0; i1 < nr1; i1++) {
+                    device const char * base = src0
+                        + (i3*args.ne3 + k3)*args.nb03
+                        + (i2*args.ne2 + k2)*args.nb02
+                        + (i1*args.ne1 + k1)*args.nb01;
+                    for (int i0 = 0; i0 < nr0; i0++) {
+                        acc += *(device const float *) (base + (i0*args.ne0 + k0)*args.nb00);
+                    }
+                }
+            }
+        }
+        d[k0] = acc;
+    }
+}

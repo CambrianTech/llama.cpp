@@ -351,6 +351,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_lo
     return res;
 }
 
+// RMS_NORM_BACK, SOFT_MAX_BACK, REPEAT_BACK: one f32 kernel each, named after the op.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_row_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    const char * kernel = nullptr;
+    switch (op->op) {
+        case GGML_OP_RMS_NORM_BACK: kernel = "kernel_rms_norm_back_f32"; break;
+        case GGML_OP_SOFT_MAX_BACK: kernel = "kernel_soft_max_back_f32"; break;
+        case GGML_OP_REPEAT_BACK:   kernel = "kernel_repeat_back_f32";   break;
+        default: GGML_ABORT("fatal error");
+    }
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, kernel);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, kernel, kernel, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_SUM);
 
