@@ -304,6 +304,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_out_prod(ctx, idx);
             } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            {
+                n_fuse = ggml_metal_op_cross_entropy_loss(ctx, idx);
+            } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            {
+                n_fuse = ggml_metal_op_cross_entropy_loss_back(ctx, idx);
+            } break;
         case GGML_OP_SILU_BACK:
             {
                 n_fuse = ggml_metal_op_silu_back(ctx, idx);
@@ -922,8 +930,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx) {
-    ggml_tensor * op  = ctx->node(idx);
+static int ggml_metal_op_sum_impl(ggml_metal_op_t ctx, const ggml_tensor * op) {
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -957,6 +964,10 @@ int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, nth, 1, 1);
 
     return 1;
+}
+
+int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx) {
+    return ggml_metal_op_sum_impl(ctx, ctx->node(idx));
 }
 
 int ggml_metal_op_sum_rows(ggml_metal_op_t ctx, int idx) {
@@ -3915,7 +3926,14 @@ bool ggml_metal_op_out_prod_supported(const ggml_tensor * op) {
     if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
         return false;
     }
-    if (!ggml_is_contiguous_rows(src1) || !ggml_is_contiguous(op)) {
+    // src1 as the graph emits it: contiguous rows, or the TRANSPOSED view of the gradient
+    // (out_prod(W, ggml_transpose(grad)) is what the mul_mat backward builds; Cormac on
+    // llama.cpp#5). Either way Y is copied contiguous per block, so both layouts are
+    // exact; anything else is refused.
+    if (!ggml_is_contiguous(op)) {
+        return false;
+    }
+    if (src1->nb[0] != sizeof(float) && src1->nb[1] != sizeof(float)) {
         return false;
     }
     if (src0->ne[0] % 16 != 0 || src0->ne[0] % ggml_blck_size(src0->type) != 0) {
@@ -4057,6 +4075,87 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
     }
 
     return 1;
+}
+
+
+// CROSS_ENTROPY_LOSS: a per-row kernel into scratch (nrows floats after the scalar dst, see
+// ggml_backend_metal_buffer_type_get_alloc_size), then the existing sum kernel into dst[0].
+static int ggml_metal_op_cross_entropy_loss_rows(ggml_metal_op_t ctx, const ggml_tensor * op, ggml_metal_buffer_id bid_dst, uint64_t nb1) {
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const bool back = op->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK;
+    const ggml_tensor * logits = back ? op->src[1] : op->src[0];
+    const ggml_tensor * labels = back ? op->src[2] : op->src[1];
+
+    const int32_t ne00 = logits->ne[0];
+    const int32_t nr   = ggml_nrows(logits);
+
+    ggml_metal_kargs_cross_entropy_loss args = {
+        /*.ne00 =*/ ne00,
+        /*.nr   =*/ nr,
+        /*.nb01 =*/ logits->nb[1],
+        /*.nb11 =*/ labels->nb[1],
+        /*.nb1  =*/ nb1,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_cross_entropy_loss(lib, op);
+
+    int nth = 32; // SIMD width
+    while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
+        nth *= 2;
+    }
+    nth = std::min(nth, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    if (back) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(logits),     2);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(labels),     3);
+        ggml_metal_encoder_set_buffer(enc, bid_dst,                              4);
+    } else {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(logits),     1);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(labels),     2);
+        ggml_metal_encoder_set_buffer(enc, bid_dst,                              3);
+    }
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float), 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, nr, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_cross_entropy_loss(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    const int64_t nr = ggml_nrows(op->src[0]);
+
+    // the per-row losses, in the scratch after dst
+    ggml_metal_buffer_id bid_rows = ggml_metal_get_buffer_id(op);
+    bid_rows.offs += ggml_nbytes(op);
+    ggml_metal_op_cross_entropy_loss_rows(ctx, op, bid_rows, sizeof(float));
+    ggml_metal_op_concurrency_reset(ctx);
+
+    // dst[0] = sum(rows)
+    ggml_tensor rows = {};
+    rows.type = GGML_TYPE_F32;
+    rows.ne[0] = nr; rows.ne[1] = 1; rows.ne[2] = 1; rows.ne[3] = 1;
+    rows.nb[0] = sizeof(float); rows.nb[1] = nr*sizeof(float); rows.nb[2] = rows.nb[1]; rows.nb[3] = rows.nb[1];
+    rows.buffer = op->buffer;
+    rows.data   = (char *) op->data + ggml_nbytes(op);
+
+    ggml_tensor sum = *op;
+    sum.op = GGML_OP_SUM;
+    sum.src[0] = &rows;
+    sum.src[1] = nullptr;
+    ggml_metal_op_sum_impl(ctx, &sum);
+
+    return 1;
+}
+
+int ggml_metal_op_cross_entropy_loss_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    return ggml_metal_op_cross_entropy_loss_rows(ctx, op, ggml_metal_get_buffer_id(op), op->nb[1]);
 }
 
 int ggml_metal_op_silu_back(ggml_metal_op_t ctx, int idx) {

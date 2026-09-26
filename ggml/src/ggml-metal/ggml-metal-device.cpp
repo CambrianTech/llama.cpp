@@ -334,6 +334,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_glu(ggml_metal_l
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_loss(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_CROSS_ENTROPY_LOSS || op->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_cross_entropy_loss%s_f32", op->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK ? "_back" : "");
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum(ggml_metal_library_t lib, const ggml_tensor * op) {
     assert(op->op == GGML_OP_SUM);
 

@@ -221,3 +221,121 @@ template [[host_name("kernel_soft_max_f16")]]   kernel kernel_soft_max_t   kerne
 template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kernel_soft_max<float>;
 template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
 template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
+
+
+// CROSS_ENTROPY_LOSS: one threadgroup per row; the row's loss goes to dst[row] (a scratch of
+// nrows floats the allocator reserves after the scalar dst), already divided by nrows, and
+// the existing sum kernel folds the rows into dst[0]. The back kernel writes the gradient
+// row: (softmax(logits) - labels) * grad[0]/nrows. Both mirror the CPU reference exactly
+// (ggml-cpu ops.cpp cross_entropy_loss{,_back}_f32) so the Metal backward of a training
+// graph matches the CPU oracle (Continuum card 55f314b8, S3b).
+template <typename F>
+static inline float ce_reduce_max(float v, threadgroup float * buf, uint sgitg, uint tiisg, uint3 tptg) {
+    float r = simd_max(v);
+    if (tptg.x > N_SIMDWIDTH) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            buf[tiisg] = -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tiisg == 0) {
+            buf[sgitg] = r;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        r = simd_max(buf[tiisg]);
+    }
+    return r;
+}
+
+static inline float ce_reduce_sum(float v, threadgroup float * buf, uint sgitg, uint tiisg, uint3 tptg) {
+    float r = simd_sum(v);
+    if (tptg.x > N_SIMDWIDTH) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sgitg == 0) {
+            buf[tiisg] = 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tiisg == 0) {
+            buf[sgitg] = r;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        r = simd_sum(buf[tiisg]);
+    }
+    return r;
+}
+
+kernel void kernel_cross_entropy_loss_f32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const  char * src0,
+        device const  char * src1,
+        device        char * dst,
+        threadgroup  float * buf [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint3  tptg[[threads_per_threadgroup]]) {
+    const int32_t row = tgpig.x;
+
+    device const float * s0 = (device const float *) (src0 + row*args.nb01);
+    device const float * s1 = (device const float *) (src1 + row*args.nb11);
+
+    float lmax = -INFINITY;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lmax = MAX(lmax, s0[i]);
+    }
+    const float max_val = ce_reduce_max<float>(lmax, buf, sgitg, tiisg, tptg);
+
+    float lsum = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lsum += exp(s0[i] - max_val);
+    }
+    const float lse = log(ce_reduce_sum(lsum, buf, sgitg, tiisg, tptg));
+
+    float lloss = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lloss += (s0[i] - max_val - lse)*s1[i];
+    }
+    const float loss = ce_reduce_sum(lloss, buf, sgitg, tiisg, tptg);
+
+    if (tpitg.x == 0) {
+        ((device float *) dst)[row] = -loss/(float) args.nr;
+    }
+}
+
+kernel void kernel_cross_entropy_loss_back_f32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const  char * src0,   // grad: one float
+        device const  char * src1,   // logits
+        device const  char * src2,   // labels
+        device        char * dst,
+        threadgroup  float * buf [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint3  tptg[[threads_per_threadgroup]]) {
+    const int32_t row = tgpig.x;
+
+    const float d_by_nr = ((device const float *) src0)[0]/(float) args.nr;
+
+    device const float * s0 = (device const float *) (src1 + row*args.nb01);
+    device const float * s1 = (device const float *) (src2 + row*args.nb11);
+    device       float * d  = (device       float *) (dst  + row*args.nb1);
+
+    float lmax = -INFINITY;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lmax = MAX(lmax, s0[i]);
+    }
+    const float max_val = ce_reduce_max<float>(lmax, buf, sgitg, tiisg, tptg);
+
+    float lsum = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lsum += exp(s0[i] - max_val);
+    }
+    const float inv_sum = 1.0f/ce_reduce_sum(lsum, buf, sgitg, tiisg, tptg);
+
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        d[i] = (exp(s0[i] - max_val)*inv_sum - s1[i])*d_by_nr;
+    }
+}

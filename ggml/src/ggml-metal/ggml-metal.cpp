@@ -237,6 +237,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_out_prod_extra(tensor);
             } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            {
+                res += ggml_nrows(tensor->src[0])*sizeof(float); // the per-row losses before the sum
+            } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
             {

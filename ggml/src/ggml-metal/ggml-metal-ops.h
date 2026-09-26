@@ -76,6 +76,8 @@ int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
 size_t ggml_metal_op_out_prod_extra(const struct ggml_tensor * op);
 bool   ggml_metal_op_out_prod_supported(const struct ggml_tensor * op);
 int ggml_metal_op_out_prod          (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_cross_entropy_loss(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_cross_entropy_loss_back(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_silu_back         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_group_norm        (ggml_metal_op_t ctx, int idx);
