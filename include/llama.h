@@ -775,6 +775,13 @@ extern "C" {
     // Get metadata value as a string by index
     LLAMA_API int32_t llama_adapter_meta_val_str_by_index(const struct llama_adapter_lora * adapter, int32_t i, char * buf, size_t buf_size);
 
+    // Write the adapter's CURRENT A/B tensors (and its alpha and the model's architecture)
+    // as a GGUF LoRA that llama_adapter_lora_init loads back: the output of LoRA-only
+    // training (llama_opt_params.adapter). Returns 0 on success.
+    LLAMA_API int32_t llama_adapter_lora_save(
+            const struct llama_adapter_lora * adapter,
+            const char * path_lora);
+
     // Manually free a LoRA adapter
     // NOTE: loaded adapters that are not manually freed will be freed when the associated model is deleted
     LLAMA_API void llama_adapter_lora_free(struct llama_adapter_lora * adapter);
@@ -1694,6 +1701,14 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
+
+        // LoRA-only training: when set, ONLY this adapter's A/B tensors are offered to
+        // param_filter as trainable parameters and every base tensor stays frozen
+        // (gradients still flow through the base, quantized or not, to the adapter).
+        // The adapter must already be attached to the context (llama_set_adapters_lora)
+        // with a non-zero scale, or its tensors are not in the graph; its A/B tensors
+        // must be F32. NULL keeps the full-model walk.
+        struct llama_adapter_lora * adapter;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
