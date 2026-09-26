@@ -5017,7 +5017,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            // src0 may be F32, or any type with an F32 converter (F16/BF16/quantized) when
+            // contiguous: the backward through a frozen quantized weight (out_prod(W, grad^T))
+            // reads W as stored and dequantizes into a transient pool copy (see out-prod.cu).
+            return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                (op->src[0]->type == GGML_TYPE_F32 ||
+                 (ggml_is_contiguous(op->src[0]) && ggml_get_to_fp32_cuda(op->src[0]->type) != nullptr));
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
