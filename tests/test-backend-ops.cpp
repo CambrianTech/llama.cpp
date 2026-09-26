@@ -9443,6 +9443,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
     }
 
+    // A quantized src0 with more rows (k) than one dequantized block holds on CUDA
+    // (256 MiB of F32 at m = 256 is 262144 rows): the row-blocked accumulation path,
+    // three blocks, against the CPU backend; both src1 orientations.
+    for (bool trans_b : {false, true}) {
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_K, GGML_TYPE_F32,
+                                                  256, 8, 600000, {1, 1}, {1, 1}, trans_b));
+    }
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q8_0, GGML_TYPE_F32,
+                                              256, 8, 600000, {1, 1}, {1, 1}, false));
+
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
