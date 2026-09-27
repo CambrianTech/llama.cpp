@@ -87,6 +87,23 @@ static bool prepare_examples(const json & examples, const server_trainer::render
             why = at + " needs \"prompt\" and \"completion\" strings, or a non-empty \"messages\" array";
             return false;
         }
+        // "tools": the tool definitions the turn was served with, so the rendered prompt is the
+        // one the model saw (a served turn's system block lists them).
+        const json tools = ex.is_object() && ex.contains("tools") && ex.at("tools").is_array() ? ex.at("tools") : json::array();
+        // "train": false on a message keeps an assistant turn as CONTEXT without training it:
+        // a lived turn carries her earlier replies as history, and those are not this lesson.
+        // The key is ours, so it is read here and removed before the template sees the message.
+        std::vector<bool> trained(messages.size(), true);
+        for (size_t k = 0; k < messages.size(); ++k) {
+            if (messages[k].is_object() && messages[k].contains("train")) {
+                if (!messages[k].at("train").is_boolean()) {
+                    why = at + ".messages[" + std::to_string(k) + "].train must be a boolean";
+                    return false;
+                }
+                trained[k] = messages[k].at("train").get<bool>();
+                messages[k].erase("train");
+            }
+        }
         auto head = [&](size_t n) { // the first n messages
             json h = json::array();
             for (size_t j = 0; j < n; ++j) {
@@ -97,13 +114,13 @@ static bool prepare_examples(const json & examples, const server_trainer::render
         std::string full;
         std::vector<std::pair<size_t, size_t>> spans; // [begin, end) in chars of `full`
         try {
-            full = render(messages, false);
+            full = render(messages, tools, false);
             for (size_t k = 0; k < messages.size(); ++k) {
-                if (!messages[k].is_object() || messages[k].value("role", std::string()) != "assistant") {
+                if (!trained[k] || !messages[k].is_object() || messages[k].value("role", std::string()) != "assistant") {
                     continue;
                 }
-                const std::string pre  = render(head(k), true);
-                const std::string upto = render(head(k + 1), false);
+                const std::string pre  = render(head(k), tools, true);
+                const std::string upto = render(head(k + 1), tools, false);
                 if (full.compare(0, upto.size(), upto) != 0 || upto.compare(0, pre.size(), pre) != 0 || pre.size() >= upto.size()) {
                     why = at + ": the chat template does not render this conversation prefix-stably at message " + std::to_string(k)
                         + ", so the assistant turn cannot be located (templates that strip earlier turns' reasoning, e.g. Qwen3's"

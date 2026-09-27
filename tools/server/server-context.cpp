@@ -4136,9 +4136,12 @@ bool server_context::load_model(common_params & params) {
         impl->trainer = std::make_unique<server_trainer>(impl->model_tgt, impl->params_base,
                                                          [p]() { return p->n_busy_slots.load(); },
                                                          // the SAME templates serving frames turns with
-                                                         [p](const json & messages, bool add_generation_prompt) {
+                                                         [p](const json & messages, const json & tools, bool add_generation_prompt) {
                                                              common_chat_templates_inputs in;
                                                              in.messages              = common_chat_msgs_parse_oaicompat(messages);
+                                                             if (tools.is_array() && !tools.empty()) {
+                                                                 in.tools = common_chat_tools_parse_oaicompat(tools);
+                                                             }
                                                              in.add_generation_prompt = add_generation_prompt;
                                                              in.use_jinja             = p->params_base.use_jinja;
                                                              return common_chat_templates_apply(p->chat_params.tmpls.get(), in).prompt;
