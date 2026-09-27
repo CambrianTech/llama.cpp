@@ -3345,6 +3345,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
     opt_ctx = ggml_opt_init(opt_params);
+    ggml_opt_set_alloc_budget(opt_ctx, opt_memory_budget);
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
@@ -3473,7 +3474,14 @@ void llama_context::opt_epoch_iter(
                 ctx_compute_opt = ggml_init(params);
             }
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
-            ggml_opt_alloc(opt_ctx, train);
+            if (!ggml_opt_alloc(opt_ctx, train)) {
+                LLAMA_LOG_ERROR("%s: the %s graph does not fit in device memory (window %u): stopping the epoch\n",
+                                __func__, train ? "training" : "evaluation", n_ctx);
+                ggml_free(ctx_compute_opt);
+                opt_alloc_failed.store(true);
+                opt_stop_requested.store(true);
+                return;
+            }
 
             res->set_inputs(&ubatch);
             {
@@ -4237,11 +4245,28 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
 }
 
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {
+    ctx->opt_alloc_failed.store(false);
     ctx->opt_init(model, lopt_params);
 }
 
 void llama_opt_stop(struct llama_context * ctx, bool stop) {
     ctx->opt_stop_requested.store(stop, std::memory_order_relaxed);
+}
+
+void llama_opt_set_memory_budget(struct llama_context * ctx, size_t bytes) {
+    ctx->opt_memory_budget = bytes;
+}
+
+size_t llama_context::opt_graph_bytes() const {
+    return opt_ctx ? ggml_opt_peak_graph_bytes(opt_ctx) : 0;
+}
+
+size_t llama_opt_graph_bytes(struct llama_context * ctx) {
+    return ctx->opt_graph_bytes();
+}
+
+bool llama_opt_failed(struct llama_context * ctx) {
+    return ctx->opt_alloc_failed.load();
 }
 
 void llama_opt_epoch(

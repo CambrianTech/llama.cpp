@@ -1718,6 +1718,18 @@ extern "C" {
     // stop = false, so every later epoch on this context returns at once as well.
     LLAMA_API void llama_opt_stop(struct llama_context * lctx, bool stop);
 
+    // True when an epoch stopped because its training graph could not be allocated (device
+    // memory): nothing was evaluated past that point. Cleared by llama_opt_init.
+    LLAMA_API bool llama_opt_failed(struct llama_context * lctx);
+
+    // Cap, in bytes, what training may add on each GPU device (0 = the device's own free
+    // figure). Set before llama_opt_init. See ggml_opt_set_alloc_budget.
+    LLAMA_API void llama_opt_set_memory_budget(struct llama_context * lctx, size_t bytes);
+
+    // The largest training graph measured so far on a GPU device, in bytes (0 before the first
+    // batch): the footprint a run of this shape needs, from the run's own allocation preflight.
+    LLAMA_API size_t llama_opt_graph_bytes(struct llama_context * lctx);
+
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,

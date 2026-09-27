@@ -183,7 +183,19 @@ extern "C" {
 
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval
-    GGML_API void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
+    // returns false when the graph could not be allocated (device memory): the graph is then NOT
+    // ready and must not be evaluated
+    GGML_API bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
+
+    // Caps what a graph may add on each non-CPU device, over and above the device's own free
+    // figure (0 = no cap). For callers that know physical memory better than the driver does: on
+    // Windows (WDDM) a CUDA device reports nearly the whole card free beside other processes, and
+    // an allocation past physical VRAM lands in host memory.
+    GGML_API void ggml_opt_set_alloc_budget(ggml_opt_context_t opt_ctx, size_t bytes);
+
+    // The largest graph (bytes, on a non-CPU device) the allocation preflight has measured: what a
+    // run of this shape needs, measured by the run itself.
+    GGML_API size_t ggml_opt_peak_graph_bytes(ggml_opt_context_t opt_ctx);
 
     // do forward pass, increment result if not NULL, do backward pass if allocated
     GGML_API void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result);

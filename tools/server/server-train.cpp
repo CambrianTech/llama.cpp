@@ -189,7 +189,7 @@ json server_trainer::start(const json & body_in) {
     // assert in the training path would take the server down (Cormac on #14).
     {
         auto num = [&](const char * key, double def) { return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : def; };
-        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed"}) {
+        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib"}) {
             if (body.contains(key) && !body.at(key).is_number()) {
                 return json::object({{"ok", false}, {"error", std::string("\"") + key + "\" must be a number"}});
             }
@@ -203,6 +203,8 @@ json server_trainer::start(const json & body_in) {
         else if (epochs < 1 || epochs > 100 || epochs != (int64_t) epochs)   why = "epochs must be an integer in [1, 100]";
         else if (!(lr > 0 && lr <= 1))                               why = "lr must be in (0, 1]";
         else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
+        else if (body.contains("memory_budget_mib") && !(num("memory_budget_mib", 0) >= 1))
+                                                                     why = "memory_budget_mib must be >= 1";
         else if (body.contains("targets") && (!body.at("targets").is_string() || split_targets(body.at("targets").get<std::string>()).empty()))
                                                                      why = "targets must be a non-empty comma-separated list of module names";
         if (!why.empty()) {
@@ -354,6 +356,9 @@ void server_trainer::run(json req, examples_data ex) {
     const float       val     = (float) req.value("val_split", 0.1);
     const uint32_t    seed    = (uint32_t) req.value("seed", (int64_t) 42);
     const bool        special = req.value("parse_special", false);
+    // what training may add on the GPU, from a caller that knows physical memory (the core's
+    // governed lease); without it the driver's own free figure, which on Windows is not physical
+    const size_t      budget  = (size_t) (req.value("memory_budget_mib", 0.0) * 1024.0 * 1024.0);
 
     // The training context: the SAME model, its own graph. One ubatch is the whole window
     // (the training graph attends to this ubatch's K/V directly); flash attention has no
@@ -439,6 +444,7 @@ void server_trainer::run(json req, examples_data ex) {
         /*optimizer_type  =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
         /*adapter         =*/ adapter,
     };
+    llama_opt_set_memory_budget(ctx, budget);
     llama_opt_init(ctx, model, lopt);
     {
         // from here an epoch can run: a cancel reaches this context directly
@@ -489,7 +495,7 @@ void server_trainer::run(json req, examples_data ex) {
         const int64_t t0 = ggml_time_us();
         llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split, &server_trainer::on_batch, nullptr);
         const double seconds = (ggml_time_us() - t0) / 1e6;
-        if (cancel_requested.load()) {
+        if (cancel_requested.load() || llama_opt_failed(ctx)) {
             break;
         }
         double loss_train = 0.0, unc_train = 0.0, loss_eval = 0.0, unc_eval = 0.0;
@@ -516,14 +522,24 @@ void server_trainer::run(json req, examples_data ex) {
         ctx_live = nullptr;
     }
 
-    // a cancelled run writes nothing: a partial adapter is not a result
+    // a cancelled run writes nothing: a partial adapter is not a result; nor does a run whose
+    // training graph did not fit (the serving slots never shared that memory, so they go on)
     const bool    cancelled = cancel_requested.load();
-    const int32_t saved     = cancelled ? 0 : llama_adapter_lora_save(adapter, out.c_str());
+    const bool    no_fit    = llama_opt_failed(ctx);
+    const double  graph_mib = llama_opt_graph_bytes(ctx) / 1048576.0;
+    const int32_t saved     = (cancelled || no_fit) ? 0 : llama_adapter_lora_save(adapter, out.c_str());
     llama_adapter_lora_free(adapter);
     llama_free(ctx);
 
     std::lock_guard<std::mutex> lock(mu);
-    if (cancelled) {
+    // what the training graph needed on the GPU, measured by its own preflight (also on a refusal:
+    // it is the number to size the next attempt, or a caller's admission, by)
+    state["graph_mib"] = graph_mib;
+    if (no_fit) {
+        state["state"] = "error";
+        state["error"] = "the training graph did not fit in device memory at window " + std::to_string(window)
+                       + "; nothing was written and serving is unaffected (use a smaller window or fewer targets)";
+    } else if (cancelled) {
         state["state"] = "cancelled";
     } else if (saved != 0) {
         state["state"] = "error";
