@@ -3315,15 +3315,17 @@ static bool llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
-    model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
-    const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
+    // The training window lives on this context, not the shared model (a serving context may
+    // be running on the same weights).
+    opt_n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
+    const uint32_t n_batch     = std::min(this->n_batch(),  opt_n_ctx_train);
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
-    GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
+    GGML_ASSERT(opt_n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
     // A training graph cannot backprop through the KV cache (SET_ROWS writes in place and
     // attention reads the cache as a leaf), so attention consumes this ubatch's K/V
     // directly; that is exact only when one ubatch is the whole context.
-    GGML_ASSERT(n_ubatch == model->hparams.n_ctx_train && "training needs one ubatch per context: set -ub = -b = -c");
+    GGML_ASSERT(n_ubatch == opt_n_ctx_train && "training needs one ubatch per context: set -ub = -b = -c");
     GGML_ASSERT(!cparams.flash_attn && "training needs flash attention off: FLASH_ATTN_EXT has no backward");
     cparams.training = true;
     // The graph result and the scheduler were sized at context creation: before training
@@ -3398,7 +3400,7 @@ void llama_context::opt_epoch_iter(
         int64_t                          ndata_in_loop,
         int64_t                          t_loop_start) {
     GGML_ASSERT(opt_ctx);
-    const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
+    const uint32_t n_ctx    = opt_n_ctx_train;
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
 

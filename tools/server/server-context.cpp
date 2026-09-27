@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-train.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -792,6 +793,9 @@ public:
     //  - when not in sleeping state
     //  - and, with thread-safe APIs (e.g., tokenizer calls)
     llama_model * model_tgt = nullptr;
+
+    // the in-process trainer on model_tgt (created once the model is loaded)
+    std::unique_ptr<server_trainer> trainer;
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -4114,7 +4118,25 @@ server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
 bool server_context::load_model(common_params & params) {
-    return impl->load_model(params);
+    const bool ok = impl->load_model(params);
+    if (ok && impl->model_tgt != nullptr) {
+        impl->trainer = std::make_unique<server_trainer>(impl->model_tgt, impl->params_base);
+    }
+    return ok;
+}
+
+json server_context::train_start(const json & body) {
+    if (!impl->trainer) {
+        return json{{"ok", false}, {"error", "no model is loaded"}};
+    }
+    return impl->trainer->start(body);
+}
+
+json server_context::train_status() const {
+    if (!impl->trainer) {
+        return json{{"state", "unavailable"}};
+    }
+    return impl->trainer->status();
 }
 
 void server_context::start_loop() {
@@ -5223,6 +5245,24 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_get_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    this->get_train = [this](const server_http_req &) {
+        auto res = create_response();
+        res->ok(ctx_server.train_status());
+        return res;
+    };
+
+    this->post_train = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        const json r = ctx_server.train_start(body);
+        if (!r.value("ok", false)) {
+            res->error(format_error_response(r.value("error", std::string("training refused")), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok(r);
         return res;
     };
 

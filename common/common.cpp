@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include <random>
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -2358,4 +2359,77 @@ void common_prompt_checkpoint::clear_tgt() {
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
+}
+
+//
+// LoRA-only training
+//
+
+// Write a fresh adapter for every `blk.<i>.<target>.weight` the model has: A (n_in x rank)
+// uniform in +-1/sqrt(n_in) (PEFT's kaiming-uniform bound), B (rank x n_out) zero. F32,
+// because the optimizer steps F32 parameters.
+bool common_lora_write_fresh(const llama_model * model, const std::string & path,
+                                int32_t rank, float alpha, const std::vector<std::string> & targets,
+                                uint32_t seed) {
+    struct shape { std::string name; int64_t n_in; int64_t n_out; };
+    std::vector<shape> shapes;
+    for (int32_t il = 0; il < llama_model_n_layer(model); ++il) {
+        for (const auto & target : targets) {
+            const std::string name = "blk." + std::to_string(il) + "." + target + ".weight";
+            const ggml_tensor * w = llama_model_get_tensor(model, name.c_str());
+            if (w != nullptr && ggml_n_dims(w) == 2) {
+                shapes.push_back({ name, w->ne[0], w->ne[1] });
+            }
+        }
+    }
+    if (shapes.empty()) {
+        LOG_ERR("%s: none of the targets (%zu names) exist in this model\n", __func__, targets.size());
+        return false;
+    }
+
+    size_t data_size = 0;
+    for (const auto & s : shapes) {
+        data_size += (size_t) (s.n_in * rank + rank * s.n_out) * sizeof(float);
+    }
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2 * shapes.size() * ggml_tensor_overhead() + data_size,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ false,
+    };
+    ggml_context * ctx = ggml_init(params);
+    gguf_context * out = gguf_init_empty();
+
+    char arch[128];
+    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) < 0) {
+        LOG_ERR("%s: the model names no general.architecture\n", __func__);
+        return false;
+    }
+    gguf_set_val_str(out, "general.type", "adapter");
+    gguf_set_val_str(out, "general.architecture", arch);
+    gguf_set_val_str(out, "adapter.type", "lora");
+    gguf_set_val_f32(out, "adapter.lora.alpha", alpha);
+
+    std::mt19937 rng(seed);
+    for (const auto & s : shapes) {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, s.n_in, rank);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, s.n_out);
+        ggml_set_name(a, (s.name + ".lora_a").c_str());
+        ggml_set_name(b, (s.name + ".lora_b").c_str());
+        const float bound = 1.0f / std::sqrt((float) s.n_in);
+        std::uniform_real_distribution<float> uniform(-bound, bound);
+        float * ad = (float *) a->data;
+        for (int64_t i = 0; i < ggml_nelements(a); ++i) {
+            ad[i] = uniform(rng);
+        }
+        std::fill_n((float *) b->data, ggml_nelements(b), 0.0f);
+        gguf_add_tensor(out, a);
+        gguf_add_tensor(out, b);
+    }
+
+    const bool ok = gguf_write_to_file(out, path.c_str(), false);
+    LOG_INF("%s: fresh adapter: %zu target tensors, rank %d, alpha %.1f, seed %u -> %s\n",
+            __func__, shapes.size(), rank, (double) alpha, seed, path.c_str());
+    gguf_free(out);
+    ggml_free(ctx);
+    return ok;
 }
