@@ -369,6 +369,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_rwkv(ctx, idx);
             } break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                n_fuse = ggml_metal_op_gated_delta_net_back(ctx, idx);
+            } break;
         case GGML_OP_GATED_DELTA_NET:
             {
                 n_fuse = ggml_metal_op_gated_delta_net(ctx, idx);
@@ -1866,6 +1870,115 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_bytes   (enc, (void *) &H, sizeof(H), ida++);
 
     ggml_metal_encoder_dispatch_threadgroups(enc, B * H, 1, 1, C/H, 1, 1);
+
+    return 1;
+}
+
+// GATED_DELTA_NET_BACK: the checkpoint length and the scratch after dst (see the kernel)
+static int64_t ggml_metal_gdn_back_C(int64_t T) {
+    int64_t C = 1;
+    while (C*C < T) {
+        ++C;
+    }
+    return C;
+}
+
+bool ggml_metal_op_gated_delta_net_back_supported(const ggml_tensor * dst) {
+    for (int s = 0; s < 7; ++s) {
+        if (dst->src[s] == nullptr || dst->src[s]->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2],
+                      * g = dst->src[3], * b = dst->src[4], * st = dst->src[5], * gr = dst->src[6];
+    const int64_t S_v = v->ne[0];
+    if (S_v != 32 && S_v != 64 && S_v != 128) {
+        return false;
+    }
+    if (q->ne[0] != S_v || k->ne[0] != S_v || !(g->ne[0] == 1 || g->ne[0] == S_v)) {
+        return false;
+    }
+    if (v->ne[3] % q->ne[3] != 0 || v->ne[3] % k->ne[3] != 0 || v->ne[1] % q->ne[1] != 0 || v->ne[1] % k->ne[1] != 0) {
+        return false;
+    }
+    return dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) &&
+           ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v) &&
+           ggml_is_contiguous(g) && ggml_is_contiguous(b) && ggml_is_contiguous(st) && ggml_is_contiguous(gr);
+}
+
+size_t ggml_metal_op_gated_delta_net_back_extra(const ggml_tensor * dst) {
+    const ggml_tensor * v = dst->src[2];
+    const int64_t S_v = v->ne[0], H = v->ne[1], T = v->ne[2], n_seqs = v->ne[3];
+    const int64_t C = ggml_metal_gdn_back_C(T);
+    const int64_t n_ck = (T + C - 1)/C;
+    return (size_t) (n_seqs*H*n_ck*S_v*S_v + n_seqs*H*(C + 3)*S_v*S_v)*sizeof(float) + 256;
+}
+
+int ggml_metal_op_gated_delta_net_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_ASSERT(ggml_metal_op_gated_delta_net_back_supported(op));
+
+    const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * g = op->src[3], * b = op->src[4];
+
+    const int64_t S_v = v->ne[0], H = v->ne[1], T = v->ne[2], n_seqs = v->ne[3];
+    const int64_t C    = ggml_metal_gdn_back_C(T);
+    const int64_t n_ck = (T + C - 1)/C;
+
+    ggml_metal_kargs_gated_delta_net_back args = {
+        /*.H      =*/ H,
+        /*.T      =*/ T,
+        /*.n_seqs =*/ n_seqs,
+        /*.neq1   =*/ q->ne[1],
+        /*.neq3   =*/ q->ne[3],
+        /*.nek1   =*/ k->ne[1],
+        /*.nek3   =*/ k->ne[3],
+        /*.sq1    =*/ (int64_t) (q->nb[1]/sizeof(float)), (int64_t) (q->nb[2]/sizeof(float)), (int64_t) (q->nb[3]/sizeof(float)),
+        /*.sk1    =*/ (int64_t) (k->nb[1]/sizeof(float)), (int64_t) (k->nb[2]/sizeof(float)), (int64_t) (k->nb[3]/sizeof(float)),
+        /*.sv1    =*/ (int64_t) (v->nb[1]/sizeof(float)), (int64_t) (v->nb[2]/sizeof(float)), (int64_t) (v->nb[3]/sizeof(float)),
+        /*.C      =*/ C,
+        /*.off_dk =*/ ggml_nelements(q),
+        /*.off_dv =*/ ggml_nelements(q) + ggml_nelements(k),
+        /*.off_dg =*/ ggml_nelements(q) + ggml_nelements(k) + ggml_nelements(v),
+        /*.off_db =*/ ggml_nelements(q) + ggml_nelements(k) + ggml_nelements(v) + ggml_nelements(g),
+        /*.off_ds =*/ ggml_nelements(q) + ggml_nelements(k) + ggml_nelements(v) + ggml_nelements(g) + ggml_nelements(b),
+        /*.kda    =*/ g->ne[0] == S_v ? 1 : 0,
+        /*.K      =*/ ggml_get_op_params_i32(op, 0),
+        /*.scale  =*/ 1.0f/sqrtf((float) S_v),
+    };
+
+    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+    ggml_metal_buffer_id bid_ckpt = bid_dst;
+    bid_ckpt.offs += GGML_PAD(ggml_nbytes(op), 16);
+    ggml_metal_buffer_id bid_seg  = bid_ckpt;
+    bid_seg.offs  += (size_t) n_seqs*H*n_ck*S_v*S_v*sizeof(float);
+
+    // dq/dk accumulate across broadcast heads: zero the packed output first
+    {
+        const uint64_t n = (uint64_t) ggml_nelements(op);
+        auto pz = ggml_metal_library_get_pipeline_gated_delta_net_back_zero(lib);
+        ggml_metal_encoder_set_pipeline(enc, pz);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst, 0);
+        ggml_metal_encoder_set_bytes   (enc, (void *) &n, sizeof(n), 1);
+        const int nth = 256;
+        ggml_metal_encoder_dispatch_threadgroups(enc, (int) ((n + nth - 1)/nth), 1, 1, nth, 1, 1);
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net_back(lib, op);
+    int ida = 0;
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), ida++);
+    for (int s = 0; s < 7; ++s) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[s]), ida++);
+    }
+    ggml_metal_encoder_set_buffer  (enc, bid_dst,  ida++);
+    ggml_metal_encoder_set_buffer  (enc, bid_ckpt, ida++);
+    ggml_metal_encoder_set_buffer  (enc, bid_seg,  ida++);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) H, (int) n_seqs, 1, (int) S_v, 1, 1);
+    ggml_metal_op_concurrency_reset(ctx);
 
     return 1;
 }
