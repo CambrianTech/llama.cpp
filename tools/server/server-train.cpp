@@ -8,7 +8,7 @@
 #include <chrono>
 #include <sstream>
 
-using json = nlohmann::ordered_json;
+using json = common_json;
 
 // ggml-opt's epoch callback carries no user data; one run at a time, so the progress of the
 // current run is kept here for status() to read.
@@ -37,7 +37,7 @@ static std::vector<std::string> split_targets(const std::string & list) {
 
 server_trainer::server_trainer(llama_model * model, const common_params & params_base)
     : model(model), params_base(params_base) {
-    state = json{{"state", "idle"}};
+    state = json::object({{"state", "idle"}});
 }
 
 server_trainer::~server_trainer() {
@@ -48,10 +48,10 @@ server_trainer::~server_trainer() {
 
 json server_trainer::start(const json & body) {
     if (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty()) {
-        return json{{"ok", false}, {"error", "\"text\" (the training corpus) is required"}};
+        return json::object({{"ok", false}, {"error", "\"text\" (the training corpus) is required"}});
     }
     if (!body.contains("out") || !body.at("out").is_string() || body.at("out").get<std::string>().empty()) {
-        return json{{"ok", false}, {"error", "\"out\" (the adapter file to write) is required"}};
+        return json::object({{"ok", false}, {"error", "\"out\" (the adapter file to write) is required"}});
     }
     // REPACKED WEIGHTS GIVE WRONG GRADIENTS, SILENTLY (Cormac on the /train plan): the backward
     // reads quantized blocks in the standard layout, and a weight in an extra buffer type
@@ -64,28 +64,28 @@ json server_trainer::start(const json & body) {
         const bool    all_gpu  = ngl <= -2 || ngl > n_layer;
         const bool    override = !params_base.tensor_buft_overrides.empty();
         if (!params_base.no_extra_bufts && (!all_gpu || override)) {
-            return json{{"ok", false}, {"error",
+            return json::object({{"ok", false}, {"error",
                 "refusing to train: this server may hold base weights in a repacked CPU buffer (n_gpu_layers " +
                 std::to_string(ngl) + " of " + std::to_string(n_layer) + " layers" + (override ? ", tensor overrides set" : "") +
                 "), and the backward reads the standard layout, so gradients would be silently wrong. "
-                "Serve with every layer offloaded (-ngl all) or with --no-repack."}};
+                "Serve with every layer offloaded (-ngl all) or with --no-repack."}});
         }
     }
     bool expected = false;
     if (!running.compare_exchange_strong(expected, true)) {
-        return json{{"ok", false}, {"error", "a training run is already in progress"}, {"status", status()}};
+        return json::object({{"ok", false}, {"error", "a training run is already in progress"}, {"status", status()}});
     }
     if (worker.joinable()) {
         worker.join();
     }
     {
         std::lock_guard<std::mutex> lock(mu);
-        state = json{{"state", "starting"}, {"out", body.at("out")}, {"epochs", json::array()}};
+        state = json::object({{"state", "starting"}, {"out", body.at("out")}, {"epochs", json::array()}});
     }
     g_train_batch.store(0);
     g_train_batch_max.store(0);
     worker = std::thread(&server_trainer::run, this, body);
-    return json{{"ok", true}, {"status", status()}};
+    return json::object({{"ok", true}, {"status", status()}});
 }
 
 json server_trainer::status() const {
@@ -107,16 +107,16 @@ void server_trainer::run(json req) {
         running.store(false);
     };
 
-    const std::string text    = req.at("text");
-    const std::string out     = req.at("out");
-    const int32_t     rank    = req.value("rank", 8);
-    const float       alpha   = req.value("alpha", 16.0f);
+    const std::string text    = req.at("text").get<std::string>();
+    const std::string out     = req.at("out").get<std::string>();
+    const int32_t     rank    = (int32_t) req.value("rank", (int64_t) 8);
+    const float       alpha   = (float) req.value("alpha", 16.0);
     const std::string targets = req.value("targets", std::string("attn_q,attn_v"));
-    const uint32_t    window  = req.value("window", 256u);
-    const unsigned    epochs  = req.value("epochs", 1u);
-    const float       lr0     = req.value("lr", 1e-5f);
-    const float       val     = req.value("val_split", 0.1f);
-    const uint32_t    seed    = req.value("seed", 42u);
+    const uint32_t    window  = (uint32_t) req.value("window", (int64_t) 256);
+    const unsigned    epochs  = (unsigned) req.value("epochs", (int64_t) 1);
+    const float       lr0     = (float) req.value("lr", 1e-5);
+    const float       val     = (float) req.value("val_split", 0.1);
+    const uint32_t    seed    = (uint32_t) req.value("seed", (int64_t) 42);
 
     // The training context: the SAME model, its own graph. One ubatch is the whole window
     // (the training graph attends to this ubatch's K/V directly); flash attention has no
@@ -208,8 +208,8 @@ void server_trainer::run(json req) {
                 __func__, lr.epoch, loss_train, loss_eval, seconds, tok_s);
         {
             std::lock_guard<std::mutex> lock(mu);
-            state["epochs"].push_back(json{{"epoch", lr.epoch}, {"train_loss", loss_train}, {"eval_loss", loss_eval},
-                                           {"seconds", seconds}, {"train_tok_s", tok_s}});
+            state["epochs"].push_back(json::object({{"epoch", lr.epoch}, {"train_loss", loss_train}, {"eval_loss", loss_eval},
+                                           {"seconds", seconds}, {"train_tok_s", tok_s}}));
         }
         ggml_opt_result_reset(result_train);
         ggml_opt_result_reset(result_eval);
