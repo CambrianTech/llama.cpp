@@ -14,6 +14,12 @@
 //                   with per-epoch train/eval loss, train tok/s, and the adapter path
 //   POST /train/cancel -> the run stops at the next training window and writes no adapter
 //
+//   POST /train  {"examples": [{"prompt": "...", "completion": "..."} | {"messages": [...]}, ...], ...}
+//                -> each example is rendered through THIS model's chat template as a closed
+//                   conversation (no generation prompt), the renders are concatenated, and their
+//                   control tokens are parsed as tokens: the adapter learns the turns exactly as
+//                   serving will frame them. "text" and "examples" are exclusive.
+//
 // "parse_special": true tokenizes control tokens in the text (<|im_start|> ...) as the tokens
 // they name, which is what a corpus rendered through the model's chat template needs; the
 // default (false) trains on the text exactly as written.
@@ -36,11 +42,14 @@ class server_trainer {
 public:
     // busy_slots: how many serving slots are working right now (read between training batches;
     // the trainer yields while it is non-zero, so a turn never waits behind more than one batch)
-    server_trainer(llama_model * model, const common_params & params_base, std::function<int()> busy_slots);
+    // render_chat: messages (OpenAI shape) -> the model's chat template applied as a closed
+    // conversation; throws on a template error. Empty = "examples" are refused.
+    server_trainer(llama_model * model, const common_params & params_base, std::function<int()> busy_slots,
+                   std::function<std::string(const common_json &)> render_chat);
     ~server_trainer();
 
     // Starts a run on a worker thread; refuses (ok=false) while one is running or on bad input.
-    common_json start(const common_json & body);
+    common_json start(const common_json & body_in);
     common_json status() const;
     // Stops the running job at its next training window (no adapter is written); ok=false when
     // nothing is running.
@@ -54,6 +63,7 @@ private:
     llama_model * model;
     common_params params_base;
     std::function<int()> busy_slots;
+    std::function<std::string(const common_json &)> render_chat;
     std::atomic<bool>    yield_to_turns{true};
     std::atomic<int64_t> yielded_ms{0};
 

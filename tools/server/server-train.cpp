@@ -29,8 +29,9 @@ static std::vector<std::string> split_targets(const std::string & list) {
     return out;
 }
 
-server_trainer::server_trainer(llama_model * model, const common_params & params_base, std::function<int()> busy_slots)
-    : model(model), params_base(params_base), busy_slots(std::move(busy_slots)) {
+server_trainer::server_trainer(llama_model * model, const common_params & params_base, std::function<int()> busy_slots,
+                               std::function<std::string(const json &)> render_chat)
+    : model(model), params_base(params_base), busy_slots(std::move(busy_slots)), render_chat(std::move(render_chat)) {
     state = json::object({{"state", "idle"}});
 }
 
@@ -63,14 +64,65 @@ static std::string confine_out(const std::string & dir, const std::string & name
     return d + name;
 }
 
-json server_trainer::start(const json & body) {
+// "examples" -> one corpus: every example rendered through the model's chat template as a closed
+// conversation. Returns "" and sets why on a malformed example or a template error.
+static std::string render_examples(const json & examples, const std::function<std::string(const json &)> & render, std::string & why) {
+    std::string text;
+    for (size_t i = 0; i < examples.size(); ++i) {
+        const json & ex = examples[i];
+        json messages;
+        if (ex.is_object() && ex.contains("messages") && ex.at("messages").is_array() && !ex.at("messages").empty()) {
+            messages = ex.at("messages");
+        } else if (ex.is_object() && ex.contains("prompt") && ex.at("prompt").is_string()
+                   && ex.contains("completion") && ex.at("completion").is_string()) {
+            messages = json::array({ json::object({{"role", "user"},      {"content", ex.at("prompt")}}),
+                                     json::object({{"role", "assistant"}, {"content", ex.at("completion")}}) });
+        } else {
+            why = "examples[" + std::to_string(i) + "] needs \"prompt\" and \"completion\" strings, or a non-empty \"messages\" array";
+            return "";
+        }
+        try {
+            text += render(messages);
+        } catch (const std::exception & e) {
+            why = "examples[" + std::to_string(i) + "] could not be rendered through the chat template: " + e.what();
+            return "";
+        }
+    }
+    return text;
+}
+
+json server_trainer::start(const json & body_in) {
+    json body = body_in;
     // OFF unless the server was started with --train-dir: the route writes files, so an engine
     // opts in explicitly and every write is confined to that directory (Cormac on #14).
     if (params_base.train_dir.empty()) {
         return json::object({{"ok", false}, {"error", "training is disabled on this server (start it with --train-dir DIR to enable /train)"}});
     }
+    if (body.contains("examples")) {
+        if (body.contains("text")) {
+            return json::object({{"ok", false}, {"error", "give \"text\" or \"examples\", not both"}});
+        }
+        if (!body.at("examples").is_array() || body.at("examples").empty()) {
+            return json::object({{"ok", false}, {"error", "\"examples\" must be a non-empty array"}});
+        }
+        if (body.contains("parse_special") && !(body.at("parse_special").is_boolean() && body.at("parse_special").get<bool>())) {
+            return json::object({{"ok", false}, {"error", "\"examples\" are rendered through the chat template, so their control tokens are always parsed (drop \"parse_special\")"}});
+        }
+        if (!render_chat) {
+            return json::object({{"ok", false}, {"error", "this server has no chat template to render \"examples\" with; send \"text\""}});
+        }
+        std::string why;
+        std::string text = render_examples(body.at("examples"), render_chat, why);
+        if (!why.empty()) {
+            return json::object({{"ok", false}, {"error", why}});
+        }
+        body["n_examples"]    = body.at("examples").size();
+        body.erase("examples");
+        body["text"]          = std::move(text);
+        body["parse_special"] = true;
+    }
     if (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty()) {
-        return json::object({{"ok", false}, {"error", "\"text\" (the training corpus) is required"}});
+        return json::object({{"ok", false}, {"error", "\"text\" or \"examples\" (the training corpus) is required"}});
     }
     if (!body.contains("out") || !body.at("out").is_string() || body.at("out").get<std::string>().empty()) {
         return json::object({{"ok", false}, {"error", "\"out\" (the adapter file name to write) is required"}});
@@ -137,6 +189,9 @@ json server_trainer::start(const json & body) {
     {
         std::lock_guard<std::mutex> lock(mu);
         state = json::object({{"state", "starting"}, {"out", body.at("out")}, {"epochs", json::array()}});
+        if (body.contains("n_examples")) {
+            state["examples"] = body.at("n_examples");
+        }
     }
     g_train_batch.store(0);
     g_train_batch_max.store(0);
