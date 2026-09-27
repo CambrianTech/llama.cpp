@@ -189,7 +189,7 @@ json server_trainer::start(const json & body_in) {
     // assert in the training path would take the server down (Cormac on #14).
     {
         auto num = [&](const char * key, double def) { return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : def; };
-        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib"}) {
+        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers"}) {
             if (body.contains(key) && !body.at(key).is_number()) {
                 return json::object({{"ok", false}, {"error", std::string("\"") + key + "\" must be a number"}});
             }
@@ -205,6 +205,9 @@ json server_trainer::start(const json & body_in) {
         else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
         else if (body.contains("memory_budget_mib") && !(num("memory_budget_mib", 0) >= 1))
                                                                      why = "memory_budget_mib must be >= 1";
+        else if (body.contains("top_layers") && !(num("top_layers", 0) >= 1 && num("top_layers", 0) <= llama_model_n_layer(model) &&
+                                                  num("top_layers", 0) == (int64_t) num("top_layers", 0)))
+                                                                     why = "top_layers must be an integer in [1, " + std::to_string(llama_model_n_layer(model)) + "]";
         else if (body.contains("targets") && (!body.at("targets").is_string() || split_targets(body.at("targets").get<std::string>()).empty()))
                                                                      why = "targets must be a non-empty comma-separated list of module names";
         if (!why.empty()) {
@@ -350,6 +353,8 @@ void server_trainer::run(json req, examples_data ex) {
     const int32_t     rank    = (int32_t) req.value("rank", (int64_t) 8);
     const float       alpha   = (float) req.value("alpha", 16.0);
     const std::string targets = req.value("targets", std::string("attn_q,attn_v"));
+    // 0 = every block; K = only the last K (the backward pass stops at the lowest adapted one)
+    const int32_t     top     = (int32_t) req.value("top_layers", (int64_t) 0);
     const uint32_t    window  = (uint32_t) req.value("window", (int64_t) 256);
     const unsigned    epochs  = (unsigned) req.value("epochs", (int64_t) 1);
     const float       lr0     = (float) req.value("lr", 1e-5);
@@ -384,7 +389,7 @@ void server_trainer::run(json req, examples_data ex) {
     }
 
     const std::string init_path = out + ".init.gguf";
-    if (!common_lora_write_fresh(model, init_path, rank, alpha, split_targets(targets), seed)) {
+    if (!common_lora_write_fresh(model, init_path, rank, alpha, split_targets(targets), seed, top)) {
         llama_free(ctx);
         fail("could not write the fresh adapter (do the targets exist in this model?)");
         return;
