@@ -617,6 +617,9 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // the adapters the state was computed under; restored only into the same set
+    lora_active_set lora;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -646,9 +649,12 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const lora_active_set & lora, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // drop every state computed with `adapter` active: it is about to be freed
+    void evict_lora(const llama_adapter_lora * adapter);
 
     void update();
 };

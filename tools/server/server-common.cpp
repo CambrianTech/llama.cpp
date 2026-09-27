@@ -170,6 +170,16 @@ std::map<int, float> parse_lora_request(const json & data) {
     return lora;
 }
 
+lora_active_set lora_active(const std::vector<common_adapter_lora_info> & loras) {
+    lora_active_set out;
+    for (const auto & la : loras) {
+        if (la.scale != 0.0f) {
+            out.emplace_back(la.ptr, la.scale);
+        }
+    }
+    return out;
+}
+
 bool are_lora_equal(
         const std::vector<common_adapter_lora_info> & l1,
         const std::vector<common_adapter_lora_info> & l2) {
