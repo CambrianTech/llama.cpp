@@ -4060,6 +4060,8 @@ struct test_ssm_conv : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a   = ggml_new_tensor(ctx, type, 4, ne_a.data());
         ggml_tensor * b   = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        if (a->type == GGML_TYPE_F32) { ggml_set_param(a); }
+        if (b->type == GGML_TYPE_F32) { ggml_set_param(b); }
         ggml_tensor * out = ggml_ssm_conv(ctx, a, b);
         return out;
     }
@@ -4403,6 +4405,58 @@ struct test_gated_delta_net : public test_case {
             }
         }
     }
+};
+
+// Backward rules the hybrid (delta-net) training graph needs, by finite differences:
+// CONCAT (the conv state concatenated with a TRANSPOSED qkv along time) and L2_NORM (q/k rows,
+// one row small enough that the eps clamp takes the other branch).
+struct test_concat_grad : public test_case {
+    const int dim;
+    const bool transposed_b;
+    std::string vars() override { return VARS_TO_STR2(dim, transposed_b); }
+    test_concat_grad(int dim = 0, bool transposed_b = false) : dim(dim), transposed_b(transposed_b) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 5, 2);
+        ggml_tensor * b = transposed_b
+            ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 5, 4, 2)   // [5, 4] transposed to [4, 5]
+            : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dim == 0 ? 4 : 3, dim == 0 ? 5 : 4, 2);
+        ggml_set_param(a);
+        ggml_set_param(b);
+        ggml_tensor * bb = transposed_b ? ggml_transpose(ctx, b) : b;
+        return ggml_concat(ctx, a, bb, dim);
+    }
+};
+
+struct test_l2_norm_grad : public test_case {
+    std::string vars() override { return "rows"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 4);
+        ggml_set_name(a, "a");
+        ggml_set_param(a);
+        return ggml_l2_norm(ctx, a, 1e-2f);
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "a") != 0) {
+                continue;
+            }
+            std::vector<float> v(ggml_nelements(t));
+            for (size_t i = 0; i < v.size(); ++i) {
+                v[i] = 0.1f + 0.05f * (float) ((i * 7) % 11) - 0.25f;
+            }
+            for (int i = 0; i < 8; ++i) {
+                v[3 * 8 + i] = 1e-4f * (float) (i + 1);   // |row 3| ~ 2e-3 < eps: the clamped branch
+            }
+            ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+        }
+    }
+    // eps = 1e-3: the loss is a sum of ~32 outputs near 1, so float32 rounding is ~ulp/eps;
+    // at 1e-4 it was ~7e-3 per element and fell tenfold at 1e-3 (rounding, not bias). The
+    // clamped row stays under eps at this step. 1e-3 is the harness's usual non-trivial bound;
+    // dropping the projection term fails it by far (mutation-checked).
+    float grad_eps() override { return 1e-3f; }
+    bool grad_precise() override { return true; }
+    double max_maa_err() override { return 1e-3; }
 };
 
 // GGML_OP_GATED_DELTA_NET, gradients: the backward (GGML_OP_GATED_DELTA_NET_BACK) checked by
@@ -10138,6 +10192,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     // the backward, by finite differences: scalar gate, KDA gate, several tokens and seqs,
     // and K > 1 so the snapshot rows' gradients enter the recurrence mid-sequence
+    test_cases.emplace_back(new test_concat_grad(0, false));
+    test_cases.emplace_back(new test_concat_grad(1, false));
+    test_cases.emplace_back(new test_concat_grad(0, true));
+    test_cases.emplace_back(new test_l2_norm_grad());
     test_cases.emplace_back(new test_gated_delta_net_grad(2, 4, 3, 1, false, 1));
     test_cases.emplace_back(new test_gated_delta_net_grad(2, 4, 3, 2, true, 1));
     test_cases.emplace_back(new test_gated_delta_net_grad(1, 8, 4, 1, false, 3));
