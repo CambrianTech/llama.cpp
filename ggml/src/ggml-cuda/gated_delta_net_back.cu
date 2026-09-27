@@ -12,21 +12,29 @@
 // (u_j, dd_j, the M update) is a plain loop over i in that thread; the column sums the
 // backward needs (dq_i, dk_i, the KDA dg_i) go through shared accumulators with each thread
 // adding at a diagonal offset (i = j + s mod S_v at step s), so no two threads touch one
-// address in the same step. The forward states are recomputed and STORED in a pool buffer
+// address in the same step. The forward states are recomputed from CHECKPOINTS (see below)
 // ((T + 1) x S_v^2 per block): the backward needs every S and S', and inverting the decay
 // would divide by exp(g). dq and dk are accumulated with atomics because q and k are shared
 // across the heads that broadcast over them.
 //
-// First cut: S_v <= 128 (M' and dM live in dynamic shared memory, 2 x S_v^2 floats); the
-// stored states cost (T + 1) x S_v^2 x 4 B per (sequence, head) — 67 MB at T = 1024,
-// S_v = 128 — and recomputing in segments is the follow-on if that transient matters.
+// S_v <= 128. M' and dM are row-private, so they live in the block's global scratch.
+//
+// CHECKPOINTED RECOMPUTE (Continuum card f4fc77c2, Cormac on llama.cpp#10): storing every
+// state cost (T + 1) x S_v^2 floats per (sequence, head) — 67 MB at T = 1024, S_v = 128,
+// GBs per call on a 27B's delta-net layer. The forward now keeps a two-slot working state
+// and saves a checkpoint every C tokens (C ~ sqrt(T), chosen by the host); the backward
+// walks the segments last to first, re-running each segment forward from its checkpoint
+// into a (C + 1)-state scratch before walking it back. ceil(T / C) + C + 1 states per
+// block instead of T + 1 (65 vs 1025 at T = 1024), for one extra forward of compute.
+// A row of the state depends only on the same row of the previous state, so thread j
+// recomputes its own row with no cross-thread dependency beyond the shared a, k, v loads.
 
 template <int S_v>
 __global__ void __launch_bounds__(S_v, 1)
 gated_delta_net_back_cuda(
         const float * __restrict__ q,     const float * __restrict__ k,     const float * __restrict__ v,
         const float * __restrict__ g,     const float * __restrict__ beta,  const float * __restrict__ s0,
-        const float * __restrict__ grad,  float * __restrict__ states,
+        const float * __restrict__ grad,  float * ckpt,  float * seg,  // written and re-read in this kernel: no __restrict__ (the read-only cache could serve a stale row)
         float * __restrict__ dq,  float * __restrict__ dk,  float * __restrict__ dv,
         float * __restrict__ dg,  float * __restrict__ db,  float * __restrict__ ds,
         const int64_t H, const int64_t T, const int64_t n_seqs,
@@ -34,12 +42,9 @@ gated_delta_net_back_cuda(
         const int64_t sq1, const int64_t sq2, const int64_t sq3,
         const int64_t sk1, const int64_t sk2, const int64_t sk3,
         const int64_t sv1, const int64_t sv2, const int64_t sv3,
-        const int      kda, const int K, const float scale) {
+        const int      kda, const int K, const float scale, const int64_t C) {
     constexpr int SS = S_v * S_v;
 
-    extern __shared__ float smem[];
-    float * Mp = smem;        // S' for the current step, row j at Mp + j*S_v
-    float * dM = smem + SS;   // dS carried backward
 
     __shared__ float a_s[S_v], q_s[S_v], k_s[S_v], v_s[S_v], gy_s[S_v];
     __shared__ float delta_s[S_v], u_s[S_v], dd_s[S_v], du_s[S_v];
@@ -53,8 +58,18 @@ gated_delta_net_back_cuda(
     const int64_t rk3  = n_seqs / nek3;
     const int64_t neg0 = kda ? S_v : 1;
 
-    // this block's slice of the stored states: (T + 1) states of SS floats
-    states += (iv3 * H + iv1) * (T + 1) * SS;
+    // this block's checkpoints (one per segment of C tokens: the state before its first
+    // token) and its segment scratch (C + 1 states)
+    const int64_t n_ck = (T + C - 1) / C;
+    ckpt += (iv3 * H + iv1) * n_ck * SS;
+    seg  += (iv3 * H + iv1) * (C + 3) * SS;
+    // S' for the current step and the dS carried backward, row j at X + j*S_v. Each row is
+    // touched only by its own thread, so they live in this block's global scratch (after the
+    // C + 1 segment states), not in shared memory: 2 x S_v^2 floats is 128 KB at S_v = 128,
+    // above the per-block shared-memory limit, and nothing here needs sharing across threads.
+    float * Mp = seg + (C + 1) * SS;
+    float * dM = Mp + SS;
+
 
     const float * s0_blk = s0 + iv3 * H * SS + iv1 * SS;
     const int64_t snap   = (int64_t) SS * H * n_seqs;
@@ -66,6 +81,26 @@ gated_delta_net_back_cuda(
     auto v_at = [&](int64_t t) { return v + iv3 * sv3 + t * sv2 + iv1 * sv1; };
     auto g_at = [&](int64_t t) { return g + (iv3 * T + t) * H * neg0 + iv1 * neg0; };
     auto b_at = [&](int64_t t) { return beta[(iv3 * T + t) * H + iv1]; };
+
+    // one forward step of row j: Mnext_j = a (.) Mprev_j + k delta_j, with a, k, v for token t
+    // loaded into shared by every thread first
+    auto fwd_step = [&](const float * Mprev, float * Mnext, int64_t t) {
+        const float * g_t = g_at(t);
+        a_s[j] = expf(kda ? g_t[j] : g_t[0]);
+        k_s[j] = k_at(t)[j];
+        v_s[j] = v_at(t)[j];
+        __syncthreads();
+        const float b = b_at(t);
+        float u = 0.0f;
+        for (int i = 0; i < S_v; ++i) {
+            u += Mprev[i] * a_s[i] * k_s[i];
+        }
+        const float delta = (v_s[j] - u) * b;
+        for (int i = 0; i < S_v; ++i) {
+            Mnext[i] = Mprev[i] * a_s[i] + k_s[i] * delta;
+        }
+        __syncthreads();
+    };
 
     // block-wide sum of one float per thread, result valid in every thread
     auto block_sum = [&](float x) {
@@ -82,28 +117,20 @@ gated_delta_net_back_cuda(
         return r;
     };
 
-    // ---- forward, storing every state ------------------------------------------------
+    // ---- forward, checkpointing every C tokens -----------------------------------------
     for (int i = 0; i < S_v; ++i) {
-        states[j * S_v + i] = s0_blk[j * S_v + i];
+        seg[j * S_v + i] = s0_blk[j * S_v + i];
     }
     for (int64_t t = 0; t < T; ++t) {
-        const float * g_t = g_at(t);
-        a_s[j] = expf(kda ? g_t[j] : g_t[0]);
-        k_s[j] = k_at(t)[j];
-        v_s[j] = v_at(t)[j];
-        __syncthreads();
-        const float   b     = b_at(t);
-        const float * Mprev = states + t * SS + j * S_v;
-        float       * Mnext = states + (t + 1) * SS + j * S_v;
-        float u = 0.0f;
-        for (int i = 0; i < S_v; ++i) {
-            u += Mprev[i] * a_s[i] * k_s[i];
+        float * cur = seg + (t & 1) * SS + j * S_v;
+        float * nxt = seg + ((t + 1) & 1) * SS + j * S_v;
+        if (t % C == 0) {
+            float * ck = ckpt + (t / C) * SS + j * S_v;
+            for (int i = 0; i < S_v; ++i) {
+                ck[i] = cur[i];
+            }
         }
-        const float delta = (v_s[j] - u) * b;
-        for (int i = 0; i < S_v; ++i) {
-            Mnext[i] = Mprev[i] * a_s[i] + k_s[i] * delta;
-        }
-        __syncthreads();
+        fwd_step(cur, nxt, t);
     }
 
     // ---- backward, carrying dM ---------------------------------------------------------
@@ -112,7 +139,20 @@ gated_delta_net_back_cuda(
     }
     __syncthreads();
 
-    for (int64_t t = T - 1; t >= 0; --t) {
+    for (int64_t s = n_ck - 1; s >= 0; --s) {
+    const int64_t t0 = s * C;
+    const int64_t t1 = t0 + C < T ? t0 + C : T;
+    // re-run this segment forward from its checkpoint: seg[x] = the state before token t0 + x
+    {
+        const float * ck = ckpt + s * SS + j * S_v;
+        for (int i = 0; i < S_v; ++i) {
+            seg[j * S_v + i] = ck[i];
+        }
+        for (int64_t tt = t0; tt < t1; ++tt) {
+            fwd_step(seg + (tt - t0) * SS + j * S_v, seg + (tt - t0 + 1) * SS + j * S_v, tt);
+        }
+    }
+    for (int64_t t = t1 - 1; t >= t0; --t) {
         const float * g_t = g_at(t);
         a_s[j]  = expf(kda ? g_t[j] : g_t[0]);
         q_s[j]  = q_at(t)[j];
@@ -127,8 +167,8 @@ gated_delta_net_back_cuda(
         const float   b     = b_at(t);
         float       * dMj   = dM + j * S_v;
         float       * Mpj   = Mp + j * S_v;
-        const float * M1j   = states + (t + 1) * SS + j * S_v;  // S after token t
-        const float * M0j   = states + t * SS + j * S_v;        // S before token t
+        const float * M1j   = seg + (t - t0 + 1) * SS + j * S_v;  // S after token t
+        const float * M0j   = seg + (t - t0) * SS + j * S_v;      // S before token t
 
         // a snapshot slot that captured the state after token t
         const int64_t slot = T - 1 - t;
@@ -225,6 +265,7 @@ gated_delta_net_back_cuda(
         }
         __syncthreads();
     }
+    }
 
     // the initial state's gradient
     for (int i = 0; i < S_v; ++i) {
@@ -258,22 +299,20 @@ bool ggml_cuda_gated_delta_net_back_supported(const ggml_tensor * dst) {
 template <int S_v>
 static void launch_gated_delta_net_back(
         const float * q, const float * k, const float * v, const float * g, const float * beta,
-        const float * s0, const float * grad, float * states,
+        const float * s0, const float * grad, float * ckpt, float * seg, int64_t C,
         float * dq, float * dk, float * dv, float * dg, float * db, float * ds,
         int64_t H, int64_t T, int64_t n_seqs,
         int64_t neq1, int64_t neq3, int64_t nek1, int64_t nek3,
         int64_t sq1, int64_t sq2, int64_t sq3, int64_t sk1, int64_t sk2, int64_t sk3,
         int64_t sv1, int64_t sv2, int64_t sv3,
         int kda, int K, float scale, cudaStream_t stream) {
-    constexpr size_t smem = 2 * (size_t) S_v * S_v * sizeof(float);
-    CUDA_SET_SHARED_MEMORY_LIMIT((gated_delta_net_back_cuda<S_v>), smem);
     const dim3 grid((unsigned) H, (unsigned) n_seqs, 1);
     const dim3 block(S_v, 1, 1);
-    const ggml_cuda_kernel_launch_params lp(grid, block, smem, stream);
+    const ggml_cuda_kernel_launch_params lp(grid, block, (size_t) 0, stream);
     ggml_cuda_kernel_launch(gated_delta_net_back_cuda<S_v>, lp,
-        q, k, v, g, beta, s0, grad, states, dq, dk, dv, dg, db, ds,
+        q, k, v, g, beta, s0, grad, ckpt, seg, dq, dk, dv, dg, db, ds,
         H, T, n_seqs, neq1, neq3, nek1, nek3, sq1, sq2, sq3, sk1, sk2, sk3, sv1, sv2, sv3,
-        kda, K, scale);
+        kda, K, scale, C);
 }
 
 void ggml_cuda_op_gated_delta_net_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -304,8 +343,15 @@ void ggml_cuda_op_gated_delta_net_back(ggml_backend_cuda_context & ctx, ggml_ten
     float * ds = db + ggml_nelements(src_b);
     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
 
-    // every state of the forward, per (sequence, head): (T + 1) x S_v^2 floats
-    ggml_cuda_pool_alloc<float> states(ctx.pool(), (size_t) n_seqs * H * (T + 1) * S_v * S_v);
+    // checkpoints every C ~ sqrt(T) tokens and one segment of C + 1 states, per (sequence, head)
+    int64_t C = 1;
+    while (C * C < T) {
+        ++C;
+    }
+    const int64_t n_ck = (T + C - 1) / C;
+    ggml_cuda_pool_alloc<float> ckpt(ctx.pool(), (size_t) n_seqs * H * n_ck    * S_v * S_v);
+    // per block: the C + 1 segment states, then S' and dS (2 more)
+    ggml_cuda_pool_alloc<float> seg (ctx.pool(), (size_t) n_seqs * H * (C + 3) * S_v * S_v);
 
     const int64_t sq1 = src_q->nb[1] / sizeof(float), sq2 = src_q->nb[2] / sizeof(float), sq3 = src_q->nb[3] / sizeof(float);
     const int64_t sk1 = src_k->nb[1] / sizeof(float), sk2 = src_k->nb[2] / sizeof(float), sk3 = src_k->nb[3] / sizeof(float);
@@ -314,7 +360,7 @@ void ggml_cuda_op_gated_delta_net_back(ggml_backend_cuda_context & ctx, ggml_ten
 #define GDN_BACK_LAUNCH(SV) \
     launch_gated_delta_net_back<SV>((const float *) src_q->data, (const float *) src_k->data, (const float *) src_v->data, \
         (const float *) src_g->data, (const float *) src_b->data, (const float *) src_s->data, (const float *) src_gr->data, \
-        states.get(), dq, dk, dv, dg, db, ds, H, T, n_seqs, neq1, neq3, nek1, nek3, \
+        ckpt.get(), seg.get(), C, dq, dk, dv, dg, db, ds, H, T, n_seqs, neq1, neq3, nek1, nek3, \
         sq1, sq2, sq3, sk1, sk2, sk3, sv1, sv2, sv3, kda, K, scale, stream)
     switch (S_v) {
         case 16:  GDN_BACK_LAUNCH(16);  break;
