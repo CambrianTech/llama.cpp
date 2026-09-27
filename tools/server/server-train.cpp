@@ -13,10 +13,9 @@
 using json = common_json;
 
 // ggml-opt's epoch callback carries no user data; one run at a time, so the current run's
-// trainer and progress are kept here.
+// progress is kept here.
 static std::atomic<int64_t>       g_train_batch{0};
 static std::atomic<int64_t>       g_train_batch_max{0};
-static std::atomic<server_trainer *> g_trainer{nullptr};
 
 static std::vector<std::string> split_targets(const std::string & list) {
     std::vector<std::string> out;
@@ -273,33 +272,55 @@ json server_trainer::start(const json & body_in) {
     if (body.contains("parse_special") && !body.at("parse_special").is_boolean()) {
         return json::object({{"ok", false}, {"error", "\"parse_special\" must be true or false"}});
     }
+    std::unique_lock<std::mutex> lock(mu);
     bool expected = false;
     if (!running.compare_exchange_strong(expected, true)) {
-        return json::object({{"ok", false}, {"error", "a training run is already in progress"}, {"status", status()}});
+        return json::object({{"ok", false}, {"error", "a training run is already in progress"}});
     }
     if (worker.joinable()) {
         worker.join();
     }
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        state = json::object({{"state", "starting"}, {"out", body.at("out")}, {"epochs", json::array()}});
-        if (body.contains("n_examples")) {
-            state["examples"] = body.at("n_examples");
-        }
+    state = json::object({{"state", "starting"}, {"out", body.at("out")}, {"epochs", json::array()}});
+    if (body.contains("n_examples")) {
+        state["examples"] = body.at("n_examples");
     }
+    pause_requested = false;
+    paused = false;
+    waiting_for_serving = false;
+    finishing = false;
     g_train_batch.store(0);
     g_train_batch_max.store(0);
     yielded_ms.store(0);
     cancel_requested.store(false);
     yield_to_turns.store(body.value("yield", true));
-    g_trainer.store(this);
     worker = std::thread([this, body, ex = std::move(prepared)]() mutable { run(std::move(body), std::move(ex)); });
+    lock.unlock();
     return json::object({{"ok", true}, {"status", status()}});
 }
 
-// Between training batches: the frame budget's first form. While any serving slot is working,
-// the next batch waits, so training fills the gaps between turns and a turn waits behind at
-// most the one batch already in flight. The time spent yielding is reported in status().
+bool server_trainer::before_window(bool, void * user_data) {
+    auto & self = *static_cast<server_trainer *>(user_data);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock(self.mu);
+    while (!self.cancel_requested.load()) {
+        self.paused = self.pause_requested;
+        self.waiting_for_serving = self.yield_to_turns.load() && self.busy_slots && self.busy_slots() > 0;
+        if (!self.paused && !self.waiting_for_serving) {
+            break;
+        }
+        if (self.paused) {
+            self.control_changed.wait(lock, [&self] { return !self.pause_requested || self.cancel_requested.load(); });
+        } else {
+            // Serving publishes an atomic count; explicit pause/resume/cancel wake this wait.
+            self.control_changed.wait_for(lock, std::chrono::milliseconds(10));
+        }
+    }
+    self.paused = false;
+    self.waiting_for_serving = false;
+    self.yielded_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    return !self.cancel_requested.load();
+}
+
 void server_trainer::on_batch(bool train, ggml_opt_context_t, ggml_opt_dataset_t, ggml_opt_result_t,
                               int64_t ibatch, int64_t ibatch_max, int64_t) {
     if (!train) {
@@ -307,28 +328,46 @@ void server_trainer::on_batch(bool train, ggml_opt_context_t, ggml_opt_dataset_t
     }
     g_train_batch.store(ibatch);
     g_train_batch_max.store(ibatch_max);
-    server_trainer * self = g_trainer.load();
-    if (self == nullptr || !self->yield_to_turns.load() || !self->busy_slots) {
-        return;
-    }
-    const auto t0 = std::chrono::steady_clock::now();
-    while (self->busy_slots() > 0 && !self->cancel_requested.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    self->yielded_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
 json server_trainer::cancel() {
-    if (!running.load()) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!running.load() || finishing) {
         return json::object({{"ok", false}, {"error", "no training run is in progress"}});
     }
     cancel_requested.store(true);
-    std::lock_guard<std::mutex> lock(mu);
     if (ctx_live != nullptr) {
         llama_opt_stop(ctx_live, true);
     }
     state["cancel_requested"] = true;
+    control_changed.notify_all();
     return json::object({{"ok", true}});
+}
+
+json server_trainer::pause(const std::string & out) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (out.empty() || state.value("out", std::string()) != out) {
+        return json::object({{"ok", false}, {"error", "training output does not match this job"}});
+    }
+    if (!running.load() || cancel_requested.load() || finishing) {
+        return json::object({{"ok", false}, {"error", "no pausable training run"}});
+    }
+    pause_requested = true;
+    control_changed.notify_all();
+    return json::object({{"ok", true}, {"pause_requested", true}, {"paused", paused}});
+}
+
+json server_trainer::resume(const std::string & out) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (out.empty() || state.value("out", std::string()) != out) {
+        return json::object({{"ok", false}, {"error", "training output does not match this job"}});
+    }
+    if (!running.load() || cancel_requested.load() || finishing) {
+        return json::object({{"ok", false}, {"error", "no resumable training run"}});
+    }
+    pause_requested = false;
+    control_changed.notify_all();
+    return json::object({{"ok", true}, {"pause_requested", false}, {"paused", paused}});
 }
 
 json server_trainer::status() const {
@@ -339,6 +378,9 @@ json server_trainer::status() const {
         s["batch_max"] = g_train_batch_max.load();
     }
     s["yielded_ms"] = yielded_ms.load();
+    s["pause_requested"] = pause_requested;
+    s["paused"] = paused;
+    s["waiting_for_serving"] = waiting_for_serving;
     return s;
 }
 
@@ -348,6 +390,9 @@ void server_trainer::run(json req, examples_data ex) {
         std::lock_guard<std::mutex> lock(mu);
         state["state"] = "error";
         state["error"] = why;
+        pause_requested = false;
+        paused = false;
+        waiting_for_serving = false;
         running.store(false);
     };
 
@@ -470,6 +515,7 @@ void server_trainer::run(json req, examples_data ex) {
     };
     llama_opt_set_memory_budget(ctx, budget);
     llama_opt_init(ctx, model, lopt);
+    llama_opt_set_step_callback(ctx, &server_trainer::before_window, this);
     {
         // from here an epoch can run: a cancel reaches this context directly
         std::lock_guard<std::mutex> lock(mu);
@@ -544,6 +590,12 @@ void server_trainer::run(json req, examples_data ex) {
     {
         std::lock_guard<std::mutex> lock(mu);
         ctx_live = nullptr;
+        // Close admission to control requests before committing the result. A late cancel
+        // must not report success after the worker has decided to save the adapter.
+        finishing = true;
+        pause_requested = false;
+        paused = false;
+        waiting_for_serving = false;
     }
 
     // a cancelled run writes nothing: a partial adapter is not a result; nor does a run whose

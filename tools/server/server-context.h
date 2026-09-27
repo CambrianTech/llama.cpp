@@ -170,6 +170,8 @@ struct server_routes {
     server_http_context::handler_t get_train;
     server_http_context::handler_t post_train;
     server_http_context::handler_t post_train_cancel;
+    server_http_context::handler_t post_train_pause;
+    server_http_context::handler_t post_train_resume;
 
     // to be used in router mode
     json get_model_info() const;

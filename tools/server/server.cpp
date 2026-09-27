@@ -276,6 +276,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/train",                    ex_wrapper(routes.get_train));
     ctx_http.post("/train",                    ex_wrapper(routes.post_train));
     ctx_http.post("/train/cancel",             ex_wrapper(routes.post_train_cancel));
+    ctx_http.post("/train/pause",              ex_wrapper(routes.post_train_pause));
+    ctx_http.post("/train/resume",             ex_wrapper(routes.post_train_resume));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));

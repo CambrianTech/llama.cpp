@@ -5490,6 +5490,26 @@ void server_routes::init_routes() {
         return res;
     };
 
+    auto train_control = [this](const server_http_req & req, bool pause) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        if (!body.is_object() || !body.contains("out") || !body.at("out").is_string() || body.at("out").get<std::string>().empty()) {
+            res->error(format_error_response("out must identify the training job", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string out = body.at("out");
+        const json r = ctx_server.trainer ? (pause ? ctx_server.trainer->pause(out) : ctx_server.trainer->resume(out))
+                                         : json::object({{"ok", false}, {"error", "no model is loaded"}});
+        if (!r.value("ok", false)) {
+            res->error(format_error_response(r.value("error", std::string("training control refused")), ERROR_TYPE_INVALID_REQUEST));
+        } else {
+            res->ok(r);
+        }
+        return res;
+    };
+    this->post_train_pause = [train_control](const server_http_req & req) { return train_control(req, true); };
+    this->post_train_resume = [train_control](const server_http_req & req) { return train_control(req, false); };
+
     this->post_lora_adapters = [this](const server_http_req & req) {
         auto res = create_response();
         const json body = json::parse(req.body);

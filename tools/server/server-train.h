@@ -10,9 +10,18 @@
 //   POST /train  {"text": "...", "out": "adapter.gguf", "rank": 8, "alpha": 16,
 //                 "targets": "attn_q,attn_v", "window": 256, "epochs": 1, "lr": 1e-5,
 //                 "val_split": 0.1, "seed": 42}
-//   GET  /train  -> the run's state: idle | running (epoch, batch/of) | done | cancelled | error,
+//   GET  /train  -> idle | starting | running | done | cancelled | error,
 //                   with per-epoch train/eval loss, train tok/s, and the adapter path
 //   POST /train/cancel -> the run stops at the next training window and writes no adapter
+//   POST /train/pause {"out": "adapter.gguf"} -> GET /train reports paused=true once acknowledged
+//   POST /train/resume {"out": "adapter.gguf"} -> continue the same optimizer, adapter and cursor
+// Use a unique output name per job; controls refuse an output name belonging to another job.
+//
+// Pause is acknowledged before the next training OR evaluation window, including the first.
+// It cannot interrupt an in-flight window. The retained training allocation is not reclaimed:
+// this is a compute pause on the same quantized base, not unloading or starting another model.
+// Resume still respects automatic serving-slot yielding. Cancel wakes a paused worker and
+// discards its partial adapter. Controls are refused once finalization starts.
 //
 //   POST /train  {"examples": [{"prompt": "...", "completion": "..."} | {"messages": [...]}, ...], ...}
 //                -> each example is rendered through THIS model's chat template as a closed
@@ -37,6 +46,7 @@
 #include "ggml-opt.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -75,9 +85,12 @@ public:
     // Stops the running job at its next training window (no adapter is written); ok=false when
     // nothing is running.
     common_json cancel();
+    common_json pause(const std::string & out);
+    common_json resume(const std::string & out);
 
 private:
     void run(common_json req, examples_data ex);
+    static bool before_window(bool train, void * user_data);
     static void on_batch(bool train, ggml_opt_context_t, ggml_opt_dataset_t, ggml_opt_result_t,
                          int64_t ibatch, int64_t ibatch_max, int64_t);
 
@@ -92,6 +105,11 @@ private:
     std::atomic<bool> running{false};
     std::atomic<bool> cancel_requested{false};
     mutable std::mutex mu;
+    std::condition_variable control_changed;
+    bool pause_requested = false; // guarded by mu
+    bool paused = false;          // worker acknowledged at a window boundary
+    bool waiting_for_serving = false;
+    bool finishing = false;      // reject controls while committing the result; guarded by mu
     common_json state;                  // guarded by mu
     llama_context * ctx_live = nullptr; // guarded by mu: the training context while an epoch can run
 };
