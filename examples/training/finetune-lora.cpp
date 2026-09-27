@@ -50,7 +50,8 @@ static std::vector<std::string> split_list(const std::string & list) {
 // uniform in +-1/sqrt(n_in) (PEFT's kaiming-uniform bound), B (rank x n_out) zero. F32,
 // because the optimizer steps F32 parameters.
 static bool write_fresh_adapter(const llama_model * model, const std::string & path,
-                                int32_t rank, float alpha, const std::vector<std::string> & targets) {
+                                int32_t rank, float alpha, const std::vector<std::string> & targets,
+                                uint32_t seed) {
     struct shape { std::string name; int64_t n_in; int64_t n_out; };
     std::vector<shape> shapes;
     for (int32_t il = 0; il < llama_model_n_layer(model); ++il) {
@@ -89,7 +90,7 @@ static bool write_fresh_adapter(const llama_model * model, const std::string & p
     gguf_set_val_str(out, "adapter.type", "lora");
     gguf_set_val_f32(out, "adapter.lora.alpha", alpha);
 
-    std::mt19937 rng(42);
+    std::mt19937 rng(seed);
     for (const auto & s : shapes) {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, s.n_in, rank);
         ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, s.n_out);
@@ -107,8 +108,8 @@ static bool write_fresh_adapter(const llama_model * model, const std::string & p
     }
 
     const bool ok = gguf_write_to_file(out, path.c_str(), false);
-    LOG_INF("%s: fresh adapter: %zu target tensors, rank %d, alpha %.1f -> %s\n",
-            __func__, shapes.size(), rank, (double) alpha, path.c_str());
+    LOG_INF("%s: fresh adapter: %zu target tensors, rank %d, alpha %.1f, seed %u -> %s\n",
+            __func__, shapes.size(), rank, (double) alpha, seed, path.c_str());
     gguf_free(out);
     ggml_free(ctx);
     return ok;
@@ -165,8 +166,11 @@ int main(int argc, char ** argv) {
     std::string adapter_path = continue_from;
     if (adapter_path.empty()) {
         adapter_path = params.out_file + ".init.gguf";
+        // -s seeds A's initialisation, so two nodes given the same seed start from the same
+        // adapter (cross-backend parity); unset, a fixed seed keeps runs reproducible.
+        const uint32_t seed = params.sampling.seed == LLAMA_DEFAULT_SEED ? 42u : params.sampling.seed;
         if (!write_fresh_adapter(model, adapter_path, params.lora_train_rank, params.lora_train_alpha,
-                                 split_list(params.lora_train_targets))) {
+                                 split_list(params.lora_train_targets), seed)) {
             return 1;
         }
     }
