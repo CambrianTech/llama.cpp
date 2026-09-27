@@ -10,18 +10,11 @@
 
 using json = common_json;
 
-// ggml-opt's epoch callback carries no user data; one run at a time, so the progress of the
-// current run is kept here for status() to read.
-static std::atomic<int64_t> g_train_batch{0};
-static std::atomic<int64_t> g_train_batch_max{0};
-
-static void train_progress(bool train, ggml_opt_context_t, ggml_opt_dataset_t, ggml_opt_result_t,
-                           int64_t ibatch, int64_t ibatch_max, int64_t) {
-    if (train) {
-        g_train_batch.store(ibatch);
-        g_train_batch_max.store(ibatch_max);
-    }
-}
+// ggml-opt's epoch callback carries no user data; one run at a time, so the current run's
+// trainer and progress are kept here.
+static std::atomic<int64_t>       g_train_batch{0};
+static std::atomic<int64_t>       g_train_batch_max{0};
+static std::atomic<server_trainer *> g_trainer{nullptr};
 
 static std::vector<std::string> split_targets(const std::string & list) {
     std::vector<std::string> out;
@@ -35,8 +28,8 @@ static std::vector<std::string> split_targets(const std::string & list) {
     return out;
 }
 
-server_trainer::server_trainer(llama_model * model, const common_params & params_base)
-    : model(model), params_base(params_base) {
+server_trainer::server_trainer(llama_model * model, const common_params & params_base, std::function<int()> busy_slots)
+    : model(model), params_base(params_base), busy_slots(std::move(busy_slots)) {
     state = json::object({{"state", "idle"}});
 }
 
@@ -88,8 +81,32 @@ json server_trainer::start(const json & body) {
     }
     g_train_batch.store(0);
     g_train_batch_max.store(0);
+    yielded_ms.store(0);
+    yield_to_turns.store(body.value("yield", true));
+    g_trainer.store(this);
     worker = std::thread(&server_trainer::run, this, body);
     return json::object({{"ok", true}, {"status", status()}});
+}
+
+// Between training batches: the frame budget's first form. While any serving slot is working,
+// the next batch waits, so training fills the gaps between turns and a turn waits behind at
+// most the one batch already in flight. The time spent yielding is reported in status().
+void server_trainer::on_batch(bool train, ggml_opt_context_t, ggml_opt_dataset_t, ggml_opt_result_t,
+                              int64_t ibatch, int64_t ibatch_max, int64_t) {
+    if (!train) {
+        return;
+    }
+    g_train_batch.store(ibatch);
+    g_train_batch_max.store(ibatch_max);
+    server_trainer * self = g_trainer.load();
+    if (self == nullptr || !self->yield_to_turns.load() || !self->busy_slots) {
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    while (self->busy_slots() > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    self->yielded_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
 json server_trainer::status() const {
@@ -99,6 +116,7 @@ json server_trainer::status() const {
         s["batch"]     = g_train_batch.load();
         s["batch_max"] = g_train_batch_max.load();
     }
+    s["yielded_ms"] = yielded_ms.load();
     return s;
 }
 
@@ -206,7 +224,7 @@ void server_trainer::run(json req) {
 
     for (lr.epoch = 0; lr.epoch < lr.epochs; ++lr.epoch) {
         const int64_t t0 = ggml_time_us();
-        llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split, train_progress, nullptr);
+        llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split, &server_trainer::on_batch, nullptr);
         const double seconds = (ggml_time_us() - t0) / 1e6;
         double loss_train = 0.0, unc_train = 0.0, loss_eval = 0.0, unc_eval = 0.0;
         ggml_opt_result_loss(result_train, &loss_train, &unc_train);
