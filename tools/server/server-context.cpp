@@ -4125,20 +4125,6 @@ bool server_context::load_model(common_params & params) {
     return ok;
 }
 
-json server_context::train_start(const json & body) {
-    if (!impl->trainer) {
-        return json::object({{"ok", false}, {"error", "no model is loaded"}});
-    }
-    return impl->trainer->start(body);
-}
-
-json server_context::train_status() const {
-    if (!impl->trainer) {
-        return json::object({{"state", "unavailable"}});
-    }
-    return impl->trainer->status();
-}
-
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -5250,14 +5236,15 @@ void server_routes::init_routes() {
 
     this->get_train = [this](const server_http_req &) {
         auto res = create_response();
-        res->ok(ctx_server.train_status());
+        res->ok(ctx_server.trainer ? ctx_server.trainer->status() : json::object({{"state", "unavailable"}}));
         return res;
     };
 
     this->post_train = [this](const server_http_req & req) {
         auto res = create_response();
         const json body = json::parse(req.body);
-        const json r = ctx_server.train_start(body);
+        const json r = ctx_server.trainer ? ctx_server.trainer->start(body)
+                                           : json::object({{"ok", false}, {"error", "no model is loaded"}});
         if (!r.value("ok", false)) {
             res->error(format_error_response(r.value("error", std::string("training refused")), ERROR_TYPE_INVALID_REQUEST));
             return res;
