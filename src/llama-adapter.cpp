@@ -6,6 +6,8 @@
 
 #include <map>
 #include <cassert>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 
