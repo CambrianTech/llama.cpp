@@ -4409,6 +4409,49 @@ struct test_gated_delta_net : public test_case {
 // finite differences on every input. q/k enter raw (no l2_norm, which has no backward yet),
 // and shapes stay small with bounded inputs so a float32 difference through the recurrence
 // is exact enough to compare. `with_state_grad` also loads the snapshot rows into the loss.
+// GATED_DELTA_NET_BACK directly, same random inputs on every backend: the GPU backward is
+// compared against the CPU reference output-for-output (no finite differences, so no noise
+// near a tolerance). Sequences long enough to cross many recompute-segment boundaries.
+struct test_gated_delta_net_back : public test_case {
+    const int64_t head_count, head_size, n_seq_tokens, n_seqs;
+    const bool    kda;
+    const int64_t K;
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_count, head_size, n_seq_tokens, n_seqs, kda, K);
+    }
+
+    test_gated_delta_net_back(int64_t head_count, int64_t head_size, int64_t n_seq_tokens, int64_t n_seqs, bool kda, int64_t K)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), kda(kda), K(K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? head_size : 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, head_count, n_seqs);
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        // the incoming gradient has the forward output's shape (attention rows + K state snapshots)
+        ggml_tensor * fwd  = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_tensor * grad = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, fwd->ne);
+        return ggml_gated_delta_net_back(ctx, q, k, v, g, beta, state, grad, K);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -1.0f, -0.1f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.1f, 0.9f);
+            } else {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            }
+        }
+    }
+};
+
 struct test_gated_delta_net_grad : public test_case {
     const int64_t head_count;
     const int64_t head_size;
@@ -10146,6 +10189,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_grad(1, 16, 3, 1, false, 1));
     test_cases.emplace_back(new test_gated_delta_net_grad(2, 16, 3, 2, true,  2));
     test_cases.emplace_back(new test_gated_delta_net_grad(2, 32, 2, 1, false, 1));
+    // 10 tokens: the CUDA backward's checkpointed recompute runs segments of C = 4 with a
+    // partial last segment (4, 4, 2).
+    test_cases.emplace_back(new test_gated_delta_net_grad(1, 16, 10, 1, true, 1));
+    for (auto [hc, hs, nt, ns, kd, kk] : std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t, bool, int64_t>>{
+             {1, 16, 10, 1, true, 1}, {2, 16, 33, 2, false, 2}, {2, 64, 40, 1, true, 3}, {1, 128, 64, 1, false, 1}, {2, 32, 7, 1, true, 2}}) {
+        test_cases.emplace_back(new test_gated_delta_net_back(hc, hs, nt, ns, kd, kk));
+    }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
