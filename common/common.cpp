@@ -2136,6 +2136,27 @@ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std
     return result;
 }
 
+ggml_opt_dataset_t common_opt_dataset_init_masked(int64_t window, const std::vector<std::vector<llama_token>> & seqs,
+                                                  const std::vector<std::vector<uint8_t>> & loss, llama_token pad) {
+    GGML_ASSERT(seqs.size() == loss.size());
+    const int64_t ndata = (int64_t) seqs.size();
+    ggml_opt_dataset_t result = ggml_opt_dataset_init(GGML_TYPE_I32, GGML_TYPE_I32, window, window, ndata, /*ndata_shard =*/ 1);
+
+    llama_token * data   = (llama_token *) ggml_opt_dataset_data(result)->data;
+    llama_token * labels = (llama_token *) ggml_opt_dataset_labels(result)->data;
+
+    for (int64_t idata = 0; idata < ndata; ++idata) {
+        const auto & s = seqs[idata];
+        const auto & m = loss[idata];
+        GGML_ASSERT(s.size() == m.size() && (int64_t) s.size() <= window + 1);
+        for (int64_t j = 0; j < window; ++j) {
+            data  [idata*window + j] = j < (int64_t) s.size() ? s[j] : pad;
+            labels[idata*window + j] = (j + 1 < (int64_t) s.size() && m[j + 1]) ? s[j + 1] : -1;
+        }
+    }
+    return result;
+}
+
 ggml_opt_optimizer_params common_opt_lr_pars(void * userdata) {
     ggml_opt_optimizer_params result = ggml_opt_get_default_optimizer_params(nullptr);
     const lr_opt &            d      = *(lr_opt *) userdata;

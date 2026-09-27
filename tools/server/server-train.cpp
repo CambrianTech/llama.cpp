@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "ggml-opt.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <chrono>
 #include <sstream>
@@ -30,7 +31,7 @@ static std::vector<std::string> split_targets(const std::string & list) {
 }
 
 server_trainer::server_trainer(llama_model * model, const common_params & params_base, std::function<int()> busy_slots,
-                               std::function<std::string(const json &)> render_chat)
+                               render_fn render_chat)
     : model(model), params_base(params_base), busy_slots(std::move(busy_slots)), render_chat(std::move(render_chat)) {
     state = json::object({{"state", "idle"}});
 }
@@ -64,11 +65,16 @@ static std::string confine_out(const std::string & dir, const std::string & name
     return d + name;
 }
 
-// "examples" -> one corpus: every example rendered through the model's chat template as a closed
-// conversation. Returns "" and sets why on a malformed example or a template error.
-static std::string render_examples(const json & examples, const std::function<std::string(const json &)> & render, std::string & why) {
-    std::string text;
+// "examples" -> one tokenized sequence per example with its loss mask. Each example is rendered
+// through the model's chat template as a closed conversation; each assistant turn's span is
+// located by rendering the conversation up to it WITH the generation prompt (where the turn's
+// content starts) and through it without (where it ends, end-of-turn included). A template that
+// does not render prefix-stably (e.g. one that rewrites earlier turns) is refused for that example:
+// the span cannot be located, and guessing would train the wrong tokens.
+static bool prepare_examples(const json & examples, const server_trainer::render_fn & render, const llama_vocab * vocab,
+                             int64_t window, server_trainer::examples_data & out, std::string & why) {
     for (size_t i = 0; i < examples.size(); ++i) {
+        const std::string at = "examples[" + std::to_string(i) + "]";
         const json & ex = examples[i];
         json messages;
         if (ex.is_object() && ex.contains("messages") && ex.at("messages").is_array() && !ex.at("messages").empty()) {
@@ -78,21 +84,77 @@ static std::string render_examples(const json & examples, const std::function<st
             messages = json::array({ json::object({{"role", "user"},      {"content", ex.at("prompt")}}),
                                      json::object({{"role", "assistant"}, {"content", ex.at("completion")}}) });
         } else {
-            why = "examples[" + std::to_string(i) + "] needs \"prompt\" and \"completion\" strings, or a non-empty \"messages\" array";
-            return "";
+            why = at + " needs \"prompt\" and \"completion\" strings, or a non-empty \"messages\" array";
+            return false;
         }
+        auto head = [&](size_t n) { // the first n messages
+            json h = json::array();
+            for (size_t j = 0; j < n; ++j) {
+                h.push_back(messages[j]);
+            }
+            return h;
+        };
+        std::string full;
+        std::vector<std::pair<size_t, size_t>> spans; // [begin, end) in chars of `full`
         try {
-            text += render(messages);
+            full = render(messages, false);
+            for (size_t k = 0; k < messages.size(); ++k) {
+                if (!messages[k].is_object() || messages[k].value("role", std::string()) != "assistant") {
+                    continue;
+                }
+                const std::string pre  = render(head(k), true);
+                const std::string upto = render(head(k + 1), false);
+                if (full.compare(0, upto.size(), upto) != 0 || upto.compare(0, pre.size(), pre) != 0 || pre.size() >= upto.size()) {
+                    why = at + ": the chat template does not render this conversation prefix-stably at message " + std::to_string(k)
+                        + ", so the assistant turn cannot be located";
+                    return false;
+                }
+                spans.emplace_back(pre.size(), upto.size());
+            }
         } catch (const std::exception & e) {
-            why = "examples[" + std::to_string(i) + "] could not be rendered through the chat template: " + e.what();
-            return "";
+            why = at + " could not be rendered through the chat template: " + e.what();
+            return false;
         }
+        if (spans.empty()) {
+            why = at + " has no assistant turn to learn";
+            return false;
+        }
+        // tokenize segment by segment so every token is wholly inside or outside a span
+        std::vector<llama_token> toks;
+        std::vector<uint8_t>     loss;
+        size_t pos = 0;
+        auto add = [&](size_t end, bool trainable) {
+            if (end <= pos) {
+                return;
+            }
+            const auto seg = common_tokenize(vocab, full.substr(pos, end - pos), /*add_special =*/ pos == 0, /*parse_special =*/ true);
+            toks.insert(toks.end(), seg.begin(), seg.end());
+            loss.insert(loss.end(), seg.size(), trainable ? 1 : 0);
+            pos = end;
+        };
+        for (const auto & [b, e] : spans) {
+            add(b, false);
+            add(e, true);
+        }
+        add(full.size(), false);
+        if ((int64_t) toks.size() > window + 1) {
+            why = at + " is " + std::to_string(toks.size()) + " tokens; one example is one window, and this window holds "
+                + std::to_string(window + 1) + " (raise \"window\" or split the example)";
+            return false;
+        }
+        if (std::count(loss.begin() + 1, loss.end(), (uint8_t) 1) == 0) {
+            why = at + ": its assistant turns tokenize to nothing to learn";
+            return false;
+        }
+        out.tokens.push_back(std::move(toks));
+        out.loss.push_back(std::move(loss));
     }
-    return text;
+    return true;
 }
 
 json server_trainer::start(const json & body_in) {
     json body = body_in;
+    examples_data prepared;
     // OFF unless the server was started with --train-dir: the route writes files, so an engine
     // opts in explicitly and every write is confined to that directory (Cormac on #14).
     if (params_base.train_dir.empty()) {
@@ -111,17 +173,18 @@ json server_trainer::start(const json & body_in) {
         if (!render_chat) {
             return json::object({{"ok", false}, {"error", "this server has no chat template to render \"examples\" with; send \"text\""}});
         }
+        if (!body.value("window", json(256)).is_number()) {
+            return json::object({{"ok", false}, {"error", "\"window\" must be a number"}});
+        }
         std::string why;
-        std::string text = render_examples(body.at("examples"), render_chat, why);
-        if (!why.empty()) {
+        if (!prepare_examples(body.at("examples"), render_chat, llama_model_get_vocab(model),
+                              (int64_t) body.value("window", 256.0), prepared, why)) {
             return json::object({{"ok", false}, {"error", why}});
         }
-        body["n_examples"]    = body.at("examples").size();
+        body["n_examples"] = body.at("examples").size();
         body.erase("examples");
-        body["text"]          = std::move(text);
-        body["parse_special"] = true;
     }
-    if (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty()) {
+    if (prepared.tokens.empty() && (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty())) {
         return json::object({{"ok", false}, {"error", "\"text\" or \"examples\" (the training corpus) is required"}});
     }
     if (!body.contains("out") || !body.at("out").is_string() || body.at("out").get<std::string>().empty()) {
@@ -199,7 +262,7 @@ json server_trainer::start(const json & body_in) {
     cancel_requested.store(false);
     yield_to_turns.store(body.value("yield", true));
     g_trainer.store(this);
-    worker = std::thread(&server_trainer::run, this, body);
+    worker = std::thread([this, body, ex = std::move(prepared)]() mutable { run(std::move(body), std::move(ex)); });
     return json::object({{"ok", true}, {"status", status()}});
 }
 
@@ -248,7 +311,7 @@ json server_trainer::status() const {
     return s;
 }
 
-void server_trainer::run(json req) {
+void server_trainer::run(json req, examples_data ex) {
     auto fail = [&](const std::string & why) {
         LOG_ERR("%s: training run failed: %s\n", __func__, why.c_str());
         std::lock_guard<std::mutex> lock(mu);
@@ -257,7 +320,8 @@ void server_trainer::run(json req) {
         running.store(false);
     };
 
-    const std::string text    = req.at("text").get<std::string>();
+    const bool        by_example = !ex.tokens.empty();
+    const std::string text    = by_example ? std::string() : req.at("text").get<std::string>();
     const std::string out     = confine_out(params_base.train_dir, req.at("out").get<std::string>());
     const int32_t     rank    = (int32_t) req.value("rank", (int64_t) 8);
     const float       alpha   = (float) req.value("alpha", 16.0);
@@ -313,14 +377,31 @@ void server_trainer::run(json req) {
         return;
     }
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, text, true, special);
-    if ((int64_t) tokens.size() < 2 * (int64_t) window) {
-        llama_adapter_lora_free(adapter);
-        llama_free(ctx);
-        fail("the corpus tokenizes to " + std::to_string(tokens.size()) + " tokens; at least two windows are needed");
-        return;
+    // text: one stream, overlapping windows, every token carries loss. examples: one window per
+    // example, only the assistant turns carry loss (the rest of each window is label -1).
+    int64_t n_tokens = 0;
+    std::vector<int64_t> trainable_prefix; // examples: trainable targets in examples [0, i)
+    ggml_opt_dataset_t dataset = nullptr;
+    if (by_example) {
+        trainable_prefix.push_back(0);
+        for (size_t i = 0; i < ex.tokens.size(); ++i) {
+            n_tokens += (int64_t) ex.tokens[i].size();
+            trainable_prefix.push_back(trainable_prefix.back() + std::count(ex.loss[i].begin() + 1, ex.loss[i].end(), (uint8_t) 1));
+        }
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const llama_token   eos   = llama_vocab_eos(vocab);
+        dataset = common_opt_dataset_init_masked(window, ex.tokens, ex.loss, eos >= 0 ? eos : 0);
+    } else {
+        std::vector<llama_token> tokens = common_tokenize(ctx, text, true, special);
+        if ((int64_t) tokens.size() < 2 * (int64_t) window) {
+            llama_adapter_lora_free(adapter);
+            llama_free(ctx);
+            fail("the corpus tokenizes to " + std::to_string(tokens.size()) + " tokens; at least two windows are needed");
+            return;
+        }
+        n_tokens = (int64_t) tokens.size();
+        dataset  = common_opt_dataset_init(ctx, tokens, window / 2);
     }
-    ggml_opt_dataset_t dataset = common_opt_dataset_init(ctx, tokens, window / 2);
 
     lr_opt lr;
     lr.lr0    = lr0;
@@ -346,19 +427,41 @@ void server_trainer::run(json req) {
         }
     }
 
-    const int64_t idata_split  = (int64_t) (ggml_opt_dataset_ndata(dataset) * (1.0f - val));
-    const int64_t train_tokens = idata_split * (int64_t) window;
+    const int64_t ndata        = ggml_opt_dataset_ndata(dataset);
+    const int64_t idata_split  = (int64_t) (ndata * (1.0f - val));
+    const int64_t train_tokens = idata_split * (int64_t) window; // positions the forward runs (padding included)
+    if (idata_split < 1) {
+        ggml_opt_dataset_free(dataset);
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            ctx_live = nullptr;
+        }
+        llama_adapter_lora_free(adapter);
+        llama_free(ctx);
+        fail("no training windows after the validation split (" + std::to_string(ndata) + " in all); send more data or lower \"val_split\"");
+        return;
+    }
+    // ggml-opt averages the loss over every position of a window, masked ones counting zero; the
+    // reported loss is per TRAINABLE token so it reads the same as an unmasked run's
+    const int64_t trainable_train = by_example ? trainable_prefix[idata_split] : train_tokens;
+    const int64_t trainable_eval  = by_example ? trainable_prefix.back() - trainable_prefix[idata_split]
+                                               : (ndata - idata_split) * (int64_t) window;
+    const double  scale_train = trainable_train > 0 ? (double) train_tokens / trainable_train : 0.0;
+    const double  scale_eval  = trainable_eval  > 0 ? (double) ((ndata - idata_split) * (int64_t) window) / trainable_eval : 0.0;
     ggml_opt_result_t result_train = ggml_opt_result_init();
     ggml_opt_result_t result_eval  = ggml_opt_result_init();
     {
         std::lock_guard<std::mutex> lock(mu);
         state["state"]        = "running";
         state["window"]       = window;
-        state["tokens"]       = (int64_t) tokens.size();
+        state["tokens"]       = n_tokens;
         state["train_tokens"] = train_tokens;
+        if (by_example) {
+            state["trainable_tokens"] = trainable_train;
+        }
     }
     LOG_INF("%s: training on the served model: %zu tokens, window %u, %u epochs, adapter -> %s\n",
-            __func__, tokens.size(), window, epochs, out.c_str());
+            __func__, (size_t) n_tokens, window, epochs, out.c_str());
 
     for (lr.epoch = 0; lr.epoch < lr.epochs && !cancel_requested.load(); ++lr.epoch) {
         const int64_t t0 = ggml_time_us();
@@ -370,6 +473,8 @@ void server_trainer::run(json req) {
         double loss_train = 0.0, unc_train = 0.0, loss_eval = 0.0, unc_eval = 0.0;
         ggml_opt_result_loss(result_train, &loss_train, &unc_train);
         ggml_opt_result_loss(result_eval,  &loss_eval,  &unc_eval);
+        loss_train *= scale_train;
+        loss_eval  *= scale_eval;
         const double tok_s = seconds > 0 ? train_tokens / seconds : 0.0;
         LOG_INF("%s: epoch %u: train_loss=%.5f eval_loss=%.5f seconds=%.1f train_tok_s=%.1f\n",
                 __func__, lr.epoch, loss_train, loss_eval, seconds, tok_s);

@@ -1135,6 +1135,13 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
 
 ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std::vector<llama_token> & tokens, int64_t stride);
 
+// One datapoint per sequence: seqs[i] (at most window + 1 tokens) is the input, left-aligned and
+// padded with `pad` to `window`; the label at position j is seqs[i][j + 1] where loss[i][j + 1]
+// is set, and -1 (no loss) everywhere else, padding included. Completion-only training marks
+// only the assistant's tokens.
+ggml_opt_dataset_t common_opt_dataset_init_masked(int64_t window, const std::vector<std::vector<llama_token>> & seqs,
+                                                  const std::vector<std::vector<uint8_t>> & loss, llama_token pad);
+
 // "adamw" or "sgd" (case insensitive)
 enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 
