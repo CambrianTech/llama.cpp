@@ -2396,10 +2396,12 @@ void common_prompt_checkpoint::clear_dft() {
 // because the optimizer steps F32 parameters.
 bool common_lora_write_fresh(const llama_model * model, const std::string & path,
                                 int32_t rank, float alpha, const std::vector<std::string> & targets,
-                                uint32_t seed) {
+                                uint32_t seed, int32_t top_layers) {
     struct shape { std::string name; int64_t n_in; int64_t n_out; };
     std::vector<shape> shapes;
-    for (int32_t il = 0; il < llama_model_n_layer(model); ++il) {
+    const int32_t n_layer = llama_model_n_layer(model);
+    const int32_t first   = top_layers > 0 && top_layers < n_layer ? n_layer - top_layers : 0;
+    for (int32_t il = first; il < n_layer; ++il) {
         for (const auto & target : targets) {
             const std::string name = "blk." + std::to_string(il) + "." + target + ".weight";
             const ggml_tensor * w = llama_model_get_tensor(model, name.c_str());

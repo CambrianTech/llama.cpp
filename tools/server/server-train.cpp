@@ -189,7 +189,7 @@ json server_trainer::start(const json & body_in) {
     // assert in the training path would take the server down (Cormac on #14).
     {
         auto num = [&](const char * key, double def) { return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : def; };
-        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib"}) {
+        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers"}) {
             if (body.contains(key) && !body.at(key).is_number()) {
                 return json::object({{"ok", false}, {"error", std::string("\"") + key + "\" must be a number"}});
             }
@@ -199,12 +199,19 @@ json server_trainer::start(const json & body_in) {
         std::string why;
         if (rank < 1 || rank > 256 || rank != (int64_t) rank)       why = "rank must be an integer in [1, 256]";
         else if (!(alpha > 0))                                       why = "alpha must be > 0";
-        else if (window < 16 || window > 8192 || window != (int64_t) window) why = "window must be an integer in [16, 8192]";
+        // a context rounds n_ctx up to a multiple of 256, and training needs the window to BE the
+        // context (one ubatch per context): any other window reached a GGML_ASSERT in opt_init and
+        // took the serving process down with it
+        else if (window < 256 || window > 8192 || window != (int64_t) window || (int64_t) window % 256 != 0)
+                                                                     why = "window must be a multiple of 256 in [256, 8192]";
         else if (epochs < 1 || epochs > 100 || epochs != (int64_t) epochs)   why = "epochs must be an integer in [1, 100]";
         else if (!(lr > 0 && lr <= 1))                               why = "lr must be in (0, 1]";
         else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
         else if (body.contains("memory_budget_mib") && !(num("memory_budget_mib", 0) >= 1))
                                                                      why = "memory_budget_mib must be >= 1";
+        else if (body.contains("top_layers") && !(num("top_layers", 0) >= 1 && num("top_layers", 0) <= llama_model_n_layer(model) &&
+                                                  num("top_layers", 0) == (int64_t) num("top_layers", 0)))
+                                                                     why = "top_layers must be an integer in [1, " + std::to_string(llama_model_n_layer(model)) + "]";
         else if (body.contains("targets") && (!body.at("targets").is_string() || split_targets(body.at("targets").get<std::string>()).empty()))
                                                                      why = "targets must be a non-empty comma-separated list of module names";
         if (!why.empty()) {
@@ -350,6 +357,8 @@ void server_trainer::run(json req, examples_data ex) {
     const int32_t     rank    = (int32_t) req.value("rank", (int64_t) 8);
     const float       alpha   = (float) req.value("alpha", 16.0);
     const std::string targets = req.value("targets", std::string("attn_q,attn_v"));
+    // 0 = every block; K = only the last K (the backward pass stops at the lowest adapted one)
+    const int32_t     top     = (int32_t) req.value("top_layers", (int64_t) 0);
     const uint32_t    window  = (uint32_t) req.value("window", (int64_t) 256);
     const unsigned    epochs  = (unsigned) req.value("epochs", (int64_t) 1);
     const float       lr0     = (float) req.value("lr", 1e-5);
@@ -382,9 +391,15 @@ void server_trainer::run(json req, examples_data ex) {
         fail("could not create the training context (window " + std::to_string(window) + "): likely out of device memory");
         return;
     }
+    if (const uint32_t n_ctx = llama_n_ctx(ctx); n_ctx != window) {
+        // never reach opt_init's one-ubatch-per-context assert inside a serving process
+        llama_free(ctx);
+        fail("the training context is " + std::to_string(n_ctx) + " tokens, not the window " + std::to_string(window));
+        return;
+    }
 
     const std::string init_path = out + ".init.gguf";
-    if (!common_lora_write_fresh(model, init_path, rank, alpha, split_targets(targets), seed)) {
+    if (!common_lora_write_fresh(model, init_path, rank, alpha, split_targets(targets), seed, top)) {
         llama_free(ctx);
         fail("could not write the fresh adapter (do the targets exist in this model?)");
         return;
@@ -395,6 +410,15 @@ void server_trainer::run(json req, examples_data ex) {
         llama_free(ctx);
         fail("could not load the fresh adapter");
         return;
+    }
+    {
+        // the depth this run ACTUALLY adapts, reported back: a caller must not infer it from
+        // what it asked for (an engine without top_layers ignores the field and adapts every
+        // block), so it reads the effective depth here (Codex on #27)
+        const int32_t n_layer = llama_model_n_layer(model);
+        std::lock_guard<std::mutex> lock(mu);
+        state["n_layer"]        = n_layer;
+        state["layers_adapted"] = top > 0 && top < n_layer ? top : n_layer;
     }
     float scale = 1.0f;
     if (llama_set_adapters_lora(ctx, &adapter, 1, &scale) != 0) {
