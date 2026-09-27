@@ -4405,6 +4405,78 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET, gradients: the backward (GGML_OP_GATED_DELTA_NET_BACK) checked by
+// finite differences on every input. q/k enter raw (no l2_norm, which has no backward yet),
+// and shapes stay small with bounded inputs so a float32 difference through the recurrence
+// is exact enough to compare. `with_state_grad` also loads the snapshot rows into the loss.
+struct test_gated_delta_net_grad : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const bool    kda;
+    const int64_t K;
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_count, head_size, n_seq_tokens, n_seqs, kda, K);
+    }
+
+    test_gated_delta_net_grad(int64_t head_count = 2, int64_t head_size = 4, int64_t n_seq_tokens = 3,
+            int64_t n_seqs = 1, bool kda = false, int64_t K = 1)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), kda(kda), K(K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? head_size : 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, head_count, n_seqs);
+        for (ggml_tensor * t : {q, k, v, g, beta, state}) {
+            ggml_set_param(t);
+        }
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(state, "state");
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -1.0f, -0.1f);   // decays in (0.37, 0.9): gradients stay visible
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.1f, 0.9f);
+            } else {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            }
+        }
+    }
+
+    // The loss is the sum of every output (tens of values near 1): the float32 rounding of a
+    // difference is ~ulp(loss)/eps, which at eps = 1e-2 was ~1e-5 absolute. That is exact in
+    // absolute terms (every q/k/v/g/beta/state gradient agreed to ~1e-5) but it inflates the
+    // RELATIVE error metric on components whose true gradient is near zero. eps = 1e-1 cuts
+    // the rounding tenfold, and the 4-point estimate's truncation is O(eps^4) on this smooth
+    // recurrence, so it stays negligible.
+    float grad_eps() override {
+        return 1e-1f;
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+
+    // The harness's usual bound for a non-trivial op. It still separates a wrong backward:
+    // dropping the decay on dS moved the error to 0.2-0.45 in every case (mutation-checked).
+    double max_maa_err() override {
+        return 1e-3;
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -10064,6 +10136,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    // the backward, by finite differences: scalar gate, KDA gate, several tokens and seqs,
+    // and K > 1 so the snapshot rows' gradients enter the recurrence mid-sequence
+    test_cases.emplace_back(new test_gated_delta_net_grad(2, 4, 3, 1, false, 1));
+    test_cases.emplace_back(new test_gated_delta_net_grad(2, 4, 3, 2, true, 1));
+    test_cases.emplace_back(new test_gated_delta_net_grad(1, 8, 4, 1, false, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));

@@ -10962,6 +10962,222 @@ void ggml_compute_forward_gated_delta_net(
 }
 
 
+
+// ggml_compute_forward_gated_delta_net_back
+//
+// The reference backward of the gated delta rule, one (head, sequence) at a time, in the
+// math of the forward above (S the S_v x S_v state, kept transposed as M[j][i] = S[i][j]):
+//   S'  = a (.) S_prev          a = exp(g), a scalar or, for KDA, per row i
+//   u   = S'^T k,  delta = beta (v - u),  S = S' + k delta^T,  o = scale S^T q
+// run in reverse carrying dS. The states are recomputed forward and stored (the backward
+// needs every S and S'; inverting the decay would divide by exp(g)). Single-threaded: q
+// and k are shared across heads (broadcast), so their gradients accumulate. This is the
+// oracle the GPU twins are checked against, not the fast path.
+static void ggml_compute_forward_gated_delta_net_back_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_k     = dst->src[1];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_g     = dst->src[3];
+    const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_state = dst->src[5];
+    const ggml_tensor * src_grad  = dst->src[6];
+
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+    const int64_t neq1 = src_q->ne[1], neq3 = src_q->ne[3];
+    const int64_t nek1 = src_k->ne[1], nek3 = src_k->ne[3];
+    const int64_t neg0 = src_g->ne[0];
+    const bool    kda  = neg0 == S_v;
+    const int64_t K    = ggml_get_op_params_i32(dst, 0);
+    const int64_t rq3  = n_seqs / neq3;
+    const int64_t rk3  = n_seqs / nek3;
+    const float   scale = 1.0f / sqrtf((float) S_v);
+    const int64_t SS    = S_v * S_v;
+
+    // the packed output: [dq | dk | dv | dg | dbeta | dstate], each dense in its input's order
+    float * dq_base = (float *) dst->data;
+    float * dk_base = dq_base + ggml_nelements(src_q);
+    float * dv_base = dk_base + ggml_nelements(src_k);
+    float * dg_base = dv_base + ggml_nelements(src_v);
+    float * db_base = dg_base + ggml_nelements(src_g);
+    float * ds_base = db_base + ggml_nelements(src_beta);
+    memset(dst->data, 0, ggml_nbytes(dst));
+
+    // the incoming gradient, laid out like the forward's packed output
+    const float * gy_base = (const float *) src_grad->data;
+    const float * gs_base = gy_base + S_v * H * n_tokens * n_seqs;
+    const int64_t snap    = SS * H * n_seqs;
+
+    // scratch: every state M_{-1..T-1}, then dM, a (per row), u, delta, dd
+    float * states = (float *) params->wdata;
+    float * dM     = states + (n_tokens + 1) * SS;
+    float * Mp     = dM + SS;
+    float * a      = Mp + SS;
+    float * u      = a + S_v;
+    float * delta  = u + S_v;
+    float * dd     = delta + S_v;
+
+    const float * s0_base = (const float *) src_state->data;
+    const int64_t s0_seq  = src_state->nb[3] / sizeof(float);
+
+    auto q_at = [&](int64_t iv1, int64_t iv3, int64_t t) {
+        return (const float *) ((const char *) src_q->data + (iv3 / rq3) * src_q->nb[3] + t * src_q->nb[2] + (iv1 % neq1) * src_q->nb[1]);
+    };
+    auto k_at = [&](int64_t iv1, int64_t iv3, int64_t t) {
+        return (const float *) ((const char *) src_k->data + (iv3 / rk3) * src_k->nb[3] + t * src_k->nb[2] + (iv1 % nek1) * src_k->nb[1]);
+    };
+    auto v_at = [&](int64_t iv1, int64_t iv3, int64_t t) {
+        return (const float *) ((const char *) src_v->data + iv3 * src_v->nb[3] + t * src_v->nb[2] + iv1 * src_v->nb[1]);
+    };
+    auto g_at = [&](int64_t iv1, int64_t iv3, int64_t t) {
+        return (const float *) ((const char *) src_g->data + iv3 * src_g->nb[3] + t * src_g->nb[2] + iv1 * src_g->nb[1]);
+    };
+    auto beta_at = [&](int64_t iv1, int64_t iv3, int64_t t) {
+        return *(const float *) ((const char *) src_beta->data + iv3 * src_beta->nb[3] + t * src_beta->nb[2] + iv1 * src_beta->nb[1]);
+    };
+    // S' = decay(M_prev) into Mp, with a[] the per-row factor
+    auto decay = [&](const float * Mprev, const float * g_d) {
+        for (int64_t i = 0; i < S_v; ++i) {
+            a[i] = expf(kda ? g_d[i] : g_d[0]);
+        }
+        for (int64_t j = 0; j < S_v; ++j) {
+            for (int64_t i = 0; i < S_v; ++i) {
+                Mp[j * S_v + i] = Mprev[j * S_v + i] * a[i];
+            }
+        }
+    };
+
+    for (int64_t iv3 = 0; iv3 < n_seqs; ++iv3) {
+        for (int64_t iv1 = 0; iv1 < H; ++iv1) {
+            // forward, storing every state
+            memcpy(states, s0_base + iv3 * s0_seq + iv1 * SS, SS * sizeof(float));
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                const float * k_d = k_at(iv1, iv3, t);
+                const float * v_d = v_at(iv1, iv3, t);
+                const float   b   = beta_at(iv1, iv3, t);
+                decay(states + t * SS, g_at(iv1, iv3, t));
+                float * M = states + (t + 1) * SS;
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float sum = 0.0f;
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        sum += Mp[j * S_v + i] * k_d[i];
+                    }
+                    delta[j] = (v_d[j] - sum) * b;
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        M[j * S_v + i] = Mp[j * S_v + i] + k_d[i] * delta[j];
+                    }
+                }
+            }
+
+            // backward
+            memset(dM, 0, SS * sizeof(float));
+            for (int64_t t = n_tokens - 1; t >= 0; --t) {
+                const float * q_d = q_at(iv1, iv3, t);
+                const float * k_d = k_at(iv1, iv3, t);
+                const float * v_d = v_at(iv1, iv3, t);
+                const float * g_d = g_at(iv1, iv3, t);
+                const float   b   = beta_at(iv1, iv3, t);
+                const float * M   = states + (t + 1) * SS;
+
+                // a snapshot slot that captured the state after token t
+                const int64_t slot = n_tokens - 1 - t;
+                if (slot < K) {
+                    const float * gs = gs_base + slot * snap + (iv3 * H + iv1) * SS;
+                    for (int64_t x = 0; x < SS; ++x) {
+                        dM[x] += gs[x];
+                    }
+                }
+
+                // o = scale S^T q
+                const float * gy = gy_base + ((iv3 * n_tokens + t) * H + iv1) * S_v;
+                float * dq = dq_base + (((iv3 / rq3) * n_tokens + t) * neq1 + iv1 % neq1) * S_v;
+                for (int64_t i = 0; i < S_v; ++i) {
+                    float sum = 0.0f;
+                    for (int64_t j = 0; j < S_v; ++j) {
+                        sum += M[j * S_v + i] * gy[j];
+                    }
+                    dq[i] += scale * sum;
+                }
+                for (int64_t j = 0; j < S_v; ++j) {
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        dM[j * S_v + i] += scale * gy[j] * q_d[i];
+                    }
+                }
+
+                // recompute S', u, delta for this step
+                decay(states + t * SS, g_d);
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float sum = 0.0f;
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        sum += Mp[j * S_v + i] * k_d[i];
+                    }
+                    u[j]     = sum;
+                    delta[j] = (v_d[j] - sum) * b;
+                }
+
+                // S = S' + k delta^T
+                float * dk = dk_base + (((iv3 / rk3) * n_tokens + t) * nek1 + iv1 % nek1) * S_v;
+                for (int64_t j = 0; j < S_v; ++j) {
+                    float sum = 0.0f;
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        sum += dM[j * S_v + i] * k_d[i];
+                        dk[i] += dM[j * S_v + i] * delta[j];
+                    }
+                    dd[j] = sum;
+                }
+
+                // delta = beta (v - u), u = S'^T k
+                float * dv = dv_base + ((iv3 * n_tokens + t) * H + iv1) * S_v;
+                float dbeta = 0.0f;
+                for (int64_t j = 0; j < S_v; ++j) {
+                    dv[j]  = b * dd[j];
+                    dbeta += dd[j] * (v_d[j] - u[j]);
+                    const float du = -b * dd[j];
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        dM[j * S_v + i] += k_d[i] * du;
+                        dk[i] += Mp[j * S_v + i] * du;
+                    }
+                }
+                db_base[(iv3 * n_tokens + t) * H + iv1] = dbeta;
+
+                // S' = a (.) S_prev: dg = sum dS' (.) S', then dS_prev = a (.) dS'
+                float * dg = dg_base + ((iv3 * n_tokens + t) * H + iv1) * neg0;
+                for (int64_t j = 0; j < S_v; ++j) {
+                    for (int64_t i = 0; i < S_v; ++i) {
+                        const float c = dM[j * S_v + i] * Mp[j * S_v + i];
+                        dg[kda ? i : 0] += c;
+                        dM[j * S_v + i] *= a[i];
+                    }
+                }
+            }
+            // the initial state's gradient
+            float * ds = ds_base + (iv3 * H + iv1) * SS;
+            memcpy(ds, dM, SS * sizeof(float));
+        }
+    }
+}
+
+void ggml_compute_forward_gated_delta_net_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            ggml_compute_forward_gated_delta_net_back_f32(params, dst);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_comb
 
 static void ggml_dsv4_hc_comb_norm_cols(float * comb, float eps) {
