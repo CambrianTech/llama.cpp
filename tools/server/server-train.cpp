@@ -106,7 +106,8 @@ static bool prepare_examples(const json & examples, const server_trainer::render
                 const std::string upto = render(head(k + 1), false);
                 if (full.compare(0, upto.size(), upto) != 0 || upto.compare(0, pre.size(), pre) != 0 || pre.size() >= upto.size()) {
                     why = at + ": the chat template does not render this conversation prefix-stably at message " + std::to_string(k)
-                        + ", so the assistant turn cannot be located";
+                        + ", so the assistant turn cannot be located (templates that strip earlier turns' reasoning, e.g. Qwen3's"
+                        + " <think>, do this: send such a conversation as single-turn examples)";
                     return false;
                 }
                 spans.emplace_back(pre.size(), upto.size());
@@ -160,40 +161,8 @@ json server_trainer::start(const json & body_in) {
     if (params_base.train_dir.empty()) {
         return json::object({{"ok", false}, {"error", "training is disabled on this server (start it with --train-dir DIR to enable /train)"}});
     }
-    if (body.contains("examples")) {
-        if (body.contains("text")) {
-            return json::object({{"ok", false}, {"error", "give \"text\" or \"examples\", not both"}});
-        }
-        if (!body.at("examples").is_array() || body.at("examples").empty()) {
-            return json::object({{"ok", false}, {"error", "\"examples\" must be a non-empty array"}});
-        }
-        if (body.contains("parse_special") && !(body.at("parse_special").is_boolean() && body.at("parse_special").get<bool>())) {
-            return json::object({{"ok", false}, {"error", "\"examples\" are rendered through the chat template, so their control tokens are always parsed (drop \"parse_special\")"}});
-        }
-        if (!render_chat) {
-            return json::object({{"ok", false}, {"error", "this server has no chat template to render \"examples\" with; send \"text\""}});
-        }
-        if (!body.value("window", json(256)).is_number()) {
-            return json::object({{"ok", false}, {"error", "\"window\" must be a number"}});
-        }
-        std::string why;
-        if (!prepare_examples(body.at("examples"), render_chat, llama_model_get_vocab(model),
-                              (int64_t) body.value("window", 256.0), prepared, why)) {
-            return json::object({{"ok", false}, {"error", why}});
-        }
-        body["n_examples"] = body.at("examples").size();
-        body.erase("examples");
-    }
-    if (prepared.tokens.empty() && (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty())) {
-        return json::object({{"ok", false}, {"error", "\"text\" or \"examples\" (the training corpus) is required"}});
-    }
-    if (!body.contains("out") || !body.at("out").is_string() || body.at("out").get<std::string>().empty()) {
-        return json::object({{"ok", false}, {"error", "\"out\" (the adapter file name to write) is required"}});
-    }
-    if (confine_out(params_base.train_dir, body.at("out").get<std::string>()).empty()) {
-        return json::object({{"ok", false}, {"error", "\"out\" must be a bare file name ending in .gguf (no directories, no \"..\"); it is written inside the server's --train-dir"}});
-    }
-    // Every numeric input is checked here, before a thread starts: inside a serving process an
+    // Every numeric input is checked first, before "examples" are prepared against "window" and
+    // before a thread starts: inside a serving process an
     // assert in the training path would take the server down (Cormac on #14).
     {
         auto num = [&](const char * key, double def) { return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : def; };
@@ -216,6 +185,36 @@ json server_trainer::start(const json & body_in) {
         if (!why.empty()) {
             return json::object({{"ok", false}, {"error", why}});
         }
+    }
+    if (body.contains("examples")) {
+        if (body.contains("text")) {
+            return json::object({{"ok", false}, {"error", "give \"text\" or \"examples\", not both"}});
+        }
+        if (!body.at("examples").is_array() || body.at("examples").empty()) {
+            return json::object({{"ok", false}, {"error", "\"examples\" must be a non-empty array"}});
+        }
+        if (body.contains("parse_special") && !(body.at("parse_special").is_boolean() && body.at("parse_special").get<bool>())) {
+            return json::object({{"ok", false}, {"error", "\"examples\" are rendered through the chat template, so their control tokens are always parsed (drop \"parse_special\")"}});
+        }
+        if (!render_chat) {
+            return json::object({{"ok", false}, {"error", "this server has no chat template to render \"examples\" with; send \"text\""}});
+        }
+        std::string why;
+        if (!prepare_examples(body.at("examples"), render_chat, llama_model_get_vocab(model),
+                              (int64_t) body.value("window", 256.0), prepared, why)) {
+            return json::object({{"ok", false}, {"error", why}});
+        }
+        body["n_examples"] = body.at("examples").size();
+        body.erase("examples");
+    }
+    if (prepared.tokens.empty() && (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty())) {
+        return json::object({{"ok", false}, {"error", "\"text\" or \"examples\" (the training corpus) is required"}});
+    }
+    if (!body.contains("out") || !body.at("out").is_string() || body.at("out").get<std::string>().empty()) {
+        return json::object({{"ok", false}, {"error", "\"out\" (the adapter file name to write) is required"}});
+    }
+    if (confine_out(params_base.train_dir, body.at("out").get<std::string>()).empty()) {
+        return json::object({{"ok", false}, {"error", "\"out\" must be a bare file name ending in .gguf (no directories, no \"..\"); it is written inside the server's --train-dir"}});
     }
     // REPACKED WEIGHTS GIVE WRONG GRADIENTS, SILENTLY (Cormac on the /train plan): the backward
     // reads quantized blocks in the standard layout, and a weight in an extra buffer type
