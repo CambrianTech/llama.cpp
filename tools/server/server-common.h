@@ -117,6 +117,12 @@ bool lora_should_clear_cache(
 
 std::map<int, float> parse_lora_request(const json & data);
 
+// The adapters that reach the graph, in id order: (adapter, scale) with a non-zero scale.
+// What a KV state was computed under, so a cached state is restored only into a slot that
+// runs the same set (--cache-ram entries are otherwise keyed by tokens alone).
+using lora_active_set = std::vector<std::pair<llama_adapter_lora *, float>>;
+lora_active_set lora_active(const std::vector<common_adapter_lora_info> & loras);
+
 bool are_lora_equal(
         const std::vector<common_adapter_lora_info> & l1,
         const std::vector<common_adapter_lora_info> & l2);

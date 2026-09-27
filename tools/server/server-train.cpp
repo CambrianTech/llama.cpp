@@ -46,7 +46,7 @@ server_trainer::~server_trainer() {
 
 // "out" names a FILE in the server's --train-dir, never a path: no separators, no "..", not
 // absolute, not empty, and it must end in .gguf. Returns the resolved path, or "" when refused.
-static std::string confine_out(const std::string & dir, const std::string & name) {
+std::string confine_out(const std::string & dir, const std::string & name) {
     if (name.empty() || name.size() > 200 || name == "." || name == "..") {
         return "";
     }

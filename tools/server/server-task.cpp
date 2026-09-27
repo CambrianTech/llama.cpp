@@ -1662,7 +1662,7 @@ json server_task_result_get_lora::to_json() {
     for (size_t i = 0; i < loras.size(); ++i) {
         auto & lora = loras[i];
         json entry = {
-            {"id",            i},
+            {"id",            lora.id},
             {"path",          lora.info.path},
             {"scale",         lora.info.scale},
             {"task_name",     lora.info.task_name},
@@ -1683,6 +1683,14 @@ json server_task_result_get_lora::to_json() {
 
 json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
+}
+
+json server_task_result_lora_change::to_json() {
+    json res = { { "success", true }, { "id", lora_id }, { "path", path } };
+    if (!loaded) {
+        res["retired"] = true;
+    }
+    return res;
 }
 
 //
@@ -1708,9 +1716,12 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->lora != lora) {
+            continue; // same tokens under other adapters is a different state
+        }
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
@@ -1738,7 +1749,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (it->lora == lora && len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1785,12 +1796,24 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.lora   =*/ lora,
     });
 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+void server_prompt_cache::evict_lora(const llama_adapter_lora * adapter) {
+    states.remove_if([adapter](const server_prompt_cache_state & state) {
+        for (const auto & [ptr, scale] : state.lora) {
+            if (ptr == adapter) {
+                return true;
+            }
+        }
+        return false;
+    });
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & lora, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1802,6 +1825,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->lora != lora) {
+            continue; // computed under other adapters: its KV is not this request's
+        }
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
         const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();

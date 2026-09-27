@@ -45,6 +45,11 @@
 struct llama_model;
 struct llama_context;
 
+// A bare `.gguf` file name resolved inside `dir` (the server's --train-dir), or "" when the
+// name carries a directory, "..", a control character or another extension. The one rule
+// for every path the server writes or reads there: /train's "out" and /lora-adapters/load.
+std::string confine_out(const std::string & dir, const std::string & name);
+
 class server_trainer {
 public:
     // busy_slots: how many serving slots are working right now (read between training batches;
