@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "../../src/llama-ext.h"
 #include "server-train.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -4227,6 +4228,18 @@ server_context_meta server_context::get_meta() const {
             }
             return bufs;
         }(),
+        /* memory_breakdown       */ [&] {
+            json out = json::array();
+            for (const auto & [buft, mb] : llama_get_memory_breakdown(impl->ctx_tgt)) {
+                out.push_back(json {
+                    { "buffer_type",   ggml_backend_buft_name(buft) },
+                    { "model_bytes",   mb.model },
+                    { "context_bytes", mb.context },
+                    { "compute_bytes", mb.compute },
+                });
+            }
+            return out;
+        }(),
     };
 }
 
@@ -4622,6 +4635,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },
         { "model_weight_buffers",        meta.model_weight_buffers },
+        { "memory_breakdown",            meta.memory_breakdown },
         { "modalities",                  json {
             {"vision", meta.has_inp_image},
             {"video",  meta.has_inp_video},

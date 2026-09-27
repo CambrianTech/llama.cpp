@@ -57,6 +57,11 @@ struct server_context_meta {
     // Reported on /props so a caller can verify placement over a CHANNEL rather
     // than by scraping the engine's console.
     json model_weight_buffers;
+    // every buffer this server's serving context holds, per buffer type, as allocated at load:
+    // weights (model), KV cache (context) and compute buffers. The lane's footprint as the engine
+    // itself measures it — what a scheduler reads where no per-process GPU reading exists
+    // (Windows/WDDM) or the lane was adopted without a spawn baseline.
+    json memory_breakdown;
 };
 
 enum server_state {
