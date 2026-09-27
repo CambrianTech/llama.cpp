@@ -599,6 +599,8 @@ struct common_params {
     float       lora_train_alpha   = 32.0f;
     std::string lora_train_targets = "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down";
     float val_split = 0.05f; // fraction of the data used for the validation set
+    // llama-server /train: the ONLY directory it may write adapters into; empty disables the route
+    std::string train_dir;
 
     // embedding
     bool embedding         = false; // get only sentence embedding

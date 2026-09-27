@@ -39,12 +39,41 @@ server_trainer::~server_trainer() {
     }
 }
 
+// "out" names a FILE in the server's --train-dir, never a path: no separators, no "..", not
+// absolute, not empty, and it must end in .gguf. Returns the resolved path, or "" when refused.
+static std::string confine_out(const std::string & dir, const std::string & name) {
+    if (name.empty() || name.size() > 200 || name == "." || name == "..") {
+        return "";
+    }
+    for (char c : name) {
+        if (c == '/' || c == '\\' || c == ':' || (unsigned char) c < 0x20) {
+            return "";
+        }
+    }
+    if (name.find("..") != std::string::npos || name.size() < 6 || name.compare(name.size() - 5, 5, ".gguf") != 0) {
+        return "";
+    }
+    std::string d = dir;
+    if (!d.empty() && d.back() != '/' && d.back() != '\\') {
+        d += '/';
+    }
+    return d + name;
+}
+
 json server_trainer::start(const json & body) {
+    // OFF unless the server was started with --train-dir: the route writes files, so an engine
+    // opts in explicitly and every write is confined to that directory (Cormac on #14).
+    if (params_base.train_dir.empty()) {
+        return json::object({{"ok", false}, {"error", "training is disabled on this server (start it with --train-dir DIR to enable /train)"}});
+    }
     if (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty()) {
         return json::object({{"ok", false}, {"error", "\"text\" (the training corpus) is required"}});
     }
     if (!body.contains("out") || !body.at("out").is_string() || body.at("out").get<std::string>().empty()) {
-        return json::object({{"ok", false}, {"error", "\"out\" (the adapter file to write) is required"}});
+        return json::object({{"ok", false}, {"error", "\"out\" (the adapter file name to write) is required"}});
+    }
+    if (confine_out(params_base.train_dir, body.at("out").get<std::string>()).empty()) {
+        return json::object({{"ok", false}, {"error", "\"out\" must be a bare file name ending in .gguf (no directories, no \"..\"); it is written inside the server's --train-dir"}});
     }
     // Every numeric input is checked here, before a thread starts: inside a serving process an
     // assert in the training path would take the server down (Cormac on #14).
@@ -154,7 +183,7 @@ void server_trainer::run(json req) {
     };
 
     const std::string text    = req.at("text").get<std::string>();
-    const std::string out     = req.at("out").get<std::string>();
+    const std::string out     = confine_out(params_base.train_dir, req.at("out").get<std::string>());
     const int32_t     rank    = (int32_t) req.value("rank", (int64_t) 8);
     const float       alpha   = (float) req.value("alpha", 16.0);
     const std::string targets = req.value("targets", std::string("attn_q,attn_v"));

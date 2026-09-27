@@ -2926,6 +2926,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--train-dir"}, "DIR",
+        "enable POST /train (LoRA-only training on the served model) and confine the adapters it writes to DIR; "
+        "off unless set (the route writes files, so a lane opts in explicitly)",
+        [](common_params & params, const std::string & value) {
+            params.train_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TRAIN_DIR"));
+    add_opt(common_arg(
         {"--lora"}, "FNAME",
         "path to LoRA adapter (use comma-separated values to load multiple adapters)",
         [](common_params & params, const std::string & value) {
