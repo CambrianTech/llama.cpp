@@ -3524,6 +3524,9 @@ void llama_context::opt_epoch(
     int64_t t_loop_start = ggml_time_us();
     int64_t ndata_in_loop = idata_split*ubatch_per_ctx;
     for (; idata < idata_split; ++idata) {
+        if (opt_stop_requested.load(std::memory_order_relaxed)) {
+            break;
+        }
         constexpr bool train = true;
         const int64_t idata_in_loop = idata*ubatch_per_ctx;
 
@@ -3535,6 +3538,9 @@ void llama_context::opt_epoch(
     t_loop_start = ggml_time_us();
     ndata_in_loop = (ndata - idata_split)*ubatch_per_ctx;
     for (; idata < ndata; ++idata) {
+        if (opt_stop_requested.load(std::memory_order_relaxed)) {
+            break;
+        }
         constexpr bool train = false;
         const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
 
@@ -4229,6 +4235,10 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
 
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {
     ctx->opt_init(model, lopt_params);
+}
+
+void llama_opt_stop(struct llama_context * ctx, bool stop) {
+    ctx->opt_stop_requested.store(stop, std::memory_order_relaxed);
 }
 
 void llama_opt_epoch(

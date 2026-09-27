@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "ggml-opt.h"
 
+#include <cstdio>
 #include <chrono>
 #include <sstream>
 
@@ -34,6 +35,8 @@ server_trainer::server_trainer(llama_model * model, const common_params & params
 }
 
 server_trainer::~server_trainer() {
+    // a shutdown must not wait out a whole run
+    cancel();
     if (worker.joinable()) {
         worker.join();
     }
@@ -121,6 +124,9 @@ json server_trainer::start(const json & body) {
                 "Serve with every layer offloaded (-ngl all) or with --no-repack."}});
         }
     }
+    if (body.contains("parse_special") && !body.at("parse_special").is_boolean()) {
+        return json::object({{"ok", false}, {"error", "\"parse_special\" must be true or false"}});
+    }
     bool expected = false;
     if (!running.compare_exchange_strong(expected, true)) {
         return json::object({{"ok", false}, {"error", "a training run is already in progress"}, {"status", status()}});
@@ -135,6 +141,7 @@ json server_trainer::start(const json & body) {
     g_train_batch.store(0);
     g_train_batch_max.store(0);
     yielded_ms.store(0);
+    cancel_requested.store(false);
     yield_to_turns.store(body.value("yield", true));
     g_trainer.store(this);
     worker = std::thread(&server_trainer::run, this, body);
@@ -156,10 +163,23 @@ void server_trainer::on_batch(bool train, ggml_opt_context_t, ggml_opt_dataset_t
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
-    while (self->busy_slots() > 0) {
+    while (self->busy_slots() > 0 && !self->cancel_requested.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     self->yielded_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+json server_trainer::cancel() {
+    if (!running.load()) {
+        return json::object({{"ok", false}, {"error", "no training run is in progress"}});
+    }
+    cancel_requested.store(true);
+    std::lock_guard<std::mutex> lock(mu);
+    if (ctx_live != nullptr) {
+        llama_opt_stop(ctx_live, true);
+    }
+    state["cancel_requested"] = true;
+    return json::object({{"ok", true}});
 }
 
 json server_trainer::status() const {
@@ -192,6 +212,7 @@ void server_trainer::run(json req) {
     const float       lr0     = (float) req.value("lr", 1e-5);
     const float       val     = (float) req.value("val_split", 0.1);
     const uint32_t    seed    = (uint32_t) req.value("seed", (int64_t) 42);
+    const bool        special = req.value("parse_special", false);
 
     // The training context: the SAME model, its own graph. One ubatch is the whole window
     // (the training graph attends to this ubatch's K/V directly); flash attention has no
@@ -223,6 +244,7 @@ void server_trainer::run(json req) {
         return;
     }
     llama_adapter_lora * adapter = llama_adapter_lora_init(model, init_path.c_str());
+    std::remove(init_path.c_str()); // loaded (or refused): the file has done its job
     if (adapter == nullptr) {
         llama_free(ctx);
         fail("could not load the fresh adapter");
@@ -236,7 +258,7 @@ void server_trainer::run(json req) {
         return;
     }
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, text, true);
+    std::vector<llama_token> tokens = common_tokenize(ctx, text, true, special);
     if ((int64_t) tokens.size() < 2 * (int64_t) window) {
         llama_adapter_lora_free(adapter);
         llama_free(ctx);
@@ -260,6 +282,14 @@ void server_trainer::run(json req) {
         /*adapter         =*/ adapter,
     };
     llama_opt_init(ctx, model, lopt);
+    {
+        // from here an epoch can run: a cancel reaches this context directly
+        std::lock_guard<std::mutex> lock(mu);
+        ctx_live = ctx;
+        if (cancel_requested.load()) {
+            llama_opt_stop(ctx, true);
+        }
+    }
 
     const int64_t idata_split  = (int64_t) (ggml_opt_dataset_ndata(dataset) * (1.0f - val));
     const int64_t train_tokens = idata_split * (int64_t) window;
@@ -275,10 +305,13 @@ void server_trainer::run(json req) {
     LOG_INF("%s: training on the served model: %zu tokens, window %u, %u epochs, adapter -> %s\n",
             __func__, tokens.size(), window, epochs, out.c_str());
 
-    for (lr.epoch = 0; lr.epoch < lr.epochs; ++lr.epoch) {
+    for (lr.epoch = 0; lr.epoch < lr.epochs && !cancel_requested.load(); ++lr.epoch) {
         const int64_t t0 = ggml_time_us();
         llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split, &server_trainer::on_batch, nullptr);
         const double seconds = (ggml_time_us() - t0) / 1e6;
+        if (cancel_requested.load()) {
+            break;
+        }
         double loss_train = 0.0, unc_train = 0.0, loss_eval = 0.0, unc_eval = 0.0;
         ggml_opt_result_loss(result_train, &loss_train, &unc_train);
         ggml_opt_result_loss(result_eval,  &loss_eval,  &unc_eval);
@@ -296,13 +329,21 @@ void server_trainer::run(json req) {
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);
     ggml_opt_dataset_free(dataset);
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        ctx_live = nullptr;
+    }
 
-    const int32_t saved = llama_adapter_lora_save(adapter, out.c_str());
+    // a cancelled run writes nothing: a partial adapter is not a result
+    const bool    cancelled = cancel_requested.load();
+    const int32_t saved     = cancelled ? 0 : llama_adapter_lora_save(adapter, out.c_str());
     llama_adapter_lora_free(adapter);
     llama_free(ctx);
 
     std::lock_guard<std::mutex> lock(mu);
-    if (saved != 0) {
+    if (cancelled) {
+        state["state"] = "cancelled";
+    } else if (saved != 0) {
         state["state"] = "error";
         state["error"] = "training finished but the adapter could not be written to " + out;
     } else {

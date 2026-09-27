@@ -1713,6 +1713,11 @@ extern "C" {
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
+    // Ask llama_opt_epoch to return at the next data item (one training window): thread-safe,
+    // callable while an epoch runs on another thread. The flag stays set until cleared with
+    // stop = false, so every later epoch on this context returns at once as well.
+    LLAMA_API void llama_opt_stop(struct llama_context * lctx, bool stop);
+
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,
