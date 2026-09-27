@@ -335,8 +335,17 @@ kernel void kernel_cross_entropy_loss_back_f32(
     }
     const float inv_sum = 1.0f/ce_reduce_sum(lsum, buf, sgitg, tiisg, tptg);
 
+    // the gradient of -sum(y log softmax(x)) is softmax(x) * sum(y) - y, which equals
+    // softmax(x) - y only when the labels of a row sum to 1: a masked row (all-zero labels,
+    // a prompt token under completion-only training) must contribute nothing, not softmax(x)
+    float ly = 0.0f;
     for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
-        d[i] = (exp(s0[i] - max_val)*inv_sum - s1[i])*d_by_nr;
+        ly += s1[i];
+    }
+    const float sum_y = ce_reduce_sum(ly, buf, sgitg, tiisg, tptg);
+
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        d[i] = (exp(s0[i] - max_val)*inv_sum*sum_y - s1[i])*d_by_nr;
     }
 }
 
