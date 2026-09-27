@@ -1718,6 +1718,14 @@ extern "C" {
     // stop = false, so every later epoch on this context returns at once as well.
     LLAMA_API void llama_opt_stop(struct llama_context * lctx, bool stop);
 
+    // Called before each training and evaluation window, including the first.
+    // May wait to yield compute without releasing the context or optimizer state.
+    // Return false to request a persistent stop (see llama_opt_stop). A blocking callback
+    // must arrange its own wakeup on cancellation. Set only while no epoch is running.
+    typedef bool (*llama_opt_step_callback)(bool train, void * user_data);
+    LLAMA_API void llama_opt_set_step_callback(
+            struct llama_context * lctx, llama_opt_step_callback callback, void * user_data);
+
     // True when an epoch stopped because its training graph could not be allocated (device
     // memory): nothing was evaluated past that point. Cleared by llama_opt_init.
     LLAMA_API bool llama_opt_failed(struct llama_context * lctx);

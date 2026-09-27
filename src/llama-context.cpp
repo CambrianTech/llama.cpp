@@ -3541,6 +3541,13 @@ void llama_context::opt_epoch(
         constexpr bool train = true;
         const int64_t idata_in_loop = idata*ubatch_per_ctx;
 
+        if (opt_step_callback && !opt_step_callback(train, opt_step_callback_data)) {
+            opt_stop_requested.store(true);
+        }
+        if (opt_stop_requested.load(std::memory_order_relaxed)) {
+            break;
+        }
+
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
             callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
@@ -3554,6 +3561,13 @@ void llama_context::opt_epoch(
         }
         constexpr bool train = false;
         const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
+
+        if (opt_step_callback && !opt_step_callback(train, opt_step_callback_data)) {
+            opt_stop_requested.store(true);
+        }
+        if (opt_stop_requested.load(std::memory_order_relaxed)) {
+            break;
+        }
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, batch,
@@ -4251,6 +4265,11 @@ void llama_opt_init(struct llama_context * ctx, struct llama_model * model, stru
 
 void llama_opt_stop(struct llama_context * ctx, bool stop) {
     ctx->opt_stop_requested.store(stop, std::memory_order_relaxed);
+}
+
+void llama_opt_set_step_callback(struct llama_context * ctx, llama_opt_step_callback callback, void * user_data) {
+    ctx->opt_step_callback = callback;
+    ctx->opt_step_callback_data = user_data;
 }
 
 void llama_opt_set_memory_budget(struct llama_context * ctx, size_t bytes) {

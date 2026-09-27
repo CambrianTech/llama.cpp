@@ -8,6 +8,7 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-train.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -15,6 +16,8 @@
 #include "log.h"
 
 #include <algorithm>
+#include <chrono>
+#include <filesystem>
 #include <exception>
 #include <fstream>
 #include <functional>
@@ -23,6 +26,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 using json = common_json;
 
@@ -7154,7 +7158,121 @@ static void test_msg_diffs_compute() {
     }
 }
 
+// Optional CPU integration check: test-chat --train-control MODEL.gguf EMPTY_OUTPUT_DIR
+static int test_train_control(const char * model_path, const char * output_dir) {
+    using namespace std::chrono;
+    const std::filesystem::path dir(output_dir);
+    if (!std::filesystem::is_directory(dir) || !std::filesystem::is_empty(dir)) {
+        throw std::runtime_error("train-control needs an existing empty output directory");
+    }
+    llama_backend_init();
+    common_params params;
+    params.n_gpu_layers = 0;
+    params.no_extra_bufts = true;
+    params.cpuparams.n_threads = 1;
+    params.cpuparams_batch.n_threads = 1;
+    params.train_dir = output_dir;
+    auto mp = common_model_params_to_llama(params);
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
+        llama_model_load_from_file(model_path, mp), llama_model_free);
+    if (!model) {
+        throw std::runtime_error("could not load test model");
+    }
+    auto require = [](bool ok, const char * why) {
+        if (!ok) {
+            throw std::runtime_error(why);
+        }
+    };
+    std::atomic<int> calls{0}, hold_at{0};
+    std::atomic<bool> held{false};
+    server_trainer trainer(model.get(), params, [&] {
+        if (held.load()) {
+            return 1;
+        }
+        if (++calls == hold_at.load()) {
+            held.store(true);
+        }
+        return held.load() ? 1 : 0;
+    }, {});
+    auto wait_for = [&](const std::function<bool(const json &)> & predicate) {
+        const auto deadline = steady_clock::now() + minutes(2);
+        while (steady_clock::now() < deadline) {
+            const auto s = trainer.status();
+            require(s.value("state", "") != "error", s.dump().c_str());
+            if (predicate(s)) {
+                return s;
+            }
+            std::this_thread::sleep_for(milliseconds(2));
+        }
+        throw std::runtime_error("train-control timed out");
+    };
+    std::string text;
+    for (int i = 0; i < 128; ++i) {
+        text += "Once upon a time a little bird learned to fly home. ";
+    }
+    json req = {{"text", text}, {"out", "baseline.gguf"}, {"window", 256},
+                {"rank", 2}, {"epochs", 2}, {"val_split", 0.5}, {"seed", 42}};
+    auto done = [](const json & s) { return s.value("state", "") == "done"; };
+    require(trainer.start(req).at("ok").get<bool>(), "baseline refused");
+    const auto baseline = wait_for(done);
+
+    // Block after two updates, then exercise manual pause separately from serving admission.
+    calls.store(0);
+    hold_at.store(3);
+    req["out"] = "resumed.gguf";
+    require(trainer.start(req).at("ok").get<bool>(), "resume run refused");
+    wait_for([](const json & s) { return s.value("waiting_for_serving", false); });
+    require(!trainer.pause("baseline.gguf").at("ok").get<bool>(), "stale pause accepted");
+    require(trainer.pause("resumed.gguf").at("ok").get<bool>(), "pause refused");
+    const auto paused = wait_for([](const json & s) { return s.value("paused", false); });
+    hold_at.store(0);
+    held.store(false);
+    std::this_thread::sleep_for(milliseconds(50));
+    require(trainer.status().at("paused").get<bool>(), "pause released without resume");
+    require(trainer.status().at("batch") == paused.at("batch"), "paused cursor advanced");
+    require(!trainer.resume("baseline.gguf").at("ok").get<bool>(), "stale resume accepted");
+    require(trainer.status().at("paused").get<bool>(), "stale resume released pause");
+    require(trainer.resume("resumed.gguf").at("ok").get<bool>(), "resume refused");
+    const auto resumed = wait_for(done);
+    auto bytes = [&](const char * name) {
+        std::ifstream file(dir / name, std::ios::binary);
+        require(file.good(), "adapter missing");
+        return std::string(std::istreambuf_iterator<char>(file), {});
+    };
+    require(bytes("baseline.gguf") == bytes("resumed.gguf"), "pause changed optimizer/adapter/cursor result");
+    for (size_t i = 0; i < baseline.at("epochs").size(); ++i) {
+        for (const char * key : {"train_loss", "eval_loss"}) {
+            require(baseline.at("epochs").at(i).at(key) == resumed.at("epochs").at(i).at(key), "loss changed after pause");
+        }
+    }
+    // Verify admission before the very first window and before held-out evaluation.
+    const int train_windows = baseline.at("train_tokens").get<int>() / 256;
+    for (const int gate : {1, train_windows + 1}) {
+        calls.store(0);
+        hold_at.store(gate);
+        req["out"] = "cancelled.gguf";
+        require(trainer.start(req).at("ok").get<bool>(), "cancel run refused");
+        wait_for([](const json & s) { return s.value("waiting_for_serving", false); });
+        require(trainer.pause("cancelled.gguf").at("ok").get<bool>(), "cancel pause refused");
+        wait_for([](const json & s) { return s.value("paused", false); });
+        require(trainer.cancel().at("ok").get<bool>(), "cancel refused");
+        wait_for([](const json & s) { return s.value("state", "") == "cancelled"; });
+        require(!std::filesystem::exists(dir / "cancelled.gguf"), "cancel wrote an adapter");
+        held.store(false);
+    }
+    std::cout << "train-control: identical adapters/losses after warm pause; first/eval admission and paused cancellation passed\n";
+    return 0;
+}
+
 int main(int argc, char ** argv) {
+    if (argc == 4 && std::string(argv[1]) == "--train-control") {
+        try {
+            return test_train_control(argv[2], argv[3]);
+        } catch (const std::exception & e) {
+            std::cerr << "train-control: " << e.what() << '\n';
+            return 1;
+        }
+    }
     bool detailed_debug    = false;
     bool only_run_filtered = false;
 

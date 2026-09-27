@@ -199,6 +199,8 @@ struct llama_context {
     // TODO: more flexible combinations of logical/physical batch size and context size
     // set by llama_opt_stop from any thread; opt_epoch returns at the next data item
     std::atomic<bool> opt_stop_requested{false};
+    llama_opt_step_callback opt_step_callback = nullptr;
+    void * opt_step_callback_data = nullptr;
     // set when an epoch's graph could not be allocated (llama_opt_failed); the epoch stops
     std::atomic<bool> opt_alloc_failed{false};
     // what training may add per GPU device (llama_opt_set_memory_budget); 0 = no cap
