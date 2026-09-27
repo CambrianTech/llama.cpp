@@ -7100,6 +7100,80 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
+        case GGML_OP_CONCAT: {
+            // Each input takes its slice of the gradient along the concat dimension. A hybrid
+            // layer concatenates the cached conv state (a leaf) with this ubatch's qkv, so the
+            // second slice is the one that carries a gradient back into the model.
+            const int dim = ggml_get_op_params_i32(tensor, 0);
+            size_t offset = 0;
+            for (int j = 0; j < 2; ++j) {
+                struct ggml_tensor * src = tensor->src[j];
+                const size_t isrc = j == 0 ? isrc0 : isrc1;
+                const bool needs  = j == 0 ? src0_needs_grads : src1_needs_grads;
+                if (needs) {
+                    struct ggml_tensor * slice = ggml_view_4d(ctx, grad,
+                            src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                            grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                    ggml_add_or_set(ctx, cgraph, isrc, ggml_cont(ctx, slice));
+                }
+                offset += src->ne[dim] * grad->nb[dim];
+            }
+        } break;
+        case GGML_OP_SSM_CONV: {
+            // x[d, t, s] = sum_k sx[t + k, d, s] * c[k, d] (sx is time-major: ne0 = n_t + d_conv - 1).
+            //   dc[k, d]     = sum_{t,s} dy[d, t, s] * sx[t + k, d, s]
+            //   dsx[t', d, s] = sum_k dy[d, t' - k, s] * c[k, d]
+            // composed from ops every backend has: a transpose of dy, a shifted view of sx per
+            // tap, broadcast MUL, SUM_ROWS, CONCAT for dc, and PAD_EXT to shift dy back for dsx.
+            struct ggml_tensor * sx = src0;
+            struct ggml_tensor * c  = src1;
+            const int64_t nc  = c->ne[0];
+            const int64_t n_t = tensor->ne[1];
+            const int64_t n_s = tensor->ne[2];
+            struct ggml_tensor * dyT = ggml_cont(ctx, ggml_transpose(ctx, grad)); // [n_t, d, n_s]
+            struct ggml_tensor * dsx = NULL;
+            struct ggml_tensor * dc  = NULL;
+            for (int64_t k = 0; k < nc; ++k) {
+                if (src1_needs_grads) {
+                    struct ggml_tensor * sx_k = ggml_cont(ctx, ggml_view_3d(ctx, sx, n_t, sx->ne[1], n_s,
+                            sx->nb[1], sx->nb[2], k * sx->nb[0]));
+                    struct ggml_tensor * col = ggml_sum_rows(ctx, ggml_mul(ctx, dyT, sx_k)); // [1, d, n_s]
+                    if (n_s > 1) {
+                        col = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, col, 2, 1, 0, 3))); // [1, d, 1]
+                    }
+                    col = ggml_reshape_2d(ctx, col, 1, c->ne[1]);
+                    dc  = dc ? ggml_concat(ctx, dc, col, 0) : col;
+                }
+                if (src0_needs_grads) {
+                    struct ggml_tensor * c_k = ggml_cont(ctx, ggml_view_2d(ctx, c, 1, c->ne[1], c->nb[1], k * c->nb[0]));
+                    struct ggml_tensor * contrib = ggml_pad_ext(ctx, ggml_mul(ctx, dyT, c_k),
+                            (int) k, (int) (nc - 1 - k), 0, 0, 0, 0, 0, 0); // [n_t + nc - 1, d, n_s]
+                    dsx = dsx ? ggml_add(ctx, dsx, contrib) : contrib;
+                }
+            }
+            if (src0_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc0, dsx);
+            }
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1, dc);
+            }
+        } break;
+        case GGML_OP_L2_NORM: {
+            // y = x / max(|x|, eps) per row:
+            //   dx = (dy - y (y . dy)) / |x|   where |x| > eps
+            //   dx = dy / eps                  where the norm is clamped (y is x scaled, no projection)
+            // composed from existing ops; the step mask selects the projection per row.
+            if (src0_needs_grads) {
+                float eps;
+                memcpy(&eps, tensor->op_params, sizeof(float));
+                struct ggml_tensor * nrm  = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, src0)));
+                struct ggml_tensor * n    = ggml_clamp(ctx, nrm, eps, INFINITY);
+                struct ggml_tensor * mask = ggml_step(ctx, ggml_scale_bias(ctx, nrm, 1.0f, -eps));
+                struct ggml_tensor * dot  = ggml_sum_rows(ctx, ggml_mul(ctx, tensor, grad));
+                struct ggml_tensor * proj = ggml_mul(ctx, tensor, ggml_mul(ctx, dot, mask));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, ggml_sub(ctx, grad, proj), n));
+            }
+        } break;
         case GGML_OP_GATED_DELTA_NET: {
             // The recurrence run in reverse (ggml_gated_delta_net_back): one op returns every
             // input's gradient packed in input order, and each input that needs one takes its
