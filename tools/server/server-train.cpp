@@ -134,6 +134,10 @@ void server_trainer::run(json req) {
     cparams.type_k          = GGML_TYPE_F32;
     cparams.type_v          = GGML_TYPE_F32;
     cparams.embeddings      = false;
+    // training reads logits for every token of the window; the serving params cap outputs per
+    // ubatch to what sampling needs (a server-computed limit), which a training batch overruns
+    cparams.n_outputs_max         = 0;   // = n_batch
+    cparams.n_outputs_max_per_seq = 0;   // = n_outputs_max
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == nullptr) {
