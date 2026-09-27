@@ -2570,6 +2570,48 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     return true;
 }
 
+bool ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const size_t * max_new, size_t * sizes) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+    GGML_ASSERT(!sched->is_alloc);
+
+    sched->cur_copy = sched->next_copy;
+    sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
+
+    // the ONE split of this graph (splitting rewrites node inputs to the scheduler's copies, so a
+    // graph must never be split twice)
+    ggml_backend_sched_split_graph(sched, graph);
+
+    // plan the split graph with a throwaway allocator: exact sizes, nothing allocated, and the
+    // live allocator's buffers untouched (a measure-only reserve on it frees what would grow)
+    std::vector<size_t> need(sched->n_backends, 0);
+    ggml_gallocr_t probe = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    ggml_gallocr_reserve_n_size(probe, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, need.data());
+    ggml_gallocr_free(probe);
+    bool fits = true;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sizes) {
+            sizes[b] = need[b];
+        }
+        const size_t held  = ggml_gallocr_get_buffer_size(sched->galloc, b);
+        const size_t extra = need[b] > held ? need[b] - held : 0;
+        if (max_new && extra > max_new[b]) {
+            GGML_LOG_ERROR("%s: the graph needs %.1f MiB more on %s, over the %.1f MiB it may add: not allocating it\n",
+                           __func__, extra/1048576.0, ggml_backend_name(sched->backends[b]), max_new[b]/1048576.0);
+            fits = false;
+        }
+    }
+    if (!fits) {
+        return false;
+    }
+
+    if (!ggml_backend_sched_alloc_splits(sched)) {
+        return false;
+    }
+    sched->is_alloc = true;
+    return true;
+}
+
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     enum ggml_status err = ggml_backend_sched_graph_compute_async(sched, graph);
     ggml_backend_sched_synchronize(sched);

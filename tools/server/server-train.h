@@ -23,6 +23,10 @@
 //                   system text. Losses are reported per trainable token. "text" and "examples"
 //                   are exclusive; "text" trains on every token.
 //
+// "memory_budget_mib": what training may add on the GPU. Pass it wherever the driver's free figure
+// is not physical (Windows/WDDM reports nearly the whole card free beside other processes): a graph
+// over it is refused before allocation instead of spilling into host memory.
+//
 // "parse_special": true tokenizes control tokens in the text (<|im_start|> ...) as the tokens
 // they name, which is what a corpus rendered through the model's chat template needs; the
 // default (false) trains on the text exactly as written.

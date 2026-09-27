@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cinttypes>
@@ -54,6 +55,8 @@ struct ggml_opt_context {
     struct ggml_cgraph * gb_grad = nullptr;
     struct ggml_cgraph * gb_opt  = nullptr;
     bool static_graphs           = false;
+    size_t alloc_budget          = 0; // bytes a graph may add on a non-CPU device; 0 = the device's own free figure
+    size_t peak_graph_bytes      = 0; // largest graph measured by the preflight on a non-CPU device
     bool eval_ready              = false;
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
@@ -722,7 +725,15 @@ void ggml_opt_prepare_alloc(
     opt_ctx->outputs     = outputs;
 }
 
-void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
+void ggml_opt_set_alloc_budget(ggml_opt_context_t opt_ctx, size_t bytes) {
+    opt_ctx->alloc_budget = bytes;
+}
+
+size_t ggml_opt_peak_graph_bytes(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->peak_graph_bytes;
+}
+
+bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
     if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
         ggml_graph_reset(opt_ctx->gb_grad);
@@ -754,7 +765,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (opt_ctx->allocated_graph == graph) {
         opt_ctx->eval_ready = true;
-        return;
+        return true;
     }
 
     ggml_backend_sched_reset(opt_ctx->backend_sched); // clear allocation of previous graph
@@ -773,10 +784,48 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         opt_ctx->allocated_graph_copy = graph;
     }
 
-    ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    // A training graph that cannot fit must be refused BEFORE it is allocated. Attempting it is not
+    // contained: on the 5090 (2026-09-27) a 75 GB graph's failed CUDA allocation spilled into host
+    // memory, exhausted the machine's commit and aborted the continuum core beside it. Each
+    // backend may grow by its device's free memory (capped by the caller's budget on GPUs: on
+    // Windows/WDDM a CUDA device reports nearly the whole card free beside other processes) minus
+    // allocator slack; the CPU device reports free system RAM, so host spill is covered too.
+    {
+        ggml_backend_sched_t sched = opt_ctx->backend_sched;
+        const int n = ggml_backend_sched_get_n_backends(sched);
+        std::vector<size_t> max_new(n, SIZE_MAX);
+        std::vector<size_t> sizes(n, 0);
+        for (int i = 0; i < n; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+            if (dev == nullptr) {
+                continue;
+            }
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            if (opt_ctx->alloc_budget > 0 && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                free = std::min(free, opt_ctx->alloc_budget);
+            }
+            const size_t margin = std::min<size_t>(free, 512u*1024*1024); // allocator slack
+            max_new[i] = free - margin;
+        }
+        const bool ok = ggml_backend_sched_alloc_graph_within(sched, opt_ctx->allocated_graph_copy, max_new.data(), sizes.data());
+        for (int i = 0; i < n; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+            if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                opt_ctx->peak_graph_bytes = std::max(opt_ctx->peak_graph_bytes, sizes[i]);
+            }
+        }
+        if (!ok) {
+            ggml_backend_sched_reset(sched);
+            opt_ctx->allocated_graph = nullptr;
+            opt_ctx->eval_ready      = false;
+            return false;
+        }
+    }
     opt_ctx->allocated_graph = graph;
 
     opt_ctx->eval_ready = true;
+    return true;
 }
 
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
@@ -905,7 +954,7 @@ void ggml_opt_epoch(
     int64_t ibatch = 0;
     int64_t t_loop_start = ggml_time_us();
     for (; ibatch < ibatch_split; ++ibatch) {
-        ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+        GGML_ASSERT(ggml_opt_alloc(opt_ctx, /*backward =*/ true) && "the training graph does not fit in device memory");
         ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
         ggml_opt_eval(opt_ctx, result_train);
         if (callback_train) {
@@ -914,7 +963,7 @@ void ggml_opt_epoch(
     }
     t_loop_start = ggml_time_us();
     for (; ibatch < nbatches; ++ibatch) {
-        ggml_opt_alloc(opt_ctx, /*backward =*/ false);
+        GGML_ASSERT(ggml_opt_alloc(opt_ctx, /*backward =*/ false) && "the evaluation graph does not fit in device memory");
         ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
         ggml_opt_eval(opt_ctx, result_eval);
         if (callback_eval) {
