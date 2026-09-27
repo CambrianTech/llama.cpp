@@ -11,6 +11,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <atomic>
 #include <map>
 #include <vector>
 
@@ -196,6 +197,9 @@ struct llama_context {
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
 
     // TODO: more flexible combinations of logical/physical batch size and context size
+    // set by llama_opt_stop from any thread; opt_epoch returns at the next data item
+    std::atomic<bool> opt_stop_requested{false};
+
     void opt_epoch(
             ggml_opt_dataset_t      dataset,
             ggml_opt_result_t       result_train,

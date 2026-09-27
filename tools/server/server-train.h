@@ -10,8 +10,13 @@
 //   POST /train  {"text": "...", "out": "adapter.gguf", "rank": 8, "alpha": 16,
 //                 "targets": "attn_q,attn_v", "window": 256, "epochs": 1, "lr": 1e-5,
 //                 "val_split": 0.1, "seed": 42}
-//   GET  /train  -> the run's state: idle | running (epoch, batch/of) | done | error, with
-//                   per-epoch train/eval loss, train tok/s, and the adapter path
+//   GET  /train  -> the run's state: idle | running (epoch, batch/of) | done | cancelled | error,
+//                   with per-epoch train/eval loss, train tok/s, and the adapter path
+//   POST /train/cancel -> the run stops at the next training window and writes no adapter
+//
+// "parse_special": true tokenizes control tokens in the text (<|im_start|> ...) as the tokens
+// they name, which is what a corpus rendered through the model's chat template needs; the
+// default (false) trains on the text exactly as written.
 
 #include "common.h"
 
@@ -25,6 +30,7 @@
 #include <thread>
 
 struct llama_model;
+struct llama_context;
 
 class server_trainer {
 public:
@@ -36,6 +42,9 @@ public:
     // Starts a run on a worker thread; refuses (ok=false) while one is running or on bad input.
     common_json start(const common_json & body);
     common_json status() const;
+    // Stops the running job at its next training window (no adapter is written); ok=false when
+    // nothing is running.
+    common_json cancel();
 
 private:
     void run(common_json req);
@@ -50,6 +59,8 @@ private:
 
     std::thread worker;
     std::atomic<bool> running{false};
+    std::atomic<bool> cancel_requested{false};
     mutable std::mutex mu;
-    common_json state;  // guarded by mu
+    common_json state;                  // guarded by mu
+    llama_context * ctx_live = nullptr; // guarded by mu: the training context while an epoch can run
 };
