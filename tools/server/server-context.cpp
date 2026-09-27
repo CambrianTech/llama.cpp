@@ -4127,14 +4127,14 @@ bool server_context::load_model(common_params & params) {
 
 json server_context::train_start(const json & body) {
     if (!impl->trainer) {
-        return json{{"ok", false}, {"error", "no model is loaded"}};
+        return json::object({{"ok", false}, {"error", "no model is loaded"}});
     }
     return impl->trainer->start(body);
 }
 
 json server_context::train_status() const {
     if (!impl->trainer) {
-        return json{{"state", "unavailable"}};
+        return json::object({{"state", "unavailable"}});
     }
     return impl->trainer->status();
 }

@@ -30,11 +30,11 @@ public:
     ~server_trainer();
 
     // Starts a run on a worker thread; refuses (ok=false) while one is running or on bad input.
-    nlohmann::ordered_json start(const nlohmann::ordered_json & body);
-    nlohmann::ordered_json status() const;
+    common_json start(const common_json & body);
+    common_json status() const;
 
 private:
-    void run(nlohmann::ordered_json req);
+    void run(common_json req);
 
     llama_model * model;
     common_params params_base;
@@ -42,5 +42,5 @@ private:
     std::thread worker;
     std::atomic<bool> running{false};
     mutable std::mutex mu;
-    nlohmann::ordered_json state;  // guarded by mu
+    common_json state;  // guarded by mu
 };
