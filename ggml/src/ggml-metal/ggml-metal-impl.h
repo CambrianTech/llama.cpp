@@ -991,6 +991,25 @@ typedef struct {
     uint64_t nb3;
 } ggml_metal_kargs_gated_delta_net;
 
+// GATED_DELTA_NET_BACK: element strides (floats) of q/k/v, the shape, and the segment size
+typedef struct {
+    int64_t H;
+    int64_t T;
+    int64_t n_seqs;
+    int64_t neq1;
+    int64_t neq3;
+    int64_t nek1;
+    int64_t nek3;
+    int64_t sq1, sq2, sq3;
+    int64_t sk1, sk2, sk3;
+    int64_t sv1, sv2, sv3;
+    int64_t C;       // checkpoint segment length (~sqrt(T))
+    int64_t off_dk, off_dv, off_dg, off_db, off_ds; // float offsets of the packed output blocks
+    int32_t kda;
+    int32_t K;
+    float   scale;
+} ggml_metal_kargs_gated_delta_net_back;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;
