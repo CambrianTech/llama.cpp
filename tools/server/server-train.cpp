@@ -46,6 +46,30 @@ json server_trainer::start(const json & body) {
     if (!body.contains("out") || !body.at("out").is_string() || body.at("out").get<std::string>().empty()) {
         return json::object({{"ok", false}, {"error", "\"out\" (the adapter file to write) is required"}});
     }
+    // Every numeric input is checked here, before a thread starts: inside a serving process an
+    // assert in the training path would take the server down (Cormac on #14).
+    {
+        auto num = [&](const char * key, double def) { return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : def; };
+        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed"}) {
+            if (body.contains(key) && !body.at(key).is_number()) {
+                return json::object({{"ok", false}, {"error", std::string("\"") + key + "\" must be a number"}});
+            }
+        }
+        const double rank = num("rank", 8), alpha = num("alpha", 16), window = num("window", 256), epochs = num("epochs", 1);
+        const double lr = num("lr", 1e-5), val = num("val_split", 0.1);
+        std::string why;
+        if (rank < 1 || rank > 256 || rank != (int64_t) rank)       why = "rank must be an integer in [1, 256]";
+        else if (!(alpha > 0))                                       why = "alpha must be > 0";
+        else if (window < 16 || window > 8192 || window != (int64_t) window) why = "window must be an integer in [16, 8192]";
+        else if (epochs < 1 || epochs > 100 || epochs != (int64_t) epochs)   why = "epochs must be an integer in [1, 100]";
+        else if (!(lr > 0 && lr <= 1))                               why = "lr must be in (0, 1]";
+        else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
+        else if (body.contains("targets") && (!body.at("targets").is_string() || split_targets(body.at("targets").get<std::string>()).empty()))
+                                                                     why = "targets must be a non-empty comma-separated list of module names";
+        if (!why.empty()) {
+            return json::object({{"ok", false}, {"error", why}});
+        }
+    }
     // REPACKED WEIGHTS GIVE WRONG GRADIENTS, SILENTLY (Cormac on the /train plan): the backward
     // reads quantized blocks in the standard layout, and a weight in an extra buffer type
     // (CPU_REPACK) is not in it — no crash, garbage gradients. Extra buffer types only apply to

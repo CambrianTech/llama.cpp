@@ -415,7 +415,10 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
     }
 
     // register adapter with model
-    model.loras.insert(&adapter);
+    {
+        std::unique_lock<std::shared_mutex> lock(model.loras_mutex);
+        model.loras.insert(&adapter);
+    }
 
     LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
 }
@@ -480,6 +483,7 @@ void llama_adapter_lora_free(llama_adapter_lora * adapter) {
     }
 
     if (adapter->model != nullptr) {
+        std::unique_lock<std::shared_mutex> lock(adapter->model->loras_mutex);
         adapter->model->loras.erase(adapter);
         adapter->model = nullptr;
     }

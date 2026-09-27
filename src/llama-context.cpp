@@ -2311,6 +2311,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+        std::shared_lock<std::shared_mutex> lock(model.loras_mutex);
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }

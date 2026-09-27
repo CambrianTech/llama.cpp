@@ -12,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <shared_mutex>
 #include <vector>
 
 struct llama_cparams;
@@ -693,6 +694,9 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+    // guards `loras`: an adapter can be loaded or freed on one thread (e.g. a training context
+    // in llama-server /train) while another context on the same model sizes its graph from it
+    mutable std::shared_mutex loras_mutex;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
