@@ -68,7 +68,7 @@ json server_trainer::start(const json & body) {
                 "refusing to train: this server may hold base weights in a repacked CPU buffer (n_gpu_layers " +
                 std::to_string(ngl) + " of " + std::to_string(n_layer) + " layers" + (override ? ", tensor overrides set" : "") +
                 "), and the backward reads the standard layout, so gradients would be silently wrong. "
-                "Serve with every layer offloaded (-ngl all) or with --no-extra-bufts."}};
+                "Serve with every layer offloaded (-ngl all) or with --no-repack."}};
         }
     }
     bool expected = false;
