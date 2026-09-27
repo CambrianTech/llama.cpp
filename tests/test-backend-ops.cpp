@@ -7363,17 +7363,41 @@ struct test_flash_attn_ext : public test_case {
 };
 
 // GGML_OP_CROSS_ENTROPY_LOSS
+// Completion-only training masks rows: a masked position's label row is all zero. Every other
+// row sums to 1. "masked" zeroes every other row, so the finite-difference check sees whether the
+// backward gives those rows a zero gradient (it must: they carry no loss).
+static ggml_tensor * ce_test_labels(ggml_context * ctx, ggml_tensor * labels, bool masked) {
+    labels = ggml_soft_max(ctx, labels);
+    ggml_set_name(labels, "labels_normalized");
+    if (masked) {
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, labels->ne[1], labels->ne[2], labels->ne[3]);
+        ggml_set_name(mask, "mask");
+        labels = ggml_mul(ctx, labels, mask);
+        ggml_set_name(labels, "labels_masked");
+    }
+    return labels;
+}
+
+static void ce_test_init_mask(ggml_tensor * t) {
+    std::vector<float> m(ggml_nelements(t));
+    for (size_t i = 0; i < m.size(); ++i) {
+        m[i] = (i % 2 == 0) ? 1.0f : 0.0f;
+    }
+    ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(float));
+}
+
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const bool masked;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, masked);
     }
 
     test_cross_entropy_loss(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 5, 4, 3})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 5, 4, 3}, bool masked = false)
+        : type(type), ne(ne), masked(masked) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * logits = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -7384,9 +7408,8 @@ struct test_cross_entropy_loss : public test_case {
         // The labels are assumed to be constant -> no gradients.
         ggml_set_name(labels, "labels");
 
-        // Ensure labels add up to 1:
-        labels = ggml_soft_max(ctx, labels);
-        ggml_set_name(labels, "labels_normalized");
+        // Rows add up to 1 (or to 0 where masked):
+        labels = ce_test_labels(ctx, labels, masked);
 
         ggml_tensor * out = ggml_cross_entropy_loss(ctx, logits, labels);
         ggml_set_name(out, "out");
@@ -7397,12 +7420,21 @@ struct test_cross_entropy_loss : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         // For larger abs. diffs between logits softmax is more linear, therefore more precise num. gradients.
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t, -100.0f, 100.0f);
+            if (strcmp(t->name, "mask") == 0) {
+                ce_test_init_mask(t);
+            } else if (masked) {
+                // No exact zeros anywhere: the MAA metric is (a-b)/(a+b), so two exact zeros make
+                // it NaN and a NaN error reads as a pass. At +-100 softmax underflows to 0 and the
+                // check cannot fail; at +-3 every probability is > 1e-3 and it can.
+                init_tensor_uniform(t, -3.0f, 3.0f);
+            } else {
+                init_tensor_uniform(t, -100.0f, 100.0f);
+            }
         }
     }
 
     float grad_eps() override {
-        return 1.0f;
+        return masked ? 1e-1f : 1.0f;
     }
 
     bool grad_precise() override {
@@ -7414,14 +7446,25 @@ struct test_cross_entropy_loss : public test_case {
 struct test_cross_entropy_loss_back : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
+    const bool masked;
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, masked);
     }
 
     test_cross_entropy_loss_back(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {10, 5, 4, 3})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {10, 5, 4, 3}, bool masked = false)
+        : type(type), ne(ne), masked(masked) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "mask") == 0) {
+                ce_test_init_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * grad = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
@@ -7433,9 +7476,8 @@ struct test_cross_entropy_loss_back : public test_case {
         ggml_tensor * labels = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_name(labels, "labels");
 
-        // Ensure labels add up to 1:
-        labels = ggml_soft_max(ctx, labels);
-        ggml_set_name(labels, "labels_normalized");
+        // Rows add up to 1 (or to 0 where masked):
+        labels = ce_test_labels(ctx, labels, masked);
 
         ggml_tensor * out = ggml_cross_entropy_loss_back(ctx, grad, logits, labels);
         ggml_set_name(out, "out");
@@ -10168,6 +10210,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {30000, 1, 1, 1}));
+    // masked rows (completion-only training): zero label rows must carry zero gradient
+    test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}, true));
+    test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}, true));
+    test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {30000, 4, 1, 1}, true));
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
