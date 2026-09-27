@@ -10141,6 +10141,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_grad(2, 4, 3, 1, false, 1));
     test_cases.emplace_back(new test_gated_delta_net_grad(2, 4, 3, 2, true, 1));
     test_cases.emplace_back(new test_gated_delta_net_grad(1, 8, 4, 1, false, 3));
+    // head sizes the GPU forwards run (the CUDA kernel dispatches S_v >= 16): these are the
+    // cases that check a GPU GATED_DELTA_NET_BACK against finite differences of its own forward.
+    test_cases.emplace_back(new test_gated_delta_net_grad(1, 16, 3, 1, false, 1));
+    test_cases.emplace_back(new test_gated_delta_net_grad(2, 16, 3, 2, true,  2));
+    test_cases.emplace_back(new test_gated_delta_net_grad(2, 32, 2, 1, false, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
