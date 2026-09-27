@@ -199,7 +199,11 @@ json server_trainer::start(const json & body_in) {
         std::string why;
         if (rank < 1 || rank > 256 || rank != (int64_t) rank)       why = "rank must be an integer in [1, 256]";
         else if (!(alpha > 0))                                       why = "alpha must be > 0";
-        else if (window < 16 || window > 8192 || window != (int64_t) window) why = "window must be an integer in [16, 8192]";
+        // a context rounds n_ctx up to a multiple of 256, and training needs the window to BE the
+        // context (one ubatch per context): any other window reached a GGML_ASSERT in opt_init and
+        // took the serving process down with it
+        else if (window < 256 || window > 8192 || window != (int64_t) window || (int64_t) window % 256 != 0)
+                                                                     why = "window must be a multiple of 256 in [256, 8192]";
         else if (epochs < 1 || epochs > 100 || epochs != (int64_t) epochs)   why = "epochs must be an integer in [1, 100]";
         else if (!(lr > 0 && lr <= 1))                               why = "lr must be in (0, 1]";
         else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
@@ -387,6 +391,12 @@ void server_trainer::run(json req, examples_data ex) {
         fail("could not create the training context (window " + std::to_string(window) + "): likely out of device memory");
         return;
     }
+    if (const uint32_t n_ctx = llama_n_ctx(ctx); n_ctx != window) {
+        // never reach opt_init's one-ubatch-per-context assert inside a serving process
+        llama_free(ctx);
+        fail("the training context is " + std::to_string(n_ctx) + " tokens, not the window " + std::to_string(window));
+        return;
+    }
 
     const std::string init_path = out + ".init.gguf";
     if (!common_lora_write_fresh(model, init_path, rank, alpha, split_targets(targets), seed, top)) {
@@ -400,6 +410,15 @@ void server_trainer::run(json req, examples_data ex) {
         llama_free(ctx);
         fail("could not load the fresh adapter");
         return;
+    }
+    {
+        // the depth this run ACTUALLY adapts, reported back: a caller must not infer it from
+        // what it asked for (an engine without top_layers ignores the field and adapts every
+        // block), so it reads the effective depth here (Codex on #27)
+        const int32_t n_layer = llama_model_n_layer(model);
+        std::lock_guard<std::mutex> lock(mu);
+        state["n_layer"]        = n_layer;
+        state["layers_adapted"] = top > 0 && top < n_layer ? top : n_layer;
     }
     float scale = 1.0f;
     if (llama_set_adapters_lora(ctx, &adapter, 1, &scale) != 0) {
