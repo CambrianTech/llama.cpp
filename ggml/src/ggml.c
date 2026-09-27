@@ -7100,6 +7100,14 @@ static void ggml_compute_backward(
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, tensor, grad));
                     }
                 } break;
+                case GGML_UNARY_OP_SIGMOID: {
+                    // d sigmoid(x)/dx = s (1 - s) = s - s^2, with s the forward output (tensor):
+                    // gated architectures (a sigmoid attention/output gate) put this on every
+                    // layer's backward path, and no backend had it.
+                    if (src0_needs_grads) {
+                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_sub(ctx, tensor, ggml_sqr(ctx, tensor))));
+                    }
+                } break;
                 case GGML_UNARY_OP_EXPM1: {
                     if (src0_needs_grads) {
                         ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, ggml_exp(ctx, src0)));
@@ -7113,7 +7121,7 @@ static void ggml_compute_backward(
                 default: {
                     fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
-                    GGML_ABORT("fatal error");
+                    GGML_ABORT("ggml_compute_backward: no backward implemented for op %s (%s)", ggml_op_name(tensor->op), ggml_op_desc(tensor));
                 } //break;
             }
         } break;
