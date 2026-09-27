@@ -350,6 +350,10 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+    // the training window this context's opt loop runs at; kept HERE, never written into the
+    // model's hparams, because several contexts share one model (a serving context and a
+    // training context on the same resident weights)
+    uint32_t opt_n_ctx_train = 0;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

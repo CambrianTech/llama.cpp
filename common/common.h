@@ -1189,3 +1189,10 @@ struct common_prompt_checkpoint {
     void clear_tgt();
     void clear_dft();
 };
+
+// LoRA-only training: write a fresh adapter for every `blk.<i>.<target>.weight` the model has —
+// A (n_in x rank) uniform in +-1/sqrt(n_in), B (rank x n_out) zero, both F32 — so the model's
+// output is unchanged until the first optimizer step moves B. One writer for the finetune tool
+// and the server's in-process training (llama-finetune-lora, llama-server /train).
+bool common_lora_write_fresh(const struct llama_model * model, const std::string & path,
+                             int32_t rank, float alpha, const std::vector<std::string> & targets, uint32_t seed);
