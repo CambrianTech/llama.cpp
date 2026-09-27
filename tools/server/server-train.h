@@ -16,8 +16,10 @@
 #include "common.h"
 
 #include "json.h"
+#include "ggml-opt.h"
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -26,7 +28,9 @@ struct llama_model;
 
 class server_trainer {
 public:
-    server_trainer(llama_model * model, const common_params & params_base);
+    // busy_slots: how many serving slots are working right now (read between training batches;
+    // the trainer yields while it is non-zero, so a turn never waits behind more than one batch)
+    server_trainer(llama_model * model, const common_params & params_base, std::function<int()> busy_slots);
     ~server_trainer();
 
     // Starts a run on a worker thread; refuses (ok=false) while one is running or on bad input.
@@ -35,9 +39,14 @@ public:
 
 private:
     void run(common_json req);
+    static void on_batch(bool train, ggml_opt_context_t, ggml_opt_dataset_t, ggml_opt_result_t,
+                         int64_t ibatch, int64_t ibatch_max, int64_t);
 
     llama_model * model;
     common_params params_base;
+    std::function<int()> busy_slots;
+    std::atomic<bool>    yield_to_turns{true};
+    std::atomic<int64_t> yielded_ms{0};
 
     std::thread worker;
     std::atomic<bool> running{false};

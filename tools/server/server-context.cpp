@@ -796,6 +796,16 @@ public:
 
     // the in-process trainer on model_tgt (created once the model is loaded)
     std::unique_ptr<server_trainer> trainer;
+    // serving slots working right now, refreshed by the loop at the start and end of every
+    // update_slots pass; the trainer reads it between batches (see server-train.h)
+    std::atomic<int> n_busy_slots{0};
+    void publish_busy_slots() {
+        int n = 0;
+        for (const auto & slot : slots) {
+            n += slot.is_processing() ? 1 : 0;
+        }
+        n_busy_slots.store(n);
+    }
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -2763,6 +2773,8 @@ private:
 #endif
 
     void update_slots() {
+        publish_busy_slots();
+        struct publish_on_exit { server_context_impl * s; ~publish_on_exit() { s->publish_busy_slots(); } } publish_guard{this};
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -4120,7 +4132,9 @@ server_context::~server_context() = default;
 bool server_context::load_model(common_params & params) {
     const bool ok = impl->load_model(params);
     if (ok && impl->model_tgt != nullptr) {
-        impl->trainer = std::make_unique<server_trainer>(impl->model_tgt, impl->params_base);
+        server_context_impl * p = impl.get();
+        impl->trainer = std::make_unique<server_trainer>(impl->model_tgt, impl->params_base,
+                                                         [p]() { return p->n_busy_slots.load(); });
     }
     return ok;
 }
