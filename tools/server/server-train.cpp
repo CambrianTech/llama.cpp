@@ -53,6 +53,24 @@ json server_trainer::start(const json & body) {
     if (!body.contains("out") || !body.at("out").is_string() || body.at("out").get<std::string>().empty()) {
         return json{{"ok", false}, {"error", "\"out\" (the adapter file to write) is required"}};
     }
+    // REPACKED WEIGHTS GIVE WRONG GRADIENTS, SILENTLY (Cormac on the /train plan): the backward
+    // reads quantized blocks in the standard layout, and a weight in an extra buffer type
+    // (CPU_REPACK) is not in it — no crash, garbage gradients. Extra buffer types only apply to
+    // weights kept on the CPU, so training is allowed when they are disabled, or when every layer
+    // is offloaded and no tensor override pins a weight elsewhere; otherwise refuse and say so.
+    {
+        const int32_t n_layer  = llama_model_n_layer(model);
+        const int32_t ngl      = params_base.n_gpu_layers;
+        const bool    all_gpu  = ngl <= -2 || ngl > n_layer;
+        const bool    override = !params_base.tensor_buft_overrides.empty();
+        if (!params_base.no_extra_bufts && (!all_gpu || override)) {
+            return json{{"ok", false}, {"error",
+                "refusing to train: this server may hold base weights in a repacked CPU buffer (n_gpu_layers " +
+                std::to_string(ngl) + " of " + std::to_string(n_layer) + " layers" + (override ? ", tensor overrides set" : "") +
+                "), and the backward reads the standard layout, so gradients would be silently wrong. "
+                "Serve with every layer offloaded (-ngl all) or with --no-extra-bufts."}};
+        }
+    }
     bool expected = false;
     if (!running.compare_exchange_strong(expected, true)) {
         return json{{"ok", false}, {"error", "a training run is already in progress"}, {"status", status()}};
