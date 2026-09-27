@@ -27,6 +27,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_LOAD_LORA,
+    SERVER_TASK_TYPE_UNLOAD_LORA,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -174,6 +176,14 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_LOAD_LORA: an adapter already read from `path` off the
+    // server loop; the loop only appends it (dormant, scale 0) to the adapter list
+    llama_adapter_lora * load_lora = nullptr;
+    std::string          load_lora_path;
+
+    // used by SERVER_TASK_TYPE_UNLOAD_LORA: the adapter id to retire
+    int32_t unload_lora = -1;
 
     server_task() = default;
 
@@ -550,6 +560,7 @@ struct server_task_result_control : server_task_result {
 
 struct server_task_result_get_lora : server_task_result {
     struct lora {
+        size_t id; // the index requests address it by; retired ids are not listed
         common_adapter_lora_info info;
         std::string  alora_invocation_string;
         llama_tokens alora_invocation_tokens;
@@ -560,6 +571,14 @@ struct server_task_result_get_lora : server_task_result {
 };
 
 struct server_task_result_apply_lora : server_task_result {
+    virtual json to_json() override;
+};
+
+// the id a runtime-loaded adapter was given, or the id an unload retired
+struct server_task_result_lora_change : server_task_result {
+    int32_t     lora_id = -1;
+    std::string path;
+    bool        loaded  = true;
     virtual json to_json() override;
 };
 

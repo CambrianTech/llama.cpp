@@ -1342,6 +1342,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
+        if (la.path.empty()) {
+            // an id the server retired at runtime: it keeps its place, with no adapter
+            la.ptr = nullptr;
+            continue;
+        }
         llama_adapter_lora_ptr lora;
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {

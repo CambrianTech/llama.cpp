@@ -173,12 +173,20 @@ std::map<int, float> parse_lora_request(const json & data) {
 bool are_lora_equal(
         const std::vector<common_adapter_lora_info> & l1,
         const std::vector<common_adapter_lora_info> & l2) {
-    if (l1.size() != l2.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < l1.size(); ++i) {
+    // Only adapters with a non-zero scale reach the graph (llama_context::set_adapters_lora
+    // drops the rest), so two lists are equal when their ACTIVE entries match. A list is
+    // shorter than another when an adapter was loaded at runtime after it was copied; the
+    // missing tail is dormant, and comparing sizes would flush every slot's KV cache and
+    // split batches on each load.
+    const size_t n = std::max(l1.size(), l2.size());
+    for (size_t i = 0; i < n; ++i) {
+        const float s1 = i < l1.size() ? l1[i].scale : 0.0f;
+        const float s2 = i < l2.size() ? l2[i].scale : 0.0f;
+        if (s1 == 0.0f && s2 == 0.0f) {
+            continue;
+        }
         // we don't check lora.path to reduce the time complexity
-        if (l1[i].scale != l2[i].scale || l1[i].ptr != l2[i].ptr) {
+        if (s1 != s2 || l1[i].ptr != l2[i].ptr) {
             return false;
         }
     }

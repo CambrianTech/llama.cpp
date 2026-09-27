@@ -1662,7 +1662,7 @@ json server_task_result_get_lora::to_json() {
     for (size_t i = 0; i < loras.size(); ++i) {
         auto & lora = loras[i];
         json entry = {
-            {"id",            i},
+            {"id",            lora.id},
             {"path",          lora.info.path},
             {"scale",         lora.info.scale},
             {"task_name",     lora.info.task_name},
@@ -1683,6 +1683,16 @@ json server_task_result_get_lora::to_json() {
 
 json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
+}
+
+json server_task_result_lora_change::to_json() {
+    json res = { { "success", true }, { "id", lora_id }, { "path", path } };
+    if (loaded) {
+        res["scale"] = 0.0f;
+    } else {
+        res["retired"] = true;
+    }
+    return res;
 }
 
 //

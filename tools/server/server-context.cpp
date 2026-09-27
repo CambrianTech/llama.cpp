@@ -1617,7 +1617,8 @@ private:
         std::vector<common_adapter_lora_info> output = params_base.lora_adapters; // copy
         for (size_t i = 0; i < output.size(); ++i) {
             auto it = config.find(i);
-            if (it != config.end()) {
+            // a retired adapter (unloaded at runtime) keeps its id with no tensors behind it
+            if (it != config.end() && output[i].ptr != nullptr) {
                 output[i].scale = it->second;
             } else {
                 output[i].scale = 0.0f;
@@ -2674,6 +2675,9 @@ private:
                     res->id = task.id;
                     for (size_t i = 0; i < loras.size(); ++i) {
                         auto & lora = loras[i];
+                        if (lora.ptr == nullptr) {
+                            continue; // retired
+                        }
                         std::string alora_invocation_string = "";
                         const uint64_t n_alora_tokens = llama_adapter_get_alora_n_invocation_tokens(lora.ptr);
                         llama_tokens alora_invocation_tokens;
@@ -2685,6 +2689,7 @@ private:
                             }
                         }
                         res->loras.push_back(server_task_result_get_lora::lora{
+                            i,
                             lora,
                             alora_invocation_string,
                             alora_invocation_tokens,
@@ -2703,6 +2708,83 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_LOAD_LORA:
+                {
+                    // Read from disk off this loop by the HTTP handler; appending it here,
+                    // between decode steps, is what makes the list change atomic for slots.
+                    // It joins dormant (scale 0), so no slot's output or KV changes until a
+                    // request or POST /lora-adapters gives it a scale. Ids are never reused:
+                    // a stale id must never address a different adapter.
+                    char buf[1024];
+                    common_adapter_lora_info la;
+                    la.path  = task.load_lora_path;
+                    la.scale = 0.0f;
+                    la.ptr   = task.load_lora;
+                    llama_adapter_meta_val_str(la.ptr, "adapter.lora.task_name", buf, sizeof(buf));
+                    la.task_name = buf;
+                    llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
+                    la.prompt_prefix = buf;
+                    params_base.lora_adapters.push_back(la);
+                    SRV_INF("loaded lora adapter id=%zu path=%s (dormant)\n", params_base.lora_adapters.size() - 1, la.path.c_str());
+                    auto res = std::make_unique<server_task_result_lora_change>();
+                    res->id      = task.id;
+                    res->lora_id = (int32_t) params_base.lora_adapters.size() - 1;
+                    res->path    = la.path;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_UNLOAD_LORA:
+                {
+                    auto & loras = params_base.lora_adapters;
+                    const int32_t id = task.unload_lora;
+                    if (id < 0 || (size_t) id >= loras.size() || loras[id].ptr == nullptr) {
+                        send_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    llama_adapter_lora * ptr = loras[id].ptr;
+                    if (loras[id].scale != 0.0f) {
+                        send_error(task, "LoRA adapter " + std::to_string(id) + " is active by default (scale " +
+                                   std::to_string(loras[id].scale) + "); set its scale to 0 first", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    for (const auto & slot : slots) {
+                        if (slot.is_processing() && (size_t) id < slot.lora.size() && slot.lora[id].ptr == ptr &&
+                            slot.lora[id].scale != 0.0f) {
+                            send_error(task, "LoRA adapter " + std::to_string(id) + " is in use by slot " +
+                                       std::to_string(slot.id) + "; retry when it finishes", ERROR_TYPE_UNAVAILABLE);
+                            ptr = nullptr;
+                            break;
+                        }
+                    }
+                    if (ptr == nullptr) {
+                        break;
+                    }
+                    // An idle slot that last ran with it keeps KV computed WITH the adapter;
+                    // once the adapter is gone its list would read as the base's, so that
+                    // cache must not be reused.
+                    for (auto & slot : slots) {
+                        if ((size_t) id < slot.lora.size() && slot.lora[id].ptr == ptr) {
+                            if (slot.lora[id].scale != 0.0f) {
+                                slot.prompt.clear();
+                            }
+                            slot.lora[id].scale = 0.0f;
+                            slot.lora[id].ptr   = nullptr;
+                        }
+                    }
+                    // the context may still hold it from the last batch; clear before freeing
+                    llama_set_adapters_lora(ctx_tgt, nullptr, 0, nullptr);
+                    llama_adapter_lora_free(ptr);
+                    // An empty path is the retired mark: a model reload after sleep skips it
+                    // (common_init_from_params) and the id stays taken.
+                    auto res = std::make_unique<server_task_result_lora_change>();
+                    res->id      = task.id;
+                    res->lora_id = id;
+                    res->path    = loras[id].path;
+                    res->loaded  = false;
+                    loras[id].ptr = nullptr;
+                    loras[id].path.clear();
+                    SRV_INF("retired lora adapter id=%d path=%s\n", id, res->path.c_str());
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -5301,6 +5383,78 @@ void server_routes::init_routes() {
             return res;
         }
         res->ok(r);
+        return res;
+    };
+
+    this->post_lora_adapters_load = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        const std::string name = json_value(body, "name", std::string());
+        const std::string path = confine_out(ctx_server.params_base.train_dir, name);
+        if (ctx_server.params_base.train_dir.empty() || path.empty()) {
+            res->error(format_error_response("\"name\" must be a bare file name ending in .gguf inside the server's --train-dir "
+                                             "(where /train writes its output)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (ctx_server.model_tgt == nullptr) {
+            res->error(format_error_response("no model is loaded", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        // Reading the tensors happens here, on the HTTP thread, like the trainer's own
+        // adapter init: the server loop only appends the pointer between decode steps.
+        llama_adapter_lora * adapter = llama_adapter_lora_init(ctx_server.model_tgt, path.c_str());
+        if (adapter == nullptr) {
+            res->error(format_error_response("failed to load LoRA adapter '" + name + "' (missing, or not a LoRA for this model)",
+                                             ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_LOAD_LORA);
+            task.id             = rd.get_new_id();
+            task.load_lora      = adapter;
+            task.load_lora_path = path;
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            // connection closed after the task was posted: the loop still owns the adapter
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_lora_adapters_unload = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        if (!body.contains("id") || !body.at("id").is_number_integer()) {
+            res->error(format_error_response("\"id\" (an integer adapter id) is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_UNLOAD_LORA);
+            task.id          = rd.get_new_id();
+            task.unload_lora = body.at("id").get<int32_t>();
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
         return res;
     };
 
