@@ -47,7 +47,8 @@ public:
     // the trainer yields while it is non-zero, so a turn never waits behind more than one batch)
     // render_chat(messages, add_generation_prompt): messages (OpenAI shape) through the model's
     // chat template; throws on a template error. Empty = "examples" are refused.
-    using render_fn = std::function<std::string(const common_json &, bool)>;
+    // (messages, tools, add_generation_prompt) -> the prompt text serving would frame
+    using render_fn = std::function<std::string(const common_json &, const common_json &, bool)>;
     server_trainer(llama_model * model, const common_params & params_base, std::function<int()> busy_slots,
                    render_fn render_chat);
 
