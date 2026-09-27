@@ -2060,6 +2060,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                ggml_compute_forward_gated_delta_net_back(params, tensor);
+            } break;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2252,6 +2256,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_ARGMAX:
             {
                 n_tasks = 1;
+            } break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                n_tasks = 1; // the reference backward accumulates shared q/k gradients
             } break;
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
@@ -2985,6 +2993,13 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_CROSS_ENTROPY_LOSS:
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
+                    } break;
+                case GGML_OP_GATED_DELTA_NET_BACK:
+                    {
+                        // every state of one (head, seq), dS, S', and four S_v vectors
+                        const int64_t S_v = node->src[2]->ne[0];
+                        const int64_t T   = node->src[2]->ne[2];
+                        cur = ((T + 1) * S_v * S_v + 2 * S_v * S_v + 4 * S_v) * sizeof(float);
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {

@@ -1079,6 +1079,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
+    "GATED_DELTA_NET_BACK",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1194,6 +1195,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
+    "gated_delta_net_back(q, k, v, g, beta, s, dy)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6366,6 +6368,37 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+// ggml_gated_delta_net_back
+
+struct ggml_tensor * ggml_gated_delta_net_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * grad,
+        int64_t               K) {
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && ggml_is_contiguous(grad));
+    const int64_t n = ggml_nelements(q) + ggml_nelements(k) + ggml_nelements(v)
+                    + ggml_nelements(g) + ggml_nelements(beta) + ggml_nelements(state);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) K);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_BACK;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = grad;
+
+    return result;
+}
+
 // ggml_lightning_indexer
 
 struct ggml_tensor * ggml_lightning_indexer(
@@ -7067,6 +7100,28 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_WIN_PART:
         case GGML_OP_WIN_UNPART:
+        case GGML_OP_GATED_DELTA_NET: {
+            // The recurrence run in reverse (ggml_gated_delta_net_back): one op returns every
+            // input's gradient packed in input order, and each input that needs one takes its
+            // block. A training graph starts from a zero state, so dstate is usually unused.
+            struct ggml_tensor * back = ggml_gated_delta_net_back(ctx,
+                    tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor->src[4], tensor->src[5],
+                    ggml_cont(ctx, grad), ggml_get_op_params_i32(tensor, 0));
+            size_t offset = 0;
+            for (int j = 0; j < 6; ++j) {
+                struct ggml_tensor * src = tensor->src[j];
+                const size_t isrc = ggml_hash_find(hash_set, src);
+                const bool needs = isrc != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc) && grads_needed[isrc];
+                if (needs) {
+                    // The packed gradient is dense in each input's logical element order
+                    // (an input may be a strided view), so blocks advance by elements.
+                    struct ggml_tensor * block = ggml_view_1d(ctx, back, ggml_nelements(src), offset);
+                    ggml_add_or_set(ctx, cgraph, isrc, ggml_reshape_4d(ctx, block,
+                            src->ne[0], src->ne[1], src->ne[2], src->ne[3]));
+                }
+                offset += ggml_nelements(src) * sizeof(float);
+            }
+        } break;
         case GGML_OP_UNARY: {
             switch (ggml_get_unary_op(tensor)) {
                 case GGML_UNARY_OP_ABS: {
