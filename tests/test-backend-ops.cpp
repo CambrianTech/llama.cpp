@@ -9661,8 +9661,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_K, GGML_TYPE_F32,
                                                   256, 8, 600000, {1, 1}, {1, 1}, trans_b));
     }
-    test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q8_0, GGML_TYPE_F32,
-                                              256, 8, 600000, {1, 1}, {1, 1}, false));
+    // the q8_0 three-block case in both gradient layouts: the training graph hands
+    // out_prod a TRANSPOSED gradient (out_prod(W, ggml_transpose(grad)))
+    for (bool trans_b : {false, true}) {
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q8_0, GGML_TYPE_F32,
+                                                  256, 8, 600000, {1, 1}, {1, 1}, trans_b));
+    }
 
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {

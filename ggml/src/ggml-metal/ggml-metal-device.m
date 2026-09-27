@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#include "ggml-metal-ops.h"
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
@@ -1467,6 +1468,27 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 default:
                     return false;
             }
+        case GGML_OP_RMS_NORM_BACK:
+        case GGML_OP_SOFT_MAX_BACK:
+            // src0 the incoming gradient, src1 the forward input/output; rows contiguous.
+            // SOFT_MAX_BACK carries no max_bias (the CPU reference asserts the same).
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) &&
+                   (op->op != GGML_OP_SOFT_MAX_BACK || ggml_get_op_params_f32(op, 1) == 0.0f);
+        case GGML_OP_REPEAT_BACK:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
+        case GGML_OP_OUT_PROD:
+            // The backward through a frozen weight: out_prod(W, grad^T). Composed on this
+            // backend from a dequantizing copy, two transposing copies and the F32 simdgroup
+            // matmul (see ggml_metal_op_out_prod). 2D, src1 F32 with contiguous rows, src0 F32
+            // or a type with a kernel_cpy_<type>_f32.
+            return ggml_metal_op_out_prod_supported(op) && ggml_metal_device_get_props(dev)->has_simdgroup_mm;
         case GGML_OP_SILU_BACK:
             return (op->src[0]->type == GGML_TYPE_F32) &&
                 (op->src[1]->type == GGML_TYPE_F32) &&
@@ -1778,6 +1800,17 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                         switch (op->type) {
                             case GGML_TYPE_F32:
                             case GGML_TYPE_F16:
+                                return true;
+                            default:
+                                return false;
+                        }
+                    case GGML_TYPE_Q2_K:
+                    case GGML_TYPE_Q3_K:
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q5_K:
+                    case GGML_TYPE_Q6_K:
+                        switch (op->type) {
+                            case GGML_TYPE_F32:
                                 return true;
                             default:
                                 return false;

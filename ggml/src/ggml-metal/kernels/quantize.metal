@@ -146,6 +146,13 @@ template [[host_name("kernel_cpy_q4_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q8_0, 2, dequantize_q8_0>;
+// K-quants: a block is 256 values = 16 tiles of 4x4. The backward of a LoRA through a resident
+// K-quant base (OUT_PROD with a quantized src0) dequantizes weight rows through these.
+template [[host_name("kernel_cpy_q2_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q2_K, 16, dequantize_q2_K>;
+template [[host_name("kernel_cpy_q3_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q3_K, 16, dequantize_q3_K>;
+template [[host_name("kernel_cpy_q4_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q4_K, 16, dequantize_q4_K>;
+template [[host_name("kernel_cpy_q5_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q5_K, 16, dequantize_q5_K>;
+template [[host_name("kernel_cpy_q6_K_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q6_K, 16, dequantize_q6_K>;
 
 template [[host_name("kernel_cpy_tq2_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tq2_0, QK_NL, dequantize_tq2_0>;
 
