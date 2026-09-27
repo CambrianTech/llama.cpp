@@ -4466,25 +4466,50 @@ struct test_l2_norm_grad : public test_case {
 // GATED_DELTA_NET_BACK directly, same random inputs on every backend: the GPU backward is
 // compared against the CPU reference output-for-output (no finite differences, so no noise
 // near a tolerance). Sequences long enough to cross many recompute-segment boundaries.
+// q and k as a hybrid model's graph hands them to the fused delta-net: head_count key heads
+// shared by head_count*v_repeat value heads (qwen35 27B: 16 key heads, 48 value heads), and,
+// when strided, row views into one packed [q | k | v] projection (conv_qkv_mix), not dense
+// tensors. A backward that is right only for dense, unshared q/k passes every other case.
+static std::pair<ggml_tensor *, ggml_tensor *> gdn_test_qk(ggml_context * ctx, int64_t head_size, int64_t head_count,
+        int64_t n_seq_tokens, int64_t n_seqs, int v_repeat, bool strided) {
+    if (!strided) {
+        return { ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs),
+                 ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs) };
+    }
+    const int64_t row = head_size*head_count*2 + head_size*head_count*v_repeat;
+    ggml_tensor * qkv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, row, n_seq_tokens, n_seqs);
+    ggml_set_name(qkv, "qkv");
+    const size_t es = ggml_element_size(qkv);
+    ggml_tensor * q = ggml_view_4d(ctx, qkv, head_size, head_count, n_seq_tokens, n_seqs,
+            head_size*es, qkv->nb[1], qkv->nb[2], 0);
+    ggml_tensor * k = ggml_view_4d(ctx, qkv, head_size, head_count, n_seq_tokens, n_seqs,
+            head_size*es, qkv->nb[1], qkv->nb[2], head_size*head_count*es);
+    return { q, k };
+}
+
 struct test_gated_delta_net_back : public test_case {
     const int64_t head_count, head_size, n_seq_tokens, n_seqs;
     const bool    kda;
     const int64_t K;
+    const int     v_repeat;
+    const bool    strided;
 
     std::string vars() override {
-        return VARS_TO_STR6(head_count, head_size, n_seq_tokens, n_seqs, kda, K);
+        return VARS_TO_STR8(head_count, head_size, n_seq_tokens, n_seqs, kda, K, v_repeat, strided);
     }
 
-    test_gated_delta_net_back(int64_t head_count, int64_t head_size, int64_t n_seq_tokens, int64_t n_seqs, bool kda, int64_t K)
-        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), kda(kda), K(K) {}
+    test_gated_delta_net_back(int64_t head_count, int64_t head_size, int64_t n_seq_tokens, int64_t n_seqs, bool kda, int64_t K,
+            int v_repeat = 1, bool strided = false)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), kda(kda), K(K),
+          v_repeat(v_repeat), strided(strided) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
-        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
-        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
-        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? head_size : 1, head_count, n_seq_tokens, n_seqs);
-        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, head_count, n_seqs);
+        const int64_t H = head_count*v_repeat;
+        auto [q, k] = gdn_test_qk(ctx, head_size, head_count, n_seq_tokens, n_seqs, v_repeat, strided);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, H, n_seq_tokens, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? head_size : 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, H, n_seqs);
         ggml_set_name(g, "g");
         ggml_set_name(beta, "beta");
         // the incoming gradient has the forward output's shape (attention rows + K state snapshots)
@@ -4513,22 +4538,25 @@ struct test_gated_delta_net_grad : public test_case {
     const int64_t n_seqs;
     const bool    kda;
     const int64_t K;
+    const int     v_repeat;
 
     std::string vars() override {
-        return VARS_TO_STR6(head_count, head_size, n_seq_tokens, n_seqs, kda, K);
+        return VARS_TO_STR7(head_count, head_size, n_seq_tokens, n_seqs, kda, K, v_repeat);
     }
 
     test_gated_delta_net_grad(int64_t head_count = 2, int64_t head_size = 4, int64_t n_seq_tokens = 3,
-            int64_t n_seqs = 1, bool kda = false, int64_t K = 1)
-        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), kda(kda), K(K) {}
+            int64_t n_seqs = 1, bool kda = false, int64_t K = 1, int v_repeat = 1)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), kda(kda), K(K),
+          v_repeat(v_repeat) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = head_count*v_repeat;
         ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
         ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
-        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
-        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? head_size : 1, head_count, n_seq_tokens, n_seqs);
-        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, head_count, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, H, n_seq_tokens, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? head_size : 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, H, n_seqs);
         for (ggml_tensor * t : {q, k, v, g, beta, state}) {
             ggml_set_param(t);
         }
@@ -10250,9 +10278,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // 10 tokens: the CUDA backward's checkpointed recompute runs segments of C = 4 with a
     // partial last segment (4, 4, 2).
     test_cases.emplace_back(new test_gated_delta_net_grad(1, 16, 10, 1, true, 1));
+    // key heads shared by value heads (the 27B shares each of 16 key heads with 3 value heads):
+    // dq/dk sum over every value head that read them, checked against finite differences too.
+    test_cases.emplace_back(new test_gated_delta_net_grad(2, 4, 3, 1, false, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net_grad(1, 4, 4, 2, true,  2, 2));
     for (auto [hc, hs, nt, ns, kd, kk] : std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t, bool, int64_t>>{
              {1, 16, 10, 1, true, 1}, {2, 16, 33, 2, false, 2}, {2, 64, 40, 1, true, 3}, {1, 128, 64, 1, false, 1}, {2, 32, 7, 1, true, 2}}) {
         test_cases.emplace_back(new test_gated_delta_net_back(hc, hs, nt, ns, kd, kk));
+    }
+    // the shape the 27B hybrid graph emits: key heads shared 3 ways, q/k as row views of the
+    // packed qkv projection, several sequences (the atomic dq/dk accumulation across heads)
+    for (auto [hc, hs, nt, ns, kd, kk, vr, st] : std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t, bool, int64_t, int, bool>>{
+             {2, 16, 10, 1, true, 1, 3, false}, {2, 32, 7, 2, false, 2, 3, true}, {2, 64, 40, 2, true, 3, 3, true},
+             {2, 128, 33, 1, false, 1, 3, true}, {3, 32, 17, 2, true, 1, 2, true}}) {
+        test_cases.emplace_back(new test_gated_delta_net_back(hc, hs, nt, ns, kd, kk, vr, st));
     }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
