@@ -62,7 +62,11 @@ json server_trainer::start(const json & body) {
         const int32_t n_layer  = llama_model_n_layer(model);
         const int32_t ngl      = params_base.n_gpu_layers;
         const bool    all_gpu  = ngl <= -2 || ngl > n_layer;
-        const bool    override = !params_base.tensor_buft_overrides.empty();
+        // the list carries a {nullptr, nullptr} terminator when parsed from args: count real entries
+        bool override = false;
+        for (const auto & o : params_base.tensor_buft_overrides) {
+            override = override || o.pattern != nullptr;
+        }
         if (!params_base.no_extra_bufts && (!all_gpu || override)) {
             return json::object({{"ok", false}, {"error",
                 "refusing to train: this server may hold base weights in a repacked CPU buffer (n_gpu_layers " +
