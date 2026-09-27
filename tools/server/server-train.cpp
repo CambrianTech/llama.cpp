@@ -89,7 +89,13 @@ static bool prepare_examples(const json & examples, const server_trainer::render
         }
         // "tools": the tool definitions the turn was served with, so the rendered prompt is the
         // one the model saw (a served turn's system block lists them).
-        const json tools = ex.is_object() && ex.contains("tools") && ex.at("tools").is_array() ? ex.at("tools") : json::array();
+        // A "tools" that is not an array is refused, like a non-boolean "train": ignoring it
+        // would train a prompt without the tool block the turn was served with (Cormac on #22).
+        if (ex.is_object() && ex.contains("tools") && !ex.at("tools").is_array()) {
+            why = at + ".tools must be an array";
+            return false;
+        }
+        const json tools = ex.is_object() && ex.contains("tools") ? ex.at("tools") : json::array();
         // "train": false on a message keeps an assistant turn as CONTEXT without training it:
         // a lived turn carries her earlier replies as history, and those are not this lesson.
         // The key is ours, so it is read here and removed before the template sees the message.
