@@ -11884,7 +11884,14 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
         assert(sum > 0.0);
         ggml_vec_scale_f32(nc, ds0, 1.0/sum);
 
-        // grad(src0f) = (softmax(src0f) - src1f) * grad(cross_entropy_loss(src0f, src1f)) / nr
+        // grad(src0f) = (softmax(src0f) * sum(src1f) - src1f) * grad(cross_entropy_loss(src0f, src1f)) / nr
+        // The derivative of -sum(y log softmax(x)) is softmax(x) * sum(y) - y. Dropping sum(y) is
+        // exact only when every label row sums to 1; a MASKED row (all zero: a position that must
+        // carry no loss, e.g. a prompt token in completion-only training) would still push
+        // softmax(x) back through the graph. With the sum the masked row's gradient is zero.
+        float lsum = 0.0f;
+        ggml_vec_sum_f32(nc, &lsum, s1);
+        ggml_vec_scale_f32(nc, ds0, lsum);
         ggml_vec_sub_f32(nc, ds0, ds0, s1);
         ggml_vec_scale_f32(nc, ds0, d_by_nr);
 
