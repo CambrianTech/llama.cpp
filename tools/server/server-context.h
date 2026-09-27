@@ -113,9 +113,6 @@ struct server_context {
     // not thread-safe, should only be used from the main thread
     server_context_meta get_meta() const;
 
-    // in-process LoRA-only training on the served model (see server-train.h)
-    json train_start(const json & body);
-    json train_status() const;
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
