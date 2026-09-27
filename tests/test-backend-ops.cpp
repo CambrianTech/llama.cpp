@@ -10227,6 +10227,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // OUT_PROD at the shapes a LoRA backward emits (dx = out_prod(W, dy^T), trans_b): a 1.5B
+    // (n_embd 1536, ffn 8960) and a 27B (n_embd 5120, ffn 17408) at 1024 tokens, plus the
+    // output head (vocab 151936) — the largest frozen matmul in the step. F32 beside Q4_K
+    // at one shape to price the dequantized copy.
+    for (auto [m, k] : { std::pair<int64_t, int64_t>{1536, 1536}, {1536, 8960}, {8960, 1536},
+                         {5120, 5120}, {5120, 17408}, {17408, 5120}, {5120, 151936} }) {
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, 1024, k, {1, 1}, {1, 1}, true));
+    }
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32,  GGML_TYPE_F32, 5120, 1024, 17408, {1, 1}, {1, 1}, true));
+    test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, 1024, 17408, {1, 1}, {1, 1}, true));
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
