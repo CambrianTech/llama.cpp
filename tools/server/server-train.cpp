@@ -272,7 +272,7 @@ static bool prepare_examples(const json & examples, const server_trainer::render
             // prompt, her reply, its tool calls and their results leave together and the
             // conversation keeps the role alternation strict templates enforce (Codex on #29)
             do {
-                messages.erase(messages.begin() + d);
+                messages.erase(d); // a JSON array erases by index
                 trained.erase(trained.begin() + d);
             } while (d < messages.size() && messages[d].is_object() && messages[d].value("role", std::string()) != "user");
             cut = true;
