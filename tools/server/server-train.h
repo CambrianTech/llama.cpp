@@ -76,6 +76,10 @@ public:
     struct examples_data {
         std::vector<std::vector<llama_token>> tokens;
         std::vector<std::vector<uint8_t>>     loss;
+        // "fit": "left" — examples cut from the front to end their last trained span inside the
+        // window, and examples whose last trained turn alone could not fit (skipped)
+        int64_t truncated = 0;
+        int64_t skipped   = 0;
     };
     ~server_trainer();
 
@@ -113,3 +117,8 @@ private:
     common_json state;                  // guarded by mu
     llama_context * ctx_live = nullptr; // guarded by mu: the training context while an epoch can run
 };
+
+// "fit": "left" for one tokenized example (see server-train.cpp): keep the window+1 tokens that
+// end the last trained turn (the leading BOS kept when `bos`), mask a trained turn cut at the
+// front, and return false when the last trained turn alone does not fit.
+bool train_fit_left(std::vector<llama_token> & toks, std::vector<uint8_t> & loss, int64_t window, bool bos);

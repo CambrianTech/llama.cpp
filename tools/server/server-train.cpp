@@ -70,8 +70,48 @@ std::string confine_out(const std::string & dir, const std::string & name) {
 // content starts) and through it without (where it ends, end-of-turn included). A template that
 // does not render prefix-stably (e.g. one that rewrites earlier turns) is refused for that example:
 // the span cannot be located, and guessing would train the wrong tokens.
+// "fit": "left" (continuum, card for Kimi's first dream): a served conversation (system prompt,
+// tool block, history) is far longer than a training window, and only her reply carries loss. An
+// example longer than the window keeps its TAIL: the window+1 tokens ending at its last trained
+// token, with the leading BOS kept when the vocab adds one. A trained turn whose start is cut off
+// is masked out (a reply learned without its opening teaches the wrong thing), and an example
+// whose LAST trained turn cannot fit whole is skipped and counted. Without "fit" a long example
+// is refused, as before.
+bool train_fit_left(std::vector<llama_token> & toks, std::vector<uint8_t> & loss, int64_t window, bool bos) {
+    const int64_t cap = window + 1;
+    int64_t last = (int64_t) loss.size() - 1;
+    while (last >= 0 && loss[last] == 0) {
+        --last;
+    }
+    int64_t first = last; // the first token of the last trained turn
+    while (first > 0 && loss[first - 1] == 1) {
+        --first;
+    }
+    const int64_t stop  = last + 1;
+    const int64_t keep  = bos ? cap - 1 : cap;
+    const int64_t start = std::max<int64_t>(bos ? 1 : 0, stop - keep);
+    if (last < 0 || first < start) {
+        return false; // the last trained turn alone does not fit
+    }
+    std::vector<llama_token> t;
+    std::vector<uint8_t>     l;
+    if (bos) {
+        t.push_back(toks[0]);
+        l.push_back(0);
+    }
+    t.insert(t.end(), toks.begin() + start, toks.begin() + stop);
+    l.insert(l.end(), loss.begin() + start, loss.begin() + stop);
+    // a trained turn cut at the front: mask what remains of it
+    for (size_t k = bos ? 1 : 0; k < l.size() && l[k] == 1 && start > 0 && loss[start - 1] == 1; ++k) {
+        l[k] = 0;
+    }
+    toks = std::move(t);
+    loss = std::move(l);
+    return true;
+}
+
 static bool prepare_examples(const json & examples, const server_trainer::render_fn & render, const llama_vocab * vocab,
-                             int64_t window, server_trainer::examples_data & out, std::string & why) {
+                             int64_t window, bool fit, server_trainer::examples_data & out, std::string & why) {
     for (size_t i = 0; i < examples.size(); ++i) {
         const std::string at = "examples[" + std::to_string(i) + "]";
         const json & ex = examples[i];
@@ -161,9 +201,17 @@ static bool prepare_examples(const json & examples, const server_trainer::render
         }
         add(full.size(), false);
         if ((int64_t) toks.size() > window + 1) {
-            why = at + " is " + std::to_string(toks.size()) + " tokens; one example is one window, and this window holds "
-                + std::to_string(window + 1) + " (raise \"window\" or split the example)";
-            return false;
+            if (!fit) {
+                why = at + " is " + std::to_string(toks.size()) + " tokens; one example is one window, and this window holds "
+                    + std::to_string(window + 1) + " (raise \"window\", split the example, or send \"fit\": \"left\")";
+                return false;
+            }
+            const bool bos = llama_vocab_get_add_bos(vocab) && !toks.empty() && toks[0] == llama_vocab_bos(vocab);
+            if (!train_fit_left(toks, loss, window, bos)) {
+                ++out.skipped;
+                continue;
+            }
+            ++out.truncated;
         }
         if (std::count(loss.begin() + 1, loss.end(), (uint8_t) 1) == 0) {
             why = at + ": its assistant turns tokenize to nothing to learn";
@@ -171,6 +219,11 @@ static bool prepare_examples(const json & examples, const server_trainer::render
         }
         out.tokens.push_back(std::move(toks));
         out.loss.push_back(std::move(loss));
+    }
+    if (out.tokens.empty()) {
+        why = "every example's last trained turn is longer than the window (" + std::to_string(window + 1)
+            + " tokens): nothing fits to learn; raise \"window\"";
+        return false;
     }
     return true;
 }
@@ -230,12 +283,17 @@ json server_trainer::start(const json & body_in) {
         if (!render_chat) {
             return json::object({{"ok", false}, {"error", "this server has no chat template to render \"examples\" with; send \"text\""}});
         }
+        if (body.contains("fit") && !(body.at("fit").is_string() && body.at("fit").get<std::string>() == "left")) {
+            return json::object({{"ok", false}, {"error", "\"fit\" must be \"left\" (keep each example's tail) or absent (refuse a long example)"}});
+        }
         std::string why;
         if (!prepare_examples(body.at("examples"), render_chat, llama_model_get_vocab(model),
-                              (int64_t) body.value("window", 256.0), prepared, why)) {
+                              (int64_t) body.value("window", 256.0), body.contains("fit"), prepared, why)) {
             return json::object({{"ok", false}, {"error", why}});
         }
-        body["n_examples"] = body.at("examples").size();
+        body["n_examples"] = prepared.tokens.size();
+        body["n_truncated"] = prepared.truncated;
+        body["n_skipped"] = prepared.skipped;
         body.erase("examples");
     }
     if (prepared.tokens.empty() && (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty())) {
@@ -283,6 +341,8 @@ json server_trainer::start(const json & body_in) {
     state = json::object({{"state", "starting"}, {"out", body.at("out")}, {"epochs", json::array()}});
     if (body.contains("n_examples")) {
         state["examples"] = body.at("n_examples");
+        state["examples_truncated"] = body.value("n_truncated", (int64_t) 0);
+        state["examples_skipped"] = body.value("n_skipped", (int64_t) 0);
     }
     pause_requested = false;
     paused = false;
