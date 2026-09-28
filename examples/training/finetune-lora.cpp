@@ -3,8 +3,8 @@
 // LoRA that llama-server loads with --lora. One copy of the base, the same kernels as
 // inference.
 //
-//   llama-finetune-lora -m base.gguf -f train.txt -o adapter.gguf \
-//       [--lora-rank 16] [--lora-alpha 32] [--lora-targets attn_q,attn_v,...] \
+//   llama-finetune-lora -m base.gguf -f train.txt -o adapter.gguf
+//       [--lora-rank 16] [--lora-alpha 32] [--lora-targets attn_q,attn_v,...]
 //       [--lora continue.gguf] [-epochs 2] [-lr 1e-4] [-val-split 0.1]
 //
 // A fresh adapter starts with A random and B zero, so the model's output is unchanged
