@@ -324,8 +324,12 @@ json server_trainer::start(const json & body_in) {
         // a context rounds n_ctx up to a multiple of 256, and training needs the window to BE the
         // context (one ubatch per context): any other window reached a GGML_ASSERT in opt_init and
         // took the serving process down with it
-        else if (window < 256 || window > 8192 || window != (int64_t) window || (int64_t) window % 256 != 0)
-                                                                     why = "window must be a multiple of 256 in [256, 8192]";
+        // No fixed ceiling (Joel, 2026-09-28: a training window is the same as inference, and huge):
+        // the bound is the model's own trained context, and the memory gate is the measured graph
+        // against the caller's budget, checked before anything is allocated.
+        else if (window < 256 || window > (double) llama_model_n_ctx_train(model) || window != (int64_t) window || (int64_t) window % 256 != 0)
+                                                                     why = "window must be a multiple of 256, at least 256 and at most the model's trained context ("
+                                                                         + std::to_string(llama_model_n_ctx_train(model)) + ")";
         else if (epochs < 1 || epochs > 100 || epochs != (int64_t) epochs)   why = "epochs must be an integer in [1, 100]";
         else if (!(lr > 0 && lr <= 1))                               why = "lr must be in (0, 1]";
         else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
