@@ -718,6 +718,9 @@ void server_trainer::run(json req, examples_data ex) {
         if (by_example) {
             state["trainable_tokens"] = trainable_train;
         }
+        // the held-out trainable tokens the eval loss is measured over; 0 means no held-out
+        // evaluation ran (val_split 0, or a split that rounded to no windows)
+        state["eval_trainable_tokens"] = trainable_eval;
     }
     LOG_INF("%s: training on the served model: %zu tokens, window %u, %u epochs, adapter -> %s\n",
             __func__, (size_t) n_tokens, window, epochs, out.c_str());
@@ -739,7 +742,9 @@ void server_trainer::run(json req, examples_data ex) {
                 __func__, lr.epoch, loss_train, loss_eval, seconds, tok_s);
         {
             std::lock_guard<std::mutex> lock(mu);
-            state["epochs"].push_back(json::object({{"epoch", lr.epoch}, {"train_loss", loss_train}, {"eval_loss", loss_eval},
+            // no held-out tokens: no eval loss (null), never a 0.0 that reads as a perfect score
+            state["epochs"].push_back(json::object({{"epoch", lr.epoch}, {"train_loss", loss_train},
+                                           {"eval_loss", trainable_eval > 0 ? json(loss_eval) : json(nullptr)},
                                            {"seconds", seconds}, {"train_tok_s", tok_s}}));
         }
         ggml_opt_result_reset(result_train);
