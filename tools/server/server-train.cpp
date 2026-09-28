@@ -70,6 +70,66 @@ std::string confine_out(const std::string & dir, const std::string & name) {
 // content starts) and through it without (where it ends, end-of-turn included). A template that
 // does not render prefix-stably (e.g. one that rewrites earlier turns) is refused for that example:
 // the span cannot be located, and guessing would train the wrong tokens.
+//
+// Returns false with `why` when the example is malformed (the run is refused); true otherwise,
+// with `toks`/`loss` filled.
+static bool render_example(const json & messages, const std::vector<bool> & trained, const json & tools,
+                           const server_trainer::render_fn & render, const llama_vocab * vocab, const std::string & at,
+                           std::vector<llama_token> & toks, std::vector<uint8_t> & loss, std::string & why) {
+    auto head = [&](size_t n) { // the first n messages
+        json h = json::array();
+        for (size_t j = 0; j < n; ++j) {
+            h.push_back(messages[j]);
+        }
+        return h;
+    };
+    std::string full;
+    std::vector<std::pair<size_t, size_t>> spans; // [begin, end) in chars of `full`
+    try {
+        full = render(messages, tools, false);
+        for (size_t k = 0; k < messages.size(); ++k) {
+            if (!trained[k] || !messages[k].is_object() || messages[k].value("role", std::string()) != "assistant") {
+                continue;
+            }
+            const std::string pre  = render(head(k), tools, true);
+            const std::string upto = render(head(k + 1), tools, false);
+            if (full.compare(0, upto.size(), upto) != 0 || upto.compare(0, pre.size(), pre) != 0 || pre.size() >= upto.size()) {
+                why = at + ": the chat template does not render this conversation prefix-stably at message " + std::to_string(k)
+                    + ", so the assistant turn cannot be located (templates that strip earlier turns' reasoning, e.g. Qwen3's"
+                    + " <think>, do this: send such a conversation as single-turn examples)";
+                return false;
+            }
+            spans.emplace_back(pre.size(), upto.size());
+        }
+    } catch (const std::exception & e) {
+        why = at + " could not be rendered through the chat template: " + e.what();
+        return false;
+    }
+    if (spans.empty()) {
+        why = at + " has no assistant turn to learn";
+        return false;
+    }
+    // tokenize segment by segment so every token is wholly inside or outside a span
+    toks.clear();
+    loss.clear();
+    size_t pos = 0;
+    auto add = [&](size_t end, bool trainable) {
+        if (end <= pos) {
+            return;
+        }
+        const auto seg = common_tokenize(vocab, full.substr(pos, end - pos), /*add_special =*/ pos == 0, /*parse_special =*/ true);
+        toks.insert(toks.end(), seg.begin(), seg.end());
+        loss.insert(loss.end(), seg.size(), trainable ? 1 : 0);
+        pos = end;
+    };
+    for (const auto & [b, e] : spans) {
+        add(b, false);
+        add(e, true);
+    }
+    add(full.size(), false);
+    return true;
+}
+
 // "fit": "left" (continuum, card for Kimi's first dream): a served conversation (system prompt,
 // tool block, history) is far longer than a training window, and only her reply carries loss. An
 // example longer than the window keeps its TAIL: the window+1 tokens ending at its last trained
@@ -110,8 +170,37 @@ bool train_fit_left(std::vector<llama_token> & toks, std::vector<uint8_t> & loss
     return true;
 }
 
+// "fit": "middle" (continuum, Kimi's first dream): a served conversation (system prompt, tool
+// block, history) is longer than a training window, and only her reply carries loss. Serving
+// always carries the system and tool head, so training keeps it too (Cormac on #29): the OLDEST
+// history messages after the leading system messages are dropped, a tool result with the call
+// that asked for it, until the rendered example fits. The last trained turn and the user message
+// it answers are never dropped. Returns the index to drop from, or npos when nothing droppable is
+// left (the head plus the last exchange alone overflow the window).
+size_t train_fit_droppable(const std::vector<std::string> & roles, const std::vector<bool> & trained) {
+    size_t head = 0;
+    while (head < roles.size() && roles[head] == "system") {
+        ++head;
+    }
+    size_t last = std::string::npos; // the last trained assistant turn
+    for (size_t k = roles.size(); k-- > 0;) {
+        if (trained[k] && roles[k] == "assistant") {
+            last = k;
+            break;
+        }
+    }
+    if (last == std::string::npos) {
+        return std::string::npos;
+    }
+    size_t anchor = last; // the user message that last turn answers
+    while (anchor > head && roles[anchor] != "user") {
+        --anchor;
+    }
+    return head < anchor ? head : std::string::npos;
+}
+
 static bool prepare_examples(const json & examples, const server_trainer::render_fn & render, const llama_vocab * vocab,
-                             int64_t window, bool fit, server_trainer::examples_data & out, std::string & why) {
+                             int64_t window, const std::string & fit, server_trainer::examples_data & out, std::string & why) {
     for (size_t i = 0; i < examples.size(); ++i) {
         const std::string at = "examples[" + std::to_string(i) + "]";
         const json & ex = examples[i];
@@ -149,63 +238,14 @@ static bool prepare_examples(const json & examples, const server_trainer::render
                 messages[k].erase("train");
             }
         }
-        auto head = [&](size_t n) { // the first n messages
-            json h = json::array();
-            for (size_t j = 0; j < n; ++j) {
-                h.push_back(messages[j]);
-            }
-            return h;
-        };
-        std::string full;
-        std::vector<std::pair<size_t, size_t>> spans; // [begin, end) in chars of `full`
-        try {
-            full = render(messages, tools, false);
-            for (size_t k = 0; k < messages.size(); ++k) {
-                if (!trained[k] || !messages[k].is_object() || messages[k].value("role", std::string()) != "assistant") {
-                    continue;
-                }
-                const std::string pre  = render(head(k), tools, true);
-                const std::string upto = render(head(k + 1), tools, false);
-                if (full.compare(0, upto.size(), upto) != 0 || upto.compare(0, pre.size(), pre) != 0 || pre.size() >= upto.size()) {
-                    why = at + ": the chat template does not render this conversation prefix-stably at message " + std::to_string(k)
-                        + ", so the assistant turn cannot be located (templates that strip earlier turns' reasoning, e.g. Qwen3's"
-                        + " <think>, do this: send such a conversation as single-turn examples)";
-                    return false;
-                }
-                spans.emplace_back(pre.size(), upto.size());
-            }
-        } catch (const std::exception & e) {
-            why = at + " could not be rendered through the chat template: " + e.what();
-            return false;
-        }
-        if (spans.empty()) {
-            why = at + " has no assistant turn to learn";
-            return false;
-        }
-        // tokenize segment by segment so every token is wholly inside or outside a span
         std::vector<llama_token> toks;
         std::vector<uint8_t>     loss;
-        size_t pos = 0;
-        auto add = [&](size_t end, bool trainable) {
-            if (end <= pos) {
-                return;
-            }
-            const auto seg = common_tokenize(vocab, full.substr(pos, end - pos), /*add_special =*/ pos == 0, /*parse_special =*/ true);
-            toks.insert(toks.end(), seg.begin(), seg.end());
-            loss.insert(loss.end(), seg.size(), trainable ? 1 : 0);
-            pos = end;
-        };
-        for (const auto & [b, e] : spans) {
-            add(b, false);
-            add(e, true);
+        if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
+            return false;
         }
-        add(full.size(), false);
-        if ((int64_t) toks.size() > window + 1) {
-            if (!fit) {
-                why = at + " is " + std::to_string(toks.size()) + " tokens; one example is one window, and this window holds "
-                    + std::to_string(window + 1) + " (raise \"window\", split the example, or send \"fit\": \"left\")";
-                return false;
-            }
+        bool cut = false;
+        bool skip = false;
+        if (fit == "left" && (int64_t) toks.size() > window + 1) {
             const bool bos = llama_vocab_get_add_bos(vocab) && !toks.empty() && toks[0] == llama_vocab_bos(vocab);
             if (!train_fit_left(toks, loss, window, bos)) {
                 ++out.skipped;
@@ -213,16 +253,46 @@ static bool prepare_examples(const json & examples, const server_trainer::render
             }
             ++out.truncated;
         }
+        while ((int64_t) toks.size() > window + 1) {
+            if (fit.empty()) {
+                why = at + " is " + std::to_string(toks.size()) + " tokens; one example is one window, and this window holds "
+                    + std::to_string(window + 1) + " (raise \"window\", split the example, or send \"fit\")";
+                return false;
+            }
+            std::vector<std::string> roles;
+            for (const auto & m : messages) {
+                roles.push_back(m.is_object() ? m.value("role", std::string()) : std::string());
+            }
+            const size_t d = train_fit_droppable(roles, trained);
+            if (d == std::string::npos) {
+                skip = true; // the head plus her last exchange alone overflow the window
+                break;
+            }
+            // drop the oldest history message, and any tool results that answered it
+            do {
+                messages.erase(messages.begin() + d);
+                trained.erase(trained.begin() + d);
+            } while (d < messages.size() && messages[d].is_object() && messages[d].value("role", std::string()) == "tool");
+            cut = true;
+            if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
+                return false;
+            }
+        }
+        if (skip) {
+            ++out.skipped;
+            continue;
+        }
         if (std::count(loss.begin() + 1, loss.end(), (uint8_t) 1) == 0) {
             why = at + ": its assistant turns tokenize to nothing to learn";
             return false;
         }
+        out.truncated += cut ? 1 : 0;
         out.tokens.push_back(std::move(toks));
         out.loss.push_back(std::move(loss));
     }
     if (out.tokens.empty()) {
-        why = "every example's last trained turn is longer than the window (" + std::to_string(window + 1)
-            + " tokens): nothing fits to learn; raise \"window\"";
+        why = "no example fits the window (" + std::to_string(window + 1)
+            + " tokens) even with its oldest history dropped: the system and tool head plus her last exchange overflow it; raise \"window\"";
         return false;
     }
     return true;
@@ -283,12 +353,15 @@ json server_trainer::start(const json & body_in) {
         if (!render_chat) {
             return json::object({{"ok", false}, {"error", "this server has no chat template to render \"examples\" with; send \"text\""}});
         }
-        if (body.contains("fit") && !(body.at("fit").is_string() && body.at("fit").get<std::string>() == "left")) {
-            return json::object({{"ok", false}, {"error", "\"fit\" must be \"left\" (keep each example's tail) or absent (refuse a long example)"}});
+        const std::string fit = body.contains("fit") && body.at("fit").is_string() ? body.at("fit").get<std::string>() : std::string();
+        if (body.contains("fit") && fit != "middle" && fit != "left") {
+            return json::object({{"ok", false}, {"error",
+                "\"fit\" must be \"middle\" (keep the system and tool head and her reply, drop the oldest history), "
+                "\"left\" (keep the tail that ends her reply), or absent (refuse a long example)"}});
         }
         std::string why;
         if (!prepare_examples(body.at("examples"), render_chat, llama_model_get_vocab(model),
-                              (int64_t) body.value("window", 256.0), body.contains("fit"), prepared, why)) {
+                              (int64_t) body.value("window", 256.0), fit, prepared, why)) {
             return json::object({{"ok", false}, {"error", why}});
         }
         body["n_examples"] = prepared.tokens.size();

@@ -76,8 +76,8 @@ public:
     struct examples_data {
         std::vector<std::vector<llama_token>> tokens;
         std::vector<std::vector<uint8_t>>     loss;
-        // "fit": "left" — examples cut from the front to end their last trained span inside the
-        // window, and examples whose last trained turn alone could not fit (skipped)
+        // "fit": examples cut to fit the window ("middle": oldest history dropped; "left": the
+        // tail that ends the last trained turn kept), and examples that could not fit (skipped)
         int64_t truncated = 0;
         int64_t skipped   = 0;
     };
@@ -122,3 +122,8 @@ private:
 // end the last trained turn (the leading BOS kept when `bos`), mask a trained turn cut at the
 // front, and return false when the last trained turn alone does not fit.
 bool train_fit_left(std::vector<llama_token> & toks, std::vector<uint8_t> & loss, int64_t window, bool bos);
+
+// "fit": "middle" for one conversation (see server-train.cpp): the index of the oldest history
+// message to drop (after the leading system messages, before the user message her last trained
+// turn answers), or npos when nothing droppable is left.
+size_t train_fit_droppable(const std::vector<std::string> & roles, const std::vector<bool> & trained);
