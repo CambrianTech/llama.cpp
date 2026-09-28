@@ -7158,6 +7158,47 @@ static void test_msg_diffs_compute() {
     }
 }
 
+// "fit": "left" (a served conversation longer than the training window): the tail that ends her
+// last reply is kept, a reply cut at the front is masked, and a reply longer than the window skips.
+static void test_train_fit_left() {
+    auto check = [](bool ok, const char * what) {
+        if (!ok) {
+            throw std::runtime_error(std::string("train_fit_left: ") + what);
+        }
+    };
+    // tokens 0..11; the last reply is 8..10 (loss 1), an earlier reply is 3..5
+    std::vector<llama_token> toks;
+    std::vector<uint8_t>     loss;
+    for (int i = 0; i < 12; ++i) {
+        toks.push_back(i);
+        loss.push_back((i >= 3 && i <= 5) || (i >= 8 && i <= 10) ? 1 : 0);
+    }
+    auto t = toks;
+    auto l = loss;
+    check(train_fit_left(t, l, 4, false), "window 4 fits the last reply");
+    check(t == std::vector<llama_token>({6, 7, 8, 9, 10}), "keeps the 5 tokens ending the last reply");
+    check(l == std::vector<uint8_t>({0, 0, 1, 1, 1}), "the kept reply keeps its loss");
+
+    t = toks;
+    l = loss;
+    check(train_fit_left(t, l, 6, true), "window 6 with BOS fits");
+    check(t == std::vector<llama_token>({0, 5, 6, 7, 8, 9, 10}), "BOS, then the 6 tokens ending the last reply");
+    check(l == std::vector<uint8_t>({0, 0, 0, 0, 1, 1, 1}), "the earlier reply, cut at its front, is masked");
+
+    t = toks;
+    l = loss;
+    check(!train_fit_left(t, l, 1, false), "a last reply longer than the window is skipped");
+
+    // "middle" (Cormac on #29): the system head and her last exchange stay; the oldest history goes
+    const std::vector<std::string> roles = {"system", "user", "assistant", "tool", "user", "assistant", "user", "assistant"};
+    const std::vector<bool> trained = {true, true, false, true, true, false, true, true};
+    check(train_fit_droppable(roles, trained) == 1, "the oldest exchange after the system head drops first");
+    check(train_fit_droppable({"system", "user", "assistant"}, {true, true, true}) == std::string::npos,
+          "the head plus her last exchange is never dropped");
+    check(train_fit_droppable({"user", "assistant", "user", "assistant"}, {true, false, true, true}) == 0,
+          "with no system head, the oldest message drops");
+}
+
 // Optional CPU integration check: test-chat --train-control MODEL.gguf EMPTY_OUTPUT_DIR
 static int test_train_control(const char * model_path, const char * output_dir) {
     using namespace std::chrono;
@@ -7344,6 +7385,7 @@ int main(int argc, char ** argv) {
     } else
 #endif
     {
+        test_train_fit_left();
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
