@@ -7192,7 +7192,7 @@ static void test_train_fit_left() {
     // "middle" (Cormac on #29): the system head and her last exchange stay; the oldest history goes
     const std::vector<std::string> roles = {"system", "user", "assistant", "tool", "user", "assistant", "user", "assistant"};
     const std::vector<bool> trained = {true, true, false, true, true, false, true, true};
-    check(train_fit_droppable(roles, trained) == 1, "the oldest message after the system head drops first");
+    check(train_fit_droppable(roles, trained) == 1, "the oldest exchange after the system head drops first");
     check(train_fit_droppable({"system", "user", "assistant"}, {true, true, true}) == std::string::npos,
           "the head plus her last exchange is never dropped");
     check(train_fit_droppable({"user", "assistant", "user", "assistant"}, {true, false, true, true}) == 0,

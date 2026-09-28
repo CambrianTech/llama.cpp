@@ -268,11 +268,13 @@ static bool prepare_examples(const json & examples, const server_trainer::render
                 skip = true; // the head plus her last exchange alone overflow the window
                 break;
             }
-            // drop the oldest history message, and any tool results that answered it
+            // drop the oldest WHOLE exchange: from d up to the next user message, so the user
+            // prompt, her reply, its tool calls and their results leave together and the
+            // conversation keeps the role alternation strict templates enforce (Codex on #29)
             do {
                 messages.erase(messages.begin() + d);
                 trained.erase(trained.begin() + d);
-            } while (d < messages.size() && messages[d].is_object() && messages[d].value("role", std::string()) == "tool");
+            } while (d < messages.size() && messages[d].is_object() && messages[d].value("role", std::string()) != "user");
             cut = true;
             if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
                 return false;
