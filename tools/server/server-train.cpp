@@ -370,6 +370,24 @@ json server_trainer::start(const json & body_in) {
                               (int64_t) body.value("window", 256.0), fit, prepared, why)) {
             return json::object({{"ok", false}, {"error", why}});
         }
+        // The GRAPH is sized to the data, the ceiling to serving (Codex on continuum #4498): the
+        // caller's window is the served context an example may use whole, but the training
+        // context holds activations for every position of its window, so a 61,696-token window
+        // around 15k-token examples reserves four times the memory any step touches. The
+        // window used is the longest fitted example rounded up to the context granularity,
+        // never above what was asked; status reports both.
+        {
+            size_t longest = 0;
+            for (const auto & t : prepared.tokens) {
+                longest = std::max(longest, t.size());
+            }
+            const int64_t asked = (int64_t) body.value("window", 256.0);
+            const int64_t need  = std::max<int64_t>(256, (((int64_t) longest - 1) + 255) / 256 * 256);
+            body["window_asked"] = asked;
+            if (need < asked) {
+                body["window"] = need;
+            }
+        }
         body["n_examples"] = prepared.tokens.size();
         body["n_truncated"] = prepared.truncated;
         body["n_skipped"] = prepared.skipped;
@@ -418,6 +436,10 @@ json server_trainer::start(const json & body_in) {
         worker.join();
     }
     state = json::object({{"state", "starting"}, {"out", body.at("out")}, {"epochs", json::array()}});
+    state["window"] = body.value("window", (int64_t) 256);
+    if (body.contains("window_asked")) {
+        state["window_asked"] = body.at("window_asked");
+    }
     if (body.contains("n_examples")) {
         state["examples"] = body.at("n_examples");
         state["examples_truncated"] = body.value("n_truncated", (int64_t) 0);
