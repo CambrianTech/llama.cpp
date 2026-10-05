@@ -461,6 +461,8 @@ json server_trainer::start(const json & body_in) {
     windows.store(0);
     windows_while_busy.store(0);
     window_started = std::chrono::steady_clock::time_point{};
+    window_ms_samples.clear();
+    window_ms_max = 0;
     worker = std::thread([this, body, ex = std::move(prepared)]() mutable { run(std::move(body), std::move(ex)); });
     lock.unlock();
     return json::object({{"ok", true}, {"status", status()}});
@@ -480,6 +482,10 @@ bool server_trainer::before_window(bool, void * user_data) {
     const int64_t owed_ms = last_ms * (1000000 - share) / share;
     bool took_while_busy = false;
     std::unique_lock<std::mutex> lock(self.mu);
+    if (last_ms > 0) { // 0 = no window yet (the first call), never a sample
+        self.window_ms_samples.push_back(last_ms);
+        self.window_ms_max = std::max(self.window_ms_max, last_ms);
+    }
     while (!self.cancel_requested.load()) {
         self.paused = self.pause_requested;
         const bool busy = self.yield_to_turns.load() && self.busy_slots && self.busy_slots() > 0;
@@ -571,6 +577,14 @@ json server_trainer::status() const {
     s["windows"] = windows.load();
     s["windows_while_busy"] = windows_while_busy.load();
     s["window_ms_last"] = window_ms_last.load();
+    s["window_ms_max"] = window_ms_max;
+    if (!window_ms_samples.empty()) {
+        std::vector<int64_t> sorted = window_ms_samples;
+        std::sort(sorted.begin(), sorted.end());
+        const auto pct = [&](double p) { return sorted[std::min(sorted.size() - 1, (size_t) (p * (double) sorted.size()))]; };
+        s["window_ms_p50"] = pct(0.50);
+        s["window_ms_p95"] = pct(0.95);
+    }
     s["pause_requested"] = pause_requested;
     s["paused"] = paused;
     s["waiting_for_serving"] = waiting_for_serving;
