@@ -115,6 +115,12 @@ private:
     std::atomic<int64_t> windows{0};
     std::atomic<int64_t> windows_while_busy{0};
     std::chrono::steady_clock::time_point window_started{};
+    // The window's duration is serving's latency bound while training is on (the share
+    // bounds how OFTEN a window runs, not how long one takes; Joel: a brief, unnoticed
+    // slowdown). Every window's duration is kept here, under `mu`, so status reports the
+    // distribution exactly (max, p50, p95), never a polled sample that misses the long one.
+    std::vector<int64_t> window_ms_samples;
+    int64_t window_ms_max{0};
 
     std::thread worker;
     std::atomic<bool> running{false};
