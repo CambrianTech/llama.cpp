@@ -104,6 +104,17 @@ private:
     render_fn render_chat;
     std::atomic<bool>    yield_to_turns{true};
     std::atomic<int64_t> yielded_ms{0};
+    // THE SHARE. Yielding while any slot is busy is starvation on a lane whose slots never go
+    // idle (continuum card 36c3c00a: a 27B lane with residents, 12 minutes at batch 0). The
+    // trainer owns a share of the lane's time instead: after a window that took d ms it yields
+    // to busy slots for at least d * (1 - share) / share, then takes the next window whether
+    // or not serving is busy; idle serving releases it at once. share_ppm = 1_000_000 never
+    // yields (the old "yield": false); 0 is refused at parse.
+    std::atomic<int64_t> share_ppm{250000};
+    std::atomic<int64_t> window_ms_last{0};
+    std::atomic<int64_t> windows{0};
+    std::atomic<int64_t> windows_while_busy{0};
+    std::chrono::steady_clock::time_point window_started{};
 
     std::thread worker;
     std::atomic<bool> running{false};

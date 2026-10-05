@@ -313,7 +313,7 @@ json server_trainer::start(const json & body_in) {
     // assert in the training path would take the server down (Cormac on #14).
     {
         auto num = [&](const char * key, double def) { return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : def; };
-        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers"}) {
+        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers", "share_ppm"}) {
             if (body.contains(key) && !body.at(key).is_number()) {
                 return json::object({{"ok", false}, {"error", std::string("\"") + key + "\" must be a number"}});
             }
@@ -337,6 +337,8 @@ json server_trainer::start(const json & body_in) {
         else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
         else if (body.contains("memory_budget_mib") && !(num("memory_budget_mib", 0) >= 1))
                                                                      why = "memory_budget_mib must be >= 1";
+        else if (body.contains("share_ppm") && !(num("share_ppm", 0) >= 1 && num("share_ppm", 0) <= 1000000 && num("share_ppm", 0) == (int64_t) num("share_ppm", 0)))
+                                                                     why = "share_ppm must be an integer in [1, 1000000]: the trainer's share of the lane's time, in parts per million";
         else if (body.contains("top_layers") && !(num("top_layers", 0) >= 1 && num("top_layers", 0) <= llama_model_n_layer(model) &&
                                                   num("top_layers", 0) == (int64_t) num("top_layers", 0)))
                                                                      why = "top_layers must be an integer in [1, " + std::to_string(llama_model_n_layer(model)) + "]";
@@ -454,6 +456,11 @@ json server_trainer::start(const json & body_in) {
     yielded_ms.store(0);
     cancel_requested.store(false);
     yield_to_turns.store(body.value("yield", true));
+    share_ppm.store(body.value("share_ppm", (int64_t) 250000));
+    window_ms_last.store(0);
+    windows.store(0);
+    windows_while_busy.store(0);
+    window_started = std::chrono::steady_clock::time_point{};
     worker = std::thread([this, body, ex = std::move(prepared)]() mutable { run(std::move(body), std::move(ex)); });
     lock.unlock();
     return json::object({{"ok", true}, {"status", status()}});
@@ -462,11 +469,25 @@ json server_trainer::start(const json & body_in) {
 bool server_trainer::before_window(bool, void * user_data) {
     auto & self = *static_cast<server_trainer *>(user_data);
     const auto t0 = std::chrono::steady_clock::now();
+    // The previous window's cost: the time since this callback last returned. The share is
+    // owed against it (nothing is owed before the first window: it must run to be measured).
+    const int64_t last_ms = self.window_started == std::chrono::steady_clock::time_point{}
+        ? 0
+        : std::chrono::duration_cast<std::chrono::milliseconds>(t0 - self.window_started).count();
+    self.window_ms_last.store(last_ms);
+    const int64_t share = std::clamp<int64_t>(self.share_ppm.load(), 1, 1000000);
+    // d * (1 - s) / s, in ms: the yield owed to serving for the window just taken.
+    const int64_t owed_ms = last_ms * (1000000 - share) / share;
+    bool took_while_busy = false;
     std::unique_lock<std::mutex> lock(self.mu);
     while (!self.cancel_requested.load()) {
         self.paused = self.pause_requested;
-        self.waiting_for_serving = self.yield_to_turns.load() && self.busy_slots && self.busy_slots() > 0;
+        const bool busy = self.yield_to_turns.load() && self.busy_slots && self.busy_slots() > 0;
+        const int64_t yielded_so_far = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        // Busy serving holds the trainer only until the share is paid; then the window is taken.
+        self.waiting_for_serving = busy && yielded_so_far < owed_ms;
         if (!self.paused && !self.waiting_for_serving) {
+            took_while_busy = busy;
             break;
         }
         if (self.paused) {
@@ -479,6 +500,13 @@ bool server_trainer::before_window(bool, void * user_data) {
     self.paused = false;
     self.waiting_for_serving = false;
     self.yielded_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (!self.cancel_requested.load()) {
+        self.windows += 1;
+        if (took_while_busy) {
+            self.windows_while_busy += 1;
+        }
+        self.window_started = std::chrono::steady_clock::now();
+    }
     return !self.cancel_requested.load();
 }
 
@@ -539,6 +567,10 @@ json server_trainer::status() const {
         s["batch_max"] = g_train_batch_max.load();
     }
     s["yielded_ms"] = yielded_ms.load();
+    s["share_ppm"] = share_ppm.load();
+    s["windows"] = windows.load();
+    s["windows_while_busy"] = windows_while_busy.load();
+    s["window_ms_last"] = window_ms_last.load();
     s["pause_requested"] = pause_requested;
     s["paused"] = paused;
     s["waiting_for_serving"] = waiting_for_serving;

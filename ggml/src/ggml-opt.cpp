@@ -802,7 +802,23 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
             }
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
-            if (opt_ctx->alloc_budget > 0 && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            // A backend with no memory of its own (BLAS reports free = total = 0: Accelerate
+            // on a Mac, OpenBLAS anywhere) computes in HOST buffers, so its allowance is the
+            // host's, as the CPU device reports it. With 0 the gate refused every training
+            // graph on a Metal+BLAS build at the first window (the M5, 2026-10-05: "needs
+            // 150.4 MiB more on BLAS, over the 0.0 MiB it may add") while 40 GB sat free.
+            bool host_backed = false;
+            if (total == 0) {
+                for (int j = 0; j < n; ++j) {
+                    ggml_backend_dev_t cpu = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, j));
+                    if (cpu != nullptr && ggml_backend_dev_type(cpu) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        ggml_backend_dev_memory(cpu, &free, &total);
+                        host_backed = true;
+                        break;
+                    }
+                }
+            }
+            if (opt_ctx->alloc_budget > 0 && !host_backed && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 free = std::min(free, opt_ctx->alloc_budget);
             }
             const size_t margin = std::min<size_t>(free, 512u*1024*1024); // allocator slack
