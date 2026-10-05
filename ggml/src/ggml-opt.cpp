@@ -77,6 +77,9 @@ struct ggml_opt_context {
 struct ggml_opt_result {
     int64_t              ndata    = 0;
     std::vector<float>   loss;
+    // rows behind each entry of `loss`: batches may differ in size (a training window with
+    // outputs only at its labelled positions), so a per-datapoint mean is weighted by them
+    std::vector<int64_t> ndata_batch;
     std::vector<int32_t> pred;
     int64_t              ncorrect = 0;
 
@@ -650,6 +653,7 @@ void ggml_opt_result_free(ggml_opt_result_t result) {
 void ggml_opt_result_reset(ggml_opt_result_t result) {
     result->ndata = 0;
     result->loss.clear();
+    result->ndata_batch.clear();
     result->pred.clear();
     result->ncorrect = 0;
 }
@@ -669,27 +673,33 @@ void ggml_opt_result_loss(ggml_opt_result_t result, double * loss, double * unc)
 
     double sum         = 0.0;
     double sum_squared = 0.0;
+    double weight_sum  = 0.0;
 
-    for (const float & loss : result->loss) {
+    for (size_t i = 0; i < result->loss.size(); ++i) {
         // If the loss is per datapoint it was scaled by 1.0f/opt_period for each physical batch.
-        const float loss_scaled = result->loss_per_datapoint ? loss*result->opt_period : loss;
-        sum         += loss_scaled;
-        sum_squared += loss_scaled*loss_scaled;
+        const float loss_scaled = result->loss_per_datapoint ? result->loss[i]*result->opt_period : result->loss[i];
+        // A per-datapoint loss is a mean over that batch's rows: batches of different sizes
+        // weigh by their rows, so the epoch's loss is the mean over every row, never a mean
+        // of per-batch means. A summed loss carries its rows already (weight 1).
+        const double w = result->loss_per_datapoint && i < result->ndata_batch.size() ? double(result->ndata_batch[i]) : 1.0;
+        sum         += w*loss_scaled;
+        sum_squared += w*loss_scaled*loss_scaled;
+        weight_sum  += w;
     }
 
-    const double mean = sum/nbatches;
+    const double mean = weight_sum > 0.0 ? sum/weight_sum : 0.0;
     *loss = result->loss_per_datapoint ? mean : sum;
 
     if (!unc) {
         return;
     }
 
-    if (nbatches < 2) {
+    if (nbatches < 2 || !(weight_sum > 0.0)) {
         *unc = NAN;
         return;
     }
 
-    const double var_sum = sum_squared/nbatches - mean*mean; // variance without Bessel's correction, i.e. nbatches/(nbatches-1)
+    const double var_sum = sum_squared/weight_sum - mean*mean; // weighted variance without Bessel's correction, i.e. nbatches/(nbatches-1)
     *unc = result->loss_per_datapoint ? sqrt(var_sum / (nbatches - 1)) : sqrt(var_sum * nbatches/(nbatches - 1));
 }
 
@@ -802,7 +812,23 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
             }
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
-            if (opt_ctx->alloc_budget > 0 && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            // A backend with no memory of its own (BLAS reports free = total = 0: Accelerate
+            // on a Mac, OpenBLAS anywhere) computes in HOST buffers, so its allowance is the
+            // host's, as the CPU device reports it. With 0 the gate refused every training
+            // graph on a Metal+BLAS build at the first window (the M5, 2026-10-05: "needs
+            // 150.4 MiB more on BLAS, over the 0.0 MiB it may add") while 40 GB sat free.
+            bool host_backed = false;
+            if (total == 0) {
+                for (int j = 0; j < n; ++j) {
+                    ggml_backend_dev_t cpu = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, j));
+                    if (cpu != nullptr && ggml_backend_dev_type(cpu) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        ggml_backend_dev_memory(cpu, &free, &total);
+                        host_backed = true;
+                        break;
+                    }
+                }
+            }
+            if (opt_ctx->alloc_budget > 0 && !host_backed && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                 free = std::min(free, opt_ctx->alloc_budget);
             }
             const size_t margin = std::min<size_t>(free, 512u*1024*1024); // allocator slack
@@ -897,8 +923,8 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     }
 
     const int64_t ndata = opt_ctx->outputs->ne[1];
-    GGML_ASSERT(result->ndata == ndata*int64_t(result->loss.size()) && "varying batch size not supported");
     result->ndata += ndata;
+    result->ndata_batch.push_back(ndata);
 
     GGML_ASSERT(ggml_is_scalar(opt_ctx->loss));
     GGML_ASSERT(opt_ctx->loss->type == GGML_TYPE_F32);
