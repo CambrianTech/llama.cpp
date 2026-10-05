@@ -3441,6 +3441,12 @@ void llama_context::opt_epoch_iter(
         embd_seq.clear();
 
         const uint32_t n_outputs_all = balloc->get_n_outputs();
+        // Unreachable from /train: it sets n_ctx = n_batch = n_ubatch = window (one ubatch is
+        // the whole context, asserted in opt_init) and refuses an example with no labelled
+        // position before it gets here, so every batch has at least one. Kept for any other
+        // caller of opt_epoch, and it RETURNS from the whole iteration (a later batch of this
+        // context would need the earlier one's state; with one batch per context there is
+        // none to lose). (Cormac and BigMama on fork #32.)
         if (n_outputs_all == 0) {
             LLAMA_LOG_ERROR("%s: a training batch with no labelled position (every label masked): nothing to learn from it\n", __func__);
             return;
