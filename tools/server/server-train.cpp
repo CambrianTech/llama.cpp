@@ -737,8 +737,14 @@ void server_trainer::run(json req, examples_data ex) {
     const int64_t trainable_train = by_example ? trainable_prefix[idata_split] : train_tokens;
     const int64_t trainable_eval  = by_example ? trainable_prefix.back() - trainable_prefix[idata_split]
                                                : (ndata - idata_split) * (int64_t) window;
-    const double  scale_train = trainable_train > 0 ? (double) train_tokens / trainable_train : 0.0;
-    const double  scale_eval  = trainable_eval  > 0 ? (double) ((ndata - idata_split) * (int64_t) window) / trainable_eval : 0.0;
+    // The loss is a mean over the LABELLED positions by construction (the training graph has
+    // outputs only where a label exists, llama_context::opt_epoch_iter), so it is already
+    // per trained token. The old mean ran over every position of the window, zeros
+    // included, and was rescaled here by window / trainable; applied to the new mean that
+    // multiplied a 2.21 window into a reported 141.67 (the M5, 2026-10-05). Gradients
+    // carry the same change: an example's step no longer shrinks with its label density.
+    const double  scale_train = trainable_train > 0 ? 1.0 : 0.0;
+    const double  scale_eval  = trainable_eval  > 0 ? 1.0 : 0.0;
     ggml_opt_result_t result_train = ggml_opt_result_init();
     ggml_opt_result_t result_eval  = ggml_opt_result_init();
     {

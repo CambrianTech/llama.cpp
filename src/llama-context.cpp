@@ -3408,6 +3408,16 @@ void llama_context::opt_epoch_iter(
 
     memory->clear(true);
 
+    // OUTPUTS ONLY WHERE THE LOSS IS. A position whose label is masked (< 0: the system and
+    // tool head, the user's turns, padding) carries no loss, so its logits are never read;
+    // computing them anyway cost n_vocab x window floats for the logits, the same again for
+    // the one-hot labels, and the same again for the logit gradients. At 151,936 x 256 that
+    // was the 148 MiB the memory gate named on the M5; at one of a citizen's 15k-token
+    // turns it was ~9 GB three times over, and "could not create the training context" on
+    // the 5090 (continuum card 36c3c00a). Decode already selects output rows per token
+    // (batch.logits); training now does the same, and the label tensor is sized to the
+    // rows that exist. Every window has at least one labelled position: the server refuses
+    // an example with none before it reaches here.
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
         batch.n_tokens = n_batch;
         for (uint32_t pos_batch = 0; pos_batch < n_batch; ++pos_batch) {
@@ -3415,10 +3425,11 @@ void llama_context::opt_epoch_iter(
             batch.pos     [pos_batch]    = pos_ctx + pos_batch;
             batch.n_seq_id[pos_batch]    = 1;
             batch.seq_id  [pos_batch][0] = 0;
-            batch.logits  [pos_batch]    = true;
+            batch.logits  [pos_batch]    = labels_sparse[pos_ctx + pos_batch] >= 0;
         }
 
-        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+        // output_all = false: the batch's own logits flags decide which rows exist
+        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, false)) {
             LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
             return;
         }
@@ -3429,7 +3440,11 @@ void llama_context::opt_epoch_iter(
 
         embd_seq.clear();
 
-        uint32_t n_outputs_all = n_tokens_all;
+        const uint32_t n_outputs_all = balloc->get_n_outputs();
+        if (n_outputs_all == 0) {
+            LLAMA_LOG_ERROR("%s: a training batch with no labelled position (every label masked): nothing to learn from it\n", __func__);
+            return;
+        }
 
         auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
         if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
@@ -3447,7 +3462,14 @@ void llama_context::opt_epoch_iter(
         do {
             const auto & ubatch = mctx->get_ubatch();
 
-            n_outputs = ubatch.n_tokens;
+            // the labelled rows of this ubatch, as decode counts its outputs
+            {
+                uint32_t n_outputs_ubatch = 0;
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    n_outputs_ubatch += (uint32_t) (ubatch.output[i] != 0);
+                }
+                n_outputs = n_outputs_ubatch;
+            }
 
             if (!mctx->apply()) {
                 LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
@@ -3485,18 +3507,23 @@ void llama_context::opt_epoch_iter(
 
             res->set_inputs(&ubatch);
             {
+                // one-hot rows for the labelled positions only, in the order the ubatch
+                // emits its outputs (the same order the logits rows take)
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
-                GGML_ASSERT(labels->ne[1] == n_ubatch);
+                GGML_ASSERT(labels->ne[1] == (int64_t) n_outputs);
                 ggml_set_zero(labels);
                 const float onef = 1.0f;
-                for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
-                    const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                    if (labels_sparse[ilabel] < 0) {
-                        continue; // masked: carries no loss (the backward honours zero label rows)
+                uint32_t row = 0;
+                for (uint32_t pos_ubatch = 0; pos_ubatch < ubatch.n_tokens; ++pos_ubatch) {
+                    if (ubatch.output[pos_ubatch] == 0) {
+                        continue;
                     }
-                    GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                    ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
+                    GGML_ASSERT(labels_sparse[ilabel] >= 0 && labels_sparse[ilabel] < labels->ne[0]);
+                    ggml_backend_tensor_set(labels, &onef, (row*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    ++row;
                 }
+                GGML_ASSERT(row == n_outputs);
             }
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
