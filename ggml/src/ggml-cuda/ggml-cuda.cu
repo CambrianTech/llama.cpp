@@ -5233,13 +5233,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ADD_ID:
         case GGML_OP_ADD1:
         case GGML_OP_SCALE:
+        case GGML_OP_CLAMP:
+            return true;
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_SIN:
         case GGML_OP_COS:
-        case GGML_OP_CLAMP:
         case GGML_OP_LOG:
-            return true;
+            // these run ggml_cuda_op_unary, which asserts a contiguous src0: say so (the 5090
+            // 2026-10-06: SQR on a viewed k_conv in a training graph took serving down)
+            return ggml_is_contiguous(op->src[0]);
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:

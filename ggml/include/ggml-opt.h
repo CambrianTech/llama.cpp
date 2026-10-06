@@ -187,6 +187,10 @@ extern "C" {
     // ready and must not be evaluated
     GGML_API bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
 
+    // Why the last ggml_opt_alloc returned false, in words a caller can put in front of a person
+    // ("" when it did not refuse): a node the device backend cannot run, or the memory gate.
+    GGML_API const char * ggml_opt_refusal(ggml_opt_context_t opt_ctx);
+
     // Caps what a graph may add on each non-CPU device, over and above the device's own free
     // figure (0 = no cap). For callers that know physical memory better than the driver does: on
     // Windows (WDDM) a CUDA device reports nearly the whole card free beside other processes, and

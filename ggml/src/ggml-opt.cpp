@@ -12,6 +12,7 @@
 #include <cinttypes>
 #include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 struct ggml_opt_dataset {
@@ -29,6 +30,8 @@ struct ggml_opt_dataset {
 };
 
 struct ggml_opt_context {
+    // why the last ggml_opt_alloc refused ("" when it did not)
+    std::string                refusal;
     ggml_backend_sched_t       backend_sched        = nullptr;
     ggml_cgraph              * allocated_graph      = nullptr;
     ggml_cgraph              * allocated_graph_copy = nullptr;
@@ -794,6 +797,43 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         opt_ctx->allocated_graph_copy = graph;
     }
 
+    opt_ctx->refusal.clear();
+
+    // A training graph with a node the device cannot run is refused BEFORE anything is allocated.
+    // For inference the scheduler falls back to another backend; inside a training graph that
+    // fallback is not contained (measured on the 5090 2026-10-06: a viewed SQR placed on the CPU
+    // aborted the scheduler on a cache view pinned to CUDA0), and a kernel run on an input it does
+    // not support aborts the whole process, the SERVING process when training runs in place.
+    // supports_op stays the one place that knows what a backend can run; a training graph only
+    // turns its "no" into a refused job instead of a fallback.
+    if (backward) {
+        ggml_backend_sched_t sched  = opt_ctx->backend_sched;
+        ggml_backend_t       device = ggml_backend_sched_get_backend(sched, 0);
+        ggml_backend_dev_t   dev    = device ? ggml_backend_get_device(device) : nullptr;
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_cgraph * g = opt_ctx->allocated_graph_copy;
+            for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+                ggml_tensor * node = ggml_graph_node(g, i);
+                switch (node->op) {
+                    case GGML_OP_NONE: case GGML_OP_VIEW: case GGML_OP_RESHAPE:
+                    case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+                        continue; // metadata, no kernel
+                    default:
+                        break;
+                }
+                if (!ggml_backend_supports_op(device, node)) {
+                    const ggml_tensor * s0 = node->src[0];
+                    opt_ctx->refusal = std::string("the training graph has a node ") + ggml_backend_name(device)
+                        + " cannot run: " + ggml_op_desc(node) + " '" + node->name + "'"
+                        + (s0 ? std::string(" on '") + s0->name + "'" + (ggml_is_contiguous(s0) ? "" : " (a non-contiguous view)") : std::string())
+                        + "; nothing was allocated and serving is unaffected";
+                    GGML_LOG_ERROR("%s: %s\n", __func__, opt_ctx->refusal.c_str());
+                    return false;
+                }
+            }
+        }
+    }
+
     // A training graph that cannot fit must be refused BEFORE it is allocated. Attempting it is not
     // contained: on the 5090 (2026-09-27) a 75 GB graph's failed CUDA allocation spilled into host
     // memory, exhausted the machine's commit and aborted the continuum core beside it. Each
@@ -1166,4 +1206,8 @@ GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type o) {
         default:
             return "undefined";
     };
+}
+
+const char * ggml_opt_refusal(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->refusal.c_str();
 }

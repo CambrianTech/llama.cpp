@@ -203,6 +203,9 @@ struct llama_context {
     void * opt_step_callback_data = nullptr;
     // set when an epoch's graph could not be allocated (llama_opt_failed); the epoch stops
     std::atomic<bool> opt_alloc_failed{false};
+    // why it was refused, copied from ggml_opt_refusal when the epoch stops (llama_opt_failure);
+    // empty for the memory gate
+    std::string opt_failure;
     // what training may add per GPU device (llama_opt_set_memory_budget); 0 = no cap
     size_t opt_memory_budget = 0;
     // the largest training graph the allocation preflight measured on a GPU device (bytes)

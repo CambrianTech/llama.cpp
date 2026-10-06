@@ -820,6 +820,8 @@ void server_trainer::run(json req, examples_data ex) {
     // training graph did not fit (the serving slots never shared that memory, so they go on)
     const bool    cancelled = cancel_requested.load();
     const bool    no_fit    = llama_opt_failed(ctx);
+    // copied before llama_free: the refusal names a node the device cannot run, when that was it
+    const std::string refusal = llama_opt_failure(ctx);
     const double  graph_mib = llama_opt_graph_bytes(ctx) / 1048576.0;
     const int32_t saved     = (cancelled || no_fit) ? 0 : llama_adapter_lora_save(adapter, out.c_str());
     llama_adapter_lora_free(adapter);
@@ -831,7 +833,8 @@ void server_trainer::run(json req, examples_data ex) {
     state["graph_mib"] = graph_mib;
     if (no_fit) {
         state["state"] = "error";
-        state["error"] = "the training graph did not fit in device memory at window " + std::to_string(window)
+        state["error"] = !refusal.empty() ? refusal + " (window " + std::to_string(window) + ")" :
+                         "the training graph did not fit in device memory at window " + std::to_string(window)
                        + "; nothing was written and serving is unaffected (use a smaller window or fewer targets)";
     } else if (cancelled) {
         state["state"] = "cancelled";
