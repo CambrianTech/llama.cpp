@@ -821,10 +821,18 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
                     default:
                         break;
                 }
-                if (!ggml_backend_supports_op(device, node)) {
+                // Refuse only a node NO backend of the scheduler can run. A device "no" with
+                // another backend's "yes" falls back as it always has: Metal has no GET_ROWS_BACK
+                // and runs it on the CPU (the M5 2026-10-06, refused by the first version of this
+                // check). supports_op is truthful, so a "yes" is a kernel that will not abort.
+                bool runnable = false;
+                for (int b = 0; b < ggml_backend_sched_get_n_backends(sched) && !runnable; ++b) {
+                    runnable = ggml_backend_supports_op(ggml_backend_sched_get_backend(sched, b), node);
+                }
+                if (!runnable) {
                     const ggml_tensor * s0 = node->src[0];
-                    opt_ctx->refusal = std::string("the training graph has a node ") + ggml_backend_name(device)
-                        + " cannot run: " + ggml_op_desc(node) + " '" + node->name + "'"
+                    opt_ctx->refusal = std::string("the training graph has a node no backend can run (")
+                        + ggml_backend_name(device) + " included): " + ggml_op_desc(node) + " '" + node->name + "'"
                         + (s0 ? std::string(" on '") + s0->name + "'" + (ggml_is_contiguous(s0) ? "" : " (a non-contiguous view)") : std::string())
                         + "; nothing was allocated and serving is unaffected";
                     GGML_LOG_ERROR("%s: %s\n", __func__, opt_ctx->refusal.c_str());
