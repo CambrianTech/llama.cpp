@@ -582,6 +582,13 @@ void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
     }
+    // A training context's scheduler was sized for the training graph in opt_init, and the
+    // optimizer holds it (ggml_opt_params.backend_sched). Re-creating it here, as the first
+    // context decode of opt_epoch_iter's walk would, leaves the optimizer on a freed scheduler.
+    if (opt_ctx != nullptr) {
+        sched_need_reserve = false;
+        return;
+    }
 
     sched_need_reserve = false;
 
@@ -2335,7 +2342,13 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (n_sampling_outputs_max > 1) {
         res += (n_sampling_outputs_max - 1) * n_sampling_nodes_max;
     }
-    if (cparams.training) {
+    // a training context (an optimizer exists), not this graph's flag: the walk decodes context
+    // with cparams.training off, and a sched_reserve() run then must not shrink the scheduler
+    // and the graph result below what the next training chunk needs
+    if (cparams.training || opt_ctx != nullptr) {
+        // each attention layer reads the cached context in front of the chunk (build_attn:
+        // views of K and V, V's permute and cont, two concats, the mask's view and cont)
+        res += 16u * model.hparams.n_layer();
         // ggml_opt duplicates the forward graph at its own size, then appends the backward
         // pass and the optimizer step: room for the forward three times over.
         res *= 3;
@@ -3324,9 +3337,11 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(opt_n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
     // A training graph cannot backprop through the KV cache (SET_ROWS writes in place and
-    // attention reads the cache as a leaf), so attention consumes this ubatch's K/V
-    // directly; that is exact only when one ubatch is the whole context.
-    GGML_ASSERT(n_ubatch == opt_n_ctx_train && "training needs one ubatch per context: set -ub = -b = -c");
+    // attention reads the cache as a leaf), so attention consumes this chunk's K/V directly
+    // and the context before it from the cache as a constant (build_attn); opt_epoch_iter
+    // walks the window decoding context and training each labelled chunk. One chunk is one
+    // batch is one ubatch: a chunk's backward needs all of its own K/V in one graph.
+    GGML_ASSERT(n_ubatch == n_batch && "training needs one ubatch per batch: set -ub = -b");
     GGML_ASSERT(!cparams.flash_attn && "training needs flash attention off: FLASH_ATTN_EXT has no backward");
     cparams.training = true;
     // The graph result and the scheduler were sized at context creation: before training
@@ -3404,25 +3419,66 @@ void llama_context::opt_epoch_iter(
         int64_t                          ndata_in_loop,
         int64_t                          t_loop_start) {
     GGML_ASSERT(opt_ctx);
-    const uint32_t n_ctx    = opt_n_ctx_train;
-    const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
-    const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
+    const uint32_t n_ctx   = opt_n_ctx_train;
+    const uint32_t n_batch = std::min(this->n_batch(), n_ctx);
 
+    fprintf(stderr, "WALK start: n_ctx %u n_batch %u\n", n_ctx, n_batch); fflush(stderr);
     memory->clear(true);
 
-    // OUTPUTS ONLY WHERE THE LOSS IS. A position whose label is masked (< 0: the system and
-    // tool head, the user's turns, padding) carries no loss, so its logits are never read;
-    // computing them anyway cost n_vocab x window floats for the logits, the same again for
-    // the one-hot labels, and the same again for the logit gradients. At 151,936 x 256 that
-    // was the 148 MiB the memory gate named on the M5; at one of a citizen's 15k-token
-    // turns it was ~9 GB three times over, and "could not create the training context" on
-    // the 5090 (continuum card 36c3c00a). Decode already selects output rows per token
-    // (batch.logits); training now does the same, and the label tensor is sized to the
-    // rows that exist. Every window has at least one labelled position: the server refuses
-    // an example with none before it reaches here.
-    for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
-        batch.n_tokens = n_batch;
-        for (uint32_t pos_batch = 0; pos_batch < n_batch; ++pos_batch) {
+    // THE WALK (Fable's design, continuum 2026-10-06): one pass over the window in one
+    // context. A run with no label is context she did not write: a plain decode into the
+    // cache, no backward. A labelled run is her reply: it trains in chunks of n_batch, each
+    // attending to everything before it read from the cache as a constant (build_attn,
+    // cparams.training), then the reply is decoded into the cache under the adapter as it
+    // now is, so the next reply sees it. Memory is chunk x window, never window x window, so
+    // her whole lived window trains. Nothing after the last label is computed.
+    int64_t last_label = -1;
+    for (int64_t i = (int64_t) n_ctx - 1; i >= 0; --i) {
+        if (labels_sparse[i] >= 0) {
+            last_label = i;
+            break;
+        }
+    }
+    if (last_label < 0) {
+        LLAMA_LOG_ERROR("%s: a training window with no labelled position: nothing to learn from it\n", __func__);
+        return;
+    }
+
+    // a plain inference decode of [p0, p1) into the cache: the training graph's attention
+    // never writes the cache, so context and finished replies reach it this way
+    auto decode_span = [&](uint32_t p0, uint32_t p1) -> bool {
+        fprintf(stderr, "WALK decode context [%u, %u)\n", p0, p1); fflush(stderr);
+        const bool training = cparams.training;
+        cparams.training = false;
+        gf_res_prev->reset();
+        bool ok = true;
+        for (uint32_t c0 = p0; c0 < p1 && ok; c0 += n_batch) {
+            const uint32_t c1 = std::min(c0 + n_batch, p1);
+            batch.n_tokens = c1 - c0;
+            for (uint32_t i = 0; i < c1 - c0; ++i) {
+                batch.token   [i]    = tokens[c0 + i];
+                batch.pos     [i]    = c0 + i;
+                batch.n_seq_id[i]    = 1;
+                batch.seq_id  [i][0] = 0;
+                batch.logits  [i]    = i + 1 == c1 - c0;
+            }
+            const int rc = decode(batch);
+            fprintf(stderr, "WALK decode [%u, %u) -> %d\n", c0, c1, rc); fflush(stderr);
+            ok = rc == 0;
+        }
+        cparams.training = training;
+        gf_res_prev->reset();
+        if (!ok) {
+            LLAMA_LOG_ERROR("%s: the context decode of [%u, %u) failed\n", __func__, p0, p1);
+        }
+        return ok;
+    };
+
+    // one training chunk [pos_ctx, pos_ctx + n_tokens): forward and backward over it alone,
+    // attending to the cached context before it
+    auto train_chunk = [&](uint32_t pos_ctx, uint32_t n_chunk) -> bool {
+        batch.n_tokens = n_chunk;
+        for (uint32_t pos_batch = 0; pos_batch < n_chunk; ++pos_batch) {
             batch.token   [pos_batch]    = tokens[pos_ctx + pos_batch];
             batch.pos     [pos_batch]    = pos_ctx + pos_batch;
             batch.n_seq_id[pos_batch]    = 1;
@@ -3433,7 +3489,7 @@ void llama_context::opt_epoch_iter(
         // output_all = false: the batch's own logits flags decide which rows exist
         if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, false)) {
             LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
-            return;
+            return false;
         }
 
         const uint32_t n_tokens_all = balloc->get_n_tokens();
@@ -3443,21 +3499,17 @@ void llama_context::opt_epoch_iter(
         embd_seq.clear();
 
         const uint32_t n_outputs_all = balloc->get_n_outputs();
-        // Unreachable from /train: it sets n_ctx = n_batch = n_ubatch = window (one ubatch is
-        // the whole context, asserted in opt_init) and refuses an example with no labelled
-        // position before it gets here, so every batch has at least one. Kept for any other
-        // caller of opt_epoch, and it RETURNS from the whole iteration (a later batch of this
-        // context would need the earlier one's state; with one batch per context there is
-        // none to lose). (Cormac and BigMama on fork #32.)
+        // Unreachable: the walk below trains only chunks of a labelled run. It RETURNS from the
+        // whole window, since a later chunk would need this one in the cache.
         if (n_outputs_all == 0) {
             LLAMA_LOG_ERROR("%s: a training batch with no labelled position (every label masked): nothing to learn from it\n", __func__);
-            return;
+            return false;
         }
 
         auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
         if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
-            break;
+            return false;
         }
 
         // reserve output buffer
@@ -3481,7 +3533,7 @@ void llama_context::opt_epoch_iter(
 
             if (!mctx->apply()) {
                 LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
-                break;
+                return false;
             }
 
             auto * res = gf_res_prev.get();
@@ -3503,6 +3555,8 @@ void llama_context::opt_epoch_iter(
                 };
                 ctx_compute_opt = ggml_init(params);
             }
+            fprintf(stderr, "WALK chunk at %u (%u tokens, n_past %d): forward graph %d nodes of %d\n",
+                    pos_ctx, ubatch.n_tokens, (int) ubatch.pos[0], ggml_graph_n_nodes(gf), (int) ggml_graph_size(gf)); fflush(stderr);
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             if (!ggml_opt_alloc(opt_ctx, train)) {
                 const char * why = ggml_opt_refusal(opt_ctx);
@@ -3513,7 +3567,7 @@ void llama_context::opt_epoch_iter(
                 ggml_free(ctx_compute_opt);
                 opt_alloc_failed.store(true);
                 opt_stop_requested.store(true);
-                return;
+                return false;
             }
 
             res->set_inputs(&ubatch);
@@ -3547,12 +3601,42 @@ void llama_context::opt_epoch_iter(
                 return;
             }
             if (callback) {
-                callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
+                callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_batch + 1, ndata_in_loop, t_loop_start);
             }
             ggml_free(ctx_compute_opt);
 
             pos_batch += ubatch.n_tokens;
         } while (mctx->next());
+        return true;
+    };
+
+    uint32_t pos = 0;
+    while (pos <= (uint32_t) last_label && !opt_stop_requested.load(std::memory_order_relaxed)) {
+        const bool labelled = labels_sparse[pos] >= 0;
+        uint32_t end = pos;
+        while (end <= (uint32_t) last_label && (labels_sparse[end] >= 0) == labelled) {
+            ++end;
+        }
+        if (!labelled) {
+            if (!decode_span(pos, end)) {
+                return;
+            }
+        } else {
+            for (uint32_t c0 = pos; c0 < end; c0 += n_batch) {
+                const uint32_t c1 = std::min(c0 + n_batch, end);
+                if (!train_chunk(c0, c1 - c0)) {
+                    return;
+                }
+                // the chunk joins the context under the adapter as it now is: the training
+                // graph never writes the cache, so its cells hold nothing until this decode
+                if (c1 <= (uint32_t) last_label) {
+                    if (!memory->seq_rm(0, c0, -1) || !decode_span(c0, c1)) {
+                        return;
+                    }
+                }
+            }
+        }
+        pos = end;
     }
 }
 

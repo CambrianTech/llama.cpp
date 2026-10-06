@@ -314,7 +314,7 @@ json server_trainer::start(const json & body_in) {
     // assert in the training path would take the server down (Cormac on #14).
     {
         auto num = [&](const char * key, double def) { return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : def; };
-        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers", "share_ppm", "max_slowdown_ppm"}) {
+        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers", "share_ppm", "max_slowdown_ppm", "chunk"}) {
             if (body.contains(key) && !body.at(key).is_number()) {
                 return json::object({{"ok", false}, {"error", std::string("\"") + key + "\" must be a number"}});
             }
@@ -336,6 +336,8 @@ json server_trainer::start(const json & body_in) {
         else if (epochs < 1 || epochs > 100 || epochs != (int64_t) epochs)   why = "epochs must be an integer in [1, 100]";
         else if (!(lr > 0 && lr <= 1))                               why = "lr must be in (0, 1]";
         else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
+        else if (body.contains("chunk") && !(num("chunk", 0) >= 256 && num("chunk", 0) == (int64_t) num("chunk", 0) && (int64_t) num("chunk", 0) % 256 == 0))
+                                                                     why = "chunk must be a multiple of 256, at least 256: the most tokens one training step holds in one graph";
         else if (body.contains("memory_budget_mib") && !(num("memory_budget_mib", 0) >= 1))
                                                                      why = "memory_budget_mib must be >= 1";
         else if (body.contains("share_ppm") && !(num("share_ppm", 0) >= 1 && num("share_ppm", 0) <= 1000000 && num("share_ppm", 0) == (int64_t) num("share_ppm", 0)))
@@ -698,6 +700,19 @@ json server_trainer::status() const {
     return s;
 }
 
+// The training chunk: the largest multiple of 256 that divides the window and is at most the
+// asked chunk (at least 256; the window is a multiple of 256, so 256 always divides it). The
+// context must be a whole number of batches (llama_context::opt_init).
+static uint32_t train_chunk_for(uint32_t window, uint32_t asked) {
+    const uint32_t blocks = window / 256;
+    for (uint32_t g = std::min(blocks, std::max(asked / 256, 1u)); g >= 1; --g) {
+        if (blocks % g == 0) {
+            return g * 256;
+        }
+    }
+    return 256;
+}
+
 void server_trainer::run(json req, examples_data ex) {
     auto fail = [&](const std::string & why) {
         LOG_ERR("%s: training run failed: %s\n", __func__, why.c_str());
@@ -732,9 +747,14 @@ void server_trainer::run(json req, examples_data ex) {
     // (the training graph attends to this ubatch's K/V directly); flash attention has no
     // backward; the KV cache types are F32 because OUT_PROD has no F16 path.
     llama_context_params cparams = common_context_params_to_llama(params_base);
+    // The context holds the whole window; one training chunk is one batch is one ubatch, the
+    // largest multiple of 256 that divides the window and is at most the caller's "chunk" (the
+    // memory gate's S). Context she did not write is decoded; her replies train chunk by chunk,
+    // each attending to everything before it from the cache (llama_context::opt_epoch_iter).
+    const uint32_t chunk = train_chunk_for(window, (uint32_t) req.value("chunk", (int64_t) window));
     cparams.n_ctx           = window;
-    cparams.n_batch         = window;
-    cparams.n_ubatch        = window;
+    cparams.n_batch         = chunk;
+    cparams.n_ubatch        = chunk;
     cparams.n_seq_max       = 1;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.type_k          = GGML_TYPE_F32;
@@ -876,6 +896,7 @@ void server_trainer::run(json req, examples_data ex) {
         std::lock_guard<std::mutex> lock(mu);
         state["state"]        = "running";
         state["window"]       = window;
+        state["chunk"]        = chunk;
         state["tokens"]       = n_tokens;
         state["train_tokens"] = train_tokens;
         if (by_example) {
