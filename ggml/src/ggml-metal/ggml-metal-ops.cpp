@@ -2470,7 +2470,7 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
 
 // The F32/quantized simdgroup matmul encode, over an explicit op (its src[0], src[1] and
 // itself may be synthetic views: OUT_PROD composes it over scratch buffers).
-static void ggml_metal_encode_mul_mm(ggml_metal_op_t ctx, const ggml_tensor * op) {
+static void ggml_metal_encode_mul_mm(ggml_metal_op_t ctx, const ggml_tensor * op, bool fp32_staging = false) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -2484,7 +2484,8 @@ static void ggml_metal_encode_mul_mm(ggml_metal_op_t ctx, const ggml_tensor * op
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
+        auto pipeline = fp32_staging ? ggml_metal_library_get_pipeline_mul_mm_fp32(lib, op)
+                                     : ggml_metal_library_get_pipeline_mul_mm(lib, op);
 
         ggml_metal_kargs_mul_mm args = {
             /*.ne00 =*/ ne00,
@@ -4185,7 +4186,11 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
         p.op = GGML_OP_MUL_MAT;
         p.src[0] = &x;
         p.src[1] = &y;
-        ggml_metal_encode_mul_mm(ctx, &p);
+        // FLOAT staging when the simdgroup kernel runs: X and Y carry gradients, which pass
+        // half's range (65504) where activations do not; half staging turned them into Inf
+        // and cost every product ~1e-3 relative precision (2026-10-06, Qwen3.5 0.8B backward)
+        const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(ctx->lib))->has_tensor;
+        ggml_metal_encode_mul_mm(ctx, &p, !has_tensor);
         ggml_metal_op_concurrency_reset(ctx);
 
         if (!first) {

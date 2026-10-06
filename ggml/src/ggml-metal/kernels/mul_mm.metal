@@ -157,8 +157,11 @@ kernel void kernel_mul_mm(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
+    // sa holds NR0 x NK = 64 x 32 staged values of S0; sb follows it. Sized by S0 so a
+    // float-staged instantiation (training: gradients exceed half's range) lays out right;
+    // for every half instantiation this is the 4096 it always was.
     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 64*32*sizeof(S0));
 
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
@@ -770,6 +773,16 @@ template [[host_name("kernel_mul_mm_iq4_nl_f32")]]  kernel mul_mm_t kernel_mul_m
 template [[host_name("kernel_mul_mm_iq4_xs_f32")]]  kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_iq4_xs,  QK_NL, dequantize_iq4_xs,  float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_tq2_0_f32")]]   kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_tq2_0,   QK_NL, dequantize_tq2_0,   float,  float4x4,  float, float2x4>;
 
+// FLOAT staging, for training: a gradient passes half's range (65504) where an activation
+// does not (Qwen3.5 0.8B LoRA backward, 2026-10-06: |grad| 131273, 95 values over, the
+// staged Inf turned 32k outputs of one OUT_PROD non-finite), and half staging also cost every
+// OUT_PROD ~1e-3 relative precision. Threadgroup memory: 64*32*4 + 32*32*4 = 12288 bytes.
+// The simdgroup kernel only (the tensor-API kernel has its own staging); the host asks for
+// this variant only when the tensor API is off.
+#ifndef GGML_METAL_HAS_TENSOR
+typedef decltype(kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_fp32_t;
+template [[host_name("kernel_mul_mm_f32_f32_fp32")]] kernel mul_mm_fp32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>;
+#endif
 template [[host_name("kernel_mul_mm_f32_f16")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_f16_f16")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   half, half2x4>;
 template [[host_name("kernel_mul_mm_q1_0_f16")]]    kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   block_q1_0,    8,     dequantize_q1_0,    float,  float4x4,  half, half2x4>;
