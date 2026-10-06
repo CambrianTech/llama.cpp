@@ -2020,6 +2020,19 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // every finished turn reaches the trainer: her per-turn baseline, or a slowdown sample
+        // t_prompt_last / t_gen_last are ggml_time_us TIMESTAMPS (server-common.h): generation
+        // began at the prompt's last batch and ended at the last token
+        if (trainer && slot.stats.t_gen_last > 0) {
+            // the earliest start of a turn still in flight: the trainer drops windows before it
+            int64_t oldest_open_us = slot.stats.t_gen_last;
+            for (const auto & other : slots) {
+                if (&other != &slot && other.is_processing() && other.stats.t_start > 0) {
+                    oldest_open_us = std::min(oldest_open_us, other.stats.t_start);
+                }
+            }
+            trainer->on_turn(slot.stats.t_prompt_last, slot.stats.t_gen_last, (int64_t) slot.stats.n_gen_steps(), oldest_open_us);
+        }
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;

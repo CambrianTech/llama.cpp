@@ -1,4 +1,5 @@
 #include "server-train.h"
+#include "server-train-spans.h"
 
 #include "common.h"
 #include "log.h"
@@ -465,6 +466,10 @@ json server_trainer::start(const json & body_in) {
     share_ppm.store(body.value("share_ppm", (int64_t) 250000));
     max_slowdown_ppm.store(body.value("max_slowdown_ppm", (int64_t) 0));
     busy_window_ms = busy_window_tokens = busy_yield_ms = busy_yield_tokens = 0;
+    window_spans.clear();
+    turn_slowdown_pct.fill(0);
+    turns_overlapped = 0;
+    turn_slowdown_ppm_max = 0;
     rate_no_window = rate_estimate{};
     rate_in_window = rate_estimate{};
     last_no_window_sample = std::chrono::steady_clock::time_point{};
@@ -491,6 +496,32 @@ int64_t server_trainer::yield_for_slowdown(int64_t d_ms, int64_t max_slowdown_pp
     }
     const double y = (double) d_ms * (r0 * (1 - t) - std::max(r_w, 0.0)) / (r0 * t);
     return y > 0 ? (int64_t) std::ceil(y) : 0;
+}
+
+void server_trainer::on_turn(int64_t gen_start_us, int64_t gen_end_us, int64_t steps, int64_t oldest_open_us) {
+    std::lock_guard<std::mutex> lock(mu);
+    // measured, then pruned, on every finished turn (a short one too: it still ends windows'
+    // relevance); see server-train-spans.h
+    const int64_t overlap_us = server_train_turn_overlap_then_prune(window_spans, gen_start_us, gen_end_us, oldest_open_us);
+    if (steps < TURN_MIN_STEPS || gen_end_us <= gen_start_us) {
+        return;
+    }
+    const double ms = (double) (gen_end_us - gen_start_us) / 1000.0;
+    if (overlap_us == 0) {
+        turn_rate_clean.add(ms, (double) steps);
+        turns_clean += 1;
+        return;
+    }
+    const double clean = turn_rate_clean.per_ms();
+    if (clean > 0) { // no clean turn yet: nothing to measure her against, never a guessed sample
+        // the WHOLE turn's rate: a turn a window overlapped for 20% of its span reads diluted,
+        // which is what she felt over that turn, not the in-window slowdown
+        const double  slowdown = std::clamp(1.0 - ((double) steps / ms) / clean, 0.0, 1.0);
+        const int64_t ppm      = (int64_t) std::llround(slowdown * 1e6);
+        turn_slowdown_pct[(size_t) std::llround(slowdown * 100)] += 1;
+        turns_overlapped += 1;
+        turn_slowdown_ppm_max = std::max(turn_slowdown_ppm_max, ppm);
+    }
 }
 
 bool server_trainer::serving_busy() const {
@@ -520,6 +551,9 @@ bool server_trainer::before_window(bool, void * user_data) {
     if (last_ms > 0) { // 0 = no window yet (the first call), never a sample
         self.window_ms_samples.push_back(last_ms);
         self.window_ms_max = std::max(self.window_ms_max, last_ms);
+        if (!self.window_spans.empty() && self.window_spans.back().second == 0) {
+            self.window_spans.back().second = ggml_time_us();
+        }
         if (self.window_busy_start && working_t0) { // her rate WITH a window running
             self.busy_window_ms += last_ms;
             self.busy_window_tokens += tokens_t0 - self.window_tokens_start;
@@ -597,6 +631,7 @@ bool server_trainer::before_window(bool, void * user_data) {
             self.windows_while_busy += 1;
         }
         self.window_started = std::chrono::steady_clock::now();
+        self.window_spans.emplace_back(ggml_time_us(), 0);
         self.window_tokens_start = tokens_t1;
         self.window_busy_start = self.serving.busy_slots && self.serving.busy_slots() > 0;
     }
@@ -679,6 +714,32 @@ json server_trainer::status() const {
     if (rate_in_window.ms > 0) {
         s["decode_tps_in_window_recent"] = rate_in_window.per_ms() * 1000.0;
     }
+    // the per-turn receipt: each turn that overlapped a window, against her clean turns. A
+    // sample is the whole turn's slowdown, so a turn a window only partly overlapped reads
+    // diluted: a p95 here is what her turns felt, never the slowdown inside a window. p50/p95
+    // to the 1% bucket (a fixed histogram), max exact.
+    s["turns_clean"] = turns_clean;
+    s["turns_overlapped"] = turns_overlapped;
+    if (turn_rate_clean.ms > 0) {
+        s["turn_tps_clean"] = turn_rate_clean.per_ms() * 1000.0;
+    }
+    if (turns_overlapped > 0) {
+        const auto pct = [&](double p) {
+            const int64_t rank = std::min(turns_overlapped - 1, (int64_t) (p * (double) turns_overlapped));
+            int64_t seen = 0;
+            for (size_t b = 0; b < turn_slowdown_pct.size(); ++b) {
+                seen += turn_slowdown_pct[b];
+                if (seen > rank) {
+                    // a bucket rounds to the nearest 1%, which can sit above the exact max
+                    return std::min((int64_t) b * 10000, turn_slowdown_ppm_max);
+                }
+            }
+            return (int64_t) 1000000;
+        };
+        s["turn_slowdown_ppm_p50"] = pct(0.50);
+        s["turn_slowdown_ppm_p95"] = pct(0.95);
+        s["turn_slowdown_ppm_max"] = turn_slowdown_ppm_max;
+    }
     s["busy_window_ms"] = busy_window_ms;
     s["busy_yield_ms"] = busy_yield_ms;
     s["windows"] = windows.load();
@@ -707,6 +768,7 @@ void server_trainer::run(json req, examples_data ex) {
         pause_requested = false;
         paused = false;
         waiting_for_serving = false;
+        close_window_span();
         running.store(false);
     };
 
@@ -956,5 +1018,14 @@ void server_trainer::run(json req, examples_data ex) {
         state["state"] = "done";
         state["adapter"] = out;
     }
+    close_window_span();
     running.store(false);
+}
+
+void server_trainer::close_window_span() {
+    // a run that ends (done, failed, cancelled) ends its last window: an open span would read
+    // every later turn as overlapped by training that no longer runs
+    if (!window_spans.empty() && window_spans.back().second == 0) {
+        window_spans.back().second = ggml_time_us();
+    }
 }
