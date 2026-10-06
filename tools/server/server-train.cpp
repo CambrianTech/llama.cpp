@@ -654,12 +654,15 @@ void server_trainer::run(json req, examples_data ex) {
     // cache stays one stream of the window, not one per sequence.
     cparams.n_seq_max       = 2;
     cparams.kv_unified      = true;
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // Flash attention ON for the context: the walk's context decodes use it, and the cache then
+    // stores V un-transposed, which a quantized V cache requires. The training graphs build
+    // explicit attention regardless (build_attn_mha under cparams.training).
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     // F16: the cache holds only CONSTANTS (the context before a chunk, read by build_attn and
     // cast to F32 where it joins the chunk). The chunk's own K/V, the ones with a gradient and
     // the only ones OUT_PROD sees, are F32 in the graph and never cached during training.
-    cparams.type_k          = GGML_TYPE_F16;
-    cparams.type_v          = GGML_TYPE_F16;
+    cparams.type_k          = GGML_TYPE_Q8_0;
+    cparams.type_v          = GGML_TYPE_Q8_0;
     cparams.embeddings      = false;
     // training reads logits for every token of the window; the serving params cap outputs per
     // ubatch to what sampling needs (a server-computed limit), which a training batch overruns

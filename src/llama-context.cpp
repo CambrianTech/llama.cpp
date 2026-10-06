@@ -3345,7 +3345,9 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     // walks the window decoding context and training each labelled chunk. One chunk is one
     // batch is one ubatch: a chunk's backward needs all of its own K/V in one graph.
     GGML_ASSERT(n_ubatch == n_batch && "training needs one ubatch per batch: set -ub = -b");
-    GGML_ASSERT(!cparams.flash_attn && "training needs flash attention off: FLASH_ATTN_EXT has no backward");
+    // FLASH_ATTN_EXT has no backward: training graphs build explicit attention whatever the
+    // context's flag (build_attn_mha checks cparams.training); flash attention, when the context
+    // has it, serves the walk's context decodes and lets the cache hold V un-transposed.
     cparams.training = true;
     // The graph result and the scheduler were sized at context creation: before training
     // (no backward pass) and before any adapter attached since (its nodes uncounted).
