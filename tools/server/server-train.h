@@ -46,6 +46,7 @@
 #include "ggml-opt.h"
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -62,14 +63,29 @@ std::string confine_out(const std::string & dir, const std::string & name);
 
 class server_trainer {
 public:
-    // busy_slots: how many serving slots are working right now (read between training batches;
-    // the trainer yields while it is non-zero, so a turn never waits behind more than one batch)
+    // serving: read between training windows; the trainer yields while serving is busy, so a
+    // turn never waits behind more than one window (the pacing below says for how long)
     // render_chat(messages, add_generation_prompt): messages (OpenAI shape) through the model's
     // chat template; throws on a template error. Empty = "examples" are refused.
     // (messages, tools, add_generation_prompt) -> the prompt text serving would frame
     using render_fn = std::function<std::string(const common_json &, const common_json &, bool)>;
-    server_trainer(llama_model * model, const common_params & params_base, std::function<int()> busy_slots,
+    // What the trainer reads of serving, between windows (each an atomic load in the server):
+    struct serving_view {
+        std::function<int()>     busy_slots;       // slots working right now
+        std::function<int64_t()> idle_ms;          // how long no slot has been working (0 while one is)
+        std::function<int64_t()> tokens_generated; // every token a slot has accepted since start
+    };
+    server_trainer(llama_model * model, const common_params & params_base, serving_view serving,
                    render_fn render_chat);
+
+    // THE SLOWDOWN BOUND, as a pure function. After a window of d_ms, the yield to busy slots
+    // that keeps her decode rate over the cycle (window + yield) at or above (1 - T) of her rate
+    // with no training running:  (r_w * d + r0 * y) / (d + y) >= r0 * (1 - T)
+    //                       =>   y >= d * (r0 * (1 - T) - r_w) / (r0 * T)
+    // r0: her tokens/ms while slots were busy and no window ran; r_w: her tokens/ms while a
+    // window ran. 0 when the window already costs her less than T. Unmeasured (r0 <= 0) takes
+    // the worst case r_w = 0, y = d * (1 - T) / T, so the bound holds before it has a sample.
+    static int64_t yield_for_slowdown(int64_t d_ms, int64_t max_slowdown_ppm, double r0, double r_w);
 
     // "examples", tokenized: one sequence per example with its loss mask (1 = the token is
     // predicted with loss: the assistant's content and end-of-turn)
@@ -100,8 +116,10 @@ private:
 
     llama_model * model;
     common_params params_base;
-    std::function<int()> busy_slots;
+    serving_view serving;
     render_fn render_chat;
+    // serving counts as busy while a slot works and until it has been idle IDLE_RELEASE_MS
+    bool serving_busy() const;
     std::atomic<bool>    yield_to_turns{true};
     std::atomic<int64_t> yielded_ms{0};
     // THE SHARE. Yielding while any slot is busy is starvation on a lane whose slots never go
@@ -111,6 +129,47 @@ private:
     // or not serving is busy; idle serving releases it at once. share_ppm = 1_000_000 never
     // yields (the old "yield": false); 0 is refused at parse.
     std::atomic<int64_t> share_ppm{250000};
+    // The bound the caller actually means (Joel: "negligible impact on inference latency ... a
+    // slowdown if clever can be unnoticed"): her decode rate while training runs stays within
+    // max_slowdown_ppm of her rate without it. 0 = off, and the share above paces the windows.
+    // When on, the yield after each window comes from yield_for_slowdown on her MEASURED rates.
+    std::atomic<int64_t> max_slowdown_ppm{0};
+    // How long the slots must stay idle before an owed yield is released: longer than the gap
+    // between one request's end and the next one's arrival in an agent's loop, shorter than
+    // any pause a person would call idle.
+    static constexpr int64_t IDLE_RELEASE_MS = 250;
+    // Her rates as the controller sees them: recent evidence, each sample discounted by the
+    // evidence that came after it (time constant RATE_EVIDENCE_MS of measured stretch), so a
+    // change in her load moves the bound within a minute instead of being outvoted by the run.
+    struct rate_estimate {
+        double ms = 0, tokens = 0;
+        void add(double d_ms, double d_tokens) {
+            const double keep = std::exp(-d_ms / (double) RATE_EVIDENCE_MS);
+            ms = ms * keep + d_ms;
+            tokens = tokens * keep + d_tokens;
+        }
+        double per_ms() const { return ms > 0 ? tokens / ms : 0.0; }
+    };
+    static constexpr int64_t RATE_EVIDENCE_MS = 60000;
+    // A bound that stops yielding stops measuring her rate without a window, and a stale rate
+    // would let training run on while her load changed. So when that rate has gone unsampled
+    // for PROBE_EVERY_MS, at least PROBE_MS is owed: about 1.6% of the trainer's time, the
+    // price of the bound staying true.
+    static constexpr int64_t PROBE_EVERY_MS = 30000;
+    static constexpr int64_t PROBE_MS = 500;
+    rate_estimate rate_no_window;   // guarded by mu
+    rate_estimate rate_in_window;   // guarded by mu
+    std::chrono::steady_clock::time_point last_no_window_sample{};
+    // Her decoded tokens and the time they took, summed over the run, only across segments
+    // that were busy end to end (a segment with an idle slot measures the load, not her rate).
+    // Guarded by mu. Ratios of sums, never an average of per-segment rates: a 30 ms yield with
+    // one token is one token of evidence, not a rate of 33 tok/s.
+    int64_t busy_window_ms{0};
+    int64_t busy_window_tokens{0};
+    int64_t busy_yield_ms{0};
+    int64_t busy_yield_tokens{0};
+    int64_t window_tokens_start{0};
+    bool    window_busy_start{false};
     std::atomic<int64_t> window_ms_last{0};
     std::atomic<int64_t> windows{0};
     std::atomic<int64_t> windows_while_busy{0};

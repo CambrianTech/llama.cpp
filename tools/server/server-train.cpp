@@ -6,6 +6,7 @@
 #include "ggml-opt.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <chrono>
 #include <sstream>
@@ -29,9 +30,9 @@ static std::vector<std::string> split_targets(const std::string & list) {
     return out;
 }
 
-server_trainer::server_trainer(llama_model * model, const common_params & params_base, std::function<int()> busy_slots,
+server_trainer::server_trainer(llama_model * model, const common_params & params_base, serving_view serving,
                                render_fn render_chat)
-    : model(model), params_base(params_base), busy_slots(std::move(busy_slots)), render_chat(std::move(render_chat)) {
+    : model(model), params_base(params_base), serving(std::move(serving)), render_chat(std::move(render_chat)) {
     state = json::object({{"state", "idle"}});
 }
 
@@ -313,7 +314,7 @@ json server_trainer::start(const json & body_in) {
     // assert in the training path would take the server down (Cormac on #14).
     {
         auto num = [&](const char * key, double def) { return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : def; };
-        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers", "share_ppm"}) {
+        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers", "share_ppm", "max_slowdown_ppm"}) {
             if (body.contains(key) && !body.at(key).is_number()) {
                 return json::object({{"ok", false}, {"error", std::string("\"") + key + "\" must be a number"}});
             }
@@ -339,6 +340,11 @@ json server_trainer::start(const json & body_in) {
                                                                      why = "memory_budget_mib must be >= 1";
         else if (body.contains("share_ppm") && !(num("share_ppm", 0) >= 1 && num("share_ppm", 0) <= 1000000 && num("share_ppm", 0) == (int64_t) num("share_ppm", 0)))
                                                                      why = "share_ppm must be an integer in [1, 1000000]: the trainer's share of the lane's time, in parts per million";
+        else if (body.contains("max_slowdown_ppm") && !(num("max_slowdown_ppm", 0) >= 1 && num("max_slowdown_ppm", 0) <= 999999 &&
+                                                        num("max_slowdown_ppm", 0) == (int64_t) num("max_slowdown_ppm", 0)))
+                                                                     why = "max_slowdown_ppm must be an integer in [1, 999999]: how much slower her decoding may run while training runs, in parts per million";
+        else if (body.contains("max_slowdown_ppm") && body.contains("share_ppm"))
+                                                                     why = "max_slowdown_ppm and share_ppm are two pacings of the same windows: send one";
         else if (body.contains("top_layers") && !(num("top_layers", 0) >= 1 && num("top_layers", 0) <= llama_model_n_layer(model) &&
                                                   num("top_layers", 0) == (int64_t) num("top_layers", 0)))
                                                                      why = "top_layers must be an integer in [1, " + std::to_string(llama_model_n_layer(model)) + "]";
@@ -457,6 +463,13 @@ json server_trainer::start(const json & body_in) {
     cancel_requested.store(false);
     yield_to_turns.store(body.value("yield", true));
     share_ppm.store(body.value("share_ppm", (int64_t) 250000));
+    max_slowdown_ppm.store(body.value("max_slowdown_ppm", (int64_t) 0));
+    busy_window_ms = busy_window_tokens = busy_yield_ms = busy_yield_tokens = 0;
+    rate_no_window = rate_estimate{};
+    rate_in_window = rate_estimate{};
+    last_no_window_sample = std::chrono::steady_clock::time_point{};
+    window_tokens_start = 0;
+    window_busy_start = false;
     window_ms_last.store(0);
     windows.store(0);
     windows_while_busy.store(0);
@@ -468,50 +481,124 @@ json server_trainer::start(const json & body_in) {
     return json::object({{"ok", true}, {"status", status()}});
 }
 
+int64_t server_trainer::yield_for_slowdown(int64_t d_ms, int64_t max_slowdown_ppm, double r0, double r_w) {
+    if (d_ms <= 0) {
+        return 0;
+    }
+    const double t = (double) std::clamp<int64_t>(max_slowdown_ppm, 1, 999999) / 1e6;
+    if (!(r0 > 0)) {
+        return (int64_t) std::ceil((double) d_ms * (1 - t) / t);
+    }
+    const double y = (double) d_ms * (r0 * (1 - t) - std::max(r_w, 0.0)) / (r0 * t);
+    return y > 0 ? (int64_t) std::ceil(y) : 0;
+}
+
+bool server_trainer::serving_busy() const {
+    if (!yield_to_turns.load() || !serving.busy_slots) {
+        return false;
+    }
+    // A turn ending is not serving going idle: an agent's next request lands milliseconds later
+    // (a tool result, the next act). A window taken in that gap holds her next turn for the
+    // whole window (measured on the 0.8B: 8.6 s windows taken between two requests).
+    return serving.busy_slots() > 0 || (serving.idle_ms && serving.idle_ms() < IDLE_RELEASE_MS);
+}
+
 bool server_trainer::before_window(bool, void * user_data) {
     auto & self = *static_cast<server_trainer *>(user_data);
     const auto t0 = std::chrono::steady_clock::now();
-    // The previous window's cost: the time since this callback last returned. The share is
+    const int64_t tokens_t0 = self.serving.tokens_generated ? self.serving.tokens_generated() : 0;
+    // The previous window's cost: the time since this callback last returned. The yield is
     // owed against it (nothing is owed before the first window: it must run to be measured).
     const int64_t last_ms = self.window_started == std::chrono::steady_clock::time_point{}
         ? 0
         : std::chrono::duration_cast<std::chrono::milliseconds>(t0 - self.window_started).count();
     self.window_ms_last.store(last_ms);
-    const int64_t share = std::clamp<int64_t>(self.share_ppm.load(), 1, 1000000);
-    // d * (1 - s) / s, in ms: the yield owed to serving for the window just taken.
-    const int64_t owed_ms = last_ms * (1000000 - share) / share;
     bool took_while_busy = false;
     std::unique_lock<std::mutex> lock(self.mu);
+    // a slot WORKING (not the idle grace): her rate is only measured while she is decoding
+    const bool working_t0 = self.serving.busy_slots && self.serving.busy_slots() > 0;
     if (last_ms > 0) { // 0 = no window yet (the first call), never a sample
         self.window_ms_samples.push_back(last_ms);
         self.window_ms_max = std::max(self.window_ms_max, last_ms);
+        if (self.window_busy_start && working_t0) { // her rate WITH a window running
+            self.busy_window_ms += last_ms;
+            self.busy_window_tokens += tokens_t0 - self.window_tokens_start;
+            self.rate_in_window.add((double) last_ms, (double) (tokens_t0 - self.window_tokens_start));
+        }
     }
+    const int64_t slowdown = self.max_slowdown_ppm.load();
+    // The yield owed for the window just taken, from her rates as measured SO FAR: recomputed
+    // on every look, so the first yield (no rate yet: the worst case) shortens as soon as her
+    // rate without a window has been seen.
+    // decided once, at the window boundary: the samples this yield takes must not cancel it
+    const bool probe = slowdown > 0 && last_ms > 0 &&
+                       (self.last_no_window_sample == std::chrono::steady_clock::time_point{} ||
+                        std::chrono::duration_cast<std::chrono::milliseconds>(t0 - self.last_no_window_sample).count() > PROBE_EVERY_MS);
+    const auto owed = [&]() -> int64_t {
+        if (slowdown > 0) {
+            const int64_t y = yield_for_slowdown(last_ms, slowdown, self.rate_no_window.per_ms(), self.rate_in_window.per_ms());
+            return probe ? std::max(y, PROBE_MS) : y;
+        }
+        const int64_t share = std::clamp<int64_t>(self.share_ppm.load(), 1, 1000000);
+        // d * (1 - s) / s, in ms: the yield owed to serving for the window just taken.
+        return last_ms * (1000000 - share) / share;
+    };
+    // Her rate with no window running, sampled between consecutive looks that both saw a slot
+    // working: any busy stretch of a yield counts, not only a yield busy end to end (bursty
+    // turns would otherwise never yield a sample).
+    auto    prev_t       = t0;
+    int64_t prev_tokens  = tokens_t0;
+    bool    prev_working = working_t0;
+    int64_t sampled_ms   = 0; // this yield's measured stretch of her rate with no window
     while (!self.cancel_requested.load()) {
         self.paused = self.pause_requested;
-        const bool busy = self.yield_to_turns.load() && self.busy_slots && self.busy_slots() > 0;
-        const int64_t yielded_so_far = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-        // Busy serving holds the trainer only until the share is paid; then the window is taken.
-        self.waiting_for_serving = busy && yielded_so_far < owed_ms;
+        const auto    now     = std::chrono::steady_clock::now();
+        const int64_t tokens  = self.serving.tokens_generated ? self.serving.tokens_generated() : 0;
+        const bool    working = self.serving.busy_slots && self.serving.busy_slots() > 0;
+        if (prev_working && working && !self.paused) {
+            const int64_t d_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - prev_t).count();
+            self.busy_yield_ms += d_ms;
+            self.busy_yield_tokens += tokens - prev_tokens;
+            self.rate_no_window.add((double) d_ms, (double) (tokens - prev_tokens));
+            sampled_ms += d_ms;
+        }
+        prev_t = now;
+        prev_tokens = tokens;
+        prev_working = working;
+        const bool busy = self.serving_busy();
+        const int64_t yielded_so_far = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count();
+        // Busy serving holds the trainer only until the yield is paid; then the window is taken.
+        self.waiting_for_serving = busy && yielded_so_far < owed();
         if (!self.paused && !self.waiting_for_serving) {
             took_while_busy = busy;
             break;
         }
         if (self.paused) {
             self.control_changed.wait(lock, [&self] { return !self.pause_requested || self.cancel_requested.load(); });
+            prev_working = false; // a pause is not a measured stretch
         } else {
             // Serving publishes an atomic count; explicit pause/resume/cancel wake this wait.
             self.control_changed.wait_for(lock, std::chrono::milliseconds(10));
         }
     }
+    const auto t1 = std::chrono::steady_clock::now();
+    const int64_t yield_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    const int64_t tokens_t1 = self.serving.tokens_generated ? self.serving.tokens_generated() : 0;
+    // fresh evidence is a probe's worth of it, never the instant a boundary looked at the slots
+    if (sampled_ms >= PROBE_MS) {
+        self.last_no_window_sample = t1;
+    }
     self.paused = false;
     self.waiting_for_serving = false;
-    self.yielded_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    self.yielded_ms += yield_ms;
     if (!self.cancel_requested.load()) {
         self.windows += 1;
         if (took_while_busy) {
             self.windows_while_busy += 1;
         }
         self.window_started = std::chrono::steady_clock::now();
+        self.window_tokens_start = tokens_t1;
+        self.window_busy_start = self.serving.busy_slots && self.serving.busy_slots() > 0;
     }
     return !self.cancel_requested.load();
 }
@@ -574,6 +661,26 @@ json server_trainer::status() const {
     }
     s["yielded_ms"] = yielded_ms.load();
     s["share_ppm"] = share_ppm.load();
+    s["max_slowdown_ppm"] = max_slowdown_ppm.load();
+    // her measured decode rates (tokens/s, busy segments only) and the slowdown they realized
+    // over the run: the receipt for the bound, absent until both have a sample
+    if (busy_yield_ms > 0 && busy_window_ms > 0 && busy_yield_tokens > 0) {
+        const double r0  = (double) busy_yield_tokens  / (double) busy_yield_ms;
+        const double r_w = (double) busy_window_tokens / (double) busy_window_ms;
+        const double cycle = (double) (busy_window_tokens + busy_yield_tokens) / (double) (busy_window_ms + busy_yield_ms);
+        s["decode_tps_no_window"] = r0 * 1000.0;
+        s["decode_tps_in_window"] = r_w * 1000.0;
+        s["slowdown_ppm_realized"] = (int64_t) std::llround(std::max(0.0, 1.0 - cycle / r0) * 1e6);
+    }
+    // what the bound acts on right now (the recent evidence; see rate_estimate)
+    if (rate_no_window.ms > 0) {
+        s["decode_tps_no_window_recent"] = rate_no_window.per_ms() * 1000.0;
+    }
+    if (rate_in_window.ms > 0) {
+        s["decode_tps_in_window_recent"] = rate_in_window.per_ms() * 1000.0;
+    }
+    s["busy_window_ms"] = busy_window_ms;
+    s["busy_yield_ms"] = busy_yield_ms;
     s["windows"] = windows.load();
     s["windows_while_busy"] = windows_while_busy.load();
     s["window_ms_last"] = window_ms_last.load();
