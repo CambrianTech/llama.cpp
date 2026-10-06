@@ -2836,14 +2836,38 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v;
     if (cparams.training) {
         // A backward pass cannot go through the cache: the write is an in-place SET_ROWS
-        // and the read is a view of a leaf, so K/V would get no gradient. Training runs one
-        // ubatch per context (llama_context::opt_init asserts it), so this ubatch's K/V ARE
-        // the whole context: attend to them directly, as the no-cache path does.
+        // and the read is a view of a leaf. So this ubatch's K/V are attended to directly,
+        // and carry the gradient. The context before it (positions [0, n_past), decoded into
+        // the cache by llama_context::opt_epoch_iter before this chunk trains) is read from
+        // the cache as a CONSTANT, concatenated in front: her reply sees the whole window,
+        // and memory is chunk x window instead of window x window. The prefix's own K/V get
+        // no gradient (a stop-gradient at the chunk boundary).
+        const int64_t n_tokens = k_cur->ne[2];
+        const int64_t n_past   = ubatch.pos[0];
         k = k_cur;
         v = v_cur;
-        if (kq_mask->ne[0] > k_cur->ne[2]) {
-            kq_mask = ggml_view_4d(ctx0, kq_mask, k_cur->ne[2], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
-                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0);
+        if (n_past > 0) {
+            ggml_tensor * k_all  = mctx_cur->get_k(ctx0, il);
+            ggml_tensor * k_prev = ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_past, 1,
+                    k_all->nb[1], k_all->nb[2], k_all->nb[3], 0);
+            k = ggml_concat(ctx0, k_prev, k_cur, 2);
+
+            // a cache without flash attention stores V transposed: [n_kv, n_head_kv, n_embd_head_v]
+            ggml_tensor * v_all  = mctx_cur->get_v(ctx0, il);
+            ggml_tensor * v_prev = v_all->nb[1] > v_all->nb[2]
+                ? ggml_cont(ctx0, ggml_permute(ctx0,
+                        ggml_view_4d(ctx0, v_all, n_past, v_all->ne[1], v_all->ne[2], 1,
+                                v_all->nb[1], v_all->nb[2], v_all->nb[3], 0),
+                        2, 1, 0, 3))
+                : ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_past, 1,
+                        v_all->nb[1], v_all->nb[2], v_all->nb[3], 0);
+            v = ggml_concat(ctx0, v_prev, v_cur, 2);
+        }
+        // the cache's cells hold the prefix at [0, n_past) and this ubatch right after it
+        // (contiguous: soft_max_ext requires it, and a column slice of the padded mask is not)
+        if (kq_mask->ne[0] > n_past + n_tokens) {
+            kq_mask = ggml_cont(ctx0, ggml_view_4d(ctx0, kq_mask, n_past + n_tokens, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0));
         }
     } else {
         // store to KV cache
