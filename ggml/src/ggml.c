@@ -7348,7 +7348,7 @@ static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_
         }
     }
 
-    if (node->op == GGML_OP_NONE && !(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+    if (node->op == GGML_OP_NONE && !(node->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_GRAD))) {
         // reached a leaf node, not part of the gradient graph (e.g. a constant)
         GGML_ASSERT(cgraph->n_leafs < cgraph->size);
 
@@ -7446,7 +7446,7 @@ void ggml_build_backward_expand(
             continue;
         }
 
-        bool node_needs_grad = (node->flags & GGML_TENSOR_FLAG_PARAM) || (node->flags & GGML_TENSOR_FLAG_LOSS);
+        bool node_needs_grad = (node->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_LOSS | GGML_TENSOR_FLAG_GRAD)) != 0;
         bool ignore_src[GGML_MAX_SRC] = {false};
         switch (node->op) {
             // gradients in node->src[0] for one reason or another have no effect on output gradients
@@ -8075,6 +8075,11 @@ void ggml_set_output(struct ggml_tensor * tensor) {
 void ggml_set_param(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor->op == GGML_OP_NONE);
     tensor->flags |= GGML_TENSOR_FLAG_PARAM;
+}
+
+void ggml_set_grad(struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->op == GGML_OP_NONE);
+    tensor->flags |= GGML_TENSOR_FLAG_GRAD;
 }
 
 void ggml_set_loss(struct ggml_tensor * tensor) {
