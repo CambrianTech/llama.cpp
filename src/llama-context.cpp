@@ -7,6 +7,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-recurrent.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3591,6 +3594,22 @@ void llama_context::opt_epoch_iter(
         return true;
     };
 
+    // a recurrent part (pure recurrent or hybrid) is snapshotted around each training chunk;
+    // a hybrid's attention part removes the chunk's cells like a plain cache
+    llama_memory_recurrent * recr = nullptr;
+    llama_kv_cache         * attn = nullptr;
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        recr = hybrid->get_mem_recr();
+        attn = hybrid->get_mem_attn();
+    } else {
+        recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+    }
+    if (recr != nullptr && cparams.n_seq_max < 2) {
+        LLAMA_LOG_ERROR("%s: a recurrent model trains with a scratch sequence for its state snapshot: create the training context with n_seq_max >= 2\n", __func__);
+        opt_stop_requested.store(true);
+        return;
+    }
+
     uint32_t pos = 0;
     while (pos <= (uint32_t) last_label && !opt_stop_requested.load(std::memory_order_relaxed)) {
         const bool labelled = labels_sparse[pos] >= 0;
@@ -3605,18 +3624,30 @@ void llama_context::opt_epoch_iter(
         } else {
             for (uint32_t c0 = pos; c0 < end; c0 += n_batch) {
                 const uint32_t c1 = std::min(c0 + n_batch, end);
+                // The training forward advances a recurrent state in place, and a recurrent
+                // memory cannot remove a partial range: snapshot the state to the scratch
+                // sequence first (Fable), restore it after, then the decode below advances it
+                // from where the context left it. The state is per sequence and small.
+                const bool snapshot = recr != nullptr && c1 <= (uint32_t) last_label;
+                if (snapshot) {
+                    recr->seq_cp(0, 1, -1, -1);
+                }
                 if (!train_chunk(c0, c1 - c0)) {
                     return;
+                }
+                if (snapshot) {
+                    recr->seq_rm(0, -1, -1);
+                    recr->seq_cp(1, 0, -1, -1);
+                    recr->seq_rm(1, -1, -1);
                 }
                 // the chunk joins the context under the adapter as it now is: the training
                 // graph never writes the cache, so its cells hold nothing until this decode
                 if (c1 <= (uint32_t) last_label) {
-                    // A recurrent or hybrid memory cannot remove a partial range, so a reply
-                    // longer than one chunk cannot be re-decoded there: stop the run loudly,
-                    // never train the next chunk against cells that hold nothing.
-                    if (!memory->seq_rm(0, c0, -1)) {
-                        LLAMA_LOG_ERROR("%s: a reply longer than one chunk (%u tokens) needs its chunks re-decoded, and this memory cannot remove a partial range (a recurrent or hybrid model): raise \"chunk\" to cover the reply\n",
-                                __func__, n_batch);
+                    // the chunk's cells hold no K/V (the training graph never writes the
+                    // cache): drop them from the attention memory, then decode them for real
+                    const bool removed = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, c0, -1)) : memory->seq_rm(0, c0, -1);
+                    if (!removed) {
+                        LLAMA_LOG_ERROR("%s: could not remove the trained chunk [%u, %u) from the cache before decoding it\n", __func__, c0, c1);
                         opt_stop_requested.store(true);
                         return;
                     }
