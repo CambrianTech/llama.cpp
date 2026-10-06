@@ -4158,7 +4158,12 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
         }
 
         // X = S^T: a transposed view of S copied contiguous, [rows, ne00]
-        ggml_tensor st_view = ggml_metal_out_prod_view(op, GGML_TYPE_F32, rows, ne00,
+        // based on S, never on op: for an F32 src0, S IS src0's memory, which lives in another
+        // buffer (a LoRA weight's adapter buffer). Based on op, the view named op's buffer with
+        // src0's address, the lookup found no buffer ('buffer is nil'), the copy below did not
+        // run, and the product read stale scratch: every OUT_PROD with a LoRA weight as src0
+        // was wrong on Metal, differently per graph layout (Fable, 2026-10-06)
+        ggml_tensor st_view = ggml_metal_out_prod_view(&s_view, GGML_TYPE_F32, rows, ne00,
                 s_view.nb[1], s_view.nb[0], s_view.data);
         ggml_tensor x = ggml_metal_out_prod_view(op, GGML_TYPE_F32, rows, ne00,
                 sizeof(float), rows*sizeof(float), x_data);
