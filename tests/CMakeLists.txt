@@ -153,6 +153,9 @@ llama_build(test-recurrent-state-rollback.cpp)
 # GGML_TENSOR_FLAG_GRAD: a leaf whose gradient the backward computes, never optimized (the walk reads the cached prefix K/V gradient)
 llama_build_and_test(test-grad-leaf.cpp)
 
+# ggml-opt with per-step graphs (the llama training path) starts each optimizer period from zero accumulators
+llama_build_and_test(test-opt-dynamic-accum.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
