@@ -755,7 +755,11 @@ void server_trainer::run(json req, examples_data ex) {
     cparams.n_ctx           = window;
     cparams.n_batch         = chunk;
     cparams.n_ubatch        = chunk;
-    cparams.n_seq_max       = 1;
+    // two sequences: 0 is the walk; 1 is the scratch a recurrent state is snapshotted into
+    // around each training chunk (llama_context::opt_epoch_iter). Unified, so the attention
+    // cache stays one stream of the window, not one per sequence.
+    cparams.n_seq_max       = 2;
+    cparams.kv_unified      = true;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.type_k          = GGML_TYPE_F32;
     cparams.type_v          = GGML_TYPE_F32;
