@@ -2574,7 +2574,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    // A training graph takes the explicit path, which has a backward (FLASH_ATTN_EXT has none),
+    // even in a context created with flash attention: there the walk's context decodes use
+    // flash attention and the cache stores V un-transposed, so it can be quantized.
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !cparams.training;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
