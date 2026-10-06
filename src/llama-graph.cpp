@@ -2850,6 +2850,10 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_tensor * k_all  = mctx_cur->get_k(ctx0, il);
             ggml_tensor * k_prev = ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_past, 1,
                     k_all->nb[1], k_all->nb[2], k_all->nb[3], 0);
+            // the cache may hold the constants at a smaller type than the chunk's own K/V
+            if (k_prev->type != k_cur->type) {
+                k_prev = ggml_cast(ctx0, k_prev, k_cur->type);
+            }
             k = ggml_concat(ctx0, k_prev, k_cur, 2);
 
             // a cache without flash attention stores V transposed: [n_kv, n_head_kv, n_embd_head_v]
@@ -2861,6 +2865,9 @@ ggml_tensor * llm_graph_context::build_attn(
                         2, 1, 0, 3))
                 : ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_past, 1,
                         v_all->nb[1], v_all->nb[2], v_all->nb[3], 0);
+            if (v_prev->type != v_cur->type) {
+                v_prev = ggml_cast(ctx0, v_prev, v_cur->type);
+            }
             v = ggml_concat(ctx0, v_prev, v_cur, 2);
         }
         // the cache's cells hold the prefix at [0, n_past) and this ubatch right after it
