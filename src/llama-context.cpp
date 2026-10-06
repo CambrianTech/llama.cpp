@@ -3448,6 +3448,20 @@ void llama_context::opt_epoch_iter(
         return;
     }
 
+    // THE YIELD POINT IS THE CHUNK, not the window: a turn that arrives mid-walk waits for one
+    // chunk, never for the whole example (measured on the 5090: one callback per example made a
+    // turn wait for its entire walk, 1.2-1.8 s on a 1.5B at 15k and 13.5 s on Fable's run). The
+    // first unit is the window's own boundary, which opt_epoch has already offered.
+    bool first_unit = true;
+    auto yield_point = [&]() -> bool {
+        if (first_unit) {
+            first_unit = false;
+        } else if (opt_step_callback && !opt_step_callback(train, opt_step_callback_data)) {
+            opt_stop_requested.store(true);
+        }
+        return !opt_stop_requested.load(std::memory_order_relaxed);
+    };
+
     // a plain inference decode of [p0, p1) into the cache: the training graph's attention
     // never writes the cache, so context and finished replies reach it this way
     auto decode_span = [&](uint32_t p0, uint32_t p1) -> bool {
@@ -3456,6 +3470,11 @@ void llama_context::opt_epoch_iter(
         gf_res_prev->reset();
         bool ok = true;
         for (uint32_t c0 = p0; c0 < p1 && ok; c0 += n_batch) {
+            if (!yield_point()) {
+                cparams.training = training;
+                gf_res_prev->reset();
+                return false; // stopped or cancelled at a chunk boundary: not a decode failure
+            }
             const uint32_t c1 = std::min(c0 + n_batch, p1);
             batch.n_tokens = c1 - c0;
             for (uint32_t i = 0; i < c1 - c0; ++i) {
@@ -3645,6 +3664,9 @@ void llama_context::opt_epoch_iter(
                 // sequence first (Fable), restore it after, then the decode below advances it
                 // from where the context left it. The state is per sequence and small.
                 const bool snapshot = recr != nullptr && c1 <= (uint32_t) last_label;
+                if (!yield_point()) {
+                    return;
+                }
                 if (snapshot) {
                     recr->seq_cp(0, 1, -1, -1);
                 }
