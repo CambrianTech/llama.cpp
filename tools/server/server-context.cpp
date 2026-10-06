@@ -811,7 +811,17 @@ public:
             n += slot.is_processing() ? 1 : 0;
         }
         n_busy_slots.store(n);
+        if (n > 0) {
+            t_last_busy_us.store(ggml_time_us());
+        }
     }
+    std::atomic<int64_t> t_last_busy_us{0};
+    int64_t idle_ms() const {
+        return n_busy_slots.load() > 0 ? 0 : (ggml_time_us() - t_last_busy_us.load()) / 1000;
+    }
+    // every token a slot has accepted since the server started: the trainer's slowdown bound
+    // measures her decode rate with it (see server-train.h, yield_for_slowdown)
+    std::atomic<int64_t> n_tokens_generated{0};
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -3963,6 +3973,7 @@ private:
             const int64_t t_now = ggml_time_us();
 
             slot.stats.n_gen += 1;
+            n_tokens_generated.fetch_add(1, std::memory_order_relaxed);
 
             if (slot.stats.n_gen == 1) {
                 slot.stats.update_prompt_last();
@@ -4101,6 +4112,7 @@ private:
                 // TODO: set result.probs
 
                 slot.stats.n_gen += 1;
+                n_tokens_generated.fetch_add(1, std::memory_order_relaxed);
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
@@ -4249,7 +4261,10 @@ bool server_context::load_model(common_params & params) {
     if (ok && impl->model_tgt != nullptr) {
         server_context_impl * p = impl.get();
         impl->trainer = std::make_unique<server_trainer>(impl->model_tgt, impl->params_base,
-                                                         [p]() { return p->n_busy_slots.load(); },
+                                                         server_trainer::serving_view{
+                                                             [p]() { return p->n_busy_slots.load(); },
+                                                             [p]() { return p->idle_ms(); },
+                                                             [p]() { return p->n_tokens_generated.load(std::memory_order_relaxed); }},
                                                          // the SAME templates serving frames turns with
                                                          [p](const json & messages, const json & tools, bool add_generation_prompt) {
                                                              common_chat_templates_inputs in;
