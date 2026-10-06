@@ -10045,6 +10045,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, -1));
+    // rows wider than one threadgroup: dst = a must be copied whole before b is added (Metal's
+    // ACC copied only the first threadgroup's worth of each row and left the rest stale, which
+    // is how a view's gradient (Qwen3.5's Q/gate split, 4096 wide) read garbage in training)
+    test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {4096, 3, 1, 1}, {1024, 3, 1, 1}, -1));
+    test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {4096, 3, 2, 1}, {4096, 2, 2, 1}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, 1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, 2));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {64, 16, 2, 3}, 3));
