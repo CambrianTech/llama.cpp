@@ -3422,7 +3422,6 @@ void llama_context::opt_epoch_iter(
     const uint32_t n_ctx   = opt_n_ctx_train;
     const uint32_t n_batch = std::min(this->n_batch(), n_ctx);
 
-    fprintf(stderr, "WALK start: n_ctx %u n_batch %u\n", n_ctx, n_batch); fflush(stderr);
     memory->clear(true);
 
     // THE WALK (Fable's design, continuum 2026-10-06): one pass over the window in one
@@ -3447,7 +3446,6 @@ void llama_context::opt_epoch_iter(
     // a plain inference decode of [p0, p1) into the cache: the training graph's attention
     // never writes the cache, so context and finished replies reach it this way
     auto decode_span = [&](uint32_t p0, uint32_t p1) -> bool {
-        fprintf(stderr, "WALK decode context [%u, %u)\n", p0, p1); fflush(stderr);
         const bool training = cparams.training;
         cparams.training = false;
         gf_res_prev->reset();
@@ -3463,7 +3461,6 @@ void llama_context::opt_epoch_iter(
                 batch.logits  [i]    = i + 1 == c1 - c0;
             }
             const int rc = decode(batch);
-            fprintf(stderr, "WALK decode [%u, %u) -> %d\n", c0, c1, rc); fflush(stderr);
             ok = rc == 0;
         }
         cparams.training = training;
@@ -3555,8 +3552,6 @@ void llama_context::opt_epoch_iter(
                 };
                 ctx_compute_opt = ggml_init(params);
             }
-            fprintf(stderr, "WALK chunk at %u (%u tokens, n_past %d): forward graph %d nodes of %d\n",
-                    pos_ctx, ubatch.n_tokens, (int) ubatch.pos[0], ggml_graph_n_nodes(gf), (int) ggml_graph_size(gf)); fflush(stderr);
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             if (!ggml_opt_alloc(opt_ctx, train)) {
                 const char * why = ggml_opt_refusal(opt_ctx);
@@ -3630,7 +3625,17 @@ void llama_context::opt_epoch_iter(
                 // the chunk joins the context under the adapter as it now is: the training
                 // graph never writes the cache, so its cells hold nothing until this decode
                 if (c1 <= (uint32_t) last_label) {
-                    if (!memory->seq_rm(0, c0, -1) || !decode_span(c0, c1)) {
+                    // A recurrent or hybrid memory cannot remove a partial range, so a reply
+                    // longer than one chunk cannot be re-decoded there: stop the run loudly,
+                    // never train the next chunk against cells that hold nothing.
+                    if (!memory->seq_rm(0, c0, -1)) {
+                        LLAMA_LOG_ERROR("%s: a reply longer than one chunk (%u tokens) needs its chunks re-decoded, and this memory cannot remove a partial range (a recurrent or hybrid model): raise \"chunk\" to cover the reply\n",
+                                __func__, n_batch);
+                        opt_stop_requested.store(true);
+                        return;
+                    }
+                    if (!decode_span(c0, c1)) {
+                        opt_stop_requested.store(true);
                         return;
                     }
                 }
