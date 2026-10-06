@@ -5026,24 +5026,35 @@ struct test_out_prod : public test_case {
     const std::array<int64_t, 2> bs; // dims 3 and 4
     const std::array<int64_t, 2> nr; // repeat in dims 3 and 4
     const bool trans_b;
+    // a in a buffer of its own, as a LoRA weight sits in its adapter's buffer during training:
+    // every other case allocates a, b and out in ONE buffer, so a kernel that resolved a's
+    // address against out's buffer passed them all (Metal's F32 transposed path did, and read
+    // stale scratch in every LoRA backward on Apple silicon until it was based on a)
+    const bool a_own_buffer;
 
     std::string vars() override {
-        return VARS_TO_STR8(type_a, type_b, m, n, k, bs, nr, trans_b);
+        return VARS_TO_STR9(type_a, type_b, m, n, k, bs, nr, trans_b, a_own_buffer);
     }
 
     double max_nmse_err() override {
         return 5e-4;
     }
 
+    bool use_weight_context() override { return a_own_buffer; }
+
     test_out_prod(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
-            bool trans_b = false)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), trans_b(trans_b) {}
+            bool trans_b = false, bool a_own_buffer = false)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), trans_b(trans_b), a_own_buffer(a_own_buffer) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_4d(ctx, type_a, m, k, bs[0], bs[1]);
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * a = ggml_new_tensor_4d(a_own_buffer ? ctx_weights : ctx, type_a, m, k, bs[0], bs[1]);
         ggml_set_name(a, "a");
 
         ggml_tensor * b;
@@ -9688,6 +9699,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool trans_b : {false, true}) {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_K, GGML_TYPE_F32,
                                                   256, 8, 600000, {1, 1}, {1, 1}, trans_b));
+    }
+    // a in its own buffer (a LoRA weight in the adapter's buffer), F32 and quantized, both
+    // gradient layouts, at LoRA's shape (rank 8 against a 1024-wide activation)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (bool trans_b : {false, true}) {
+            test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32,
+                                                      type_a == GGML_TYPE_F32 ? 1024 : 256, 1024, 8, {1, 1}, {1, 1}, trans_b, true));
+        }
     }
     // the q8_0 three-block case in both gradient layouts: the training graph hands
     // out_prod a TRANSPOSED gradient (out_prod(W, ggml_transpose(grad)))
