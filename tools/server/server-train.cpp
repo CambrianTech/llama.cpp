@@ -497,16 +497,16 @@ int64_t server_trainer::yield_for_slowdown(int64_t d_ms, int64_t max_slowdown_pp
     return y > 0 ? (int64_t) std::ceil(y) : 0;
 }
 
-void server_trainer::on_turn(int64_t gen_start_us, int64_t gen_end_us, int64_t steps) {
+void server_trainer::on_turn(int64_t gen_start_us, int64_t gen_end_us, int64_t steps, int64_t oldest_open_us) {
+    std::lock_guard<std::mutex> lock(mu);
+    // pruned on every finished turn, measured or not: the turns still in flight are the only
+    // ones a span can still be asked about, and none of them began before oldest_open_us
+    window_spans.erase(std::remove_if(window_spans.begin(), window_spans.end(),
+                                      [oldest_open_us](const std::pair<int64_t, int64_t> & w) { return w.second != 0 && w.second < oldest_open_us; }),
+                       window_spans.end());
     if (steps < TURN_MIN_STEPS || gen_end_us <= gen_start_us) {
         return;
     }
-    std::lock_guard<std::mutex> lock(mu);
-    longest_turn_us = std::max(longest_turn_us, gen_end_us - gen_start_us);
-    const int64_t horizon = gen_end_us - longest_turn_us; // no unfinished turn began before this
-    window_spans.erase(std::remove_if(window_spans.begin(), window_spans.end(),
-                                      [horizon](const std::pair<int64_t, int64_t> & w) { return w.second != 0 && w.second < horizon; }),
-                       window_spans.end());
     int64_t overlap_us = 0;
     for (const auto & [start, end] : window_spans) {
         const int64_t e = end == 0 ? gen_end_us : end; // the window still running
@@ -736,7 +736,8 @@ json server_trainer::status() const {
             for (size_t b = 0; b < turn_slowdown_pct.size(); ++b) {
                 seen += turn_slowdown_pct[b];
                 if (seen > rank) {
-                    return (int64_t) b * 10000;
+                    // a bucket rounds to the nearest 1%, which can sit above the exact max
+                    return std::min((int64_t) b * 10000, turn_slowdown_ppm_max);
                 }
             }
             return (int64_t) 1000000;

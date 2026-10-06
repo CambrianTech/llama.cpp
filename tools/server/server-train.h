@@ -108,7 +108,9 @@ public:
     // gen_end_us (ggml_time_us) over `steps` decode steps. A turn that overlapped no training
     // window is her per-turn baseline; one that overlapped a window is a per-turn slowdown
     // sample against it (the bound is on the cycle's average, Joel's bar is per turn: Cormac).
-    void on_turn(int64_t gen_start_us, int64_t gen_end_us, int64_t steps);
+    // oldest_open_us: the earliest start of any turn still in flight (gen_end_us when none); no
+    // window that ended before it can overlap a turn still to finish.
+    void on_turn(int64_t gen_start_us, int64_t gen_end_us, int64_t steps, int64_t oldest_open_us);
     // Stops the running job at its next training window (no adapter is written); ok=false when
     // nothing is running.
     common_json cancel();
@@ -169,10 +171,9 @@ private:
     // one runs), every turn's overlap measured against them; a turn's rate is per slot, so its
     // baseline is other turns' rate, never the lane's total rate. Guarded by mu.
     static constexpr int64_t TURN_MIN_STEPS = 16; // fewer decode steps time the scheduler, not her
-    // Bounded: spans that ended before (now - the longest turn seen) can overlap no turn still
-    // to finish, and are dropped; samples live in a fixed histogram of 1% buckets.
+    // Bounded: spans that ended before the oldest turn still in flight began can overlap no
+    // turn still to finish, and are dropped; samples live in a fixed histogram of 1% buckets.
     std::vector<std::pair<int64_t, int64_t>> window_spans;
-    int64_t longest_turn_us{0};
     rate_estimate turn_rate_clean;               // turns that overlapped no window, across runs
     std::array<int64_t, 101> turn_slowdown_pct{}; // turns that overlapped a window, this run, by % slower
     int64_t turns_overlapped{0};
