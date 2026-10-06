@@ -9078,6 +9078,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_set(GGML_TYPE_F32, GGML_TYPE_F32, {6, 5, 4, 3}, dim, false));
         test_cases.emplace_back(new test_set(GGML_TYPE_F32, GGML_TYPE_F32, {6, 5, 4, 3}, dim, true));
     }
+    // a dst row wider than one threadgroup (4096): its copy must be whole before src is set
+    // into it (Metal's SET, like its ACC, copied only the first threadgroup's worth per row)
+    test_cases.emplace_back(new test_set(GGML_TYPE_F32, GGML_TYPE_F32, {2048, 2, 1, 1}, 1, false));
 
     for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
         test_cases.emplace_back(new test_set(GGML_TYPE_I32, GGML_TYPE_I32, {6, 5, 4, 3}, dim, false));
