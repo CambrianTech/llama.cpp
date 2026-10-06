@@ -3617,7 +3617,7 @@ void llama_context::opt_epoch_iter(
                 ggml_free(ctx_compute_opt);
                 opt_alloc_failed.store(true);
                 opt_stop_requested.store(true);
-                return;
+                return false;
             }
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_batch + 1, ndata_in_loop, t_loop_start);
