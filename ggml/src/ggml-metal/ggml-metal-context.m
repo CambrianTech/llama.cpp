@@ -79,6 +79,10 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
+
+    // lookups that found no buffer while THIS context encoded its current graph (counted by the
+    // encode blocks through ggml_metal_nil_sink_set; read once every block has finished)
+    uint64_t nil_lookups;
 };
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -443,7 +447,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     // a lookup that finds no buffer during this graph's encode means some op ran on the wrong
     // memory: the graph is reported failed, never as a success computed on stale bytes
-    const uint64_t nil_lookups_0 = ggml_metal_nil_lookups();
+    __atomic_store_n(&ctx->nil_lookups, 0, __ATOMIC_RELAXED);
 
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
@@ -615,9 +619,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
     }
 
-    if (ggml_metal_nil_lookups() != nil_lookups_0) {
+    if (__atomic_load_n(&ctx->nil_lookups, __ATOMIC_RELAXED) != 0) {
         GGML_LOG_ERROR("%s: %llu tensor lookup(s) found no buffer while encoding this graph: its result is not trusted\n",
-                __func__, (unsigned long long) (ggml_metal_nil_lookups() - nil_lookups_0));
+                __func__, (unsigned long long) __atomic_load_n(&ctx->nil_lookups, __ATOMIC_RELAXED));
         return GGML_STATUS_FAILED;
     }
 
@@ -714,6 +718,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->debug_graph,
             ctx->debug_fusion);
 
+        ggml_metal_nil_sink_set(&ctx->nil_lookups); // this block's lookups count against this graph
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
@@ -722,6 +727,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
             idx += res - 1;
         }
+        ggml_metal_nil_sink_set(NULL);
 
         ggml_metal_op_free(ctx_op);
 
