@@ -2378,6 +2378,17 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     }
 }
 
+// Lookups that found no buffer holding a tensor's bytes are counted into the graph compute
+// that is encoding on this thread (ggml_metal_nil_sink_set): such a lookup hands the kernel a
+// nil buffer, the op reads or writes nothing it was meant to, and the graph goes on with stale
+// memory (Metal OUT_PROD read stale scratch in every LoRA backward that way, one log line each).
+// Per compute, never process-wide: a training graph's lookup must not fail a decode beside it.
+static _Thread_local uint64_t * g_ggml_metal_nil_sink = NULL;
+
+void ggml_metal_nil_sink_set(uint64_t * sink) {
+    g_ggml_metal_nil_sink = sink;
+}
+
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
     struct ggml_metal_buffer_id res = { nil, 0 };
 
@@ -2399,6 +2410,9 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
     }
 
     GGML_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__, t->name);
+    if (g_ggml_metal_nil_sink != NULL) {
+        __atomic_fetch_add(g_ggml_metal_nil_sink, 1, __ATOMIC_RELAXED);
+    }
 
     return res;
 }

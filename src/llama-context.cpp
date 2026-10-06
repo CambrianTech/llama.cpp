@@ -3537,6 +3537,15 @@ void llama_context::opt_epoch_iter(
                 GGML_ASSERT(row == n_outputs);
             }
             ggml_opt_eval(opt_ctx, result);
+            if (const char * why = ggml_opt_refusal(opt_ctx); why[0] != '\0') {
+                // the backend failed the graph (ggml_opt_eval): the run fails, as a refused graph does
+                opt_failure = why;
+                LLAMA_LOG_ERROR("%s: %s: stopping the epoch\n", __func__, why);
+                ggml_free(ctx_compute_opt);
+                opt_alloc_failed.store(true);
+                opt_stop_requested.store(true);
+                return;
+            }
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }

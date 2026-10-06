@@ -1090,7 +1090,14 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
-    ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    const enum ggml_status status = ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    if (status != GGML_STATUS_SUCCESS) {
+        // the step's gradients (and the optimizer update inside this graph) were computed on
+        // memory the backend says it did not have: the run must stop, never continue on them
+        opt_ctx->refusal = std::string("the backend failed to compute the training graph (") + ggml_status_to_string(status)
+            + "): this step's gradients are not trusted, so the run stopped and nothing was written";
+        GGML_LOG_ERROR("%s: %s\n", __func__, opt_ctx->refusal.c_str());
+    }
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
     opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
 
