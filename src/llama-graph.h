@@ -938,6 +938,20 @@ public:
 
     std::vector<ggml_tensor *> t_layer_inp;
 
+    // THE EXACT WALK: per attention layer of a reverse-pass chunk graph, the tensors the walk
+    // fills before the step and reads after it (llama_context::opt_epoch_iter)
+    struct walk_layer {
+        int           il;
+        uint32_t      grad_from;   // the GRAD leaves cover cached positions [grad_from, n_past)
+        uint32_t      n_past;
+        ggml_tensor * dk = nullptr; // GRAD leaves, zero-filled: their gradient is dL/d(cached K/V)
+        ggml_tensor * dv = nullptr; //   [n_embd_head, n_head_kv, n_past - grad_from], V untransposed
+        ggml_tensor * gk = nullptr; // inputs: the gradient later chunks accumulated on this chunk's
+        ggml_tensor * gv = nullptr; //   own K/V, shaped like k_cur / v_cur (null without a surrogate)
+    };
+    std::vector<walk_layer> t_walk;
+    ggml_tensor * t_walk_surrogate = nullptr; // sum over layers of <k_cur, gk> + <v_cur, gv>
+
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;

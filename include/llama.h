@@ -1714,6 +1714,14 @@ extern "C" {
         // per-layer residual, "l_out") instead of keeping every layer's alive: about one extra
         // forward, and one layer's attention scores in memory instead of all of them.
         bool recompute;
+
+        // THE EXACT WALK (pure attention models): one optimizer step per training window, with
+        // each chunk's loss carried backward through the cached K/V of every chunk before it, so
+        // the step is the gradient of the whole window's loss, not of each chunk alone. false keeps
+        // the walk's stop-gradient at each chunk boundary. walk_horizon: how many cached positions
+        // before a chunk receive its gradient (0 = the whole window).
+        bool     walk_exact;
+        uint32_t walk_horizon;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);

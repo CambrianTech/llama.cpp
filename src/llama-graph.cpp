@@ -1340,6 +1340,9 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_walk.clear();
+    t_walk_surrogate = nullptr;
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -2849,29 +2852,83 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t n_past   = ubatch.pos[0];
         k = k_cur;
         v = v_cur;
-        if (n_past > 0) {
-            ggml_tensor * k_all  = mctx_cur->get_k(ctx0, il);
-            ggml_tensor * k_prev = ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], n_past, 1,
-                    k_all->nb[1], k_all->nb[2], k_all->nb[3], 0);
+        // the cached prefix positions [p0, p1) as this chunk's K / V type
+        ggml_tensor * k_all = n_past > 0 ? mctx_cur->get_k(ctx0, il) : nullptr;
+        ggml_tensor * v_all = n_past > 0 ? mctx_cur->get_v(ctx0, il) : nullptr;
+        auto k_span = [&](int64_t p0, int64_t p1) {
+            ggml_tensor * t = ggml_view_4d(ctx0, k_all, k_all->ne[0], k_all->ne[1], p1 - p0, 1,
+                    k_all->nb[1], k_all->nb[2], k_all->nb[3], p0*k_all->nb[2]);
             // the cache may hold the constants at a smaller type than the chunk's own K/V
-            if (k_prev->type != k_cur->type) {
-                k_prev = ggml_cast(ctx0, k_prev, k_cur->type);
-            }
-            k = ggml_concat(ctx0, k_prev, k_cur, 2);
-
+            return t->type != k_cur->type ? ggml_cast(ctx0, t, k_cur->type) : t;
+        };
+        auto v_span = [&](int64_t p0, int64_t p1) {
             // a cache without flash attention stores V transposed: [n_kv, n_head_kv, n_embd_head_v]
-            ggml_tensor * v_all  = mctx_cur->get_v(ctx0, il);
-            ggml_tensor * v_prev = v_all->nb[1] > v_all->nb[2]
+            ggml_tensor * t = v_all->nb[1] > v_all->nb[2]
                 ? ggml_cont(ctx0, ggml_permute(ctx0,
-                        ggml_view_4d(ctx0, v_all, n_past, v_all->ne[1], v_all->ne[2], 1,
-                                v_all->nb[1], v_all->nb[2], v_all->nb[3], 0),
+                        ggml_view_4d(ctx0, v_all, p1 - p0, v_all->ne[1], v_all->ne[2], 1,
+                                v_all->nb[1], v_all->nb[2], v_all->nb[3], p0*v_all->nb[0]),
                         2, 1, 0, 3))
-                : ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], n_past, 1,
-                        v_all->nb[1], v_all->nb[2], v_all->nb[3], 0);
-            if (v_prev->type != v_cur->type) {
-                v_prev = ggml_cast(ctx0, v_prev, v_cur->type);
+                : ggml_view_4d(ctx0, v_all, v_all->ne[0], v_all->ne[1], p1 - p0, 1,
+                        v_all->nb[1], v_all->nb[2], v_all->nb[3], p0*v_all->nb[2]);
+            return t->type != v_cur->type ? ggml_cast(ctx0, t, v_cur->type) : t;
+        };
+        if (cparams.walk_exact) {
+            // THE EXACT WALK's chunk graph. The prefix positions [grad_from, n_past) are the
+            // cached values PLUS a zero GRAD leaf, so the backward yields dL/d(cached K/V) for
+            // them without copying the cache; earlier positions stay constants. The chunk's own
+            // K/V meet the gradient later chunks put on them through the surrogate
+            // <k_cur, gk> + <v_cur, gv>: its gradient on k_cur / v_cur IS gk / gv, which the
+            // backward carries through this chunk into the adapter and into its own prefix.
+            const int64_t g0 = std::min<int64_t>(cparams.walk_grad_from, n_past);
+            llm_graph_result::walk_layer io = { il, (uint32_t) g0, (uint32_t) n_past };
+            // [const prefix][gradient prefix][this chunk]: the order the cells hold them in
+            std::vector<ggml_tensor *> k_parts, v_parts;
+            if (g0 > 0) {
+                k_parts.push_back(k_span(0, g0));
+                v_parts.push_back(v_span(0, g0));
             }
-            v = ggml_concat(ctx0, v_prev, v_cur, 2);
+            if (n_past > g0) {
+                ggml_tensor * kc = ggml_cont(ctx0, ggml_cast(ctx0, k_span(g0, n_past), GGML_TYPE_F32));
+                ggml_tensor * vc = ggml_cont(ctx0, ggml_cast(ctx0, v_span(g0, n_past), GGML_TYPE_F32));
+                io.dk = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, kc->ne[0], kc->ne[1], kc->ne[2], 1);
+                io.dv = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, vc->ne[0], vc->ne[1], vc->ne[2], 1);
+                ggml_format_name(io.dk, "walk_dk-%d", il);
+                ggml_format_name(io.dv, "walk_dv-%d", il);
+                ggml_set_input(io.dk);
+                ggml_set_input(io.dv);
+                ggml_set_grad(io.dk);
+                ggml_set_grad(io.dv);
+                ggml_tensor * kg = ggml_add(ctx0, kc, io.dk);
+                ggml_tensor * vg = ggml_add(ctx0, vc, io.dv);
+                k_parts.push_back(kg->type != k_cur->type ? ggml_cast(ctx0, kg, k_cur->type) : kg);
+                v_parts.push_back(vg->type != v_cur->type ? ggml_cast(ctx0, vg, v_cur->type) : vg);
+            }
+            k_parts.push_back(k_cur);
+            v_parts.push_back(v_cur);
+            k = k_parts[0];
+            v = v_parts[0];
+            for (size_t i = 1; i < k_parts.size(); ++i) {
+                k = ggml_concat(ctx0, k, k_parts[i], 2);
+                v = ggml_concat(ctx0, v, v_parts[i], 2);
+            }
+            if (cparams.walk_surrogate) {
+                io.gk = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, k_cur->ne[0], k_cur->ne[1], k_cur->ne[2]);
+                io.gv = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, v_cur->ne[0], v_cur->ne[1], v_cur->ne[2]);
+                ggml_format_name(io.gk, "walk_gk-%d", il);
+                ggml_format_name(io.gv, "walk_gv-%d", il);
+                ggml_set_input(io.gk);
+                ggml_set_input(io.gv);
+                ggml_tensor * k32 = k_cur->type == GGML_TYPE_F32 ? k_cur : ggml_cast(ctx0, k_cur, GGML_TYPE_F32);
+                ggml_tensor * v32 = v_cur->type == GGML_TYPE_F32 ? v_cur : ggml_cast(ctx0, v_cur, GGML_TYPE_F32);
+                ggml_tensor * term = ggml_add(ctx0,
+                        ggml_sum(ctx0, ggml_mul(ctx0, k32, io.gk)),
+                        ggml_sum(ctx0, ggml_mul(ctx0, v32, io.gv)));
+                res->t_walk_surrogate = res->t_walk_surrogate ? ggml_add(ctx0, res->t_walk_surrogate, term) : term;
+            }
+            res->t_walk.push_back(io);
+        } else if (n_past > 0) {
+            k = ggml_concat(ctx0, k_span(0, n_past), k_cur, 2);
+            v = ggml_concat(ctx0, v_span(0, n_past), v_cur, 2);
         }
         // the cache's cells hold the prefix at [0, n_past) and this ubatch right after it
         // (contiguous: soft_max_ext requires it, and a column slice of the padded mask is not)

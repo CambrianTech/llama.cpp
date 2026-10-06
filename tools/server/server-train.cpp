@@ -314,7 +314,7 @@ json server_trainer::start(const json & body_in) {
     // assert in the training path would take the server down (Cormac on #14).
     {
         auto num = [&](const char * key, double def) { return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : def; };
-        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers", "share_ppm", "max_slowdown_ppm", "chunk"}) {
+        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers", "share_ppm", "max_slowdown_ppm", "chunk", "walk_horizon"}) {
             if (body.contains(key) && !body.at(key).is_number()) {
                 return json::object({{"ok", false}, {"error", std::string("\"") + key + "\" must be a number"}});
             }
@@ -338,6 +338,10 @@ json server_trainer::start(const json & body_in) {
         else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
         else if (body.contains("chunk") && !(num("chunk", 0) >= 256 && num("chunk", 0) == (int64_t) num("chunk", 0) && (int64_t) num("chunk", 0) % 256 == 0))
                                                                      why = "chunk must be a multiple of 256, at least 256: the most tokens one training step holds in one graph";
+        else if (body.contains("exact") && !body.at("exact").is_boolean())
+                                                                     why = "exact must be true or false: the exact walk (one step per window on its whole loss) or the per-chunk walk";
+        else if (body.contains("walk_horizon") && !(num("walk_horizon", 0) >= 0 && num("walk_horizon", 0) == (int64_t) num("walk_horizon", 0) && num("walk_horizon", 0) <= 4294967295.0))
+                                                                     why = "walk_horizon must be an integer >= 0: how many cached positions before a chunk receive its gradient (0 = the whole window)";
         else if (body.contains("memory_budget_mib") && !(num("memory_budget_mib", 0) >= 1))
                                                                      why = "memory_budget_mib must be >= 1";
         else if (body.contains("share_ppm") && !(num("share_ppm", 0) >= 1 && num("share_ppm", 0) <= 1000000 && num("share_ppm", 0) == (int64_t) num("share_ppm", 0)))
@@ -861,6 +865,10 @@ void server_trainer::run(json req, examples_data ex) {
         // with it on is measured beside #39's receipt; Cormac): one layer's
         // attention scores alive in the backward pass instead of every layer's
         /*recompute       =*/ req.value("recompute", false),
+        // the exact walk (OFF unless the request says "exact": true, until it is measured against
+        // the single-context gradient): one step per window on the window's whole loss
+        /*walk_exact      =*/ req.value("exact", false),
+        /*walk_horizon    =*/ (uint32_t) req.value("walk_horizon", (int64_t) 0),
     };
     llama_opt_set_memory_budget(ctx, budget);
     llama_opt_init(ctx, model, lopt);
