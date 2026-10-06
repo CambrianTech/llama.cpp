@@ -1,4 +1,5 @@
 #include "server-train.h"
+#include "server-train-spans.h"
 
 #include "common.h"
 #include "log.h"
@@ -499,18 +500,11 @@ int64_t server_trainer::yield_for_slowdown(int64_t d_ms, int64_t max_slowdown_pp
 
 void server_trainer::on_turn(int64_t gen_start_us, int64_t gen_end_us, int64_t steps, int64_t oldest_open_us) {
     std::lock_guard<std::mutex> lock(mu);
-    // pruned on every finished turn, measured or not: the turns still in flight are the only
-    // ones a span can still be asked about, and none of them began before oldest_open_us
-    window_spans.erase(std::remove_if(window_spans.begin(), window_spans.end(),
-                                      [oldest_open_us](const std::pair<int64_t, int64_t> & w) { return w.second != 0 && w.second < oldest_open_us; }),
-                       window_spans.end());
+    // measured, then pruned, on every finished turn (a short one too: it still ends windows'
+    // relevance); see server-train-spans.h
+    const int64_t overlap_us = server_train_turn_overlap_then_prune(window_spans, gen_start_us, gen_end_us, oldest_open_us);
     if (steps < TURN_MIN_STEPS || gen_end_us <= gen_start_us) {
         return;
-    }
-    int64_t overlap_us = 0;
-    for (const auto & [start, end] : window_spans) {
-        const int64_t e = end == 0 ? gen_end_us : end; // the window still running
-        overlap_us += std::max<int64_t>(0, std::min(e, gen_end_us) - std::max(start, gen_start_us));
     }
     const double ms = (double) (gen_end_us - gen_start_us) / 1000.0;
     if (overlap_us == 0) {

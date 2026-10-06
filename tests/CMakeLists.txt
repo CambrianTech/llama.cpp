@@ -150,6 +150,10 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 
+# the server trainer's per-turn receipt, pure (tools/server/server-train-spans.h)
+llama_build_and_test(test-server-train-spans.cpp)
+target_include_directories(test-server-train-spans PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
