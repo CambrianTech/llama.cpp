@@ -743,15 +743,16 @@ void server_trainer::run(json req, examples_data ex) {
     // governed lease); without it the driver's own free figure, which on Windows is not physical
     const size_t      budget  = (size_t) (req.value("memory_budget_mib", 0.0) * 1024.0 * 1024.0);
 
-    // The training context: the SAME model, its own graph. One ubatch is the whole window
-    // (the training graph attends to this ubatch's K/V directly); flash attention has no
-    // backward; the KV cache types are F32 because OUT_PROD has no F16 path.
+    // The training context: the SAME model, its own graph; flash attention has no backward.
     llama_context_params cparams = common_context_params_to_llama(params_base);
     // The context holds the whole window; one training chunk is one batch is one ubatch, the
     // largest multiple of 256 that divides the window and is at most the caller's "chunk" (the
     // memory gate's S). Context she did not write is decoded; her replies train chunk by chunk,
     // each attending to everything before it from the cache (llama_context::opt_epoch_iter).
-    const uint32_t chunk = train_chunk_for(window, (uint32_t) req.value("chunk", (int64_t) window));
+    // INTERIM: a caller that sends no "chunk" gets 512 until the core passes the lease's S
+    // (Fable); the window's whole length as one chunk is the window x window memory the walk
+    // exists to avoid.
+    const uint32_t chunk = train_chunk_for(window, (uint32_t) req.value("chunk", (int64_t) 512));
     cparams.n_ctx           = window;
     cparams.n_batch         = chunk;
     cparams.n_ubatch        = chunk;
@@ -761,8 +762,11 @@ void server_trainer::run(json req, examples_data ex) {
     cparams.n_seq_max       = 2;
     cparams.kv_unified      = true;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    cparams.type_k          = GGML_TYPE_F32;
-    cparams.type_v          = GGML_TYPE_F32;
+    // F16: the cache holds only CONSTANTS (the context before a chunk, read by build_attn and
+    // cast to F32 where it joins the chunk). The chunk's own K/V, the ones with a gradient and
+    // the only ones OUT_PROD sees, are F32 in the graph and never cached during training.
+    cparams.type_k          = GGML_TYPE_F16;
+    cparams.type_v          = GGML_TYPE_F16;
     cparams.embeddings      = false;
     // training reads logits for every token of the window; the serving params cap outputs per
     // ubatch to what sampling needs (a server-computed limit), which a training batch overruns
