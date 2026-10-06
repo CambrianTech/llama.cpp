@@ -133,6 +133,7 @@ int main(int argc, char ** argv) {
         /*get_opt_pars_ud =*/&params.lr,
         /*optimizer_type  =*/params.optimizer,
         /*adapter         =*/adapter,
+        /*recompute       =*/false, // keep every layer's intermediates, as before
     };
     llama_opt_init(ctx, model, lopt_params);
 

@@ -7226,7 +7226,9 @@ static int test_train_control(const char * model_path, const char * output_dir) 
     };
     std::atomic<int> calls{0}, hold_at{0};
     std::atomic<bool> held{false};
-    server_trainer trainer(model.get(), params, [&] {
+    // #36 takes a serving_view: this test drives only busy_slots (idle_ms and
+    // tokens_generated are optional and left empty)
+    server_trainer trainer(model.get(), params, server_trainer::serving_view{ [&] {
         if (held.load()) {
             return 1;
         }
@@ -7234,7 +7236,7 @@ static int test_train_control(const char * model_path, const char * output_dir) 
             held.store(true);
         }
         return held.load() ? 1 : 0;
-    }, {});
+    }, {}, {} }, {});
     auto wait_for = [&](const std::function<bool(const json &)> & predicate) {
         const auto deadline = steady_clock::now() + minutes(2);
         while (steady_clock::now() < deadline) {
