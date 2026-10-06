@@ -912,7 +912,9 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         // this, a period's step applied the SUM of every gradient since the run began, since
         // each backward adds into the accumulator in place (test-opt-dynamic-accum).
         if (backward && opt_ctx->opt_i == 0) {
-            for (size_t i = 0; i < opt_ctx->grad_accs.size(); ++i) {
+            // grad_accs is indexed by the FIRST graph's nodes: a later graph may hold fewer (Fable)
+            const size_t n = std::min(opt_ctx->grad_accs.size(), (size_t) opt_ctx->gf->n_nodes);
+            for (size_t i = 0; i < n; ++i) {
                 ggml_tensor * acc = opt_ctx->grad_accs[i];
                 if (acc && (opt_ctx->gf->nodes[i]->flags & GGML_TENSOR_FLAG_PARAM)) {
                     ggml_set_zero(acc);
