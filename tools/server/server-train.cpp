@@ -466,7 +466,9 @@ json server_trainer::start(const json & body_in) {
     max_slowdown_ppm.store(body.value("max_slowdown_ppm", (int64_t) 0));
     busy_window_ms = busy_window_tokens = busy_yield_ms = busy_yield_tokens = 0;
     window_spans.clear();
-    turn_slowdown_ppm.clear();
+    turn_slowdown_pct.fill(0);
+    turns_overlapped = 0;
+    turn_slowdown_ppm_max = 0;
     rate_no_window = rate_estimate{};
     rate_in_window = rate_estimate{};
     last_no_window_sample = std::chrono::steady_clock::time_point{};
@@ -500,6 +502,11 @@ void server_trainer::on_turn(int64_t gen_start_us, int64_t gen_end_us, int64_t s
         return;
     }
     std::lock_guard<std::mutex> lock(mu);
+    longest_turn_us = std::max(longest_turn_us, gen_end_us - gen_start_us);
+    const int64_t horizon = gen_end_us - longest_turn_us; // no unfinished turn began before this
+    window_spans.erase(std::remove_if(window_spans.begin(), window_spans.end(),
+                                      [horizon](const std::pair<int64_t, int64_t> & w) { return w.second != 0 && w.second < horizon; }),
+                       window_spans.end());
     int64_t overlap_us = 0;
     for (const auto & [start, end] : window_spans) {
         const int64_t e = end == 0 ? gen_end_us : end; // the window still running
@@ -513,8 +520,13 @@ void server_trainer::on_turn(int64_t gen_start_us, int64_t gen_end_us, int64_t s
     }
     const double clean = turn_rate_clean.per_ms();
     if (clean > 0) { // no clean turn yet: nothing to measure her against, never a guessed sample
-        const double slowdown = std::max(0.0, 1.0 - ((double) steps / ms) / clean);
-        turn_slowdown_ppm.push_back((int64_t) std::llround(slowdown * 1e6));
+        // the WHOLE turn's rate: a turn a window overlapped for 20% of its span reads diluted,
+        // which is what she felt over that turn, not the in-window slowdown
+        const double  slowdown = std::clamp(1.0 - ((double) steps / ms) / clean, 0.0, 1.0);
+        const int64_t ppm      = (int64_t) std::llround(slowdown * 1e6);
+        turn_slowdown_pct[(size_t) std::llround(slowdown * 100)] += 1;
+        turns_overlapped += 1;
+        turn_slowdown_ppm_max = std::max(turn_slowdown_ppm_max, ppm);
     }
 }
 
@@ -708,19 +720,30 @@ json server_trainer::status() const {
     if (rate_in_window.ms > 0) {
         s["decode_tps_in_window_recent"] = rate_in_window.per_ms() * 1000.0;
     }
-    // the per-turn receipt: each turn that overlapped a window, against her clean turns
+    // the per-turn receipt: each turn that overlapped a window, against her clean turns. A
+    // sample is the whole turn's slowdown, so a turn a window only partly overlapped reads
+    // diluted: a p95 here is what her turns felt, never the slowdown inside a window. p50/p95
+    // to the 1% bucket (a fixed histogram), max exact.
     s["turns_clean"] = turns_clean;
-    s["turns_overlapped"] = (int64_t) turn_slowdown_ppm.size();
+    s["turns_overlapped"] = turns_overlapped;
     if (turn_rate_clean.ms > 0) {
         s["turn_tps_clean"] = turn_rate_clean.per_ms() * 1000.0;
     }
-    if (!turn_slowdown_ppm.empty()) {
-        std::vector<int64_t> sorted = turn_slowdown_ppm;
-        std::sort(sorted.begin(), sorted.end());
-        const auto pct = [&](double p) { return sorted[std::min(sorted.size() - 1, (size_t) (p * (double) sorted.size()))]; };
+    if (turns_overlapped > 0) {
+        const auto pct = [&](double p) {
+            const int64_t rank = std::min(turns_overlapped - 1, (int64_t) (p * (double) turns_overlapped));
+            int64_t seen = 0;
+            for (size_t b = 0; b < turn_slowdown_pct.size(); ++b) {
+                seen += turn_slowdown_pct[b];
+                if (seen > rank) {
+                    return (int64_t) b * 10000;
+                }
+            }
+            return (int64_t) 1000000;
+        };
         s["turn_slowdown_ppm_p50"] = pct(0.50);
         s["turn_slowdown_ppm_p95"] = pct(0.95);
-        s["turn_slowdown_ppm_max"] = sorted.back();
+        s["turn_slowdown_ppm_max"] = turn_slowdown_ppm_max;
     }
     s["busy_window_ms"] = busy_window_ms;
     s["busy_yield_ms"] = busy_yield_ms;

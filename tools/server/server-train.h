@@ -45,6 +45,7 @@
 #include "json.h"
 #include "ggml-opt.h"
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -168,9 +169,14 @@ private:
     // one runs), every turn's overlap measured against them; a turn's rate is per slot, so its
     // baseline is other turns' rate, never the lane's total rate. Guarded by mu.
     static constexpr int64_t TURN_MIN_STEPS = 16; // fewer decode steps time the scheduler, not her
+    // Bounded: spans that ended before (now - the longest turn seen) can overlap no turn still
+    // to finish, and are dropped; samples live in a fixed histogram of 1% buckets.
     std::vector<std::pair<int64_t, int64_t>> window_spans;
-    rate_estimate turn_rate_clean;          // turns that overlapped no window, across runs
-    std::vector<int64_t> turn_slowdown_ppm; // one per turn that overlapped a window, this run
+    int64_t longest_turn_us{0};
+    rate_estimate turn_rate_clean;               // turns that overlapped no window, across runs
+    std::array<int64_t, 101> turn_slowdown_pct{}; // turns that overlapped a window, this run, by % slower
+    int64_t turns_overlapped{0};
+    int64_t turn_slowdown_ppm_max{0};
     int64_t turns_clean{0};
     rate_estimate rate_no_window;   // guarded by mu
     rate_estimate rate_in_window;   // guarded by mu

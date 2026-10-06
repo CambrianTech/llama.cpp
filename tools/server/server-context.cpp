@@ -2021,6 +2021,8 @@ private:
 
     void send_final_response(server_slot & slot) {
         // every finished turn reaches the trainer: her per-turn baseline, or a slowdown sample
+        // t_prompt_last / t_gen_last are ggml_time_us TIMESTAMPS (server-common.h): generation
+        // began at the prompt's last batch and ended at the last token
         if (trainer && slot.stats.t_gen_last > 0) {
             trainer->on_turn(slot.stats.t_prompt_last, slot.stats.t_gen_last, (int64_t) slot.stats.n_gen_steps());
         }
