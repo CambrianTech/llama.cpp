@@ -340,7 +340,14 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
     for (int i = 0; i < n_fwd; ++i) {
         ggml_tensor * node = g->nodes[i];
         forward.insert(node);
-        if (node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS) {
+        // A write in place: a copy into another tensor, or any computing op that is a view of
+        // its source (an in-place op: ggml_*_inplace writes its result over src). A recompute
+        // clone reading such a buffer, or writing into a shared clone, would see a different
+        // value than the original did (Metal, 2026-10-06: a deterministic qwen35 run moved by
+        // 6.8e-4 with recompute on until in-place ops counted here).
+        const bool view_op = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
+        if (node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS || (node->view_src != nullptr && !view_op)) {
             mutated.insert(ggml_opt_view_root(node));
         }
     }
