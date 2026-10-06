@@ -812,6 +812,41 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
+// F32 x F32 with FLOAT staging (kernel_mul_mm_f32_f32_fp32), for training's internal products:
+// a gradient overflows half's range where an activation does not. Simdgroup kernel only: the
+// caller uses it when the tensor API is off.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_fp32(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32);
+    GGML_ASSERT(!ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor);
+    char name[256];
+    const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
+    const bool bc_out = op->ne[0] % 64 != 0 || op->ne[1] % 32 != 0;
+    GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
+    const int16_t ne12 = (int16_t) op->src[1]->ne[2];
+    const int16_t ne13 = (int16_t) op->src[1]->ne[3];
+    const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
+    const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
+    const char * base = "kernel_mul_mm_f32_f32_fp32";
+    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d", base, bc_inp, bc_out, ne12, ne13, r2, r3);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
+        ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
+        ggml_metal_cv_set_int16(cv, ne12,  FC_MUL_MM + 2);
+        ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
+        ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
+        ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+    res.nr0  = 64;
+    res.nr1  = 32;
+    res.smem = 64*32*sizeof(float) + 32*32*sizeof(float); // sa + sb; the bc_out tile (8192) fits
+    res.nsg  = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
