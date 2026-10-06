@@ -67,9 +67,17 @@ struct ggml_opt_context {
     size_t alloc_budget          = 0; // bytes a graph may add on a non-CPU device; 0 = the device's own free figure
     size_t peak_graph_bytes      = 0; // largest graph measured by the preflight on a non-CPU device
     bool eval_ready              = false;
+    // Accumulators and momenta belong to a PARAMETER (or to the loss), never to a node index: a
+    // graph built per step may differ in topology from the first one (the training walk's chunks
+    // with and without a prefix, its reverse pass with GRAD leaves and a surrogate term), and an
+    // index would bind one tensor's accumulator to whatever node took that index. grad_accs is
+    // the current graph's view of them, rebuilt by every ggml_opt_build.
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_grad_acc;
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_m;
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_v;
+    struct ggml_tensor * loss_grad_acc = nullptr;
+    bool accumulators_created          = false;
     std::vector<struct ggml_tensor *> grad_accs;
-    std::vector<struct ggml_tensor *> grad_m;
-    std::vector<struct ggml_tensor *> grad_v;
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
@@ -606,32 +614,41 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         return;
     }
 
-    if (opt_ctx->grad_accs.empty()) {
+    if (!opt_ctx->accumulators_created) {
         GGML_ASSERT(opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD);
+        opt_ctx->accumulators_created = true;
 
-        const int n_nodes = opt_ctx->gf->n_nodes;
-        opt_ctx->grad_accs.resize(n_nodes);
-        for (int i = 0; i < n_nodes; ++i) {
+        // created once, in ctx_static, for the parameters of the first graph: every later graph
+        // trains the same parameters (asserted below), whatever else its topology holds
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
-            if ((accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) || (node->flags & GGML_TENSOR_FLAG_LOSS)) {
-                opt_ctx->grad_accs[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-            } else {
-                opt_ctx->grad_accs[i] = nullptr;
+            if (node->flags & GGML_TENSOR_FLAG_LOSS) {
+                opt_ctx->loss_grad_acc = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+            }
+            if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                continue;
+            }
+            if (accumulate) {
+                opt_ctx->param_grad_acc[node] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+            }
+            if (need_momenta && opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_OPT) {
+                opt_ctx->param_m[node] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                opt_ctx->param_v[node] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
             }
         }
+    }
 
-        if (need_momenta && opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_OPT) {
-            opt_ctx->grad_m.resize(n_nodes);
-            opt_ctx->grad_v.resize(n_nodes);
-            for (int i = 0; i < n_nodes; ++i) {
-                ggml_tensor * node = opt_ctx->gf->nodes[i];
-                if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-                    opt_ctx->grad_m[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-                    opt_ctx->grad_v[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-                } else {
-                    opt_ctx->grad_m[i] = nullptr;
-                    opt_ctx->grad_v[i] = nullptr;
-                }
+    // this graph's view of the accumulators, by tensor
+    opt_ctx->grad_accs.assign(opt_ctx->gf->n_nodes, nullptr);
+    for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+        ggml_tensor * node = opt_ctx->gf->nodes[i];
+        if (node->flags & GGML_TENSOR_FLAG_LOSS) {
+            opt_ctx->grad_accs[i] = opt_ctx->loss_grad_acc;
+        } else if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+            GGML_ASSERT((!accumulate || opt_ctx->param_grad_acc.count(node)) &&
+                "a graph trains a parameter the optimizer context was not built with");
+            if (accumulate) {
+                opt_ctx->grad_accs[i] = opt_ctx->param_grad_acc.at(node);
             }
         }
     }
@@ -670,8 +687,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             struct ggml_tensor * m = nullptr;
             struct ggml_tensor * v = nullptr;
             if (need_momenta) {
-                m = opt_ctx->grad_m[i];
-                v = opt_ctx->grad_v[i];
+                m = opt_ctx->param_m.at(node);
+                v = opt_ctx->param_v.at(node);
                 ggml_format_name(m, "AdamW m for %s", node->name);
                 ggml_format_name(v, "AdamW v for %s", node->name);
             }
@@ -912,11 +929,8 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         // this, a period's step applied the SUM of every gradient since the run began, since
         // each backward adds into the accumulator in place (test-opt-dynamic-accum).
         if (backward && opt_ctx->opt_i == 0) {
-            for (size_t i = 0; i < opt_ctx->grad_accs.size(); ++i) {
-                ggml_tensor * acc = opt_ctx->grad_accs[i];
-                if (acc && (opt_ctx->gf->nodes[i]->flags & GGML_TENSOR_FLAG_PARAM)) {
-                    ggml_set_zero(acc);
-                }
+            for (auto & [param, acc] : opt_ctx->param_grad_acc) {
+                ggml_set_zero(acc);
             }
         }
     }
