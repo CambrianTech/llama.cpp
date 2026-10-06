@@ -826,6 +826,9 @@ void server_trainer::run(json req, examples_data ex) {
         /*get_opt_pars_ud =*/ &lr,
         /*optimizer_type  =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
         /*adapter         =*/ adapter,
+        // per-layer recompute (on unless the request says "recompute": false): one layer's
+        // attention scores alive in the backward pass instead of every layer's
+        /*recompute       =*/ req.value("recompute", true),
     };
     llama_opt_set_memory_budget(ctx, budget);
     llama_opt_init(ctx, model, lopt);

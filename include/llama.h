@@ -1709,6 +1709,11 @@ extern "C" {
         // with a non-zero scale, or its tensors are not in the graph; its A/B tensors
         // must be F32. NULL keeps the full-model walk.
         struct llama_adapter_lora * adapter;
+
+        // Recompute each layer's intermediates in the backward pass from its input (the
+        // per-layer residual, "l_out") instead of keeping every layer's alive: about one extra
+        // forward, and one layer's attention scores in memory instead of all of them.
+        bool recompute;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);

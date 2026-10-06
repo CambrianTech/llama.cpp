@@ -11,8 +11,12 @@
 #include <cstdint>
 #include <cinttypes>
 #include <map>
+#include <cstring>
+#include <functional>
 #include <random>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct ggml_opt_dataset {
@@ -32,6 +36,8 @@ struct ggml_opt_dataset {
 struct ggml_opt_context {
     // why the last ggml_opt_alloc refused ("" when it did not)
     std::string                refusal;
+    // forward nodes named with this prefix are kept; the rest are recomputed (empty = keep all)
+    std::string                checkpoint_prefix;
     ggml_backend_sched_t       backend_sched        = nullptr;
     ggml_cgraph              * allocated_graph      = nullptr;
     ggml_cgraph              * allocated_graph_copy = nullptr;
@@ -265,7 +271,136 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*checkpoint_prefix =*/ nullptr,
     };
+}
+
+// Gradient checkpointing, ported from ggml's former ggml_build_backward_gradient_checkpointing
+// (llama.cpp #2632, removed with the optimizer rewrite) onto the current graph layout, where
+// gradients live on the cgraph by hash slot. The backward nodes of g (nodes [n_fwd, n_nodes))
+// stop reading forward intermediates: each one is replaced by a recompute clone rooted at the
+// nearest checkpoint, and the clones are placed just before their first consumer. The forward
+// originals are then dead after their forward use, so the allocator reuses their memory.
+static ggml_tensor * ggml_opt_view_root(ggml_tensor * t) {
+    while (t != nullptr && t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static ggml_tensor * ggml_opt_recompute_node(
+        ggml_context * ctx, const std::unordered_set<ggml_tensor *> & forward,
+        const std::unordered_set<ggml_tensor *> & keep, std::unordered_map<ggml_tensor *, ggml_tensor *> & clones,
+        ggml_tensor * node) {
+    if (node == nullptr || !forward.count(node) || keep.count(node)) {
+        return node;
+    }
+    // keep is also every node that READS a buffer the forward pass writes in place (a recurrent
+    // state, a cache): recomputed after that write it would read the advanced value, not the
+    // one the original read (measured on a qwen35 delta-net: losses diverged until this)
+    if (node->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT)) {
+        return node;
+    }
+    switch (node->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_CPY:      // a write into another tensor (a cache): side effect, never repeated
+        case GGML_OP_SET_ROWS:
+            return node;
+        default:
+            break;
+    }
+    if (auto it = clones.find(node); it != clones.end()) {
+        return it->second;
+    }
+    ggml_tensor * clone = ggml_new_tensor(ctx, node->type, GGML_MAX_DIMS, node->ne);
+    clone->op    = node->op;
+    clone->flags = node->flags & ~(GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS);
+    memcpy(clone->op_params, node->op_params, sizeof(node->op_params));
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+        clone->nb[k] = node->nb[k];
+    }
+    clones[node] = clone; // before recursing: a graph is acyclic, this only memoises
+    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+        clone->src[k] = ggml_opt_recompute_node(ctx, forward, keep, clones, node->src[k]);
+    }
+    if (node->view_src != nullptr) {
+        // a view of the recomputed source, not of the original (which is freed)
+        clone->view_src  = ggml_opt_recompute_node(ctx, forward, keep, clones, node->view_src);
+        clone->view_offs = node->view_offs;
+    }
+    ggml_format_name(clone, "%s (recompute)", ggml_get_name(node));
+    return clone;
+}
+
+static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, const char * prefix) {
+    std::unordered_set<ggml_tensor *> forward;
+    std::unordered_set<ggml_tensor *> keep;
+    std::unordered_set<ggml_tensor *> mutated; // roots of the buffers the forward pass writes in place
+    const size_t plen = strlen(prefix);
+    for (int i = 0; i < n_fwd; ++i) {
+        ggml_tensor * node = g->nodes[i];
+        forward.insert(node);
+        if (node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS) {
+            mutated.insert(ggml_opt_view_root(node));
+        }
+    }
+    for (int i = 0; i < n_fwd; ++i) {
+        ggml_tensor * node = g->nodes[i];
+        bool reads_mutated = false;
+        for (int k = 0; k < GGML_MAX_SRC && !reads_mutated; ++k) {
+            reads_mutated = node->src[k] != nullptr && mutated.count(ggml_opt_view_root(node->src[k]));
+        }
+        if (strncmp(ggml_get_name(node), prefix, plen) == 0 || (node->flags & GGML_TENSOR_FLAG_LOSS) ||
+                (node->flags & GGML_TENSOR_FLAG_OUTPUT) || reads_mutated ||
+                (node->view_src != nullptr && mutated.count(ggml_opt_view_root(node)))) {
+            keep.insert(node);
+        }
+    }
+    if (keep.empty()) {
+        return; // no checkpoint named: nothing to rewrite
+    }
+    std::unordered_map<ggml_tensor *, ggml_tensor *> clones;
+    std::vector<ggml_tensor *> backward(g->nodes + n_fwd, g->nodes + g->n_nodes);
+    for (ggml_tensor * node : backward) {
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            node->src[k] = ggml_opt_recompute_node(ctx, forward, keep, clones, node->src[k]);
+        }
+        if (node->view_src != nullptr) {
+            node->view_src = ggml_opt_recompute_node(ctx, forward, keep, clones, node->view_src);
+        }
+    }
+    if (clones.empty()) {
+        return;
+    }
+    // re-order: forward nodes as they were, then each backward node after the clones it needs
+    std::vector<ggml_tensor *> order(g->nodes, g->nodes + n_fwd);
+    std::unordered_set<ggml_tensor *> placed;
+    std::unordered_set<ggml_tensor *> is_clone;
+    for (auto & kv : clones) {
+        is_clone.insert(kv.second);
+    }
+    std::function<void(ggml_tensor *)> place = [&](ggml_tensor * t) {
+        if (t == nullptr || !is_clone.count(t) || placed.count(t)) {
+            return;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            place(t->src[k]);
+        }
+        place(t->view_src);
+        placed.insert(t);
+        order.push_back(t);
+        ggml_hash_insert(&g->visited_hash_set, t);
+    };
+    for (ggml_tensor * node : backward) {
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            place(node->src[k]);
+        }
+        place(node->view_src);
+        order.push_back(node);
+    }
+    GGML_ASSERT((int) order.size() <= g->size && "recompute clones overflow the graph: raise the training node budget");
+    std::copy(order.begin(), order.end(), g->nodes);
+    g->n_nodes = (int) order.size();
 }
 
 static ggml_tensor * map_tensor(std::map<ggml_tensor *, ggml_tensor *> & tensor_map, ggml_context * ctx, ggml_tensor * tensor) {
@@ -497,6 +632,9 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
     ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    if (!opt_ctx->checkpoint_prefix.empty()) {
+        ggml_opt_checkpoint(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->gf->n_nodes, opt_ctx->checkpoint_prefix.c_str());
+    }
 
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
@@ -568,6 +706,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
+    result->checkpoint_prefix = params.checkpoint_prefix ? params.checkpoint_prefix : "";
 
     GGML_ASSERT(result->opt_period >= 1);
 
