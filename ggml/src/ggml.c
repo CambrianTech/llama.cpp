@@ -7115,18 +7115,23 @@ static void ggml_compute_backward(
             // layer concatenates the cached conv state (a leaf) with this ubatch's qkv, so the
             // second slice is the one that carries a gradient back into the model.
             const int dim = ggml_get_op_params_i32(tensor, 0);
+            // A view's first stride is the element size (ggml_view_4d takes nb[1..3] only), so the
+            // gradient is sliced from a CONTIGUOUS copy: one that arrives through a transpose (the
+            // training attention transposes V for its KQV product) has a first stride that is not,
+            // and slicing it in place read the right number of elements from the wrong places.
+            struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
             size_t offset = 0;
             for (int j = 0; j < 2; ++j) {
                 struct ggml_tensor * src = tensor->src[j];
                 const size_t isrc = j == 0 ? isrc0 : isrc1;
                 const bool needs  = j == 0 ? src0_needs_grads : src1_needs_grads;
                 if (needs) {
-                    struct ggml_tensor * slice = ggml_view_4d(ctx, grad,
+                    struct ggml_tensor * slice = ggml_view_4d(ctx, g,
                             src->ne[0], src->ne[1], src->ne[2], src->ne[3],
-                            grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                            g->nb[1], g->nb[2], g->nb[3], offset);
                     ggml_add_or_set(ctx, cgraph, isrc, ggml_cont(ctx, slice));
                 }
-                offset += src->ne[dim] * grad->nb[dim];
+                offset += src->ne[dim] * g->nb[dim];
             }
         } break;
         case GGML_OP_SSM_CONV: {
