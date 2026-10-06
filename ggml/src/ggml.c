@@ -7166,7 +7166,11 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 float eps;
                 memcpy(&eps, tensor->op_params, sizeof(float));
-                struct ggml_tensor * nrm  = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, src0)));
+                // src0 is often a VIEW (qwen35's delta-net normalises k_conv, a slice of the conv
+                // output), and the CUDA unary kernels require contiguous input: the CPU reference
+                // passed and the 5090 aborted the serving process (SQR on k_conv, unary.cu:144)
+                struct ggml_tensor * x    = ggml_is_contiguous(src0) ? src0 : ggml_cont(ctx, src0);
+                struct ggml_tensor * nrm  = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, x)));
                 struct ggml_tensor * n    = ggml_clamp(ctx, nrm, eps, INFINITY);
                 struct ggml_tensor * mask = ggml_step(ctx, ggml_scale_bias(ctx, nrm, 1.0f, -eps));
                 struct ggml_tensor * dot  = ggml_sum_rows(ctx, ggml_mul(ctx, tensor, grad));
