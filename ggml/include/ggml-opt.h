@@ -127,6 +127,13 @@ extern "C" {
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
+
+        // Recompute instead of keep (gradient checkpointing): forward nodes whose name starts
+        // with this prefix are kept for the backward pass, and every other forward intermediate
+        // the backward pass reads is recomputed from the nearest of them, just before it is
+        // needed. NULL = keep everything (the default). One layer's intermediates are then
+        // alive at a time instead of every layer's, for about one extra forward pass.
+        const char * checkpoint_prefix;
     };
 
     // get parameters for an optimization context with defaults set where possible

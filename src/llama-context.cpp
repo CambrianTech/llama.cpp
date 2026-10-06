@@ -3362,6 +3362,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
+    // per-layer recompute: the layer outputs are the checkpoints (llm_graph names them l_out-N)
+    opt_params.checkpoint_prefix = lopt_params.recompute ? "l_out" : nullptr;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
     opt_ctx = ggml_opt_init(opt_params);
