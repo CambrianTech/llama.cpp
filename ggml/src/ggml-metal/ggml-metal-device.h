@@ -346,6 +346,8 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+// lookups that found no buffer holding the tensor, process-wide (see ggml_metal_buffer_get_id)
+uint64_t ggml_metal_nil_lookups(void);
 
 // [MOE-GATHER #23] GPU virtual address of a host pointer inside this Metal buffer (MTLBuffer.gpuAddress
 // + intra-buffer delta), or 0 when the pointer is not covered / the OS lacks gpuAddress. Cross-buffer

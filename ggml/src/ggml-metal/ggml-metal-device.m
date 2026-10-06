@@ -2378,6 +2378,16 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     }
 }
 
+// Every lookup that found no buffer holding a tensor's bytes, process-wide. Such a lookup hands
+// the kernel a nil buffer: the op reads or writes nothing it was meant to, and the graph goes on
+// with stale memory (Metal OUT_PROD read stale scratch in every LoRA backward that way, only a
+// log line saying so). ggml_metal_graph_compute fails a graph during which this count rose.
+static atomic_uint_fast64_t g_ggml_metal_nil_lookups = 0;
+
+uint64_t ggml_metal_nil_lookups(void) {
+    return (uint64_t) atomic_load(&g_ggml_metal_nil_lookups);
+}
+
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
     struct ggml_metal_buffer_id res = { nil, 0 };
 
@@ -2399,6 +2409,7 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
     }
 
     GGML_LOG_ERROR("%s: error: tensor '%s' buffer is nil\n", __func__, t->name);
+    atomic_fetch_add(&g_ggml_metal_nil_lookups, 1);
 
     return res;
 }

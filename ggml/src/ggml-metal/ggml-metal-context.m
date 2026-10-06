@@ -441,6 +441,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_FAILED;
     }
 
+    // a lookup that finds no buffer during this graph's encode means some op ran on the wrong
+    // memory: the graph is reported failed, never as a success computed on stale bytes
+    const uint64_t nil_lookups_0 = ggml_metal_nil_lookups();
+
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
 
@@ -609,6 +613,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
             ctx->capture_started = false;
         }
+    }
+
+    if (ggml_metal_nil_lookups() != nil_lookups_0) {
+        GGML_LOG_ERROR("%s: %llu tensor lookup(s) found no buffer while encoding this graph: its result is not trusted\n",
+                __func__, (unsigned long long) (ggml_metal_nil_lookups() - nil_lookups_0));
+        return GGML_STATUS_FAILED;
     }
 
     return GGML_STATUS_SUCCESS;
