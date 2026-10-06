@@ -1730,6 +1730,10 @@ extern "C" {
     // memory): nothing was evaluated past that point. Cleared by llama_opt_init.
     LLAMA_API bool llama_opt_failed(struct llama_context * lctx);
 
+    // Why the epoch's graph was refused, in words for a person ("" when it was the memory gate or
+    // nothing refused): e.g. a node the device backend cannot run. Valid until llama_free.
+    LLAMA_API const char * llama_opt_failure(struct llama_context * lctx);
+
     // Cap, in bytes, what training may add on each GPU device (0 = the device's own free
     // figure). Set before llama_opt_init. See ggml_opt_set_alloc_budget.
     LLAMA_API void llama_opt_set_memory_budget(struct llama_context * lctx, size_t bytes);

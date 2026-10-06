@@ -6659,8 +6659,18 @@ static void ggml_acc_or_set(
         const  size_t         offset) {
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
+    // ACC runs on a GPU only with contiguous inputs, and the gradient a VIEW backward accumulates
+    // is often a view itself (a slice of a fused QKV projection): copy it, or the op leaves the
+    // device (the 5090 2026-10-06, a qwen35 training graph: ACC 'grad for Qcur')
+    if (!ggml_is_contiguous(tensor)) {
+        tensor = ggml_cont(ctx, tensor);
+    }
     if (cgraph->grads[isrc]) {
-        cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
+        struct ggml_tensor * acc_into = cgraph->grads[isrc];
+        if (!ggml_is_contiguous(acc_into) && !cgraph->grad_accs[isrc]) {
+            acc_into = ggml_cont(ctx, acc_into);
+        }
+        cgraph->grads[isrc] = ggml_acc_impl(ctx, acc_into, tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
         struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);

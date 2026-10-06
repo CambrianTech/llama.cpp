@@ -3503,8 +3503,11 @@ void llama_context::opt_epoch_iter(
             }
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             if (!ggml_opt_alloc(opt_ctx, train)) {
-                LLAMA_LOG_ERROR("%s: the %s graph does not fit in device memory (window %u): stopping the epoch\n",
-                                __func__, train ? "training" : "evaluation", n_ctx);
+                const char * why = ggml_opt_refusal(opt_ctx);
+                opt_failure = why;
+                LLAMA_LOG_ERROR("%s: the %s graph was refused (window %u): %s: stopping the epoch\n",
+                                __func__, train ? "training" : "evaluation", n_ctx,
+                                why[0] ? why : "it does not fit in device memory");
                 ggml_free(ctx_compute_opt);
                 opt_alloc_failed.store(true);
                 opt_stop_requested.store(true);
@@ -4293,6 +4296,7 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
 
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {
     ctx->opt_alloc_failed.store(false);
+    ctx->opt_failure.clear();
     ctx->opt_init(model, lopt_params);
 }
 
@@ -4319,6 +4323,10 @@ size_t llama_opt_graph_bytes(struct llama_context * ctx) {
 
 bool llama_opt_failed(struct llama_context * ctx) {
     return ctx->opt_alloc_failed.load();
+}
+
+const char * llama_opt_failure(struct llama_context * ctx) {
+    return ctx->opt_failure.c_str();
 }
 
 void llama_opt_epoch(
