@@ -102,6 +102,12 @@ public:
     // Starts a run on a worker thread; refuses (ok=false) while one is running or on bad input.
     common_json start(const common_json & body_in);
     common_json status() const;
+
+    // A finished turn, from serving: its generation began at gen_start_us and ended at
+    // gen_end_us (ggml_time_us) over `steps` decode steps. A turn that overlapped no training
+    // window is her per-turn baseline; one that overlapped a window is a per-turn slowdown
+    // sample against it (the bound is on the cycle's average, Joel's bar is per turn: Cormac).
+    void on_turn(int64_t gen_start_us, int64_t gen_end_us, int64_t steps);
     // Stops the running job at its next training window (no adapter is written); ok=false when
     // nothing is running.
     common_json cancel();
@@ -111,6 +117,7 @@ public:
 private:
     void run(common_json req, examples_data ex);
     static bool before_window(bool train, void * user_data);
+    void close_window_span(); // under mu: a run's end ends its last window
     static void on_batch(bool train, ggml_opt_context_t, ggml_opt_dataset_t, ggml_opt_result_t,
                          int64_t ibatch, int64_t ibatch_max, int64_t);
 
@@ -157,6 +164,14 @@ private:
     // price of the bound staying true.
     static constexpr int64_t PROBE_EVERY_MS = 30000;
     static constexpr int64_t PROBE_MS = 500;
+    // THE PER-TURN RECEIPT. Windows of this run as [start, end) in ggml_time_us (end 0 while
+    // one runs), every turn's overlap measured against them; a turn's rate is per slot, so its
+    // baseline is other turns' rate, never the lane's total rate. Guarded by mu.
+    static constexpr int64_t TURN_MIN_STEPS = 16; // fewer decode steps time the scheduler, not her
+    std::vector<std::pair<int64_t, int64_t>> window_spans;
+    rate_estimate turn_rate_clean;          // turns that overlapped no window, across runs
+    std::vector<int64_t> turn_slowdown_ppm; // one per turn that overlapped a window, this run
+    int64_t turns_clean{0};
     rate_estimate rate_no_window;   // guarded by mu
     rate_estimate rate_in_window;   // guarded by mu
     std::chrono::steady_clock::time_point last_no_window_sample{};

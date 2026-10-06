@@ -2020,6 +2020,10 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // every finished turn reaches the trainer: her per-turn baseline, or a slowdown sample
+        if (trainer && slot.stats.t_gen_last > 0) {
+            trainer->on_turn(slot.stats.t_prompt_last, slot.stats.t_gen_last, (int64_t) slot.stats.n_gen_steps());
+        }
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
