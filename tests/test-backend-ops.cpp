@@ -6258,6 +6258,47 @@ struct test_concat : public test_case {
     }
 };
 
+// GGML_OP_CONCAT, its gradient: the output consumed through a permute and a transpose, the way the
+// training attention consumes a walk's [cached prefix | chunk] V, so the gradient reaches CONCAT
+// non-contiguous (its first stride is not the element size). The backward used to slice that
+// gradient in place and read the right number of elements from the wrong places (fork #46).
+struct test_concat_grad_transposed : public test_case {
+    const std::array<int64_t, 4> ne_a;
+    const int64_t ne_b_d;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne_a, ne_b_d);
+    }
+
+    test_concat_grad_transposed(std::array<int64_t, 4> ne_a = {4, 3, 5, 1}, int64_t ne_b_d = 2)
+        : ne_a(ne_a), ne_b_d(ne_b_d) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto ne_b = ne_a;
+        ne_b[2] = ne_b_d;
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_b.data());
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * cat = ggml_concat(ctx, a, b, 2);
+        ggml_set_name(cat, "cat");
+        // squared: the harness differentiates a SUM, whose gradient is all ones, and a scrambled
+        // tensor of ones is still ones; through SQR the gradient varies by element (2x)
+        ggml_tensor * out = ggml_sqr(ctx, ggml_cont(ctx, ggml_transpose(ctx, ggml_permute(ctx, cat, 0, 2, 1, 3))));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_ARGSORT
 struct test_argsort : public test_case {
     const ggml_type type;
@@ -9943,6 +9984,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    test_cases.emplace_back(new test_concat_grad_transposed());
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
