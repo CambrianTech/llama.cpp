@@ -3512,6 +3512,9 @@ void llama_context::opt_epoch_iter(
     const exact_chunk * xc = nullptr;
     // per layer, per position: dL/d(cached K) and dL/d(cached V), [position][n_embd_*_gqa]
     std::vector<std::vector<float>> walk_gk, walk_gv;
+    // per recurrent state tensor: dL/d(the state the chunk just before leaves), from the chunk
+    // trained last (each chunk's exit state feeds exactly one chunk, the next)
+    std::unordered_map<const ggml_tensor *, std::vector<float>> walk_gstate;
 
     // one training chunk [pos_ctx, pos_ctx + n_tokens): forward and backward over it alone,
     // attending to the cached context before it
@@ -3652,6 +3655,18 @@ void llama_context::opt_epoch_iter(
                     }
                 }
             }
+            if (xc != nullptr) {
+                for (const auto & ws : res->t_walk_state) {
+                    if (ws.ds) {
+                        ggml_backend_tensor_memset(ws.ds, 0, 0, ggml_nbytes(ws.ds));
+                    }
+                    if (ws.gs) {
+                        const auto it = walk_gstate.find(ws.cache);
+                        GGML_ASSERT(it != walk_gstate.end() && it->second.size() == (size_t) ggml_nelements(ws.gs));
+                        ggml_backend_tensor_set(ws.gs, it->second.data(), 0, ggml_nbytes(ws.gs));
+                    }
+                }
+            }
             ggml_opt_eval(opt_ctx, xc != nullptr && xc->n_labels == 0 ? nullptr : result);
             if (const char * why = ggml_opt_refusal(opt_ctx); why[0] != '\0') {
                 // the backend failed the graph (ggml_opt_eval): the run fails, as a refused graph does
@@ -3682,6 +3697,19 @@ void llama_context::opt_epoch_iter(
                     }
                 }
             }
+            if (xc != nullptr) {
+                // dL/d(entry state): what the previous chunk's exit state takes in its surrogate
+                for (const auto & ws : res->t_walk_state) {
+                    if (!ws.ds) {
+                        continue;
+                    }
+                    ggml_tensor * grad = ggml_opt_leaf_grad(opt_ctx, ws.ds);
+                    GGML_ASSERT(grad != nullptr && grad->type == GGML_TYPE_F32 && ggml_is_contiguous(grad));
+                    auto & g = walk_gstate[ws.cache];
+                    g.resize(ggml_nelements(grad));
+                    ggml_backend_tensor_get(grad, g.data(), 0, ggml_nbytes(grad));
+                }
+            }
             if (callback && !(xc != nullptr && xc->n_labels == 0)) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_batch + 1, ndata_in_loop, t_loop_start);
             }
@@ -3702,7 +3730,8 @@ void llama_context::opt_epoch_iter(
     } else {
         recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
     }
-    if (recr != nullptr && cparams.n_seq_max < 2) {
+    // the plain walk snapshots a recurrent state into a scratch sequence; the exact walk keeps host snapshots
+    if (recr != nullptr && cparams.n_seq_max < 2 && !(train && opt_walk_exact)) {
         LLAMA_LOG_ERROR("%s: a recurrent model trains with a scratch sequence for its state snapshot: create the training context with n_seq_max >= 2\n", __func__);
         opt_stop_requested.store(true);
         return;
@@ -3719,13 +3748,10 @@ void llama_context::opt_epoch_iter(
         // prefix's G. ONE optimizer step per window, on the gradient of the window's loss
         // (exact within the horizon). Memory stays chunk x window; the cost is one decode plus
         // one forward and backward per chunk, context chunks included.
-        if (recr != nullptr) {
-            opt_failure = "the exact walk trains pure attention models: a recurrent state's gradient across chunks is not carried yet";
-            LLAMA_LOG_ERROR("%s: %s\n", __func__, opt_failure.c_str());
-            opt_alloc_failed.store(true);
-            opt_stop_requested.store(true);
-            return;
-        }
+        // A recurrent model's state is carried the same way, one chunk at a time: the state
+        // entering a chunk is a GRAD leaf, the state it leaves meets the next chunk's gradient
+        // (build_rs, build_walk_state_exit). The reverse pass restores each chunk's entry state
+        // from a host snapshot taken at its boundary in the forward pass.
         std::vector<exact_chunk> chunks;
         uint32_t n_labels_window = 0;
         for (uint32_t p = 0; p <= (uint32_t) last_label; ) {
@@ -3747,7 +3773,8 @@ void llama_context::opt_epoch_iter(
         for (int64_t j = (int64_t) chunks.size() - 1; j >= 0; --j) {
             exact_chunk & c = chunks[j];
             c.surrogate = reach < c.c0 + c.n;
-            c.needed    = c.n_labels > 0 || c.surrogate;
+            // a recurrent state reaches every later chunk: a chunk before a trained one trains
+            c.needed    = c.n_labels > 0 || c.surrogate || (recr != nullptr && first >= 0);
             if (!c.needed) {
                 continue;
             }
@@ -3766,9 +3793,48 @@ void llama_context::opt_epoch_iter(
             walk_gv[il].assign((size_t) (last_label + 1)*model.hparams.n_embd_v_gqa(il), 0.0f);
         }
 
-        // the window as the adapter now reads it, then the reverse pass, popping the cache
-        if (!decode_span(0, (uint32_t) last_label + 1)) {
-            return;
+        // the window as the adapter now reads it, chunk by chunk: a recurrent model's state is
+        // snapshotted at each chunk's start (empty before the first: it starts from zero)
+        struct state_snapshot {
+            bool                            empty = true;
+            std::vector<std::vector<float>> r, s; // per layer
+        };
+        std::vector<state_snapshot> snaps(recr != nullptr ? chunks.size() : 0);
+        auto state_rows = [&](bool write, state_snapshot & snap) {
+            const int32_t cell = recr->cells[0].tail; // the cell holding sequence 0's state
+            if (!write) {
+                snap.empty = cell < 0;
+                snap.r.assign(recr->r_l.size(), {});
+                snap.s.assign(recr->s_l.size(), {});
+            }
+            if (cell < 0) {
+                return;
+            }
+            for (size_t il = 0; il < recr->r_l.size(); ++il) {
+                for (int kind = 0; kind < 2; ++kind) {
+                    ggml_tensor * t = kind == 0 ? recr->r_l[il] : recr->s_l[il];
+                    if (t == nullptr) {
+                        continue;
+                    }
+                    GGML_ASSERT(t->type == GGML_TYPE_F32);
+                    auto & row = kind == 0 ? snap.r[il] : snap.s[il];
+                    const size_t bytes = t->nb[1];
+                    if (write) {
+                        ggml_backend_tensor_set(t, row.data(), (size_t) cell*bytes, bytes);
+                    } else {
+                        row.resize(t->ne[0]);
+                        ggml_backend_tensor_get(t, row.data(), (size_t) cell*bytes, bytes);
+                    }
+                }
+            }
+        };
+        for (size_t j = 0; j < chunks.size(); ++j) {
+            if (recr != nullptr) {
+                state_rows(false, snaps[j]);
+            }
+            if (!decode_span(chunks[j].c0, chunks[j].c0 + chunks[j].n)) {
+                return;
+            }
         }
         bool ok = true;
         for (int64_t j = (int64_t) chunks.size() - 1; j >= first && ok; --j) {
@@ -3780,24 +3846,36 @@ void llama_context::opt_epoch_iter(
                 ok = false;
                 break;
             }
-            if (!memory->seq_rm(0, c.c0, -1)) {
+            // attention: pop the cache to [0, c0); recurrent: restore the chunk's entry state
+            const bool popped = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, c.c0, -1)) : memory->seq_rm(0, c.c0, -1);
+            if (!popped) {
                 LLAMA_LOG_ERROR("%s: could not pop the cache to [0, %u) for the reverse pass\n", __func__, c.c0);
                 opt_stop_requested.store(true);
                 ok = false;
                 break;
             }
+            if (recr != nullptr) {
+                if (snaps[j].empty) {
+                    recr->seq_rm(0, -1, -1); // the first chunk starts from a zero state
+                } else {
+                    state_rows(true, snaps[j]);
+                }
+            }
             cparams.walk_exact     = true;
             cparams.walk_grad_from = c.grad_from;
             cparams.walk_surrogate = c.surrogate;
+            cparams.walk_state_surrogate = recr != nullptr && j < (int64_t) chunks.size() - 1 && !walk_gstate.empty();
             xc = &c;
             ok = train_chunk(c.c0, c.n);
             xc = nullptr;
             cparams.walk_exact     = false;
             cparams.walk_grad_from = 0;
             cparams.walk_surrogate = false;
+            cparams.walk_state_surrogate = false;
         }
         walk_gk.clear();
         walk_gv.clear();
+        walk_gstate.clear();
         return;
     }
 

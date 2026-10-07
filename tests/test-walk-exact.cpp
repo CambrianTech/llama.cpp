@@ -11,7 +11,9 @@
 //   2. context, then a reply (a masked window, the walk's real case): the exact walk in 4 chunks
 //      must take the step it takes with one chunk per run, and the plain walk must not
 //
-// Needs a pure-attention model: test-walk-exact -m Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf
+// Run on a pure-attention model and on a hybrid (attention + gated delta-net):
+//   test-walk-exact -m Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf
+//   test-walk-exact -m Qwen3.5-0.8B-Q8_0.gguf
 
 #include "arg.h"
 #include "common.h"
@@ -40,7 +42,8 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
     cparams.n_ctx           = WINDOW;
     cparams.n_batch         = chunk;
     cparams.n_ubatch        = chunk;
-    cparams.n_seq_max       = 1;
+    cparams.n_seq_max       = 2;    // the plain walk snapshots a recurrent state into a scratch sequence
+    cparams.kv_unified      = true; // ...and the window keeps every cell
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.type_k          = GGML_TYPE_F32; // the walk's cached constants equal the chunk's own K/V
     cparams.type_v          = GGML_TYPE_F32;

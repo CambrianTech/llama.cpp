@@ -21,6 +21,8 @@ struct llama_cparams {
     bool     walk_exact     = false;
     uint32_t walk_grad_from = 0;
     bool     walk_surrogate = false;
+    // a later chunk's gradient sits on the recurrent state this chunk leaves
+    bool     walk_state_surrogate = false;
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;

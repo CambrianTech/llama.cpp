@@ -1341,6 +1341,7 @@ void llm_graph_result::reset() {
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
     t_walk.clear();
+    t_walk_state.clear();
     t_walk_surrogate = nullptr;
 
     t_sampled.clear();
@@ -3551,6 +3552,17 @@ ggml_tensor * llm_graph_context::build_rs(
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
     // {state_size, rs_size} -> {state_size, n_seqs}
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
+    if (cparams.training && cparams.walk_exact) {
+        // THE EXACT WALK: the state entering the chunk is the cached one PLUS a zero GRAD leaf,
+        // so the backward yields dL/d(entry state): the gradient the previous chunk's exit takes
+        GGML_ASSERT(output_states->type == GGML_TYPE_F32 && "the exact walk carries an F32 recurrent state");
+        ggml_tensor * ds = ggml_new_tensor(ctx0, GGML_TYPE_F32, GGML_MAX_DIMS, output_states->ne);
+        ggml_format_name(ds, "walk_ds-%s", s->name);
+        ggml_set_input(ds);
+        ggml_set_grad(ds);
+        output_states = ggml_add(ctx0, output_states, ds);
+        res->walk_state_of(s).ds = ds;
+    }
     ggml_build_forward_expand(gf, output_states);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
@@ -3604,6 +3616,22 @@ ggml_tensor * llm_graph_context::build_rs(
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+}
+
+void llm_graph_context::build_walk_state_exit(ggml_tensor * cache, ggml_tensor * exit) const {
+    if (!(cparams.training && cparams.walk_exact && cparams.walk_state_surrogate)) {
+        return;
+    }
+    ggml_tensor * flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, exit), ggml_nelements(exit));
+    if (flat->type != GGML_TYPE_F32) {
+        flat = ggml_cast(ctx0, flat, GGML_TYPE_F32);
+    }
+    ggml_tensor * gs = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, ggml_nelements(exit));
+    ggml_format_name(gs, "walk_gs-%s", cache->name);
+    ggml_set_input(gs);
+    ggml_tensor * term = ggml_sum(ctx0, ggml_mul(ctx0, flat, gs));
+    res->t_walk_surrogate = res->t_walk_surrogate ? ggml_add(ctx0, res->t_walk_surrogate, term) : term;
+    res->walk_state_of(cache).gs = gs;
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
