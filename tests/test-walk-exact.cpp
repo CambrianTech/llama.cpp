@@ -41,6 +41,8 @@ static ggml_opt_optimizer_params sgd_pars(void *) {
 // q8_0, in a flash-attention context that stores V untransposed) measure the straight-through
 // approximation the walk makes there (Fable on #47: the gradient is taken at the cache's values)
 static ggml_type g_cache_type = GGML_TYPE_F32;
+// recurrent rollback slots in the context (serving keeps some for speculative decoding)
+static uint32_t g_n_rs_seq = 0;
 
 static llama_context * make_ctx(const common_params & params, llama_model * model, uint32_t chunk) {
     auto cparams = common_context_params_to_llama(params);
@@ -54,6 +56,7 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
     cparams.flash_attn_type = g_cache_type == GGML_TYPE_F32 ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_ENABLED;
     cparams.type_k          = g_cache_type;
     cparams.type_v          = g_cache_type;
+    cparams.n_rs_seq        = g_n_rs_seq;
     return llama_init_from_model(model, cparams);
 }
 
@@ -275,6 +278,39 @@ int main(int argc, char ** argv) {
         printf("  host budget of 1 byte: failed=%d, \"%s\", needs %zu MiB\n", (int) llama_opt_failed(ctx), why.c_str(), llama_opt_walk_host_bytes(ctx) >> 20);
         if (!llama_opt_failed(ctx) || why.find("host memory") == std::string::npos || adapter_params(adapter) != before) {
             fprintf(stderr, "FAILED: a window over the host budget was not refused by name before it ran\n");
+            ++failures;
+        }
+        ggml_opt_dataset_free(dataset);
+        llama_free(ctx);
+        llama_adapter_lora_free(adapter);
+    }
+
+    if (llama_model_is_hybrid(model)) {
+        // 4. regression for the 5090 crash (2026-10-07 04:09Z): a recurrent context with rollback
+        // slots (serving's, inherited by the training context) made the exact walk ASSERT inside
+        // the serving process. It must refuse by name, and the adapter stays untouched.
+        llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
+        const std::vector<float> before = adapter_params(adapter);
+        g_n_rs_seq = 4;
+        llama_context * ctx = make_ctx(params, model, WINDOW / 4);
+        g_n_rs_seq = 0;
+        float scale = 1.0f;
+        GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
+        llama_opt_params lopt{};
+        lopt.param_filter   = llama_opt_param_filter_all;
+        lopt.get_opt_pars   = sgd_pars;
+        lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
+        lopt.adapter        = adapter;
+        lopt.walk_exact     = true;
+        llama_opt_init(ctx, model, lopt);
+        std::vector<std::vector<llama_token>> seqs = { std::vector<llama_token>(tokens.begin(), tokens.begin() + WINDOW + 1) };
+        std::vector<std::vector<uint8_t>>     loss = { std::vector<uint8_t>(WINDOW + 1, 1) };
+        ggml_opt_dataset_t dataset = common_opt_dataset_init_masked(WINDOW, seqs, loss, tokens[0]);
+        llama_opt_epoch(ctx, dataset, nullptr, nullptr, /*idata_split =*/ 1, nullptr, nullptr);
+        const std::string why = llama_opt_failure(ctx);
+        printf("  rollback slots: failed=%d, \"%s\"\n", (int) llama_opt_failed(ctx), why.c_str());
+        if (!llama_opt_failed(ctx) || why.find("rollback") == std::string::npos || adapter_params(adapter) != before) {
+            fprintf(stderr, "FAILED: a recurrent context with rollback slots was not refused by name\n");
             ++failures;
         }
         ggml_opt_dataset_free(dataset);
