@@ -3758,6 +3758,17 @@ void llama_context::opt_epoch_iter(
         // Each window starts from the REQUESTED horizon: a halving that fit one window's device
         // budget must not shrink every later window and epoch, which may be shorter (Fable).
         opt_walk_horizon = opt_walk_horizon_req;
+        // A recurrent context with rollback slots keeps several states per sequence; the walk
+        // carries exactly one. Refused by name, never asserted: training runs inside the serving
+        // process, and an assert there takes serving down (2026-10-07 04:09Z on the 5090).
+        if (recr != nullptr && cparams.n_rs_seq > 0) {
+            opt_failure = "the exact walk needs a training context with no recurrent rollback slots (n_rs_seq = 0, it has "
+                + std::to_string(cparams.n_rs_seq) + "): create the training context with n_rs_seq = 0";
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, opt_failure.c_str());
+            opt_alloc_failed.store(true);
+            opt_stop_requested.store(true);
+            return;
+        }
         // A recurrent model's state is carried the same way, one chunk at a time: the state
         // entering a chunk is a GRAD leaf, the state it leaves meets the next chunk's gradient
         // (build_rs, build_walk_state_exit). The reverse pass restores each chunk's entry state
@@ -3856,18 +3867,25 @@ void llama_context::opt_epoch_iter(
         // snapshotted at each chunk's start (empty before the first: it starts from zero)
         struct state_snapshot {
             bool                            empty = true;
-            std::vector<std::vector<float>> r, s; // per layer
+            llama_pos                       pos   = -1; // the cell's last position at the snapshot
+            std::vector<std::vector<float>> r, s;       // per layer
         };
         std::vector<state_snapshot> snaps(recr != nullptr ? chunks.size() : 0);
         auto state_rows = [&](bool write, state_snapshot & snap) {
             const int32_t cell = recr->cells[0].tail; // the cell holding sequence 0's state
             if (!write) {
                 snap.empty = cell < 0;
+                snap.pos   = cell < 0 ? -1 : recr->cells[cell].pos;
                 snap.r.assign(recr->r_l.size(), {});
                 snap.s.assign(recr->s_l.size(), {});
             }
             if (cell < 0) {
                 return;
+            }
+            // the restored state is the state AFTER snap.pos, so the cell says so: left at the
+            // window's end, the next ubatch read as non-consecutive ("position 65640 after 66345")
+            if (write) {
+                recr->cells[cell].pos = snap.pos;
             }
             for (size_t il = 0; il < recr->r_l.size(); ++il) {
                 for (int kind = 0; kind < 2; ++kind) {

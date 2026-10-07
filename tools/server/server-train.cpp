@@ -751,6 +751,11 @@ void server_trainer::run(json req, examples_data ex) {
 
     // The training context: the SAME model, its own graph; flash attention has no backward.
     llama_context_params cparams = common_context_params_to_llama(params_base);
+    // NO ROLLBACK SLOTS. Serving keeps recurrent-state snapshots for speculative decoding's
+    // rollback (n_rs_seq, from the MTP draft); a training context never rolls back, and the exact
+    // walk carries one recurrent state per sequence. Inherited, they crashed the 5090's serving
+    // process on Kimi's first exact run (2026-10-07 04:09Z: the delta-net invariant asserted).
+    cparams.n_rs_seq = 0;
     // The context holds the whole window; one training chunk is one batch is one ubatch, the
     // largest multiple of 256 that divides the window and is at most the caller's "chunk" (the
     // memory gate's S). Context she did not write is decoded; her replies train chunk by chunk,
