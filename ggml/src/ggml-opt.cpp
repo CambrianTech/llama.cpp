@@ -363,6 +363,29 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
             keep.insert(node);
         }
     }
+    if (const char * range = getenv("GGML_OPT_CKPT_LAYERS")) { // LOCAL DEBUG PATCH: bisect the recompute by layer
+        int lo = 0, hi = 1 << 30;
+        sscanf(range, "%d-%d", &lo, &hi);
+        int layer = -1, kept = 0;
+        for (int i = 0; i < n_fwd; ++i) {
+            ggml_tensor * node = g->nodes[i];
+            const char * dash = strrchr(ggml_get_name(node), '-');
+            if (dash && dash[1] >= '0' && dash[1] <= '9') { layer = atoi(dash + 1); }
+            if (layer < lo || layer >= hi) { keep.insert(node); kept++; }
+        }
+        GGML_LOG_WARN("CKPT-LAYERS: recompute only layers [%d,%d): %d forward nodes kept as they are\n", lo, hi, kept);
+    }
+    if (const char * range = getenv("GGML_OPT_CKPT_LAYERS")) { // LOCAL DEBUG PATCH: bisect the recompute by layer
+        int lo = 0, hi = 1 << 30;
+        sscanf(range, "%d-%d", &lo, &hi);
+        int layer = -1;
+        for (int i = 0; i < n_fwd; ++i) {
+            ggml_tensor * node = g->nodes[i];
+            const char * dash = strrchr(ggml_get_name(node), '-');
+            if (dash && dash[1] >= '0' && dash[1] <= '9') { layer = atoi(dash + 1); }
+            if (layer < lo || layer >= hi) { keep.insert(node); }
+        }
+    }
     if (keep.empty()) {
         return; // no checkpoint named: nothing to rewrite
     }
@@ -375,6 +398,60 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
         if (node->view_src != nullptr) {
             node->view_src = ggml_opt_recompute_node(ctx, forward, keep, clones, node->view_src);
         }
+    }
+    if (getenv("GGML_OPT_CLONE_CHECK")) { // LOCAL DEBUG PATCH: pair each original and its clone by a unique tag
+        int n = 0;
+        for (auto & kv : clones) {
+            char tagged[GGML_MAX_NAME];
+            snprintf(tagged, sizeof(tagged), "#%d %.40s", n, ggml_get_name(kv.first));
+            ggml_set_name(kv.first, tagged);
+            ggml_format_name(kv.second, "%s (recompute)", tagged);
+            n++;
+        }
+    }
+    if (getenv("GGML_OPT_MISSED_CHECK")) { // LOCAL DEBUG PATCH: a backward read the rewrite did not redirect
+        int missed = 0;
+        auto fwd_only = [&](ggml_tensor * t) {
+            return t && forward.count(t) && !keep.count(t) && !(t->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT))
+                && t->op != GGML_OP_NONE && t->op != GGML_OP_CPY && t->op != GGML_OP_SET_ROWS;
+        };
+        for (ggml_tensor * node : backward) {
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (fwd_only(node->src[k]) && missed++ < 20) {
+                    GGML_LOG_WARN("MISSED: bwd %s '%s' src%d reads un-kept fwd %s '%s'\n", ggml_op_desc(node), node->name, k, ggml_op_desc(node->src[k]), node->src[k]->name);
+                }
+            }
+            if (fwd_only(node->view_src) && missed++ < 20) {
+                GGML_LOG_WARN("MISSED: bwd %s '%s' view_src un-kept fwd %s '%s'\n", ggml_op_desc(node), node->name, ggml_op_desc(node->view_src), node->view_src->name);
+            }
+        }
+        for (auto & kv : clones) { // a clone reading an un-kept, un-cloned original
+            ggml_tensor * c = kv.second;
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                if (fwd_only(c->src[k]) && missed++ < 20) {
+                    GGML_LOG_WARN("MISSED: clone %s '%s' src%d reads un-kept fwd %s '%s'\n", ggml_op_desc(c), c->name, k, ggml_op_desc(c->src[k]), c->src[k]->name);
+                }
+            }
+        }
+        // a clone of an IN-PLACE op whose memory is a KEPT original: re-running it writes into
+        // that original during the backward pass (applied twice), invisible to a value compare
+        std::unordered_set<ggml_tensor *> is_clone_set;
+        for (auto & kv : clones) { is_clone_set.insert(kv.second); }
+        int inplace = 0;
+        for (auto & kv : clones) {
+            ggml_tensor * c = kv.second;
+            if (c->view_src && c->op != GGML_OP_VIEW && c->op != GGML_OP_RESHAPE && c->op != GGML_OP_PERMUTE
+                && c->op != GGML_OP_TRANSPOSE && c->op != GGML_OP_NONE) {
+                ggml_tensor * root = c->view_src;
+                while (root->view_src) { root = root->view_src; }
+                const bool writes_kept = !is_clone_set.count(c->view_src);
+                if (inplace++ < 20) {
+                    GGML_LOG_WARN("MISSED: in-place clone %s '%s' writes into %s '%s' (%s; root '%s')\n", ggml_op_desc(c), c->name,
+                        ggml_op_desc(c->view_src), c->view_src->name, writes_kept ? "a KEPT original" : "a clone", root->name);
+                }
+            }
+        }
+        GGML_LOG_WARN("MISSED: total %d, in-place clones %d (clones %zu, backward %zu)\n", missed, inplace, clones.size(), backward.size());
     }
     if (clones.empty()) {
         return;
@@ -1048,6 +1125,193 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     return true;
 }
 
+
+// LOCAL DEBUG PATCH (not for merge): name the first node whose output holds a NaN/Inf.
+struct opt_nan_hunt { bool found = false; int idx = 0; };
+static bool opt_nan_hunt_cb(struct ggml_tensor * t, bool ask, void * ud) {
+    auto * h = (opt_nan_hunt *) ud;
+    if (ask) { return !h->found && t->type == GGML_TYPE_F32; }
+    h->idx++;
+    if (h->found || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) { return true; }
+    const int64_t n = ggml_nelements(t);
+    std::vector<float> buf(n);
+    ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+    for (int64_t i = 0; i < n; ++i) {
+        if (!std::isfinite(buf[i])) {
+            h->found = true;
+            GGML_LOG_WARN("NAN-HUNT: first non-finite at node %d: %s '%s' ne=[%lld,%lld,%lld,%lld] elem %lld data=%p nbytes=%zu alloc=%zu\n", h->idx, ggml_op_desc(t), t->name,
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], (long long) i, t->data, ggml_nbytes(t),
+                t->buffer ? ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(t->buffer), t) : (size_t) 0);
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                const ggml_tensor * s = t->src[k];
+                if (s) {
+                    // the source's bytes NOW (right after this op ran): a non-finite source that
+                    // was finite when it was produced was clobbered during this op
+                    const ggml_tensor * base = s->view_src ? s->view_src : s;
+                    long long bad = -1;
+                    if (base->type == GGML_TYPE_F32 && ggml_is_contiguous(base)) {
+                        std::vector<float> sb(ggml_nelements(base));
+                        ggml_backend_tensor_get(base, sb.data(), 0, sb.size() * sizeof(float));
+                        for (size_t j = 0; j < sb.size(); ++j) { if (!std::isfinite(sb[j])) { bad = (long long) j; break; } }
+                    }
+                    GGML_LOG_WARN("NAN-HUNT:   src%d %s '%s' type=%s ne=[%lld,%lld,%lld,%lld] contiguous=%d view_src='%s' data=%p base_first_nonfinite=%lld\n", k, ggml_op_desc(s), s->name, ggml_type_name(s->type),
+                        (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3], (int) ggml_is_contiguous(s), s->view_src ? s->view_src->name : "", s->data, bad);
+                }
+            }
+            if (t->op == GGML_OP_OUT_PROD && t->src[0]->type != GGML_TYPE_F32 && t->src[1]->view_src) {
+                // the op's own scratch, still intact right after it ran: S | X=S^T | Y=src1^T
+                const ggml_tensor * s0 = t->src[0];
+                const ggml_tensor * s1 = t->src[1];
+                const int64_t ne00 = s0->ne[0], rows = s0->ne[1], ne10 = s1->ne[0];
+                auto scan = [&](const char * tag, size_t off, int64_t nel) {
+                    ggml_tensor v = *t; v.view_src = nullptr; v.op = GGML_OP_NONE;
+                    v.type = GGML_TYPE_F32; v.ne[0] = nel; v.ne[1] = v.ne[2] = v.ne[3] = 1;
+                    v.nb[0] = 4; v.nb[1] = v.nb[2] = v.nb[3] = nel * 4;
+                    v.data = (char *) t->data + off;
+                    std::vector<float> b(nel);
+                    ggml_backend_tensor_get(&v, b.data(), 0, nel * 4);
+                    long long first = -1, count = 0;
+                    for (int64_t j = 0; j < nel; ++j) { if (!std::isfinite(b[j])) { if (first < 0) { first = j; } count++; } }
+                    GGML_LOG_WARN("NAN-HUNT:   scratch %s off=%zu n=%lld first_nonfinite=%lld count=%lld\n", tag, off, (long long) nel, first, count);
+                    return b;
+                };
+                const size_t sz_s = GGML_PAD(rows * ne00 * sizeof(float), 256);
+                const size_t o_s = ggml_nbytes(t), o_x = o_s + sz_s, o_y = o_x + sz_s;
+                scan("S", o_s, rows * ne00);
+                scan("X", o_x, rows * ne00);
+                auto y = scan("Y", o_y, rows * ne10);
+                // Y should be src1^T: compare against src1's base read directly
+                const ggml_tensor * base = s1->view_src;
+                std::vector<float> g(ggml_nelements(base));
+                ggml_backend_tensor_get(base, g.data(), 0, g.size() * 4);
+                long long mismatch = -1;
+                for (int64_t k = 0; k < rows && mismatch < 0; ++k) {
+                    for (int64_t j = 0; j < ne10; ++j) {
+                        // src1 is a transposed view: element (j, k) of src1 is base[k + j*base->ne[0]]? read by src1 strides
+                        const size_t src1_off = (size_t) j * s1->nb[0] + (size_t) k * s1->nb[1] - ((char *) base->data - (char *) s1->data);
+                        const float want = g[((char *) s1->data - (char *) base->data + j * s1->nb[0] + k * s1->nb[1]) / 4];
+                        (void) src1_off;
+                        const float got = y[k + j * rows];
+                        if (!(want == got) && !(std::isnan(want) && std::isnan(got))) { mismatch = k * ne10 + j; break; }
+                    }
+                }
+                GGML_LOG_WARN("NAN-HUNT:   Y vs src1^T first mismatch=%lld\n", mismatch);
+                // the output itself: how many are bad, and what P should be at a bad column
+                std::vector<float> d(ggml_nelements(t));
+                ggml_backend_tensor_get(t, d.data(), 0, d.size() * 4);
+                long long nan = 0, inf = 0, bad_lo = 0;
+                for (size_t j = 0; j < d.size(); ++j) {
+                    if (std::isnan(d[j])) { nan++; } else if (std::isinf(d[j])) { inf++; }
+                    if (!std::isfinite(d[j]) && (int64_t) (j / ne00) < 512) { bad_lo++; }
+                }
+                auto xs = scan("X", o_x, rows * ne00);
+                for (int64_t i1 : {0, 511, 512, 700, 1023}) {
+                    const int64_t i0 = 17;
+                    double want = 0;
+                    for (int64_t k = 0; k < rows; ++k) { want += (double) xs[k + i0 * rows] * (double) y[k + i1 * rows]; }
+                    GGML_LOG_WARN("NAN-HUNT:   P[%lld,%lld] got=%g want=%g\n", (long long) i0, (long long) i1, d[i0 + i1 * ne00], want);
+                }
+                GGML_LOG_WARN("NAN-HUNT:   dst nan=%lld inf=%lld bad_in_first_half=%lld of %zu\n", nan, inf, bad_lo, d.size());
+                float mx = 0, my = 0; long long yover = 0, xover = 0;
+                for (float v : xs) { mx = std::max(mx, std::fabs(v)); xover += std::fabs(v) > 65504.0f; }
+                for (float v : y)  { my = std::max(my, std::fabs(v)); yover += std::fabs(v) > 65504.0f; }
+                GGML_LOG_WARN("NAN-HUNT:   max|X|=%g (over half max: %lld)  max|Y|=%g (over half max: %lld)\n", mx, xover, my, yover);
+            }
+            break;
+        }
+    }
+    return true;
+}
+
+
+// LOCAL DEBUG PATCH (not for merge): compare each recompute clone to the original it replaces.
+struct opt_clone_check { std::map<std::string, std::vector<float>> originals; bool reported = false; std::string suffix; };
+static bool opt_clone_check_cb(struct ggml_tensor * t, bool ask, void * ud) {
+    auto * c = (opt_clone_check *) ud;
+    if (ask) { return t->type == GGML_TYPE_F32; }
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) { return true; }
+    std::string name = ggml_get_name(t);
+    const std::string tag = " (recompute)";
+    const bool is_clone = name.size() > tag.size() && name.compare(name.size() - tag.size(), tag.size(), tag) == 0;
+    const std::string base = is_clone ? name.substr(0, name.size() - tag.size()) : name;
+    if (base.empty() || base[0] != '#') { return true; } // only the tagged (cloned) originals and their clones
+    std::vector<float> v(ggml_nelements(t));
+    ggml_backend_tensor_get(t, v.data(), 0, v.size() * 4);
+    if (!is_clone) { c->originals[base] = std::move(v); return true; }
+    auto it = c->originals.find(base);
+    if (it == c->originals.end() || it->second.size() != v.size()) { return true; }
+    double maxd = 0; size_t at = 0;
+    for (size_t i = 0; i < v.size(); ++i) { const double d = std::fabs((double) v[i] - it->second[i]); if (d > maxd) { maxd = d; at = i; } }
+    GGML_LOG_WARN("CLONE-CHECK: %s %s '%s' max|clone-orig|=%g at %zu (orig %g clone %g)\n", maxd > 0 ? "DIFF" : "same", ggml_op_desc(t), base.c_str(), maxd, at, it->second[at], v[at]);
+    if (maxd > 0 && !c->reported) {
+        c->reported = true;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * s = t->src[k];
+            if (s) { GGML_LOG_WARN("CLONE-CHECK:   src%d %s '%s' type=%s view_src='%s'\n", k, ggml_op_desc(s), s->name, ggml_type_name(s->type), s->view_src ? s->view_src->name : ""); }
+        }
+    }
+    return true;
+}
+
+
+// LOCAL DEBUG PATCH (not for merge): record (OFF run) / compare (ON run) each gradient's bytes
+struct opt_grad_diff { bool dump = false; std::string path; std::map<std::string, uint64_t> want; std::map<std::string, int> seen; bool reported = false; int diffs = 0; int same = 0; FILE * out = nullptr; };
+static bool opt_grad_diff_cb(struct ggml_tensor * t, bool ask, void * ud) {
+    auto * g = (opt_grad_diff *) ud;
+    const std::string name = ggml_get_name(t);
+    const bool is_grad = name.rfind("grad for ", 0) == 0;
+    if (ask) { return is_grad && t->type == GGML_TYPE_F32; }
+    if (!is_grad || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) { return true; }
+    const std::string key = name + " #" + std::to_string(g->seen[name]++);
+    std::vector<uint8_t> b(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, b.data(), 0, b.size());
+    uint64_t h = 1469598103934665603ull;
+    for (uint8_t c : b) { h = (h ^ c) * 1099511628211ull; }
+    if (key == "grad for Qcur_full-23 #0") { // the first divergence: its inputs' bytes, in both runs
+        for (int k = 0; k < 2; ++k) {
+            const ggml_tensor * sv = t->src[k];
+            const ggml_tensor * bse = sv->view_src ? sv->view_src : sv;
+            std::vector<uint8_t> sb(ggml_nbytes(bse));
+            ggml_backend_tensor_get(bse, sb.data(), 0, sb.size());
+            uint64_t sh = 1469598103934665603ull; size_t nz = 0, nf = 0;
+            for (size_t i = 0; i < sb.size(); ++i) { sh = (sh ^ sb[i]) * 1099511628211ull; }
+            const float * fv = (const float *) sb.data();
+            for (size_t i = 0; i < sb.size() / 4; ++i) { nz += fv[i] != 0.0f; nf += !std::isfinite(fv[i]); }
+            GGML_LOG_WARN("GRAD-DIFF:   %s src%d %s '%s' (base '%s' %zu bytes) hash=%016llx nonzero=%zu nonfinite=%zu inplace_param=%d dst_data=%p src_data=%p\n",
+                g->dump ? "OFF" : "ON ", k, ggml_op_desc(sv), sv->name, bse->name, sb.size(), (unsigned long long) sh, nz, nf,
+                ((const int32_t *) t->op_params)[4], t->data, sv->data);
+        }
+        GGML_LOG_WARN("GRAD-DIFF:   %s out hash=%016llx ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] params=[%d,%d,%d,%d,%d] src1 ne=[%lld,%lld,%lld,%lld]\n", g->dump ? "OFF" : "ON ", (unsigned long long) h,
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3],
+            ((const int32_t *) t->op_params)[0], ((const int32_t *) t->op_params)[1], ((const int32_t *) t->op_params)[2], ((const int32_t *) t->op_params)[3], ((const int32_t *) t->op_params)[4],
+            (long long) t->src[1]->ne[0], (long long) t->src[1]->ne[1], (long long) t->src[1]->ne[2], (long long) t->src[1]->ne[3]);
+        FILE * fo = fopen(g->dump ? "/tmp/acc-off.bin" : "/tmp/acc-on.bin", "wb");
+        if (fo) { fwrite(b.data(), 1, b.size(), fo); fclose(fo); }
+        if (g->dump) { // and src1 itself, contiguous
+            const ggml_tensor * s1 = t->src[1];
+            const ggml_tensor * bse = s1->view_src ? s1->view_src : s1;
+            std::vector<uint8_t> sb(ggml_nbytes(bse));
+            ggml_backend_tensor_get(bse, sb.data(), 0, sb.size());
+            FILE * f1 = fopen("/tmp/acc-src1.bin", "wb");
+            if (f1) { fwrite(sb.data(), 1, sb.size(), f1); fclose(f1); }
+        }
+    }
+    if (g->dump) { fprintf(g->out, "%016llx %s\n", (unsigned long long) h, key.c_str()); return true; }
+    auto it = g->want.find(key);
+    if (it == g->want.end()) { return true; }
+    if (it->second == h) { g->same++; return true; }
+    g->diffs++;
+    if (!g->reported) {
+        g->reported = true;
+        GGML_LOG_WARN("GRAD-DIFF: first differing gradient (after %d equal): %s '%s'\n", g->same, ggml_op_desc(t), key.c_str());
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * sv = t->src[k];
+            if (sv) { GGML_LOG_WARN("GRAD-DIFF:   src%d %s '%s' type=%s contiguous=%d view_src='%s'\n", k, ggml_op_desc(sv), sv->name, ggml_type_name(sv->type), (int) ggml_is_contiguous(sv), sv->view_src ? sv->view_src->name : ""); }
+        }
+    }
+    return true;
+}
+
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->eval_ready);
     if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {
@@ -1090,7 +1354,35 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
+    static opt_nan_hunt nan_hunt;
+    if (getenv("GGML_OPT_NAN_HUNT")) { ggml_backend_sched_set_eval_callback(opt_ctx->backend_sched, opt_nan_hunt_cb, &nan_hunt); nan_hunt.idx = 0; }
+    static opt_grad_diff grad_diff;
+    static int grad_diff_evals = 0;
+    const char * gd_dump = getenv("GGML_OPT_GRAD_DUMP");
+    const char * gd_cmp  = getenv("GGML_OPT_GRAD_CMP");
+    const bool gd = (gd_dump || gd_cmp) && grad_diff_evals++ == 0; // the first eval only: same weights, same inputs
+    if (gd) {
+        grad_diff.dump = gd_dump != nullptr;
+        if (grad_diff.dump) { grad_diff.out = fopen(gd_dump, "w"); }
+        else {
+            FILE * f = fopen(gd_cmp, "r");
+            char hs[32], rest[512];
+            while (f && fscanf(f, "%31s %511[^\n]", hs, rest) == 2) { grad_diff.want[rest] = strtoull(hs, nullptr, 16); }
+            if (f) { fclose(f); }
+        }
+        ggml_backend_sched_set_eval_callback(opt_ctx->backend_sched, opt_grad_diff_cb, &grad_diff);
+    }
+    static opt_clone_check clone_check;
+    const char * cc = getenv("GGML_OPT_CLONE_CHECK");
+    if (cc) { clone_check.suffix = cc; clone_check.originals.clear(); ggml_backend_sched_set_eval_callback(opt_ctx->backend_sched, opt_clone_check_cb, &clone_check); }
     const enum ggml_status status = ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    if (cc) { ggml_backend_sched_set_eval_callback(opt_ctx->backend_sched, nullptr, nullptr); }
+    if (gd) {
+        ggml_backend_sched_set_eval_callback(opt_ctx->backend_sched, nullptr, nullptr);
+        if (grad_diff.out) { fclose(grad_diff.out); grad_diff.out = nullptr; }
+        if (!grad_diff.dump) { GGML_LOG_WARN("GRAD-DIFF: %d equal, %d differing (of %zu recorded)\n", grad_diff.same, grad_diff.diffs, grad_diff.want.size()); }
+    }
+    if (getenv("GGML_OPT_NAN_HUNT")) { ggml_backend_sched_set_eval_callback(opt_ctx->backend_sched, nullptr, nullptr); }
     if (status != GGML_STATUS_SUCCESS) {
         // the step's gradients (and the optimizer update inside this graph) were computed on
         // memory the backend says it did not have: the run must stop, never continue on them
