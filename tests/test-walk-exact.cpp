@@ -21,6 +21,7 @@
 #include "../src/llama-adapter.h"
 
 #include <cmath>
+#include <cstring>
 #include <map>
 #include <cstdlib>
 #include <cstdio>
@@ -43,6 +44,19 @@ static ggml_opt_optimizer_params sgd_pars(void *) {
 static ggml_type g_cache_type = GGML_TYPE_F32;
 // recurrent rollback slots in the context (serving keeps some for speculative decoding)
 static uint32_t g_n_rs_seq = 0;
+
+// counts the recurrent memory's "non-consecutive token position" warnings: a state restore that
+// leaves the cell's position at the window's end makes every next chunk read as non-consecutive
+// (the 5090 log, 2026-10-07: "position 65640 after 66345"), passing everything else through
+static int g_nonconsecutive = 0;
+static void count_log(ggml_log_level level, const char * text, void * ud) {
+    if (text && strstr(text, "non-consecutive token position")) {
+        ++g_nonconsecutive;
+    }
+    GGML_UNUSED(level);
+    GGML_UNUSED(ud);
+    fputs(text, stderr);
+}
 
 static llama_context * make_ctx(const common_params & params, llama_model * model, uint32_t chunk) {
     auto cparams = common_context_params_to_llama(params);
@@ -285,6 +299,22 @@ int main(int argc, char ** argv) {
         llama_adapter_lora_free(adapter);
     }
 
+    if (llama_model_is_hybrid(model)) {
+        // 5. what this catches: a state restore that does not restore the recurrent cell's
+        // position. The reverse pass restores each chunk's entry state; with the cell left at the
+        // window's end, every chunk after the first restore reads as non-consecutive.
+        std::vector<uint8_t> all(WINDOW + 1, 1);
+        all[0] = 0;
+        g_nonconsecutive = 0;
+        llama_log_set(count_log, nullptr);
+        step_delta(params, model, init, tokens, all, WINDOW / 4, true);
+        llama_log_set(nullptr, nullptr); // the default logger again
+        printf("  state restore: %d non-consecutive position warnings in the reverse pass\n", g_nonconsecutive);
+        if (g_nonconsecutive != 0) {
+            fprintf(stderr, "FAILED: a restored recurrent state left its cell at another position\n");
+            ++failures;
+        }
+    }
     if (llama_model_is_hybrid(model)) {
         // 4. regression for the 5090 crash (2026-10-07 04:09Z): a recurrent context with rollback
         // slots (serving's, inherited by the training context) made the exact walk ASSERT inside
