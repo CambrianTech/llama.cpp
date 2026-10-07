@@ -3786,36 +3786,50 @@ void llama_context::opt_epoch_iter(
         GGML_ASSERT(first >= 0);
         chunks[first].period_end = true;
 
-        // THE HOST BUDGET (Fable): the accumulators are layers x positions x (k + v) floats, the
-        // snapshots chunks x one sequence's state rows; both are known before anything runs.
+        // THE HOST BUDGET (Fable): the accumulators are layers x positions x (k + v) floats, and a
+        // recurrent state is checkpointed every `stride` chunks (one sequence's state rows each;
+        // the first chunk's entry is the zero state and costs nothing). Both are known before
+        // anything runs. Under a budget the stride is the smallest that fits: the reverse pass
+        // rebuilds a chunk's entry state by decoding forward from its checkpoint, so a longer
+        // stride trades host memory for decode, never for exactness.
+        size_t stride = 1;
         {
-            size_t bytes = 0;
+            size_t kv_bytes = 0;
             for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
                 if (!model.hparams.is_recr(il)) {
-                    bytes += (size_t) (last_label + 1)*(model.hparams.n_embd_k_gqa(il) + model.hparams.n_embd_v_gqa(il))*sizeof(float);
+                    kv_bytes += (size_t) (last_label + 1)*(model.hparams.n_embd_k_gqa(il) + model.hparams.n_embd_v_gqa(il))*sizeof(float);
                 }
             }
+            size_t state = 0;
             if (recr != nullptr) {
-                size_t state = 0;
                 for (size_t il = 0; il < recr->r_l.size(); ++il) {
                     state += recr->r_l[il] ? recr->r_l[il]->nb[1] : 0;
                     state += recr->s_l[il] ? recr->s_l[il]->nb[1] : 0;
                 }
-                bytes += chunks.size()*state;
             }
+            auto bytes_at = [&](size_t s) { return kv_bytes + ((chunks.size() + s - 1)/s - 1)*state; };
+            if (opt_walk_host_budget > 0) {
+                while (stride < chunks.size() && bytes_at(stride) > opt_walk_host_budget) {
+                    ++stride;
+                }
+            }
+            const size_t bytes = bytes_at(stride);
             opt_walk_host_bytes = std::max(opt_walk_host_bytes, bytes);
             if (opt_walk_host_budget > 0 && bytes > opt_walk_host_budget) {
                 char why[512];
                 snprintf(why, sizeof(why),
-                    "the exact walk needs %.1f MiB of host memory for this window (%lld positions, %zu chunks), over its budget of %.1f MiB: "
-                    "the K/V gradient grows with the window and a recurrent state's snapshots with the chunk count (a larger chunk has fewer); "
-                    "the horizon does not change either",
-                    bytes/1048576.0, (long long) (last_label + 1), chunks.size(), opt_walk_host_budget/1048576.0);
+                    "the exact walk needs %.1f MiB of host memory for this window (%lld positions, the K/V gradient alone), over its budget of %.1f MiB: "
+                    "the K/V gradient grows with the window; neither the horizon nor the chunk size changes it",
+                    bytes/1048576.0, (long long) (last_label + 1), opt_walk_host_budget/1048576.0);
                 opt_failure = why;
                 LLAMA_LOG_ERROR("%s: %s\n", __func__, opt_failure.c_str());
                 opt_alloc_failed.store(true);
                 opt_stop_requested.store(true);
                 return;
+            }
+            if (stride > 1) {
+                LLAMA_LOG_INFO("%s: the exact walk checkpoints the recurrent state every %zu chunks to fit %.1f MiB of host memory (%.1f MiB)\n",
+                        __func__, stride, opt_walk_host_budget/1048576.0, bytes/1048576.0);
             }
         }
         walk_gk.assign(model.hparams.n_layer(), {});
@@ -3864,7 +3878,7 @@ void llama_context::opt_epoch_iter(
             }
         };
         for (size_t j = 0; j < chunks.size(); ++j) {
-            if (recr != nullptr) {
+            if (recr != nullptr && j % stride == 0) {
                 state_rows(false, snaps[j]);
             }
             if (!decode_span(chunks[j].c0, chunks[j].c0 + chunks[j].n)) {
@@ -3881,19 +3895,27 @@ void llama_context::opt_epoch_iter(
                 ok = false;
                 break;
             }
-            // attention: pop the cache to [0, c0); recurrent: restore the chunk's entry state
-            const bool popped = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, c.c0, -1)) : memory->seq_rm(0, c.c0, -1);
+            // attention: pop the cache to [0, c0); recurrent: restore the state at the chunk's
+            // checkpoint and decode forward to its start (that decode rebuilds the attention K/V
+            // in between too, under the same adapter: the same values)
+            const size_t   cp    = recr != nullptr ? (size_t) j - (size_t) j % stride : (size_t) j;
+            const uint32_t p_pop = chunks[cp].c0;
+            const bool popped = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, p_pop, -1)) : memory->seq_rm(0, p_pop, -1);
             if (!popped) {
-                LLAMA_LOG_ERROR("%s: could not pop the cache to [0, %u) for the reverse pass\n", __func__, c.c0);
+                LLAMA_LOG_ERROR("%s: could not pop the cache to [0, %u) for the reverse pass\n", __func__, p_pop);
                 opt_stop_requested.store(true);
                 ok = false;
                 break;
             }
             if (recr != nullptr) {
-                if (snaps[j].empty) {
+                if (snaps[cp].empty) {
                     recr->seq_rm(0, -1, -1); // the first chunk starts from a zero state
                 } else {
-                    state_rows(true, snaps[j]);
+                    state_rows(true, snaps[cp]);
+                }
+                if (p_pop < c.c0 && !decode_span(p_pop, c.c0)) {
+                    ok = false;
+                    break;
                 }
             }
             cparams.walk_exact     = true;

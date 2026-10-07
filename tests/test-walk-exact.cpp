@@ -71,7 +71,7 @@ static std::vector<float> adapter_params(const llama_adapter_lora * adapter) {
 // one SGD step from the fresh adapter: the step itself, -lr * the gradient it took
 static std::vector<float> step_delta(const common_params & params, llama_model * model, const std::string & init,
                                      const std::vector<llama_token> & tokens, const std::vector<uint8_t> & labelled,
-                                     uint32_t chunk, bool exact) {
+                                     uint32_t chunk, bool exact, size_t host_budget = 0, size_t * host_bytes = nullptr) {
     llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
     GGML_ASSERT(adapter != nullptr);
     const std::vector<float> before = adapter_params(adapter);
@@ -88,6 +88,7 @@ static std::vector<float> step_delta(const common_params & params, llama_model *
     lopt.walk_exact      = exact;
     lopt.walk_horizon    = 0;
     llama_opt_init(ctx, model, lopt);
+    llama_opt_set_walk_host_budget(ctx, host_budget);
     std::vector<std::vector<llama_token>> seqs = { std::vector<llama_token>(tokens.begin(), tokens.begin() + WINDOW + 1) };
     std::vector<std::vector<uint8_t>>     loss = { labelled };
     ggml_opt_dataset_t dataset = common_opt_dataset_init_masked(WINDOW, seqs, loss, tokens[0]);
@@ -98,6 +99,9 @@ static std::vector<float> step_delta(const common_params & params, llama_model *
         double l = 0.0, unc = 0.0;
         ggml_opt_result_loss(result, &l, &unc);
         printf("  chunk %3u %-5s: training loss %.6f (the forward the step saw)\n", chunk, exact ? "exact" : "plain", l);
+    }
+    if (host_bytes) {
+        *host_bytes = llama_opt_walk_host_bytes(ctx);
     }
     ggml_opt_result_free(result);
     ggml_opt_dataset_free(dataset);
@@ -174,7 +178,8 @@ int main(int argc, char ** argv) {
         std::vector<uint8_t> all(WINDOW + 1, 1);
         all[0] = 0;
         const auto ref   = step_delta(params, model, init, tokens, all, WINDOW, false);
-        const auto exact = step_delta(params, model, init, tokens, all, WINDOW / 4, true);
+        size_t full_bytes = 0;
+        const auto exact = step_delta(params, model, init, tokens, all, WINDOW / 4, true, 0, &full_bytes);
         const auto plain = step_delta(params, model, init, tokens, all, WINDOW / 4, false);
         if (!same_step(compare("all labelled: exact walk in 4 chunks vs one graph", exact, ref))) {
             fprintf(stderr, "FAILED: the exact walk's step is not the window's gradient\n");
@@ -183,6 +188,17 @@ int main(int argc, char ** argv) {
         if (same_step(compare("all labelled: plain walk in 4 chunks vs one graph", plain, ref))) {
             fprintf(stderr, "FAILED: the plain walk matches one graph too: this window cannot tell the two apart\n");
             ++failures;
+        }
+        if (llama_model_is_hybrid(model)) {
+            // a host budget below every chunk's state snapshot: the walk checkpoints every few
+            // chunks and decodes forward from the checkpoint, and the step must not change
+            size_t strided_bytes = 0;
+            const auto strided = step_delta(params, model, init, tokens, all, WINDOW / 4, true, full_bytes * 3 / 4, &strided_bytes);
+            printf("  host memory: %.1f MiB with a snapshot per chunk, %.1f MiB checkpointed\n", full_bytes / 1048576.0, strided_bytes / 1048576.0);
+            if (!(strided_bytes < full_bytes) || !same_step(compare("all labelled: checkpointed state vs a snapshot per chunk", strided, exact))) {
+                fprintf(stderr, "FAILED: checkpointing the recurrent state changed the step (or saved nothing)\n");
+                ++failures;
+            }
         }
     }
     {
