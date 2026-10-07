@@ -208,6 +208,10 @@ struct llama_context {
     std::string opt_failure;
     // what training may add per GPU device (llama_opt_set_memory_budget); 0 = no cap
     size_t opt_memory_budget = 0;
+    // the exact walk's host memory per window (llama_opt_set_walk_host_budget); 0 = no cap
+    size_t opt_walk_host_budget = 0;
+    size_t opt_walk_host_bytes  = 0; // the largest window's, measured by its own arithmetic
+    uint32_t opt_walk_horizon_used = 0; // the gradient horizon the last exact window trained at (0 = all)
     // the largest training graph the allocation preflight measured on a GPU device (bytes)
     size_t opt_graph_bytes() const;
 
@@ -369,6 +373,9 @@ private:
     // model's hparams, because several contexts share one model (a serving context and a
     // training context on the same resident weights)
     uint32_t opt_n_ctx_train = 0;
+    bool     opt_walk_exact   = false; // llama_opt_params::walk_exact
+    uint32_t opt_walk_horizon_req = 0; // llama_opt_params::walk_horizon, as requested
+    uint32_t opt_walk_horizon = 0;     // this window's: starts at the request, shrinks to fit the device
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

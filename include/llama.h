@@ -1714,6 +1714,14 @@ extern "C" {
         // per-layer residual, "l_out") instead of keeping every layer's alive: about one extra
         // forward, and one layer's attention scores in memory instead of all of them.
         bool recompute;
+
+        // THE EXACT WALK (pure attention models): one optimizer step per training window, with
+        // each chunk's loss carried backward through the cached K/V of every chunk before it, so
+        // the step is the gradient of the whole window's loss, not of each chunk alone. false keeps
+        // the walk's stop-gradient at each chunk boundary. walk_horizon: how many cached positions
+        // before a chunk receive its gradient (0 = the whole window).
+        bool     walk_exact;
+        uint32_t walk_horizon;
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1746,6 +1754,20 @@ extern "C" {
     // The largest training graph measured so far on a GPU device, in bytes (0 before the first
     // batch): the footprint a run of this shape needs, from the run's own allocation preflight.
     LLAMA_API size_t llama_opt_graph_bytes(struct llama_context * lctx);
+
+    // Cap, in bytes, the HOST memory the exact walk keeps per training window (0 = no cap): the
+    // gradient accumulated on every cached K/V position of every attention layer, and a recurrent
+    // model's state snapshot at every chunk boundary. A window over the cap refuses the run by
+    // name before anything is decoded (llama_opt_failure). Set before llama_opt_epoch.
+    LLAMA_API void llama_opt_set_walk_host_budget(struct llama_context * lctx, size_t bytes);
+
+    // The host bytes the exact walk's largest window so far kept (0 before one ran, or when the
+    // walk is not exact): what a run of this shape needs, from the run's own arithmetic.
+    LLAMA_API size_t llama_opt_walk_host_bytes(struct llama_context * lctx);
+
+    // The gradient horizon the exact walk's last window trained at, in positions (0 = the whole
+    // window): the requested one, or smaller where a chunk's graph did not fit the device.
+    LLAMA_API uint32_t llama_opt_walk_horizon(struct llama_context * lctx);
 
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,

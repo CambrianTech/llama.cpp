@@ -211,6 +211,25 @@ extern "C" {
     // do forward pass, increment result if not NULL, do backward pass if allocated
     GGML_API void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result);
 
+    // A caller-driven optimizer period, for graphs built per step (the training walk's reverse
+    // pass: one graph per chunk, ONE optimizer step per window). Applies to the next
+    // ggml_opt_alloc + ggml_opt_eval only:
+    //   period_end: true = this graph runs the optimizer step, false = it only accumulates
+    //   loss_scale: the weight of this graph's loss in the period's total (replaces 1/opt_period)
+    //   extra_loss: NULL, or a scalar F32 node of the forward graph added to the loss the backward
+    //               differentiates (a surrogate carrying a later graph's gradient into this one);
+    //               the loss the result reports stays the unweighted loss of the outputs
+    // A period starts from zero gradients after the step that ended the previous one.
+    GGML_API void ggml_opt_set_next_step(
+        ggml_opt_context_t   opt_ctx,
+        bool                 period_end,
+        float                loss_scale,
+        struct ggml_tensor * extra_loss);
+
+    // After ggml_opt_eval and until the next ggml_opt_alloc: the gradient the backward computed
+    // for a GRAD leaf (ggml_set_grad) of the evaluated graph, or NULL when the graph has none.
+    GGML_API struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * leaf);
+
     // ############################################################################
     // ## The high-level functions start here. They do not depend on any private ##
     // ## functions or structs and can be copied to and adapted for user code.   ##

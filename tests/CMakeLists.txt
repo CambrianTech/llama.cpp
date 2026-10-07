@@ -150,6 +150,12 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 
+# the exact walk trains on the window's whole gradient whatever the chunking (needs -m <pure attention model>)
+llama_build(test-walk-exact.cpp)
+
+# GGML_TENSOR_FLAG_GRAD: a leaf whose gradient the backward computes, never optimized (the walk reads the cached prefix K/V gradient)
+llama_build_and_test(test-grad-leaf.cpp)
+
 # ggml-opt with per-step graphs (the llama training path) starts each optimizer period from zero accumulators
 llama_build_and_test(test-opt-dynamic-accum.cpp)
 

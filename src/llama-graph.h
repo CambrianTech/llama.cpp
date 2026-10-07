@@ -938,6 +938,37 @@ public:
 
     std::vector<ggml_tensor *> t_layer_inp;
 
+    // THE EXACT WALK: per attention layer of a reverse-pass chunk graph, the tensors the walk
+    // fills before the step and reads after it (llama_context::opt_epoch_iter)
+    struct walk_layer {
+        int           il;
+        uint32_t      grad_from;   // the GRAD leaves cover cached positions [grad_from, n_past)
+        uint32_t      n_past;
+        ggml_tensor * dk = nullptr; // GRAD leaves, zero-filled: their gradient is dL/d(cached K/V)
+        ggml_tensor * dv = nullptr; //   [n_embd_head, n_head_kv, n_past - grad_from], V untransposed
+        ggml_tensor * gk = nullptr; // inputs: the gradient later chunks accumulated on this chunk's
+        ggml_tensor * gv = nullptr; //   own K/V, shaped like k_cur / v_cur (null without a surrogate)
+    };
+    std::vector<walk_layer> t_walk;
+    // the recurrent states of a reverse-pass chunk graph, one per state tensor of the memory
+    // (a layer's conv state r_l and its recurrent state s_l): the chain runs through them too
+    struct walk_state {
+        ggml_tensor * cache = nullptr; // the memory's state tensor this entry belongs to
+        ggml_tensor * ds    = nullptr; // GRAD leaf, zero-filled, on the state ENTERING the chunk
+        ggml_tensor * gs    = nullptr; // input: the gradient later chunks put on the state it LEAVES
+    };
+    std::vector<walk_state> t_walk_state;
+    walk_state & walk_state_of(ggml_tensor * cache) {
+        for (auto & w : t_walk_state) {
+            if (w.cache == cache) {
+                return w;
+            }
+        }
+        t_walk_state.push_back({ cache, nullptr, nullptr });
+        return t_walk_state.back();
+    }
+    ggml_tensor * t_walk_surrogate = nullptr; // sum over layers of <k_cur, gk> + <v_cur, gv>
+
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
     std::vector<ggml_tensor *> t_sampled_logits;
@@ -1325,6 +1356,10 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+
+    // THE EXACT WALK: the state a chunk leaves (`exit`, what is written back to `cache`) meets the
+    // gradient later chunks put on it, through the surrogate <exit, gs>. A no-op outside the walk.
+    void build_walk_state_exit(ggml_tensor * cache, ggml_tensor * exit) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

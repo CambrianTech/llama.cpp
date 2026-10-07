@@ -3335,6 +3335,9 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     // The training window lives on this context, not the shared model (a serving context may
     // be running on the same weights).
     opt_n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
+    opt_walk_exact   = lopt_params.walk_exact;
+    opt_walk_horizon_req = lopt_params.walk_horizon;
+    opt_walk_horizon     = lopt_params.walk_horizon;
     const uint32_t n_batch     = std::min(this->n_batch(),  opt_n_ctx_train);
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
     GGML_ASSERT(opt_n_ctx_train % n_batch  == 0);
@@ -3495,6 +3498,25 @@ void llama_context::opt_epoch_iter(
         return ok;
     };
 
+    // THE EXACT WALK's state for the chunk being trained (null in the plain walk): its place in
+    // the window's one optimizer period, and the gradient accumulated on the window's cached K/V
+    struct exact_chunk {
+        uint32_t c0;
+        uint32_t n;
+        uint32_t n_labels;
+        uint32_t grad_from;  // its GRAD leaves cover cached positions [grad_from, c0)
+        bool     surrogate;  // a later chunk's gradient sits on its own K/V
+        bool     needed;
+        bool     period_end; // the window's optimizer step
+        float    loss_scale; // its labelled positions over the window's
+    };
+    const exact_chunk * xc = nullptr;
+    // per layer, per position: dL/d(cached K) and dL/d(cached V), [position][n_embd_*_gqa]
+    std::vector<std::vector<float>> walk_gk, walk_gv;
+    // per recurrent state tensor: dL/d(the state the chunk just before leaves), from the chunk
+    // trained last (each chunk's exit state feeds exactly one chunk, the next)
+    std::unordered_map<const ggml_tensor *, std::vector<float>> walk_gstate;
+
     // one training chunk [pos_ctx, pos_ctx + n_tokens): forward and backward over it alone,
     // attending to the cached context before it
     auto train_chunk = [&](uint32_t pos_ctx, uint32_t n_chunk) -> bool {
@@ -3504,7 +3526,10 @@ void llama_context::opt_epoch_iter(
             batch.pos     [pos_batch]    = pos_ctx + pos_batch;
             batch.n_seq_id[pos_batch]    = 1;
             batch.seq_id  [pos_batch][0] = 0;
-            batch.logits  [pos_batch]    = labels_sparse[pos_ctx + pos_batch] >= 0;
+            // an exact walk's context chunk has no label but still trains (its K/V carry later
+            // chunks' gradient): one output row, weighted zero, so the graph has its loss
+            batch.logits  [pos_batch]    = labels_sparse[pos_ctx + pos_batch] >= 0
+                || (xc != nullptr && xc->n_labels == 0 && pos_batch + 1 == n_chunk);
         }
 
         // output_all = false: the batch's own logits flags decide which rows exist
@@ -3577,6 +3602,9 @@ void llama_context::opt_epoch_iter(
                 ctx_compute_opt = ggml_init(params);
             }
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+            if (xc != nullptr) {
+                ggml_opt_set_next_step(opt_ctx, xc->period_end, xc->loss_scale, res->t_walk_surrogate);
+            }
             if (!ggml_opt_alloc(opt_ctx, train)) {
                 const char * why = ggml_opt_refusal(opt_ctx);
                 opt_failure = why;
@@ -3603,13 +3631,44 @@ void llama_context::opt_epoch_iter(
                         continue;
                     }
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                    GGML_ASSERT(labels_sparse[ilabel] >= 0 && labels_sparse[ilabel] < labels->ne[0]);
-                    ggml_backend_tensor_set(labels, &onef, (row*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    // an exact walk's context chunk: its one row has no label (weighted zero)
+                    GGML_ASSERT((xc != nullptr && labels_sparse[ilabel] < 0) || (labels_sparse[ilabel] >= 0 && labels_sparse[ilabel] < labels->ne[0]));
+                    if (labels_sparse[ilabel] >= 0) {
+                        ggml_backend_tensor_set(labels, &onef, (row*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    }
                     ++row;
                 }
                 GGML_ASSERT(row == n_outputs);
             }
-            ggml_opt_eval(opt_ctx, result);
+            if (xc != nullptr) {
+                // the GRAD leaves start at zero; the surrogate inputs are what later chunks
+                // accumulated on this chunk's own K/V
+                for (const auto & io : res->t_walk) {
+                    if (io.dk) {
+                        ggml_backend_tensor_memset(io.dk, 0, 0, ggml_nbytes(io.dk));
+                        ggml_backend_tensor_memset(io.dv, 0, 0, ggml_nbytes(io.dv));
+                    }
+                    if (io.gk) {
+                        const size_t kd = io.gk->ne[0]*io.gk->ne[1];
+                        const size_t vd = io.gv->ne[0]*io.gv->ne[1];
+                        ggml_backend_tensor_set(io.gk, walk_gk[io.il].data() + (size_t) pos_ctx*kd, 0, ggml_nbytes(io.gk));
+                        ggml_backend_tensor_set(io.gv, walk_gv[io.il].data() + (size_t) pos_ctx*vd, 0, ggml_nbytes(io.gv));
+                    }
+                }
+            }
+            if (xc != nullptr) {
+                for (const auto & ws : res->t_walk_state) {
+                    if (ws.ds) {
+                        ggml_backend_tensor_memset(ws.ds, 0, 0, ggml_nbytes(ws.ds));
+                    }
+                    if (ws.gs) {
+                        const auto it = walk_gstate.find(ws.cache);
+                        GGML_ASSERT(it != walk_gstate.end() && it->second.size() == (size_t) ggml_nelements(ws.gs));
+                        ggml_backend_tensor_set(ws.gs, it->second.data(), 0, ggml_nbytes(ws.gs));
+                    }
+                }
+            }
+            ggml_opt_eval(opt_ctx, xc != nullptr && xc->n_labels == 0 ? nullptr : result);
             if (const char * why = ggml_opt_refusal(opt_ctx); why[0] != '\0') {
                 // the backend failed the graph (ggml_opt_eval): the run fails, as a refused graph does
                 opt_failure = why;
@@ -3619,7 +3678,40 @@ void llama_context::opt_epoch_iter(
                 opt_stop_requested.store(true);
                 return false;
             }
-            if (callback) {
+            if (xc != nullptr) {
+                // dL/d(cached K/V) of this chunk's prefix joins what later chunks put there
+                std::vector<float> g;
+                for (const auto & io : res->t_walk) {
+                    if (!io.dk) {
+                        continue;
+                    }
+                    for (int kv = 0; kv < 2; ++kv) {
+                        ggml_tensor * leaf = kv == 0 ? io.dk : io.dv;
+                        ggml_tensor * grad = ggml_opt_leaf_grad(opt_ctx, leaf);
+                        GGML_ASSERT(grad != nullptr && grad->type == GGML_TYPE_F32 && ggml_is_contiguous(grad));
+                        g.resize(ggml_nelements(grad));
+                        ggml_backend_tensor_get(grad, g.data(), 0, ggml_nbytes(grad));
+                        float * acc = (kv == 0 ? walk_gk : walk_gv)[io.il].data() + (size_t) io.grad_from*leaf->ne[0]*leaf->ne[1];
+                        for (size_t e = 0; e < g.size(); ++e) {
+                            acc[e] += g[e];
+                        }
+                    }
+                }
+            }
+            if (xc != nullptr) {
+                // dL/d(entry state): what the previous chunk's exit state takes in its surrogate
+                for (const auto & ws : res->t_walk_state) {
+                    if (!ws.ds) {
+                        continue;
+                    }
+                    ggml_tensor * grad = ggml_opt_leaf_grad(opt_ctx, ws.ds);
+                    GGML_ASSERT(grad != nullptr && grad->type == GGML_TYPE_F32 && ggml_is_contiguous(grad));
+                    auto & g = walk_gstate[ws.cache];
+                    g.resize(ggml_nelements(grad));
+                    ggml_backend_tensor_get(grad, g.data(), 0, ggml_nbytes(grad));
+                }
+            }
+            if (callback && !(xc != nullptr && xc->n_labels == 0)) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_batch + 1, ndata_in_loop, t_loop_start);
             }
             ggml_free(ctx_compute_opt);
@@ -3639,9 +3731,240 @@ void llama_context::opt_epoch_iter(
     } else {
         recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
     }
-    if (recr != nullptr && cparams.n_seq_max < 2) {
+    // the plain walk snapshots a recurrent state into a scratch sequence; the exact walk keeps host snapshots
+    if (recr != nullptr && cparams.n_seq_max < 2 && !(train && opt_walk_exact)) {
         LLAMA_LOG_ERROR("%s: a recurrent model trains with a scratch sequence for its state snapshot: create the training context with n_seq_max >= 2\n", __func__);
         opt_stop_requested.store(true);
+        return;
+    }
+
+    if (train && opt_walk_exact) {
+        // THE EXACT WALK. The plain walk below steps per chunk and stops the gradient at every
+        // chunk boundary: a reply learns only through its own chunk's K/V, never through what
+        // an earlier chunk computed for it. Here the window is decoded once under the adapter
+        // as it is, then trained in REVERSE: each chunk's graph attends to the cache, with its
+        // last walk_horizon prefix positions behind a GRAD leaf, and adds the surrogate
+        // <K, G> + <V, G> on its own K/V, where G is what every later chunk put there. Its
+        // backward then carries that gradient through itself into the adapter and into its own
+        // prefix's G. ONE optimizer step per window, on the gradient of the window's loss
+        // (exact within the horizon). Memory stays chunk x window; the cost is one decode plus
+        // one forward and backward per chunk, context chunks included.
+        // THE INVARIANT THAT MAKES THE REVERSE PASS VALID (Fable): the adapter does not change
+        // between the forward decode and the last chunk's backward. One optimizer step per window,
+        // taken by the chunk the reverse pass trains last, is what keeps each chunk's recomputed
+        // K/V (and recurrent state) equal to the cached values its successors attended to; a step
+        // inside the window would make every surrogate a gradient of a different function.
+        //
+        // Each window starts from the REQUESTED horizon: a halving that fit one window's device
+        // budget must not shrink every later window and epoch, which may be shorter (Fable).
+        opt_walk_horizon = opt_walk_horizon_req;
+        // A recurrent model's state is carried the same way, one chunk at a time: the state
+        // entering a chunk is a GRAD leaf, the state it leaves meets the next chunk's gradient
+        // (build_rs, build_walk_state_exit). The reverse pass restores each chunk's entry state
+        // from a host snapshot taken at its boundary in the forward pass.
+        std::vector<exact_chunk> chunks;
+        uint32_t n_labels_window = 0;
+        for (uint32_t p = 0; p <= (uint32_t) last_label; ) {
+            const bool labelled = labels_sparse[p] >= 0;
+            uint32_t end = p;
+            while (end <= (uint32_t) last_label && (labels_sparse[end] >= 0) == labelled) {
+                ++end;
+            }
+            for (uint32_t c0 = p; c0 < end; c0 += n_batch) {
+                const uint32_t c1 = std::min(c0 + n_batch, end);
+                chunks.push_back({ c0, c1 - c0, labelled ? c1 - c0 : 0, 0, false, false, false, 0.0f });
+                n_labels_window += labelled ? c1 - c0 : 0;
+            }
+            p = end;
+        }
+        // which chunks train, and how far back each one's gradient reaches
+        uint32_t reach = UINT32_MAX; // the lowest position a later trained chunk's gradient reaches
+        int64_t  first = -1;         // the last chunk the reverse pass trains: the step
+        for (int64_t j = (int64_t) chunks.size() - 1; j >= 0; --j) {
+            exact_chunk & c = chunks[j];
+            c.surrogate = reach < c.c0 + c.n;
+            // a recurrent state reaches every later chunk: a chunk before a trained one trains
+            c.needed    = c.n_labels > 0 || c.surrogate || (recr != nullptr && first >= 0);
+            if (!c.needed) {
+                continue;
+            }
+            c.grad_from  = opt_walk_horizon == 0 || c.c0 < opt_walk_horizon ? 0 : c.c0 - opt_walk_horizon;
+            c.loss_scale = (float) c.n_labels / (float) n_labels_window;
+            reach = std::min(reach, c.grad_from);
+            first = j;
+        }
+        GGML_ASSERT(first >= 0);
+        chunks[first].period_end = true;
+
+        // THE HOST BUDGET (Fable): the accumulators are layers x positions x (k + v) floats, and a
+        // recurrent state is checkpointed every `stride` chunks (one sequence's state rows each;
+        // the first chunk's entry is the zero state and costs nothing). Both are known before
+        // anything runs. Under a budget the stride is the smallest that fits: the reverse pass
+        // rebuilds a chunk's entry state by decoding forward from its checkpoint, so a longer
+        // stride trades host memory for decode, never for exactness.
+        size_t stride = 1;
+        {
+            size_t kv_bytes = 0;
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                if (!model.hparams.is_recr(il)) {
+                    kv_bytes += (size_t) (last_label + 1)*(model.hparams.n_embd_k_gqa(il) + model.hparams.n_embd_v_gqa(il))*sizeof(float);
+                }
+            }
+            size_t state = 0;
+            if (recr != nullptr) {
+                for (size_t il = 0; il < recr->r_l.size(); ++il) {
+                    state += recr->r_l[il] ? recr->r_l[il]->nb[1] : 0;
+                    state += recr->s_l[il] ? recr->s_l[il]->nb[1] : 0;
+                }
+            }
+            auto bytes_at = [&](size_t s) { return kv_bytes + ((chunks.size() + s - 1)/s - 1)*state; };
+            if (opt_walk_host_budget > 0) {
+                while (stride < chunks.size() && bytes_at(stride) > opt_walk_host_budget) {
+                    ++stride;
+                }
+            }
+            const size_t bytes = bytes_at(stride);
+            opt_walk_host_bytes = std::max(opt_walk_host_bytes, bytes);
+            if (opt_walk_host_budget > 0 && bytes > opt_walk_host_budget) {
+                char why[512];
+                snprintf(why, sizeof(why),
+                    "the exact walk needs %.1f MiB of host memory for this window (%lld positions, the K/V gradient alone), over its budget of %.1f MiB: "
+                    "the K/V gradient grows with the window; neither the horizon nor the chunk size changes it",
+                    bytes/1048576.0, (long long) (last_label + 1), opt_walk_host_budget/1048576.0);
+                opt_failure = why;
+                LLAMA_LOG_ERROR("%s: %s\n", __func__, opt_failure.c_str());
+                opt_alloc_failed.store(true);
+                opt_stop_requested.store(true);
+                return;
+            }
+            if (stride > 1) {
+                LLAMA_LOG_INFO("%s: the exact walk checkpoints the recurrent state every %zu chunks to fit %.1f MiB of host memory (%.1f MiB)\n",
+                        __func__, stride, opt_walk_host_budget/1048576.0, bytes/1048576.0);
+            }
+        }
+        walk_gk.assign(model.hparams.n_layer(), {});
+        walk_gv.assign(model.hparams.n_layer(), {});
+        for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (model.hparams.is_recr(il)) {
+                continue; // a recurrent layer has no K/V: its state carries the chain
+            }
+            walk_gk[il].assign((size_t) (last_label + 1)*model.hparams.n_embd_k_gqa(il), 0.0f);
+            walk_gv[il].assign((size_t) (last_label + 1)*model.hparams.n_embd_v_gqa(il), 0.0f);
+        }
+
+        // the window as the adapter now reads it, chunk by chunk: a recurrent model's state is
+        // snapshotted at each chunk's start (empty before the first: it starts from zero)
+        struct state_snapshot {
+            bool                            empty = true;
+            std::vector<std::vector<float>> r, s; // per layer
+        };
+        std::vector<state_snapshot> snaps(recr != nullptr ? chunks.size() : 0);
+        auto state_rows = [&](bool write, state_snapshot & snap) {
+            const int32_t cell = recr->cells[0].tail; // the cell holding sequence 0's state
+            if (!write) {
+                snap.empty = cell < 0;
+                snap.r.assign(recr->r_l.size(), {});
+                snap.s.assign(recr->s_l.size(), {});
+            }
+            if (cell < 0) {
+                return;
+            }
+            for (size_t il = 0; il < recr->r_l.size(); ++il) {
+                for (int kind = 0; kind < 2; ++kind) {
+                    ggml_tensor * t = kind == 0 ? recr->r_l[il] : recr->s_l[il];
+                    if (t == nullptr) {
+                        continue;
+                    }
+                    GGML_ASSERT(t->type == GGML_TYPE_F32);
+                    auto & row = kind == 0 ? snap.r[il] : snap.s[il];
+                    const size_t bytes = t->nb[1];
+                    if (write) {
+                        ggml_backend_tensor_set(t, row.data(), (size_t) cell*bytes, bytes);
+                    } else {
+                        row.resize(t->ne[0]);
+                        ggml_backend_tensor_get(t, row.data(), (size_t) cell*bytes, bytes);
+                    }
+                }
+            }
+        };
+        for (size_t j = 0; j < chunks.size(); ++j) {
+            if (recr != nullptr && j % stride == 0) {
+                state_rows(false, snaps[j]);
+            }
+            if (!decode_span(chunks[j].c0, chunks[j].c0 + chunks[j].n)) {
+                return;
+            }
+        }
+        bool ok = true;
+        for (int64_t j = (int64_t) chunks.size() - 1; j >= first && ok; --j) {
+            const exact_chunk & c = chunks[j];
+            if (!c.needed) {
+                continue;
+            }
+            if (!yield_point()) {
+                ok = false;
+                break;
+            }
+            // attention: pop the cache to [0, c0); recurrent: restore the state at the chunk's
+            // checkpoint and decode forward to its start (that decode rebuilds the attention K/V
+            // in between too, under the same adapter: the same values)
+            const size_t   cp    = recr != nullptr ? (size_t) j - (size_t) j % stride : (size_t) j;
+            const uint32_t p_pop = chunks[cp].c0;
+            const bool popped = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, p_pop, -1)) : memory->seq_rm(0, p_pop, -1);
+            if (!popped) {
+                LLAMA_LOG_ERROR("%s: could not pop the cache to [0, %u) for the reverse pass\n", __func__, p_pop);
+                opt_stop_requested.store(true);
+                ok = false;
+                break;
+            }
+            if (recr != nullptr) {
+                if (snaps[cp].empty) {
+                    recr->seq_rm(0, -1, -1); // the first chunk starts from a zero state
+                } else {
+                    state_rows(true, snaps[cp]);
+                }
+                if (p_pop < c.c0 && !decode_span(p_pop, c.c0)) {
+                    ok = false;
+                    break;
+                }
+            }
+            cparams.walk_exact     = true;
+            cparams.walk_surrogate = c.surrogate;
+            cparams.walk_state_surrogate = recr != nullptr && j < (int64_t) chunks.size() - 1 && !walk_gstate.empty();
+            // THE HORIZON FITS THE DEVICE. Its GRAD leaves are the chunk graph's largest growth
+            // with the window (layers x horizon x (k + v) floats, twice with their gradient); the
+            // graph preflight refuses a chunk that does not fit before allocating anything, so a
+            // memory refusal halves the horizon (whole chunks) and the chunk is tried again; every
+            // later chunk keeps the smaller one. The forward still attends to the whole window and
+            // the recurrent state is carried exactly; only attention gradient past the horizon is
+            // dropped. A refusal at a horizon of one chunk, or for a node the device cannot run,
+            // stands.
+            exact_chunk cc = c;
+            for (;;) {
+                cc.grad_from = opt_walk_horizon == 0 || cc.c0 < opt_walk_horizon ? 0 : cc.c0 - opt_walk_horizon;
+                cparams.walk_grad_from = cc.grad_from;
+                xc = &cc;
+                ok = train_chunk(cc.c0, cc.n);
+                xc = nullptr;
+                const uint32_t span = cc.c0 - cc.grad_from;
+                if (ok || !opt_failure.empty() || !opt_alloc_failed.load() || span <= n_batch) {
+                    break;
+                }
+                opt_walk_horizon = std::max<uint32_t>(n_batch, (span/2)/n_batch*n_batch);
+                LLAMA_LOG_WARN("%s: the chunk at %u did not fit with a gradient horizon of %u positions: retrying at %u\n",
+                        __func__, cc.c0, span, opt_walk_horizon);
+                opt_alloc_failed.store(false);
+                opt_stop_requested.store(false);
+            }
+            opt_walk_horizon_used = opt_walk_horizon;
+            cparams.walk_exact     = false;
+            cparams.walk_grad_from = 0;
+            cparams.walk_surrogate = false;
+            cparams.walk_state_surrogate = false;
+        }
+        walk_gk.clear();
+        walk_gv.clear();
+        walk_gstate.clear();
         return;
     }
 
@@ -4462,6 +4785,18 @@ void llama_opt_stop(struct llama_context * ctx, bool stop) {
 void llama_opt_set_step_callback(struct llama_context * ctx, llama_opt_step_callback callback, void * user_data) {
     ctx->opt_step_callback = callback;
     ctx->opt_step_callback_data = user_data;
+}
+
+void llama_opt_set_walk_host_budget(struct llama_context * ctx, size_t bytes) {
+    ctx->opt_walk_host_budget = bytes;
+}
+
+size_t llama_opt_walk_host_bytes(struct llama_context * ctx) {
+    return ctx->opt_walk_host_bytes;
+}
+
+uint32_t llama_opt_walk_horizon(struct llama_context * ctx) {
+    return ctx->opt_walk_horizon_used;
 }
 
 void llama_opt_set_memory_budget(struct llama_context * ctx, size_t bytes) {

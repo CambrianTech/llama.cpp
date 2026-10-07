@@ -75,6 +75,8 @@ int main(int argc, char ** argv) {
         /*optimizer_type  =*/params.optimizer,
         /*adapter         =*/nullptr, // full-model training: every tensor the filter allows
         /*recompute       =*/false, // keep every layer's intermediates, as before
+        /*walk_exact      =*/false, // the per-chunk walk, as before
+        /*walk_horizon    =*/0,
     };
     llama_opt_init(ctx, model, lopt_params);
 
