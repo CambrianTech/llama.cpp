@@ -7,7 +7,6 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 #include "ggml-opt.h"
 
 #include <cmath>
@@ -27,7 +26,10 @@ static ggml_opt_optimizer_params sgd_pars(void *) {
 }
 
 static void run(int32_t opt_period) {
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    // by type, not ggml_backend_cpu_init: in a dynamically loaded backend build (CI) the CPU
+    // backend is its own library
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    GGML_ASSERT(cpu != nullptr);
     ggml_backend_t backends[] = { cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
 
@@ -91,7 +93,10 @@ static void run(int32_t opt_period) {
 // weight times w, plus 3 w in the second) must read back after its eval; a following period
 // starts from zero.
 static void run_manual() {
-    ggml_backend_t cpu = ggml_backend_cpu_init();
+    // by type, not ggml_backend_cpu_init: in a dynamically loaded backend build (CI) the CPU
+    // backend is its own library
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    GGML_ASSERT(cpu != nullptr);
     ggml_backend_t backends[] = { cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
 
@@ -177,6 +182,7 @@ static void run_manual() {
 }
 
 int main() {
+    ggml_backend_load_all();
     run(1);
     run(2);
     run_manual();
