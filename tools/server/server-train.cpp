@@ -979,6 +979,7 @@ void server_trainer::run(json req, examples_data ex) {
     const std::string refusal = llama_opt_failure(ctx);
     const double  graph_mib = llama_opt_graph_bytes(ctx) / 1048576.0;
     const double  walk_host_mib = llama_opt_walk_host_bytes(ctx) / 1048576.0;
+    const int64_t walk_horizon  = llama_opt_walk_horizon(ctx);
     const int32_t saved     = (cancelled || no_fit) ? 0 : llama_adapter_lora_save(adapter, out.c_str());
     llama_adapter_lora_free(adapter);
     llama_free(ctx);
@@ -989,6 +990,11 @@ void server_trainer::run(json req, examples_data ex) {
     state["graph_mib"] = graph_mib;
     // what the exact walk kept on the host per window (its K/V gradient and state snapshots)
     state["walk_host_mib"] = walk_host_mib;
+    // the exact walk's gradient horizon as trained (0 = the whole window), smaller where the device
+    // could not hold the requested one
+    if (req.value("exact", false)) {
+        state["walk_horizon"] = walk_horizon;
+    }
     if (no_fit) {
         state["state"] = "error";
         state["error"] = !refusal.empty() ? refusal + " (window " + std::to_string(window) + ")" :

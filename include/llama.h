@@ -1765,6 +1765,10 @@ extern "C" {
     // walk is not exact): what a run of this shape needs, from the run's own arithmetic.
     LLAMA_API size_t llama_opt_walk_host_bytes(struct llama_context * lctx);
 
+    // The gradient horizon the exact walk's last window trained at, in positions (0 = the whole
+    // window): the requested one, or smaller where a chunk's graph did not fit the device.
+    LLAMA_API uint32_t llama_opt_walk_horizon(struct llama_context * lctx);
+
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,

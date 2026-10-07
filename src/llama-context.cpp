@@ -3919,12 +3919,34 @@ void llama_context::opt_epoch_iter(
                 }
             }
             cparams.walk_exact     = true;
-            cparams.walk_grad_from = c.grad_from;
             cparams.walk_surrogate = c.surrogate;
             cparams.walk_state_surrogate = recr != nullptr && j < (int64_t) chunks.size() - 1 && !walk_gstate.empty();
-            xc = &c;
-            ok = train_chunk(c.c0, c.n);
-            xc = nullptr;
+            // THE HORIZON FITS THE DEVICE. Its GRAD leaves are the chunk graph's largest growth
+            // with the window (layers x horizon x (k + v) floats, twice with their gradient); the
+            // graph preflight refuses a chunk that does not fit before allocating anything, so a
+            // memory refusal halves the horizon (whole chunks) and the chunk is tried again; every
+            // later chunk keeps the smaller one. The forward still attends to the whole window and
+            // the recurrent state is carried exactly; only attention gradient past the horizon is
+            // dropped. A refusal at a horizon of one chunk, or for a node the device cannot run,
+            // stands.
+            exact_chunk cc = c;
+            for (;;) {
+                cc.grad_from = opt_walk_horizon == 0 || cc.c0 < opt_walk_horizon ? 0 : cc.c0 - opt_walk_horizon;
+                cparams.walk_grad_from = cc.grad_from;
+                xc = &cc;
+                ok = train_chunk(cc.c0, cc.n);
+                xc = nullptr;
+                const uint32_t span = cc.c0 - cc.grad_from;
+                if (ok || !opt_failure.empty() || !opt_alloc_failed.load() || span <= n_batch) {
+                    break;
+                }
+                opt_walk_horizon = std::max<uint32_t>(n_batch, (span/2)/n_batch*n_batch);
+                LLAMA_LOG_WARN("%s: the chunk at %u did not fit with a gradient horizon of %u positions: retrying at %u\n",
+                        __func__, cc.c0, span, opt_walk_horizon);
+                opt_alloc_failed.store(false);
+                opt_stop_requested.store(false);
+            }
+            opt_walk_horizon_used = opt_walk_horizon;
             cparams.walk_exact     = false;
             cparams.walk_grad_from = 0;
             cparams.walk_surrogate = false;
@@ -4761,6 +4783,10 @@ void llama_opt_set_walk_host_budget(struct llama_context * ctx, size_t bytes) {
 
 size_t llama_opt_walk_host_bytes(struct llama_context * ctx) {
     return ctx->opt_walk_host_bytes;
+}
+
+uint32_t llama_opt_walk_horizon(struct llama_context * ctx) {
+    return ctx->opt_walk_horizon_used;
 }
 
 void llama_opt_set_memory_budget(struct llama_context * ctx, size_t bytes) {
