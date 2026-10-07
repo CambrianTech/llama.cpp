@@ -314,7 +314,7 @@ json server_trainer::start(const json & body_in) {
     // assert in the training path would take the server down (Cormac on #14).
     {
         auto num = [&](const char * key, double def) { return body.contains(key) && body.at(key).is_number() ? body.at(key).get<double>() : def; };
-        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers", "share_ppm", "max_slowdown_ppm", "chunk", "walk_horizon"}) {
+        for (const char * key : {"rank", "alpha", "window", "epochs", "lr", "val_split", "seed", "memory_budget_mib", "top_layers", "share_ppm", "max_slowdown_ppm", "chunk", "walk_horizon", "walk_host_budget_mib"}) {
             if (body.contains(key) && !body.at(key).is_number()) {
                 return json::object({{"ok", false}, {"error", std::string("\"") + key + "\" must be a number"}});
             }
@@ -340,6 +340,8 @@ json server_trainer::start(const json & body_in) {
                                                                      why = "chunk must be a multiple of 256, at least 256: the most tokens one training step holds in one graph";
         else if (body.contains("exact") && !body.at("exact").is_boolean())
                                                                      why = "exact must be true or false: the exact walk (one step per window on its whole loss) or the per-chunk walk";
+        else if (body.contains("walk_host_budget_mib") && !(num("walk_host_budget_mib", 0) >= 1 && num("walk_host_budget_mib", 0) == (int64_t) num("walk_host_budget_mib", 0)))
+                                                                     why = "walk_host_budget_mib must be an integer >= 1: the host memory the exact walk may keep per window";
         else if (body.contains("walk_horizon") && !(num("walk_horizon", 0) >= 0 && num("walk_horizon", 0) == (int64_t) num("walk_horizon", 0) && num("walk_horizon", 0) <= 4294967295.0))
                                                                      why = "walk_horizon must be an integer >= 0: how many cached positions before a chunk receive its gradient (0 = the whole window)";
         else if (body.contains("memory_budget_mib") && !(num("memory_budget_mib", 0) >= 1))
@@ -871,6 +873,8 @@ void server_trainer::run(json req, examples_data ex) {
         /*walk_horizon    =*/ (uint32_t) req.value("walk_horizon", (int64_t) 0),
     };
     llama_opt_set_memory_budget(ctx, budget);
+    // the exact walk's host memory per window: refused by name over the caller's cap
+    llama_opt_set_walk_host_budget(ctx, (size_t) req.value("walk_host_budget_mib", (int64_t) 0) << 20);
     llama_opt_init(ctx, model, lopt);
     llama_opt_set_step_callback(ctx, &server_trainer::before_window, this);
     {
@@ -974,6 +978,7 @@ void server_trainer::run(json req, examples_data ex) {
     // copied before llama_free: the refusal names a node the device cannot run, when that was it
     const std::string refusal = llama_opt_failure(ctx);
     const double  graph_mib = llama_opt_graph_bytes(ctx) / 1048576.0;
+    const double  walk_host_mib = llama_opt_walk_host_bytes(ctx) / 1048576.0;
     const int32_t saved     = (cancelled || no_fit) ? 0 : llama_adapter_lora_save(adapter, out.c_str());
     llama_adapter_lora_free(adapter);
     llama_free(ctx);
@@ -982,6 +987,8 @@ void server_trainer::run(json req, examples_data ex) {
     // what the training graph needed on the GPU, measured by its own preflight (also on a refusal:
     // it is the number to size the next attempt, or a caller's admission, by)
     state["graph_mib"] = graph_mib;
+    // what the exact walk kept on the host per window (its K/V gradient and state snapshots)
+    state["walk_host_mib"] = walk_host_mib;
     if (no_fit) {
         state["state"] = "error";
         state["error"] = !refusal.empty() ? refusal + " (window " + std::to_string(window) + ")" :

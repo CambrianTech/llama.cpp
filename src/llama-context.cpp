@@ -3786,9 +3786,44 @@ void llama_context::opt_epoch_iter(
         GGML_ASSERT(first >= 0);
         chunks[first].period_end = true;
 
+        // THE HOST BUDGET (Fable): the accumulators are layers x positions x (k + v) floats, the
+        // snapshots chunks x one sequence's state rows; both are known before anything runs.
+        {
+            size_t bytes = 0;
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                if (!model.hparams.is_recr(il)) {
+                    bytes += (size_t) (last_label + 1)*(model.hparams.n_embd_k_gqa(il) + model.hparams.n_embd_v_gqa(il))*sizeof(float);
+                }
+            }
+            if (recr != nullptr) {
+                size_t state = 0;
+                for (size_t il = 0; il < recr->r_l.size(); ++il) {
+                    state += recr->r_l[il] ? recr->r_l[il]->nb[1] : 0;
+                    state += recr->s_l[il] ? recr->s_l[il]->nb[1] : 0;
+                }
+                bytes += chunks.size()*state;
+            }
+            opt_walk_host_bytes = std::max(opt_walk_host_bytes, bytes);
+            if (opt_walk_host_budget > 0 && bytes > opt_walk_host_budget) {
+                char why[512];
+                snprintf(why, sizeof(why),
+                    "the exact walk needs %.1f MiB of host memory for this window (%lld positions, %zu chunks), over its budget of %.1f MiB: "
+                    "the K/V gradient grows with the window and a recurrent state's snapshots with the chunk count (a larger chunk has fewer); "
+                    "the horizon does not change either",
+                    bytes/1048576.0, (long long) (last_label + 1), chunks.size(), opt_walk_host_budget/1048576.0);
+                opt_failure = why;
+                LLAMA_LOG_ERROR("%s: %s\n", __func__, opt_failure.c_str());
+                opt_alloc_failed.store(true);
+                opt_stop_requested.store(true);
+                return;
+            }
+        }
         walk_gk.assign(model.hparams.n_layer(), {});
         walk_gv.assign(model.hparams.n_layer(), {});
         for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+            if (model.hparams.is_recr(il)) {
+                continue; // a recurrent layer has no K/V: its state carries the chain
+            }
             walk_gk[il].assign((size_t) (last_label + 1)*model.hparams.n_embd_k_gqa(il), 0.0f);
             walk_gv[il].assign((size_t) (last_label + 1)*model.hparams.n_embd_v_gqa(il), 0.0f);
         }
@@ -4696,6 +4731,14 @@ void llama_opt_stop(struct llama_context * ctx, bool stop) {
 void llama_opt_set_step_callback(struct llama_context * ctx, llama_opt_step_callback callback, void * user_data) {
     ctx->opt_step_callback = callback;
     ctx->opt_step_callback_data = user_data;
+}
+
+void llama_opt_set_walk_host_budget(struct llama_context * ctx, size_t bytes) {
+    ctx->opt_walk_host_budget = bytes;
+}
+
+size_t llama_opt_walk_host_bytes(struct llama_context * ctx) {
+    return ctx->opt_walk_host_bytes;
 }
 
 void llama_opt_set_memory_budget(struct llama_context * ctx, size_t bytes) {

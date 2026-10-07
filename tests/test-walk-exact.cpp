@@ -205,6 +205,37 @@ int main(int argc, char ** argv) {
         }
     }
 
+    {
+        // 3. the host budget: a window whose accumulators and snapshots exceed it refuses by
+        // name before anything runs, and the adapter is untouched
+        llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
+        const std::vector<float> before = adapter_params(adapter);
+        llama_context * ctx = make_ctx(params, model, WINDOW / 4);
+        float scale = 1.0f;
+        GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
+        llama_opt_params lopt{};
+        lopt.param_filter   = llama_opt_param_filter_all;
+        lopt.get_opt_pars   = sgd_pars;
+        lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
+        lopt.adapter        = adapter;
+        lopt.walk_exact     = true;
+        llama_opt_init(ctx, model, lopt);
+        llama_opt_set_walk_host_budget(ctx, 1);
+        std::vector<std::vector<llama_token>> seqs = { std::vector<llama_token>(tokens.begin(), tokens.begin() + WINDOW + 1) };
+        std::vector<std::vector<uint8_t>>     loss = { std::vector<uint8_t>(WINDOW + 1, 1) };
+        ggml_opt_dataset_t dataset = common_opt_dataset_init_masked(WINDOW, seqs, loss, tokens[0]);
+        llama_opt_epoch(ctx, dataset, nullptr, nullptr, /*idata_split =*/ 1, nullptr, nullptr);
+        const std::string why = llama_opt_failure(ctx);
+        printf("  host budget of 1 byte: failed=%d, \"%s\", needs %zu MiB\n", (int) llama_opt_failed(ctx), why.c_str(), llama_opt_walk_host_bytes(ctx) >> 20);
+        if (!llama_opt_failed(ctx) || why.find("host memory") == std::string::npos || adapter_params(adapter) != before) {
+            fprintf(stderr, "FAILED: a window over the host budget was not refused by name before it ran\n");
+            ++failures;
+        }
+        ggml_opt_dataset_free(dataset);
+        llama_free(ctx);
+        llama_adapter_lora_free(adapter);
+    }
+
     std::remove(init.c_str());
     llama_model_free(model);
     llama_backend_free();

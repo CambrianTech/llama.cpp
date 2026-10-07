@@ -1755,6 +1755,16 @@ extern "C" {
     // batch): the footprint a run of this shape needs, from the run's own allocation preflight.
     LLAMA_API size_t llama_opt_graph_bytes(struct llama_context * lctx);
 
+    // Cap, in bytes, the HOST memory the exact walk keeps per training window (0 = no cap): the
+    // gradient accumulated on every cached K/V position of every attention layer, and a recurrent
+    // model's state snapshot at every chunk boundary. A window over the cap refuses the run by
+    // name before anything is decoded (llama_opt_failure). Set before llama_opt_epoch.
+    LLAMA_API void llama_opt_set_walk_host_budget(struct llama_context * lctx, size_t bytes);
+
+    // The host bytes the exact walk's largest window so far kept (0 before one ran, or when the
+    // walk is not exact): what a run of this shape needs, from the run's own arithmetic.
+    LLAMA_API size_t llama_opt_walk_host_bytes(struct llama_context * lctx);
+
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,
