@@ -5031,9 +5031,23 @@ struct test_out_prod : public test_case {
     // address against out's buffer passed them all (Metal's F32 transposed path did, and read
     // stale scratch in every LoRA backward on Apple silicon until it was based on a)
     const bool a_own_buffer;
+    // b's values span [-b_range, b_range]: a training gradient passes half's range (65504)
+    // where an activation does not, and a kernel that staged b through half turned those
+    // into Inf and the products into NaN (Metal, 2026-10-06)
+    const float b_range;
 
     std::string vars() override {
-        return VARS_TO_STR9(type_a, type_b, m, n, k, bs, nr, trans_b, a_own_buffer);
+        return VARS_TO_STR10(type_a, type_b, m, n, k, bs, nr, trans_b, a_own_buffer, b_range);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue; // a view's values are its source's
+            }
+            const bool is_b = std::string(ggml_get_name(t)).rfind("b", 0) == 0;
+            init_tensor_uniform(t, is_b ? -b_range : -1.0f, is_b ? b_range : 1.0f);
+        }
     }
 
     double max_nmse_err() override {
@@ -5046,8 +5060,8 @@ struct test_out_prod : public test_case {
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
-            bool trans_b = false, bool a_own_buffer = false)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), trans_b(trans_b), a_own_buffer(a_own_buffer) {}
+            bool trans_b = false, bool a_own_buffer = false, float b_range = 1.0f)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), trans_b(trans_b), a_own_buffer(a_own_buffer), b_range(b_range) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         return build_graph(ctx, nullptr);
@@ -5060,6 +5074,7 @@ struct test_out_prod : public test_case {
         ggml_tensor * b;
         if (trans_b) {
             b = ggml_new_tensor_4d(ctx, type_b, k, n, bs[0]*nr[0], bs[1]*nr[1]);
+            ggml_set_name(b, "b_base");
             b = ggml_transpose(ctx, b);
         } else {
             b = ggml_new_tensor_4d(ctx, type_b, n, k, bs[0]*nr[0], bs[1]*nr[1]);
@@ -9699,6 +9714,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool trans_b : {false, true}) {
         test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q4_K, GGML_TYPE_F32,
                                                   256, 8, 600000, {1, 1}, {1, 1}, trans_b));
+    }
+    // gradient-sized b (past half's 65504), both layouts, F32 and q8_0 weights: the values a
+    // LoRA backward actually hands OUT_PROD (|grad| 131273 measured on the 0.8B)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (bool trans_b : {false, true}) {
+            test_cases.emplace_back(new test_out_prod(type_a, GGML_TYPE_F32, 256, 64, 64, {1, 1}, {1, 1}, trans_b, false, 1.5e5f));
+        }
     }
     // a in its own buffer (a LoRA weight in the adapter's buffer), F32 and quantized, both
     // gradient layouts, at LoRA's shape (rank 8 against a 1024-wide activation)
