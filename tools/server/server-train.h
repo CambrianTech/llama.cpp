@@ -41,6 +41,7 @@
 // default (false) trains on the text exactly as written.
 
 #include "common.h"
+#include "train-segment.h"
 
 #include "json.h"
 #include "ggml-opt.h"
@@ -111,6 +112,12 @@ public:
 private:
     void run(common_json req, examples_data ex);
     static bool before_window(bool train, void * user_data);
+    // The step boundary: a new graph begins, so the segment plan starts over (then the same
+    // yield as every segment boundary).
+    static bool before_step(bool train, void * user_data);
+    // The training context's sched eval callback: cuts each step into segments of about one of
+    // her decode steps and yields to serving between them (train-segment.h, continuum S4).
+    static bool on_eval(ggml_tensor * t, bool ask, void * user_data);
     static void on_batch(bool train, ggml_opt_context_t, ggml_opt_dataset_t, ggml_opt_result_t,
                          int64_t ibatch, int64_t ibatch_max, int64_t);
 
@@ -174,6 +181,10 @@ private:
     std::atomic<int64_t> windows{0};
     std::atomic<int64_t> windows_while_busy{0};
     std::chrono::steady_clock::time_point window_started{};
+    // The segments a step is cut into (touched only on the training thread) and the duration
+    // each aims at, refreshed at every boundary from her measured rate (read per node, so atomic).
+    train_segmenter      segmenter;
+    std::atomic<double>  segment_target_ms{TRAIN_SEGMENT_DEFAULT_MS};
     // The window's duration is serving's latency bound while training is on (the share
     // bounds how OFTEN a window runs, not how long one takes; Joel: a brief, unnoticed
     // slowdown). Every window's duration is kept here, under `mu`, so status reports the

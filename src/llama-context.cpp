@@ -3360,6 +3360,11 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         gf_res_prev.reset(new llm_graph_result(max_nodes));
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                     max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        // The context's eval callback reaches the training graphs too: decode installs it per
+        // graph (process_ubatch), but the optimizer computes on this new scheduler directly, so
+        // without this a trainer's callback (a server cutting steps into segments to yield to
+        // serving) would only apply after some decode happened to run first.
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
     }
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);

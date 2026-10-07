@@ -159,6 +159,9 @@ llama_build_and_test(test-grad-leaf.cpp)
 # ggml-opt with per-step graphs (the llama training path) starts each optimizer period from zero accumulators
 llama_build_and_test(test-opt-dynamic-accum.cpp)
 
+# a training step cut into segments (the eval callback a trainer yields to serving at) trains exactly as the uncut step
+llama_build_and_test(test-opt-segmented.cpp)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)

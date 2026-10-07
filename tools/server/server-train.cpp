@@ -604,11 +604,36 @@ bool server_trainer::before_window(bool, void * user_data) {
         if (took_while_busy) {
             self.windows_while_busy += 1;
         }
+        // the next segment aims at one of her decode steps, from her rate with no window running
+        const int busy_now = self.serving.busy_slots ? self.serving.busy_slots() : 0;
+        self.segment_target_ms.store(train_segment_target_ms(self.rate_no_window.per_ms(), std::max(busy_now, 1)),
+                                     std::memory_order_relaxed);
         self.window_started = std::chrono::steady_clock::now();
         self.window_tokens_start = tokens_t1;
         self.window_busy_start = self.serving.busy_slots && self.serving.busy_slots() > 0;
     }
     return !self.cancel_requested.load();
+}
+
+bool server_trainer::before_step(bool train, void * user_data) {
+    // a new graph: the tail of the last one was never cut, and belongs to no segment
+    static_cast<server_trainer *>(user_data)->segmenter.reset_plan();
+    return before_window(train, user_data);
+}
+
+bool server_trainer::on_eval(ggml_tensor * t, bool ask, void * user_data) {
+    auto & self = *static_cast<server_trainer *>(user_data);
+    if (ask) {
+        // planning, once per node, before anything in the segment runs: cut after this node?
+        return self.segmenter.cut_after(train_node_cost(t), self.segment_target_ms.load(std::memory_order_relaxed));
+    }
+    // The segment this cut closed has run and synchronized: its duration teaches the cost rate,
+    // then the boundary is the same as between steps (the yield her measured rates owe, a pause,
+    // a cancel). Returning false stops the graph, which only a cancel asks for.
+    if (self.window_started != std::chrono::steady_clock::time_point{}) {
+        self.segmenter.measured(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - self.window_started).count());
+    }
+    return before_window(true, user_data);
 }
 
 void server_trainer::on_batch(bool train, ggml_opt_context_t, ggml_opt_dataset_t, ggml_opt_result_t,
@@ -782,6 +807,11 @@ void server_trainer::run(json req, examples_data ex) {
     cparams.n_outputs_max         = 0;   // = n_batch
     cparams.n_outputs_max_per_seq = 0;   // = n_outputs_max
 
+    // S4: a step is computed in segments of about one of her decode steps, with the same yield
+    // to serving between them as between steps, so a turn waits at most one segment, never a
+    // whole step (train-segment.h; 40 s steps on the M5's 27B before this).
+    cparams.cb_eval           = &server_trainer::on_eval;
+    cparams.cb_eval_user_data = this;
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == nullptr) {
         fail("could not create the training context (window " + std::to_string(window) + "): likely out of device memory");
@@ -876,7 +906,7 @@ void server_trainer::run(json req, examples_data ex) {
     // the exact walk's host memory per window: refused by name over the caller's cap
     llama_opt_set_walk_host_budget(ctx, (size_t) req.value("walk_host_budget_mib", (int64_t) 0) << 20);
     llama_opt_init(ctx, model, lopt);
-    llama_opt_set_step_callback(ctx, &server_trainer::before_window, this);
+    llama_opt_set_step_callback(ctx, &server_trainer::before_step, this);
     {
         // from here an epoch can run: a cancel reaches this context directly
         std::lock_guard<std::mutex> lock(mu);
