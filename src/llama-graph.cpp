@@ -2880,6 +2880,11 @@ ggml_tensor * llm_graph_context::build_attn(
             // K/V meet the gradient later chunks put on them through the surrogate
             // <k_cur, gk> + <v_cur, gv>: its gradient on k_cur / v_cur IS gk / gv, which the
             // backward carries through this chunk into the adapter and into its own prefix.
+            // At a quantized or f16 cache the prefix's gradient is taken at the cache's values and
+            // applied to the chunk's own full-precision K/V: straight-through. Measured
+            // (test-walk-exact, q8_0 and f16 caches): cosine 0.998 against one graph, the same as
+            // at an F32 cache, so training reads the numbers serving runs on (Joel: align the bit
+            // depth to inference).
             const int64_t g0 = std::min<int64_t>(cparams.walk_grad_from, n_past);
             llm_graph_result::walk_layer io = { il, (uint32_t) g0, (uint32_t) n_past };
             // [const prefix][gradient prefix][this chunk]: the order the cells hold them in

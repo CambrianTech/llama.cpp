@@ -37,6 +37,11 @@ static ggml_opt_optimizer_params sgd_pars(void *) {
     return p;
 }
 
+// the cache the walk reads its prefix from: F32 for the exactness checks; the served types (f16,
+// q8_0, in a flash-attention context that stores V untransposed) measure the straight-through
+// approximation the walk makes there (Fable on #47: the gradient is taken at the cache's values)
+static ggml_type g_cache_type = GGML_TYPE_F32;
+
 static llama_context * make_ctx(const common_params & params, llama_model * model, uint32_t chunk) {
     auto cparams = common_context_params_to_llama(params);
     cparams.n_ctx           = WINDOW;
@@ -44,9 +49,11 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
     cparams.n_ubatch        = chunk;
     cparams.n_seq_max       = 2;    // the plain walk snapshots a recurrent state into a scratch sequence
     cparams.kv_unified      = true; // ...and the window keeps every cell
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
-    cparams.type_k          = GGML_TYPE_F32; // the walk's cached constants equal the chunk's own K/V
-    cparams.type_v          = GGML_TYPE_F32;
+    // a quantized V cache needs flash attention (it stores V untransposed); training graphs take
+    // the explicit path either way
+    cparams.flash_attn_type = g_cache_type == GGML_TYPE_F32 ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cparams.type_k          = g_cache_type;
+    cparams.type_v          = g_cache_type;
     return llama_init_from_model(model, cparams);
 }
 
@@ -138,6 +145,11 @@ static agreement compare(const char * what, const std::vector<float> & a, const 
 // Measured on the 1.5B Q4_K_M (5090): the exact walk agrees with one graph at cosine 0.998 and
 // norm 0.995 (what is left is the quantized matmuls' batch-size variance: a 128-row chunk and a
 // 512-row graph take different kernels); the plain walk sits at cosine 0.81, norm 2.1.
+// the served cache types' bar (see 1b). Measured on the 5090: f16 0.9986 (1.5B) / 0.9981 (hybrid),
+// q8_0 0.9978 / 0.9979, against F32's 0.998: the straight-through approximation costs nothing
+// measurable, so the bar sits just under F32's own agreement.
+static const double STRAIGHT_THROUGH_COSINE = 0.99;
+
 static bool same_step(const agreement & r) {
     return r.cosine > 0.995 && std::fabs(r.norm_ratio - 1.0) < 0.02;
 }
@@ -197,6 +209,24 @@ int main(int argc, char ** argv) {
             printf("  host memory: %.1f MiB with a snapshot per chunk, %.1f MiB checkpointed\n", full_bytes / 1048576.0, strided_bytes / 1048576.0);
             if (!(strided_bytes < full_bytes) || !same_step(compare("all labelled: checkpointed state vs a snapshot per chunk", strided, exact))) {
                 fprintf(stderr, "FAILED: checkpointing the recurrent state changed the step (or saved nothing)\n");
+                ++failures;
+            }
+        }
+    }
+    {
+        // 1b. the served cache types: the walk reads the prefix at the cache's precision and its
+        // gradient is taken there, then applied to the chunk's own full-precision K/V (straight-
+        // through). Measured against the same one-graph reference, which never reads the cache.
+        std::vector<uint8_t> all(WINDOW + 1, 1);
+        all[0] = 0;
+        const auto ref = step_delta(params, model, init, tokens, all, WINDOW, false);
+        for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            g_cache_type = t;
+            const auto exact = step_delta(params, model, init, tokens, all, WINDOW / 4, true);
+            g_cache_type = GGML_TYPE_F32;
+            const agreement r = compare((std::string("all labelled, ") + ggml_type_name(t) + " cache: exact walk in 4 chunks vs one graph").c_str(), exact, ref);
+            if (!(r.cosine > STRAIGHT_THROUGH_COSINE)) {
+                fprintf(stderr, "FAILED: at a %s cache the exact walk's step strays from the window's gradient (cosine %.4f)\n", ggml_type_name(t), r.cosine);
                 ++failures;
             }
         }

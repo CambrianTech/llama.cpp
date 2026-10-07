@@ -3336,7 +3336,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     // be running on the same weights).
     opt_n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     opt_walk_exact   = lopt_params.walk_exact;
-    opt_walk_horizon = lopt_params.walk_horizon;
+    opt_walk_horizon_req = lopt_params.walk_horizon;
+    opt_walk_horizon     = lopt_params.walk_horizon;
     const uint32_t n_batch     = std::min(this->n_batch(),  opt_n_ctx_train);
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
     GGML_ASSERT(opt_n_ctx_train % n_batch  == 0);
@@ -3748,6 +3749,15 @@ void llama_context::opt_epoch_iter(
         // prefix's G. ONE optimizer step per window, on the gradient of the window's loss
         // (exact within the horizon). Memory stays chunk x window; the cost is one decode plus
         // one forward and backward per chunk, context chunks included.
+        // THE INVARIANT THAT MAKES THE REVERSE PASS VALID (Fable): the adapter does not change
+        // between the forward decode and the last chunk's backward. One optimizer step per window,
+        // taken by the chunk the reverse pass trains last, is what keeps each chunk's recomputed
+        // K/V (and recurrent state) equal to the cached values its successors attended to; a step
+        // inside the window would make every surrogate a gradient of a different function.
+        //
+        // Each window starts from the REQUESTED horizon: a halving that fit one window's device
+        // budget must not shrink every later window and epoch, which may be shorter (Fable).
+        opt_walk_horizon = opt_walk_horizon_req;
         // A recurrent model's state is carried the same way, one chunk at a time: the state
         // entering a chunk is a GRAD leaf, the state it leaves meets the next chunk's gradient
         // (build_rs, build_walk_state_exit). The reverse pass restores each chunk's entry state
