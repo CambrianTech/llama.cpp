@@ -6,6 +6,7 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
+#include "ggml-metal-tuning.h"
 
 #include <mutex>
 #include <string>
@@ -203,6 +204,11 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
     ggml_metal_buffer_t res = ggml_metal_buffer_init(ctx_dev, size, shared);
 
+    if (res == NULL) {
+        GGML_LOG_ERROR("%s: failed to allocate Metal buffer of %zu bytes (out of memory)\n", __func__, size);
+        return NULL;
+    }
+
     ggml_backend_buffer_i buf_i = ggml_metal_buffer_is_shared(res)
         ? ggml_backend_metal_buffer_shared_i
         : ggml_backend_metal_buffer_private_i;
@@ -225,6 +231,19 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_flash_attn_ext_extra_pad(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_blk(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
+                res += ggml_metal_op_flash_attn_ext_extra_kv_f16(tensor);
+            } break;
+        case GGML_OP_OUT_PROD:
+            {
+                res += ggml_metal_op_out_prod_extra(tensor);
+            } break;
+        case GGML_OP_GATED_DELTA_NET_BACK:
+            {
+                res += ggml_metal_op_gated_delta_net_back_extra(tensor);
+            } break;
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            {
+                res += ggml_nrows(tensor->src[0])*sizeof(float); // the per-row losses before the sum
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
@@ -681,6 +700,7 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
         /* .host_buffer          = */ false,
         /* .buffer_from_host_ptr = */ true,
         /* .events               = */ true,
+        /* .mmap_support         = */ true,
     };
 }
 
@@ -868,9 +888,86 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+// test/tune-only override for the FA vec (Q, NE) selection, reached via proc_address.
+static void ggml_backend_metal_tuning_set_fa_vec_override(int Q, int NE) {
+    ggml_metal_tuning::fa_vec_set_override({ (int8_t) Q, (int8_t) NE });
+}
+
+static void ggml_backend_metal_tuning_clear_fa_vec_override(void) {
+    ggml_metal_tuning::fa_vec_clear_override();
+}
+
+static int ggml_backend_metal_tuning_fa_vec_ne11_bucket(int64_t ne11) {
+    return ggml_metal_tuning::fa_vec_ne11_bucket(ne11);
+}
+
+static int ggml_backend_metal_tuning_fa_vec_ne01_bucket(int64_t ne01) {
+    return ggml_metal_tuning::fa_vec_ne01_bucket(ne01);
+}
+
+static int ggml_backend_metal_tuning_fa_vec_baseline_ne(int dk, int dv) {
+    return ggml_metal_tuning::fa_vec_baseline_ne(dk, dv);
+}
+
+static const char * ggml_backend_metal_tuning_device_token(ggml_backend_dev_t dev) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    return ggml_metal_device_id_token(ggml_metal_device_get_props(ctx_dev)->device_id);
+}
+
+// [MOE-GATHER #23] Metal repr of an expert-table entry: GPU-VA byte delta of the slot relative to
+// src0_cpy's tensor start. CPU-pointer deltas do NOT transfer across MTLBuffers — both ends must
+// resolve through MTLBuffer.gpuAddress (ggml_metal_buffer_gpu_va). Fails (false) when either side
+// is not a Metal buffer or gpuAddress is unavailable; the consume-arm then copies as before.
+static bool ggml_backend_metal_moe_gather_entry(const struct ggml_tensor * src0_cpy,
+        ggml_backend_buffer_t slot_buf, size_t slot_off, int64_t * entry) {
+    if (src0_cpy == NULL || src0_cpy->buffer == NULL || slot_buf == NULL || entry == NULL) {
+        return false;
+    }
+    // both buffers must be Metal buffers (shared OR private flavor) — a foreign context cast is UB
+    const auto is_metal_buf = [](ggml_backend_buffer_t b) {
+        return b->iface.get_base == ggml_backend_metal_buffer_shared_i.get_base ||
+               b->iface.get_base == ggml_backend_metal_buffer_private_i.get_base;
+    };
+    if (!is_metal_buf(src0_cpy->buffer) || !is_metal_buf(slot_buf)) {
+        return false;
+    }
+    ggml_metal_buffer_t ctx_src0 = (ggml_metal_buffer_t) src0_cpy->buffer->context;
+    ggml_metal_buffer_t ctx_slot = (ggml_metal_buffer_t) slot_buf->context;
+
+    const uint64_t va_src0 = ggml_metal_buffer_gpu_va(ctx_src0, src0_cpy->data);
+    const uint64_t va_slot = ggml_metal_buffer_gpu_va(ctx_slot, (const char *) ggml_backend_buffer_get_base(slot_buf) + slot_off);
+    if (va_src0 == 0 || va_slot == 0) {
+        return false;
+    }
+    *entry = (int64_t) (va_slot - va_src0);
+    return true;
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_metal_tuning_set_fa_vec_override") == 0) {
+        return (void *)ggml_backend_metal_tuning_set_fa_vec_override;
+    }
+    if (strcmp(name, "ggml_backend_metal_tuning_clear_fa_vec_override") == 0) {
+        return (void *)ggml_backend_metal_tuning_clear_fa_vec_override;
+    }
+    if (strcmp(name, "ggml_backend_metal_tuning_fa_vec_ne11_bucket") == 0) {
+        return (void *)ggml_backend_metal_tuning_fa_vec_ne11_bucket;
+    }
+    if (strcmp(name, "ggml_backend_metal_tuning_fa_vec_ne01_bucket") == 0) {
+        return (void *)ggml_backend_metal_tuning_fa_vec_ne01_bucket;
+    }
+    if (strcmp(name, "ggml_backend_metal_tuning_fa_vec_baseline_ne") == 0) {
+        return (void *)ggml_backend_metal_tuning_fa_vec_baseline_ne;
+    }
+    if (strcmp(name, "ggml_backend_metal_tuning_device_token") == 0) {
+        return (void *)ggml_backend_metal_tuning_device_token;
+    }
+    if (strcmp(name, "ggml_backend_moe_gather_entry") == 0) {
+        return (void *)ggml_backend_metal_moe_gather_entry;
     }
 
     return NULL;
@@ -889,7 +986,7 @@ static ggml_backend_dev_t ggml_backend_metal_device_init(ggml_backend_reg_t reg,
     return new ggml_backend_device {
         /* .iface   = */ ggml_backend_metal_device_i,
         /* .reg     = */ reg,
-        /* .context = */ ggml_metal_device_get(device),
+        /* .context = */ ggml_metal_device_get(device, g_devices),
     };
 }
 

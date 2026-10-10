@@ -127,6 +127,13 @@ extern "C" {
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
+
+        // Recompute instead of keep (gradient checkpointing): forward nodes whose name starts
+        // with this prefix are kept for the backward pass, and every other forward intermediate
+        // the backward pass reads is recomputed from the nearest of them, just before it is
+        // needed. NULL = keep everything (the default). One layer's intermediates are then
+        // alive at a time instead of every layer's, for about one extra forward pass.
+        const char * checkpoint_prefix;
     };
 
     // get parameters for an optimization context with defaults set where possible
@@ -183,10 +190,45 @@ extern "C" {
 
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval
-    GGML_API void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
+    // returns false when the graph could not be allocated (device memory): the graph is then NOT
+    // ready and must not be evaluated
+    GGML_API bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
+
+    // Why the last ggml_opt_alloc returned false, in words a caller can put in front of a person
+    // ("" when it did not refuse): a node the device backend cannot run, or the memory gate.
+    GGML_API const char * ggml_opt_refusal(ggml_opt_context_t opt_ctx);
+
+    // Caps what a graph may add on each non-CPU device, over and above the device's own free
+    // figure (0 = no cap). For callers that know physical memory better than the driver does: on
+    // Windows (WDDM) a CUDA device reports nearly the whole card free beside other processes, and
+    // an allocation past physical VRAM lands in host memory.
+    GGML_API void ggml_opt_set_alloc_budget(ggml_opt_context_t opt_ctx, size_t bytes);
+
+    // The largest graph (bytes, on a non-CPU device) the allocation preflight has measured: what a
+    // run of this shape needs, measured by the run itself.
+    GGML_API size_t ggml_opt_peak_graph_bytes(ggml_opt_context_t opt_ctx);
 
     // do forward pass, increment result if not NULL, do backward pass if allocated
     GGML_API void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result);
+
+    // A caller-driven optimizer period, for graphs built per step (the training walk's reverse
+    // pass: one graph per chunk, ONE optimizer step per window). Applies to the next
+    // ggml_opt_alloc + ggml_opt_eval only:
+    //   period_end: true = this graph runs the optimizer step, false = it only accumulates
+    //   loss_scale: the weight of this graph's loss in the period's total (replaces 1/opt_period)
+    //   extra_loss: NULL, or a scalar F32 node of the forward graph added to the loss the backward
+    //               differentiates (a surrogate carrying a later graph's gradient into this one);
+    //               the loss the result reports stays the unweighted loss of the outputs
+    // A period starts from zero gradients after the step that ended the previous one.
+    GGML_API void ggml_opt_set_next_step(
+        ggml_opt_context_t   opt_ctx,
+        bool                 period_end,
+        float                loss_scale,
+        struct ggml_tensor * extra_loss);
+
+    // After ggml_opt_eval and until the next ggml_opt_alloc: the gradient the backward computed
+    // for a GRAD leaf (ggml_set_grad) of the evaluated graph, or NULL when the graph has none.
+    GGML_API struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * leaf);
 
     // ############################################################################
     // ## The high-level functions start here. They do not depend on any private ##

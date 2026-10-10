@@ -6,10 +6,14 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#define PSAPI_VERSION 2
+#include <psapi.h>
 #endif
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-moe-residency.hpp"   // universal MoE expert residency (ExpertId / ExpertFetcher / ResidencyCache)
+#include "ggml-moe-container-fetcher.h" // DirContainerFetcher — the aligned container read path (#268)
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -20,7 +24,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <memory>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <chrono>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -182,6 +190,8 @@ void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backe
     // FIXME: add a generic callback to the buffer interface
     if (ggml_backend_buffer_is_multi_buffer(buffer)) {
         ggml_backend_multi_buffer_set_usage(buffer, usage);
+    } else if (ggml_backend_buffer_is_meta(buffer)) {
+        ggml_backend_meta_buffer_set_usage(buffer, usage);
     }
 }
 
@@ -306,7 +316,7 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
 
-    if (n_copies <= 1 || backend->iface.set_tensor_2d_async == NULL) {
+    if (n_copies <= 1 || backend->iface.get_tensor_2d_async == NULL) {
         for (size_t i = 0; i < n_copies; i++) {
             ggml_backend_tensor_get_async(backend, tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size);
         }
@@ -317,7 +327,7 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
     }
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
-    GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+    GGML_ASSERT(offset + (n_copies-1)*stride_tensor + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
     backend->iface.get_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
@@ -379,7 +389,7 @@ void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor, void * data, 
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     GGML_ASSERT(buf != NULL && "tensor buffer not set");
 
-    if (n_copies <= 1 || buf->iface.set_tensor_2d == NULL) {
+    if (n_copies <= 1 || buf->iface.get_tensor_2d == NULL) {
         for (size_t i = 0; i < n_copies; i++) {
             ggml_backend_tensor_get(tensor, (char *) data + i*stride_data, offset + i*stride_tensor, size);
         }
@@ -765,8 +775,9 @@ struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
     int i_end;
-    struct ggml_tensor * inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
+    struct ggml_tensor ** inputs;
     int n_inputs;
+    int inputs_capacity;
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -805,8 +816,9 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
-    struct ggml_tensor * graph_inputs[GGML_SCHED_MAX_SPLIT_INPUTS];
+    struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
+    int graph_inputs_capacity;
 
     struct ggml_context * ctx;
 
@@ -831,6 +843,36 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
+    int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
+    if (split->inputs_capacity > 0) {
+        new_cap = 2*split->inputs_capacity;
+        GGML_LOG_WARN("%s: increasing split inputs capacity from %d to %d\n", __func__, split->inputs_capacity, new_cap);
+    }
+    auto * pnew = (struct ggml_tensor **) realloc((void *) split->inputs, new_cap * sizeof(struct ggml_tensor *));
+    if (pnew == NULL) {
+        GGML_LOG_ERROR("%s: failed to allocate %zu bytes\n", __func__, new_cap * sizeof(struct ggml_tensor *));
+        GGML_ABORT("failed to grow split inputs container");
+    }
+    split->inputs = pnew;
+    split->inputs_capacity = new_cap;
+}
+
+static void ggml_backend_sched_graph_inputs_grow(ggml_backend_sched_t sched) {
+    int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
+    if (sched->graph_inputs_capacity > 0) {
+        new_cap = 2*sched->graph_inputs_capacity;
+        GGML_LOG_WARN("%s: increasing graph inputs capacity from %d to %d\n", __func__, sched->graph_inputs_capacity, new_cap);
+    }
+    auto * pnew = (struct ggml_tensor **) realloc((void *) sched->graph_inputs, new_cap * sizeof(struct ggml_tensor *));
+    if (pnew == NULL) {
+        GGML_LOG_ERROR("%s: failed to allocate %zu bytes\n", __func__, new_cap * sizeof(struct ggml_tensor *));
+        GGML_ABORT("failed to grow graph inputs container");
+    }
+    sched->graph_inputs = pnew;
+    sched->graph_inputs_capacity = new_cap;
+}
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -906,26 +948,35 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     }
 
     // operations with weights are preferably run on the same backend as the weights
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        const struct ggml_tensor * src = tensor->src[i];
-        if (src == NULL) {
-            continue;
-        }
-        // skip ROPE since the rope freqs tensor is too small to choose a backend based on it
-        // not an ideal solution
-        if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-            int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-            // check if a backend with higher prio wants to offload the op
-            if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
-                for (int b = 0; b < src_backend_id; b++) {
-                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
-                        SET_CAUSE(tensor, "1.off");
-                        return b;
+    // TODO: there are exceptions (see below) - not an ideal solution
+    bool allow = true;
+
+    // skip ROPE since the rope freqs tensor is too small to choose a backend based on it
+    allow = allow && tensor->op != GGML_OP_ROPE;
+
+    // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
+    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
+
+    if (allow) {
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            const struct ggml_tensor * src = tensor->src[i];
+            if (src == NULL) {
+                continue;
+            }
+            if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                // check if a backend with higher prio wants to offload the op
+                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                    for (int b = 0; b < src_backend_id; b++) {
+                        if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                            SET_CAUSE(tensor, "1.off");
+                            return b;
+                        }
                     }
                 }
+                SET_CAUSE(tensor, "1.wgt%d", i);
+                return src_backend_id;
             }
-            SET_CAUSE(tensor, "1.wgt%d", i);
-            return src_backend_id;
         }
     }
 
@@ -1288,7 +1339,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // check if the split has too many inputs
                     // FIXME: count the number of inputs instead of only checking when full
-                    if (split->n_inputs == GGML_SCHED_MAX_SPLIT_INPUTS) {
+                    if (split->n_inputs >= split->inputs_capacity) {
                         const size_t id = hash_id(src);
                         int src_backend_id = sched->hv_tensor_backend_ids[id];
                         bool supported = ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
@@ -1304,10 +1355,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_end = i;
                 i_split++;
                 if (i_split >= sched->splits_capacity) {
+                    int old_cap = sched->splits_capacity;
                     sched->splits_capacity *= 2;
                     sched->splits = (ggml_backend_sched_split *)
                         realloc(sched->splits, sched->splits_capacity * sizeof(struct ggml_backend_sched_split));
                     GGML_ASSERT(sched->splits != NULL);
+                    for (int k = old_cap; k < sched->splits_capacity; k++) {
+                        memset(&sched->splits[k], 0, sizeof(struct ggml_backend_sched_split));
+                    }
                 }
                 split = &sched->splits[i_split];
                 split->backend_id = node_backend_id;
@@ -1344,7 +1399,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
                         int n_graph_inputs = sched->n_graph_inputs++;
-                        GGML_ASSERT(n_graph_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
+                        if (n_graph_inputs >= sched->graph_inputs_capacity) {
+                            ggml_backend_sched_graph_inputs_grow(sched);
+                        }
                         sched->graph_inputs[n_graph_inputs] = src;
                     }
                 }
@@ -1364,7 +1421,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
                         int n_inputs = split->n_inputs++;
-                        GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
+                        if (n_inputs >= split->inputs_capacity) {
+                            ggml_backend_sched_split_inputs_grow(split);
+                        }
                         split->inputs[n_inputs] = src;
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
@@ -1390,7 +1449,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->prev_leaf_backend_ids = tmp;
     }
 
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + sched->n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sched->n_copies;
+    int total_inputs = sched->n_graph_inputs;
+    for (int i = 0; i < sched->n_splits; i++) {
+        total_inputs += sched->splits[i].n_inputs;
+    }
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies;
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1538,6 +1601,160 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// [MOE-EXPERT-PAGING] MoE expert residency (task #23/#28) lives in ggml-moe-residency.hpp as a clean
+// module — ExpertId (semantic identity), ExpertFetcher (mmap-fault / direct-NVMe adapter), and
+// ResidencyCache (pinned LRU). Here we just pick the fetcher and hold the cache. See the call site
+// in ggml_backend_sched_compute_splits for how the op-offload seam feeds it.
+//   fetcher: direct NVMe read on Windows when GGML_MOE_DIRECT_READ is set, else portable mmap-fault.
+#ifdef _WIN32
+static ggml_moe::DirectReadFetcher moe_direct_fetcher;
+#endif
+static ggml_moe::MmapFaultFetcher  moe_mmap_fetcher;
+static ggml_moe::ExpertFetcher &   moe_pick_base_fetcher() {
+    // Container-serve (#268): when a packed per-layer expert container is configured, read from it.
+    // Its records are contiguous + 16KiB-aligned, so this is the honest ~GB/s sequential path — vs
+    // DirectRead scraping scattered offsets out of the raw GGUF's mmap. The serving caller packs
+    // (layer, byte_offset) into `src` via DirContainerFetcher::pack_src; the cache passes it opaquely.
+    // Constructed once with the configured dir (banks open lazily); a bad dir opens no banks and every
+    // fetch fails LOUD (zeroed record -> downstream validation), never a silent wrong-source serve.
+    if (const char * cdir = ggml_moe::moe_config().container_dir) {
+        static ggml_moe::DirContainerFetcher container_fetcher(cdir);
+        return container_fetcher;
+    }
+#ifdef _WIN32
+    if (ggml_moe::moe_config().direct_read) { return moe_direct_fetcher; }
+#endif
+    return moe_mmap_fetcher;
+}
+// [DEVICE-RESIDENT #23] set once by the serving caller via moe_expert_cache_enable_device(): a
+// DeviceUploadFetcher wrapping the base fetcher, so a VRAM-slot MISS reads host-side then does ONE H2D.
+// Null => host cache (the base fetcher fills host slots directly). moe_expert_cache() reads this at its
+// first construction, so enable_device MUST run before the cache's first use (first-token call_once).
+static ggml_moe::ExpertFetcher *   g_moe_device_fetcher = nullptr;
+static ggml_moe::ExpertFetcher &   moe_pick_fetcher() {
+    return g_moe_device_fetcher ? *g_moe_device_fetcher : moe_pick_base_fetcher();
+}
+// budget from moe_config().host_cache_bytes (0 => disabled). Cache holds a mutex, so it is a plain
+// function-local static, constructed once with the chosen fetcher; budget applied idempotently.
+static ggml_moe::ResidencyCache & moe_expert_cache() {
+    // Budget is GOVERNED. When a plan file is configured (GGML_MOE_PLAN_FILE), the governor's
+    // plan_file.budget_bytes is the ONLY budget source - the env is ignored so a hardcoded value can
+    // never overcommit RAM behind the governor's back (the 40 GB-on-a-63 GB-box thrash). The env budget
+    // applies ONLY in ungoverned standalone (no plan file), as a fallback. See
+    // docs/architecture/MOE-SERVING-GOVERNED-BUDGET.md.
+    const size_t initial_budget = ggml_moe::moe_config().plan_path.empty()
+        ? ggml_moe::moe_config().host_cache_bytes   // ungoverned standalone fallback
+        : 0;                                        // governed: plan-file sets the budget on first tick
+    static ggml_moe::ResidencyCache cache(initial_budget, moe_pick_fetcher());
+    return cache;
+}
+
+// [DEVICE-RESIDENT #23 LiveUploadPager] The ONE bridge the serving expert loop calls (its own call_once)
+// to make the expert cache VRAM-resident so hits kill the per-op H2D. It owns the CUDA backend, so it
+// supplies the split backend's VRAM buffer type + an h2d closure (one host->device copy for a slot miss).
+// Wires the DeviceUploadFetcher over the base fetcher and flips the cache device-backed BEFORE its first
+// pool alloc — hence this must run before the cache's first use. Idempotent (call_once) + null-safe.
+// Off unless called: the host path is byte-for-byte unchanged. Budget is GOVERNED (plan.device_budget_bytes)
+// or the GGML_MOE_VRAM_CACHE_GB env fallback in ungoverned standalone — the cache decides, per the host mirror.
+// [[maybe_unused]] until M5's expert-loop caller wires the enable-call (same TU); keeps -Werror happy.
+[[maybe_unused]] static void moe_expert_cache_enable_device(ggml_backend_buffer_type_t vram_buft,
+                                           std::function<bool(void *, const void *, size_t)> h2d) {
+    if (vram_buft == nullptr || !h2d) { return; }
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+        // DeviceUploadFetcher lives for process lifetime; g_moe_device_fetcher then steers moe_pick_fetcher.
+        static ggml_moe::DeviceUploadFetcher duf(moe_pick_base_fetcher(), std::move(h2d));
+        g_moe_device_fetcher = &duf;
+        moe_expert_cache().enable_device(vram_buft);   // constructs (if first) with the device fetcher, flips buft
+    });
+}
+
+
+// [MOE-GATHER #23 — consume arm] persistent pool of expert-offset tables (ggml_mul_mat_id's src[3]).
+// Process-global like moe_expert_cache(): the pager serves one llama instance per process. Tables are
+// claimed in order per compute call and reset where the recency clock ticks; their device buffers and
+// host staging live for the process lifetime because a node's src[3] (and the staging an async upload
+// reads) must stay valid until that graph's compute completes. Sub-pooled by sched->cur_copy so
+// pipeline-parallel copies never overwrite a table an in-flight copy's kernels still read — the same
+// hazard the input_cpy event_wait guards, solved the same per-copy way.
+struct MoeGatherTables {
+    struct Entry {
+        struct ggml_tensor    tens {};
+        ggml_backend_buffer_t buf      = nullptr;
+        int64_t               capacity = 0;      // experts the device buffer can hold
+        std::vector<int64_t>  staging;           // host mirror; outlives the async upload
+    };
+    std::vector<std::unique_ptr<Entry>> entries[GGML_SCHED_MAX_COPIES];
+    size_t next[GGML_SCHED_MAX_COPIES] = {};
+
+    void reset(int copy) { next[copy] = 0; }
+
+    // claim the next table sized for n_expert on `backend`'s default buffer type; nullptr on alloc failure
+    Entry * claim(ggml_backend_t backend, int copy, int64_t n_expert) {
+        auto & pool = entries[copy];
+        if (next[copy] == pool.size()) { pool.emplace_back(new Entry()); }
+        Entry * e = pool[next[copy]].get();
+        if (e->capacity < n_expert) {
+            if (e->buf) { ggml_backend_buffer_free(e->buf); e->buf = nullptr; e->capacity = 0; }
+            e->buf = ggml_backend_alloc_buffer(backend, (size_t) n_expert * sizeof(int64_t));
+            if (e->buf == nullptr) { return nullptr; }
+            e->capacity = n_expert;
+        }
+        struct ggml_tensor * t = &e->tens;
+        memset(t, 0, sizeof(*t));
+        t->type  = GGML_TYPE_I64;
+        t->ne[0] = n_expert; t->ne[1] = t->ne[2] = t->ne[3] = 1;
+        t->nb[0] = sizeof(int64_t);
+        t->nb[1] = t->nb[2] = t->nb[3] = (size_t) n_expert * sizeof(int64_t);
+        t->op     = GGML_OP_NONE;
+        t->buffer = e->buf;
+        t->data   = ggml_backend_buffer_get_base(e->buf);
+        snprintf(t->name, sizeof(t->name), "moe_eptrs");
+        e->staging.assign((size_t) n_expert, 0);
+        next[copy]++;
+        return e;
+    }
+};
+static MoeGatherTables g_moe_gather_tables;
+
+// [MOE-GATHER #23] TRUE retirement: a generation's slots stay fenced until the graph that read their
+// table has PROVABLY finished on the device. A ring of recorded events is synchronized RING calls
+// later — by then the work is long done, so the sync is free, but it is a fact rather than the
+// assumption a generation-window makes. Without usable events the cache keeps its conservative
+// window, so a backend that cannot supply them is still correct, just less precise.
+struct MoeGatherRetire {
+    // Depth 2 == the true in-flight set: at call N we synchronize the event recorded at call N-2,
+    // which retires everything through that generation and leaves exactly the current + previous
+    // generation protected. Deeper rings PROVE completion later, over-protect, and collapse the hit
+    // rate (measured: RING=4 took OLMoE full-fit from 100% to 67.7%).
+    static const int RING = 2;
+    ggml_backend_event_t ev[RING]  = {};
+    uint64_t             gen[RING] = {};
+    int                  head      = 0;
+    bool                 usable    = false;
+    bool                 tried     = false;
+
+    void ensure(ggml_backend_t backend) {
+        if (tried) { return; }
+        tried = true;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr) { return; }
+        for (int i = 0; i < RING; i++) {
+            ev[i] = ggml_backend_event_new(dev);
+            if (ev[i] == nullptr) { return; }   // partial ring => stay unusable; freed at process exit
+        }
+        usable = true;
+    }
+};
+static MoeGatherRetire g_moe_gather_retire;
+
+// per-backend entry-builder proc ("ggml_backend_moe_gather_entry"); nullptr = backend has no gather repr
+static ggml_backend_moe_gather_entry_t moe_gather_entry_fn(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    return reg ? (ggml_backend_moe_gather_entry_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_gather_entry") : nullptr;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1546,10 +1763,111 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // [MOE-EXPERT-PAGING] measure the host->VRAM MoE expert stream per graph-compute (per decode token).
+    // Values feed the design's residency negotiation: working_set_size (distinct experts streamed) and
+    // bytes streamed (basis for pcie_h2d_bps). Zero-cost by default: accumulation is a couple of int
+    // adds; the summary log is emitted only when GGML_MOE_OFFLOAD_STATS is set.
+    static const bool moe_stats = ggml_moe::moe_config().stats;
+    // [MOE-EXPERT-PAGING] read-based residency (task #28): batched OS prefetch of the selected experts'
+    // mmap ranges, turning cold random demand-faults into concurrent sequential NVMe reads. Opt-in so
+    // before/after is a single binary (A/B by env).
+    [[maybe_unused]] static const bool moe_prefetch = ggml_moe::moe_config().prefetch; // consumed under _WIN32 only
+    // [MOE-TRACE] optional ordered expert-access trace for OFFLINE residency-policy simulation. One binary
+    // record (u64 tensor_key, u32 expert_id) per activated expert, in true access order. Lets us replay
+    // the real MoE routing against ANY cache policy/budget (LRU vs LFU vs a learned predictor) to measure
+    // achievable hit-rate BEFORE building the predictor — the make-or-break input. GGML_MOE_TRACE_FILE=path.
+    static FILE * moe_trace = []{ const char * p = ggml_moe::moe_config().trace_path; return p ? fopen(p, "wb") : nullptr; }();
+    // [MOE-CAPTURE] structured PagerCaptureEvent JSONL for Positron (graph-control performance fields; the
+    // policy fields — chosen_decay/per_arm_reward/tier_counts — are filled by the Rust ServingExpertPager).
+    // One line per decode token; Positron tails it. GGML_MOE_CAPTURE_FILE=path enables it.
+    static const char * moe_capture_path = ggml_moe::moe_config().capture_path;
+    static FILE * moe_capture = moe_capture_path ? fopen(moe_capture_path, "wb") : nullptr;
+    static uint64_t moe_capture_token = 0, moe_capture_bytes = 0;
+    // DRAIN: bound the JSONL so it can't grow unbounded — recent data is what matters. At the cap we
+    // rotate (path -> path.1, reopen fresh), keeping ~2x cap of recent capture cleanly. This is the raw
+    // guard; the proper drain is the facility layer (Rust CaptureSink ring/rotation, as TrackedDir does
+    // for other capture). GGML_MOE_CAPTURE_MB overrides the cap (default 32 MB ~ 200k tokens).
+    static const uint64_t moe_capture_cap = ggml_moe::moe_config().capture_cap_bytes;
+    // [DEVICE-RESIDENT #23 — caller half] Flip the expert cache VRAM-resident BEFORE the
+    // moe_expert_cache() reference below constructs it (the fetcher is bound at construction, so
+    // this MUST win the first-token race — the ordering contract on enable_device). Opt-in via
+    // GGML_MOE_VRAM_CACHE_GB for the A/B (governed auto-enable via plan.device_budget_bytes is the
+    // follow-up once the cache can request a buft). The h2d closure is backend-neutral: every
+    // buffer iface addresses writes by tensor->data (+offset), so a data-only stack tensor over the
+    // raw slot pointer is a legal handle, and a tiny probe buffer from the same buft supplies the
+    // iface + device context for slots that live in OTHER buffers of that buft.
+    {
+        static std::once_flag moe_dev_once;
+        std::call_once(moe_dev_once, [&]() {
+            if (ggml_moe::moe_config().vram_cache_bytes == 0) { return; }
+            ggml_backend_t gpu = nullptr;
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    gpu = sched->backends[b];
+                    break;
+                }
+            }
+            if (gpu == nullptr) { return; } // CPU-only box: host cache stays as-is
+            ggml_backend_buffer_type_t vbuft = ggml_backend_get_default_buffer_type(gpu);
+            static ggml_backend_buffer_t h2d_probe = ggml_backend_buft_alloc_buffer(vbuft, 16);
+            if (h2d_probe == nullptr) { return; }
+            moe_expert_cache_enable_device(vbuft, [](void * dst, const void * src, size_t n) -> bool {
+                struct ggml_tensor t = {};
+                t.type  = GGML_TYPE_I8;
+                t.ne[0] = (int64_t) n; t.ne[1] = t.ne[2] = t.ne[3] = 1;
+                t.nb[0] = 1; t.nb[1] = t.nb[2] = t.nb[3] = n;
+                t.buffer = h2d_probe;  // iface + device ctx; impls write to t.data, not the probe
+                t.data   = dst;
+                ggml_backend_tensor_set(&t, src, 0, n);
+                return true;
+            });
+        });
+    }
+    // host-side expert residency cache (the module; budget from GGML_MOE_HOST_CACHE_GB, 0 => disabled).
+    ggml_moe::ResidencyCache & host_cache = moe_expert_cache();
+    // [MOE-RECENCY] one compute-splits call == one token (decode) / one prefill batch. Poll the governor's
+    // plan-file and advance the recency clock EVERY call, BEFORE reading enabled() - so a governed budget
+    // arriving via the plan (which starts the cache at budget 0) can turn it ON. Cheap mtime check; a
+    // no-op when no plan file is configured. Advancing the clock also protects whole recent tokens' sets.
+    host_cache.advance_generation();
+    const bool host_cache_on = host_cache.enabled();
+    // [MOE-GATHER #23] opt-in consume-arm; tables recycle at the same per-call cadence as the clock
+    static const bool moe_gather_on = ggml_moe::moe_config().gather;
+    // [MOE-GATHER #23 BISECT] identity mode: publish the table (all entries = the expert's NATURAL
+    // offset in input_cpy) but keep EVERY copy, so the kernel's table path runs over bytes byte-for-byte
+    // identical to the copy path. Splits a gather-only failure cleanly in two: still broken => the
+    // kernel's table arithmetic is wrong at real shapes/quants; clean => the addresses or the slot
+    // lifetime are wrong, not the kernel.
+    static const bool moe_gather_identity = ggml_moe::moe_config().gather_identity;
+    static const bool moe_gather_verify   = ggml_moe::moe_config().gather_verify;
+    static const bool moe_gather_sync     = ggml_moe::moe_config().gather_sync;
+    if (moe_gather_on) { g_moe_gather_tables.reset(sched->cur_copy); }
+    ggml_backend_t moe_gather_backend = nullptr;   // backend the tables were published to this call
+    size_t  moe_bytes_streamed  = 0;
+    int64_t moe_experts_streamed = 0;
+    int64_t moe_experts_gathered = 0;
+    // per-token deltas snapshot the cumulative cache counters at entry
+    const uint64_t hits0   = host_cache.n_hits();
+    const uint64_t misses0 = host_cache.n_misses();
+    const double   admit0  = host_cache.admit_micros();
+    const size_t   bytes0  = host_cache.admit_bytes_n();
+    const auto     t_start = std::chrono::steady_clock::now();
+    int prev_backend_id = -1;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        // ensure the previous split's async work has completed before we start
+        // this split, the allocator may have reused buffer regions across splits
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+            }
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1627,6 +1945,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        moe_experts_streamed += (last_id - first_id + 1);
+                        moe_bytes_streamed   += expert_size_copy + padding_end;
+
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
@@ -1635,29 +1956,307 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_end);
                     };
 
-                    int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
-                        id++;
-                    }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
-
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
+                    // collect the grouped consecutive expert ranges once, so we can prefetch them all
+                    // as a batch before copying (read-based residency), then copy.
+                    std::vector<std::pair<int32_t, int32_t>> groups;
+                    {
+                        int id = 0;
+                        while (!ggml_bitset_get(used_ids.data(), id)) {
+                            id++;
                         }
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
 
-                        if (id == last_id + 1) {
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                continue;
+                            }
+
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            groups.emplace_back(first_id, last_id);
+
+                            first_id = id;
                             last_id = id;
-                            continue;
                         }
-
-                        copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
+                        groups.emplace_back(first_id, last_id);
                     }
-                    copy_experts(first_id, last_id);
+
+                    // [MOE-TRACE] record the selected experts for this (layer,matrix) tensor in access order.
+                    if (moe_trace) {
+                        const uint64_t tkey = ggml_moe::canonical_name_key(ggml_get_name(input));
+                        for (const auto & g : groups) {
+                            for (int32_t id = g.first; id <= g.second; ++id) {
+                                const uint32_t e = (uint32_t) id;
+                                fwrite(&tkey, sizeof(tkey), 1, moe_trace);
+                                fwrite(&e,    sizeof(e),    1, moe_trace);
+                            }
+                        }
+                    }
+
+#ifdef _WIN32
+                    // [MOE-EXPERT-PAGING] one batched PrefetchVirtualMemory over every selected expert
+                    // range kicks off concurrent sequential NVMe reads for the whole layer's working set,
+                    // instead of the copy loop demand-faulting one page at a time (~564 MB/s, GPU-starved).
+                    if (moe_prefetch && !groups.empty()) {
+                        std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+                        ranges.reserve(groups.size());
+                        for (const auto & g : groups) {
+                            WIN32_MEMORY_RANGE_ENTRY e;
+                            e.VirtualAddress = (void *) ((const uint8_t *) input->data + (size_t) g.first * expert_size);
+                            e.NumberOfBytes  = (size_t) (g.second - g.first + 1) * expert_size;
+                            ranges.push_back(e);
+                        }
+                        PrefetchVirtualMemory(GetCurrentProcess(), ranges.size(), ranges.data(), 0);
+                    }
+#endif
+
+                    if (host_cache_on) {
+                        // serve each selected expert from the pinned host cache (RAM-resident, no re-fault),
+                        // admitting on miss; then DMA the resident copy host->VRAM. Per-expert so scattered
+                        // cache slots map back to the expert's natural offset in input_cpy.
+                        const size_t pad = std::min<size_t>(expert_size, 512);
+                        // pinned host memory from the compute (CUDA) backend's host buffer type
+                        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(split_backend));
+
+                        // [MOE-GATHER #23 — consume arm] publish an expert base table (src[3]) so the
+                        // MUL_MAT_ID kernel reads cache slots IN PLACE — no per-expert copy at all.
+                        // Every entry defaults to the expert's natural offset inside input_cpy (in the
+                        // BACKEND's repr, built by the same proc), so unused experts stay valid and any
+                        // per-expert fallback below needs no bookkeeping. The node's src[3] is reset
+                        // first: a stale table from a prior call must never survive a bail-out.
+                        node->src[3] = nullptr;
+                        MoeGatherTables::Entry *          gtab   = nullptr;
+                        ggml_backend_moe_gather_entry_t   gentry = nullptr;
+                        if (moe_gather_on) {
+                            gentry = moe_gather_entry_fn(split_backend);
+                            if (gentry != nullptr) {
+                                gtab = g_moe_gather_tables.claim(split_backend, sched->cur_copy, n_expert);
+                            }
+                            if (gtab != nullptr) {
+                                node->src[3] = &gtab->tens;
+                                if (!ggml_backend_supports_op(split_backend, node)) {
+                                    node->src[3] = nullptr;   // kernel family not gather-capable here
+                                    gtab = nullptr;
+                                }
+                            }
+                            if (gtab != nullptr) {
+                                // slots referenced by this table are read at COMPUTE time — evicting a
+                                // current-generation slot would dangle an entry. Sticky by design (doc
+                                // on set_gather_fence).
+                                // [MOE-GATHER #23] MULTI-CONSUMER CHECK. The consume-arm publishes src[3] on
+                                // nodes[0] only — upstream's own partial-copy logic makes the same
+                                // assumption. If ANY other node in this split also reads input_cpy, that
+                                // node sees staging we deliberately did not populate for aliased experts:
+                                // stale bytes, DETERMINISTICALLY, on whichever experts were gathered — which
+                                // is exactly the shape left standing after content, addressing and timing
+                                // were all cleared. Warn once so the assumption is verified, not trusted.
+                                {
+                                    static bool warned = false;
+                                    int consumers = 0;
+                                    for (int gi = 0; gi < split->graph.n_nodes; gi++) {
+                                        ggml_tensor * gn = split->graph.nodes[gi];
+                                        for (int si = 0; si < GGML_MAX_SRC; si++) {
+                                            if (gn->src[si] == input_cpy) { consumers++; break; }
+                                        }
+                                    }
+                                    if (consumers > 1 && !warned) {
+                                        warned = true;
+                                        fprintf(stderr,
+                                            "[MOE-GATHER] WARNING: %d nodes in this split consume the same staging "
+                                            "tensor, but the offset table is published on nodes[0] only — every other "
+                                            "consumer reads UNPOPULATED staging for gathered experts. Real corruption "
+                                            "source; gather must not engage for such splits.\n", consumers);
+                                    }
+                                }
+                                moe_gather_backend = split_backend;   // event ring records here
+                                host_cache.set_gather_fence(true);
+                                const size_t input_cpy_buf_off =
+                                    (size_t) ((char *) input_cpy->data - (char *) ggml_backend_buffer_get_base(input_cpy->buffer));
+                                for (int64_t i = 0; i < n_expert && gtab != nullptr; i++) {
+                                    int64_t ent = 0;
+                                    if (gentry(input_cpy, input_cpy->buffer, input_cpy_buf_off + (size_t) i * expert_size, &ent)) {
+                                        gtab->staging[(size_t) i] = ent;
+                                    } else {
+                                        node->src[3] = nullptr;   // repr can't express even identity — bail this node
+                                        gtab = nullptr;
+                                    }
+                                }
+                            }
+                        }
+                        // SEMANTIC identity of this expert weight (blk.N.ffn_*_exps.weight): stable across
+                        // tokens and universal across MoEs. Hashed once per weight tensor, not per expert.
+                        const char * tname = ggml_get_name(input);
+                        // DISCRIMINATOR (M5): print the RAW seam name + the canonical key it produces,
+                        // for the first N calls, so we SEE what the name actually is across tokens
+                        // instead of assuming the "BACKEND#leaf#C" shape. Same (layer,tensor) two tokens
+                        // apart must show the SAME canon key; if not, the raw string tells us why.
+                        {
+                            static int _nm = 0;
+                            if (moe_stats && _nm++ < 40) {
+                                fprintf(stderr, "[NAME] raw='%s' canon_key=%llu\n",
+                                        tname, (unsigned long long) ggml_moe::canonical_name_key(tname));
+                            }
+                        }
+                        // Prefetch this layer's whole selected-expert set concurrently (overlapped NVMe
+                        // reads => saturated bandwidth), THEN the per-expert loop below serves each from
+                        // RAM and DMAs it to VRAM. Turns the QD1 per-expert crawl into one batched read.
+                        // Identity is the expert's STABLE FILE-KEY (expert_id_for) so it matches across
+                        // tokens — the name-based key gave exactly 0 cross-token reuse (name is per-eval).
+                        // Container-serve caller side (#268): when a packed container is active, the
+                        // fetch `src` handed to the cache is the PACKED (layer, byte-offset) token
+                        // DirContainerFetcher decodes — NEVER the mmap address. record_bytes comes from
+                        // the container manifest (read once per process); 0 ⇒ manifest unreadable ⇒ the
+                        // container is treated as ABSENT (mmap path), never a guessed stride. The layer
+                        // parses from the tensor name's `blk.N.` (names may be backend-prefixed, so
+                        // anchor on the substring, not the string start).
+                        static const uint64_t moec_record_bytes =
+                            ggml_moe::dir_container_record_bytes(ggml_moe::moe_config().container_dir);
+                        uint32_t moec_layer = 0;
+                        const char * moec_blk = std::strstr(tname, "blk.");
+                        const bool moec_active = moec_record_bytes > 0 && moec_blk != nullptr &&
+                            std::sscanf(moec_blk, "blk.%u.", &moec_layer) == 1;
+                        {
+                            std::vector<ggml_moe::ExpertId> pf_ids;
+                            std::vector<const uint8_t *>    pf_srcs;
+                            for (const auto & g : groups) {
+                                for (int32_t id = g.first; id <= g.second; ++id) {
+                                    const uint8_t * src = (const uint8_t *) input->data + (size_t) id * expert_size;
+                                    pf_ids.push_back(ggml_moe::expert_id_for(src, tname, id));
+                                    pf_srcs.push_back(moec_active
+                                        ? (const uint8_t *) (uintptr_t) ggml_moe::DirContainerFetcher::pack_src(
+                                              moec_layer, (uint64_t) id * moec_record_bytes)
+                                        : src);
+                                }
+                            }
+                            host_cache.prefetch(host_buft, pf_ids.data(), pf_srcs.data(), pf_ids.size(), expert_size, pad);
+                        }
+                        for (const auto & g : groups) {
+                            for (int32_t id = g.first; id <= g.second; ++id) {
+                                const size_t   dst_off = (size_t) id * expert_size;
+                                const uint8_t * mmap_src = (const uint8_t *) input->data + dst_off;
+                                const size_t   pad_end = id < n_expert - 1 ? pad : 0;
+                                const uint8_t * fetch_src = moec_active
+                                    ? (const uint8_t *) (uintptr_t) ggml_moe::DirContainerFetcher::pack_src(
+                                          moec_layer, (uint64_t) id * moec_record_bytes)
+                                    : mmap_src;
+                                ggml_moe::ExpertSlot slot = host_cache.get_slot(host_buft, ggml_moe::expert_id_for(mmap_src, tname, id),
+                                                                   fetch_src, expert_size, pad);
+                                moe_experts_streamed += 1;
+                                int64_t gent = 0;
+                                if (gtab != nullptr && !moe_gather_identity && slot.ok() &&
+                                    gentry(input_cpy, slot.buffer, slot.offset, &gent)) {
+                                    // [MOE-GATHER #23] the kernel reads the slot IN PLACE through the
+                                    // table — zero bytes moved for this expert (hit or freshly-admitted
+                                    // miss alike; the fetcher already filled the slot). Slot lifetime
+                                    // across the async compute is the gather fence's contract.
+                                    gtab->staging[(size_t) id] = gent;
+                                    // fence ONLY what a table actually publishes (precision keeps
+                                    // eviction headroom for copy-served experts under pressure)
+                                    host_cache.mark_table_ref(slot);
+                                    moe_experts_gathered += 1;
+                                    // [MOE-GATHER #23 VERIFY] read the aliased slot back off the
+                                    // device and compare to the source bytes. Identity mode proved the
+                                    // kernel's table math but never touched a REAL pool slot, so this
+                                    // is the missing discriminator: a mismatch means the slot's
+                                    // CONTENT is wrong (fetch, ordering, or lifetime) and no amount of
+                                    // address work will fix it; a match means the bytes are right and
+                                    // the fault is purely how the kernel reaches them.
+                                    if (moe_gather_verify && !moec_active) {
+                                        static uint64_t n_bad = 0, n_ok = 0;
+                                        std::vector<uint8_t> back(expert_size), want(expert_size);
+                                        struct ggml_tensor v = {};
+                                        v.type  = GGML_TYPE_I8;
+                                        v.ne[0] = (int64_t) expert_size;
+                                        v.ne[1] = v.ne[2] = v.ne[3] = 1;
+                                        v.nb[0] = 1;
+                                        v.nb[1] = v.nb[2] = v.nb[3] = expert_size;
+                                        v.buffer = slot.buffer;
+                                        v.data   = (uint8_t *) ggml_backend_buffer_get_base(slot.buffer) + slot.offset;
+                                        ggml_backend_tensor_get(&v, back.data(), 0, expert_size);
+                                        memcpy(want.data(), mmap_src, expert_size);
+                                        if (memcmp(back.data(), want.data(), expert_size) != 0) {
+                                            if (n_bad++ < 8) {
+                                                size_t first = 0;
+                                                while (first < expert_size && back[first] == want[first]) { first++; }
+                                                fprintf(stderr,
+                                                    "[MOE-GATHER-VERIFY] MISMATCH %s expert %d: slot bytes differ from source "
+                                                    "at byte %zu of %zu (slot=%p off=%zu). The SLOT CONTENT is wrong — this is "
+                                                    "fetch/ordering/lifetime, not addressing.\n",
+                                                    tname, id, first, expert_size, (void *) slot.buffer, slot.offset);
+                                            }
+                                        } else if (n_ok++ == 0) {
+                                            fprintf(stderr,
+                                                "[MOE-GATHER-VERIFY] slot contents match source bytes — the cache holds the RIGHT "
+                                                "data, so any remaining corruption is in how the kernel reaches it.\n");
+                                        }
+                                    }
+                                } else if (slot.host_ptr) {
+                                    moe_bytes_streamed += expert_size + pad_end;
+                                    ggml_backend_tensor_set_async(split_backend, input_cpy, slot.host_ptr, dst_off, expert_size + pad_end);
+                                } else if (slot.ok() && slot.buffer != nullptr) {
+                                    moe_bytes_streamed += expert_size + pad_end;
+                                    // [DEVICE-RESIDENT #23 — the H2D kill] The slot lives in VRAM (host_ptr
+                                    // null => not host-visible): copy device-to-device into the graph's
+                                    // staging tensor instead of streaming expert_size bytes over PCIe.
+                                    // Data-only stack tensor views make the raw regions legal copy handles
+                                    // (impls address by tensor->data); async on the split backend when the
+                                    // iface supports it, generic tensor_copy (iface cpy_tensor / bounce)
+                                    // otherwise. Cut 2 — aliasing MUL_MAT_ID's src at the slot to skip even
+                                    // this D2D — only after this measures.
+                                    struct ggml_tensor src_t = {};
+                                    src_t.type  = GGML_TYPE_I8;
+                                    src_t.ne[0] = (int64_t) (expert_size + pad_end);
+                                    src_t.ne[1] = src_t.ne[2] = src_t.ne[3] = 1;
+                                    src_t.nb[0] = 1;
+                                    src_t.nb[1] = src_t.nb[2] = src_t.nb[3] = expert_size + pad_end;
+                                    src_t.buffer = slot.buffer;
+                                    src_t.data   = (uint8_t *) ggml_backend_buffer_get_base(slot.buffer) + slot.offset;
+                                    struct ggml_tensor dst_t = src_t;
+                                    dst_t.buffer = input_cpy->buffer;
+                                    dst_t.data   = (char *) input_cpy->data + dst_off;
+                                    if (!split_backend->iface.cpy_tensor_async ||
+                                        !split_backend->iface.cpy_tensor_async(split_backend, split_backend, &src_t, &dst_t)) {
+                                        ggml_backend_tensor_copy(&src_t, &dst_t);
+                                    }
+                                } else if (!moec_active) {
+                                    moe_bytes_streamed += expert_size + pad_end;
+                                    ggml_backend_tensor_set_async(split_backend, input_cpy, mmap_src, dst_off, expert_size + pad_end);
+                                } else {
+                                    // Container mode has NO mmap fallback: the packed token is not a
+                                    // dereferenceable address, and streaming it would ship garbage weights
+                                    // silently. A missed fetch here is a broken/incomplete container —
+                                    // fail LOUD (the #268 safety invariant, pinned on both sides).
+                                    GGML_ABORT("[MOE-CONTAINER] fetch failed for %s expert %d "
+                                               "(bank missing or short read) — no mmap fallback in container mode",
+                                               tname, id);
+                                }
+                            }
+                        }
+                        // [MOE-GATHER #23] ONE table upload per node per ubatch. Enqueued inside the same
+                        // event-guarded region as the input_cpy writes, so it inherits exactly their
+                        // ordering contract w.r.t. the prior graph's in-flight compute.
+                        if (gtab != nullptr) {
+                            ggml_backend_tensor_set_async(split_backend, &gtab->tens, gtab->staging.data(), 0,
+                                                          (size_t) n_expert * sizeof(int64_t));
+                            // [MOE-GATHER #23 SYNC] the ordering discriminator. Blocks the host until every
+                            // slot fill and this table upload have LANDED before any compute is enqueued,
+                            // which removes concurrency from the picture entirely. If a fault survives
+                            // cross-allocation PASS and VERIFY MATCH but disappears here, it is ordering —
+                            // and GGML_MOE_GATHER_RETIRE=1 is the principled fix. If it survives even this,
+                            // nothing about WHEN memory is touched explains it and the fault is elsewhere.
+                            if (moe_gather_sync) {
+                                ggml_backend_synchronize(split_backend);
+                            }
+                        }
+                    } else {
+                        for (const auto & g : groups) {
+                            copy_experts(g.first, g.second);
+                        }
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -1713,10 +2312,94 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // record the event of this copy
-        if (split->n_inputs > 0) {
-            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        // record the event of this split
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+
+        prev_backend_id = split_backend_id;
+    }
+
+    // [MOE-GATHER #23] close the retirement cycle for this call: synchronize the ring's OLDEST event
+    // (recorded RING calls ago — long finished, so this does not stall), which PROVES every generation
+    // up to that point completed and lets the fence release those slots; then record a fresh event for
+    // this call's generation. Ordered completion on one queue makes "<= that generation" sound.
+    // Event-proven retirement is OPT-IN: measured on Metal it costs ~9% decode and a few percent hit
+    // rate (the per-call event sync), while the conservative generation window measured free and is
+    // sound wherever the frontend synchronizes per token — which llama.cpp does. Turn it on for
+    // genuinely overlapping graphs (pipeline parallel / n_copies > 1), where the guess stops holding.
+    static const bool moe_gather_retire = ggml_moe::moe_config().gather_retire;
+    if (moe_gather_retire && moe_gather_on && moe_gather_backend != nullptr) {
+        g_moe_gather_retire.ensure(moe_gather_backend);
+        if (g_moe_gather_retire.usable) {
+            const int h = g_moe_gather_retire.head;
+            if (g_moe_gather_retire.gen[h] != 0) {
+                ggml_backend_event_synchronize(g_moe_gather_retire.ev[h]);
+                host_cache.retire_generations_through(g_moe_gather_retire.gen[h]);
+            }
+            ggml_backend_event_record(g_moe_gather_retire.ev[h], moe_gather_backend);
+            g_moe_gather_retire.gen[h] = host_cache.current_generation();
+            g_moe_gather_retire.head   = (h + 1) % MoeGatherRetire::RING;
+        }
+    }
+
+    // [MOE-EXPERT-PAGING] per-compute MoE-stream summary (opt-in). On a decode step (batch=1) this is the
+    // per-token host->VRAM expert working set: the number the persistent VRAM slot cache must shrink.
+    // [MOE-PAGER] fail LOUD when paging is configured but never engages. Three silent killers cost a
+    // day of debugging (2026-08-03): CPU-repacked expert buffers (ops on transformed layouts never
+    // offload — use --no-repack), the op-offload min-batch default keeping decode on CPU, and a
+    // CPU-only device selection. Each produced ZERO pager lines and ZERO errors — indistinguishable
+    // from "pager off". One warning after a stable window of compute calls names all three.
+    {
+        static int      moe_engage_probe_calls = 0;
+        static int64_t  moe_engage_total       = 0;
+        moe_engage_total += moe_experts_streamed;
+        if (host_cache.enabled() && moe_engage_probe_calls >= 0) {
+            moe_engage_probe_calls++;
+        }
+        if (moe_engage_probe_calls == 32 && moe_engage_total == 0) {
+            fprintf(stderr,
+                "[MOE-PAGER] WARNING: expert cache is configured (GGML_MOE_*_CACHE_GB) but NO expert "
+                "stream engaged in the first 32 compute calls. Likely causes: (1) CPU repack captured "
+                "the expert tensors — relaunch with --no-repack; (2) decode never offloads — see "
+                "GGML_OP_OFFLOAD_MIN_BATCH; (3) model loaded CPU-only — check 'offloaded N/N layers' "
+                "and --device. Paging is currently doing NOTHING.\n");
+            moe_engage_probe_calls = -1;   // fired once; never re-arm
+        }
+    }
+    if ((moe_stats || moe_capture) && moe_experts_streamed > 0) {
+        // per-token (per graph-compute) seam breakdown. total_ms is this call's wall time; fault_ms is the
+        // synchronous NVMe stall on cache misses - the number that must fall as hit-rate climbs.
+        const uint64_t hits   = host_cache.n_hits()   - hits0;
+        const uint64_t misses = host_cache.n_misses() - misses0;
+        const double   fault_ms = (host_cache.admit_micros() - admit0) / 1000.0;
+        const double   fetch_mb = (double) (host_cache.admit_bytes_n() - bytes0) / (1024.0 * 1024.0);
+        const double   fetch_mbps = fault_ms > 0.0 ? (fetch_mb / (fault_ms / 1000.0)) : 0.0;
+        const double   total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
+        const double   hit_rate = (hits + misses) ? (100.0 * hits / (hits + misses)) : 0.0;
+        if (moe_stats) {   // stderr (not GGML_LOG_INFO) so it survives the server's log-level filtering.
+            fprintf(stderr,
+                "[MOE-PAGER] moe_stream: experts=%lld gather=%lld bytes=%.1f MiB | hits=%llu miss=%llu hit_rate=%.1f%% | fetch=%.0f MB/s fault_wait=%.1f ms total=%.1f ms\n",
+                (long long) moe_experts_streamed, (long long) moe_experts_gathered, (double) moe_bytes_streamed / (1024.0 * 1024.0),
+                (unsigned long long) hits, (unsigned long long) misses, hit_rate, fetch_mbps, fault_ms, total_ms);
+        }
+        if (moe_capture) {   // structured PagerCaptureEvent (graph-control fields) — Positron tails this JSONL.
+            const int nw = fprintf(moe_capture,
+                "{\"token\":%llu,\"hit_rate\":%.4f,\"fault_wait_ms\":%.1f,\"tok_per_s\":%.4f,"
+                "\"bytes_fetched_mb\":%.1f,\"fetch_mb_s\":%.0f,\"resident_experts\":%llu,"
+                "\"experts\":%lld,\"misses\":%llu,\"gathered\":%lld}\n",
+                (unsigned long long) moe_capture_token++, hit_rate / 100.0, fault_ms,
+                total_ms > 0.0 ? 1000.0 / total_ms : 0.0, fetch_mb, fetch_mbps,
+                (unsigned long long) hits, (long long) moe_experts_streamed, (unsigned long long) misses,
+                (long long) moe_experts_gathered);
+            fflush(moe_capture);
+            if (nw > 0) { moe_capture_bytes += (uint64_t) nw; }
+            if (moe_capture_bytes >= moe_capture_cap) {   // DRAIN: rotate to path.1, reopen fresh (keep recent)
+                fclose(moe_capture);
+                std::string rot = std::string(moe_capture_path) + ".1";
+                std::remove(rot.c_str()); std::rename(moe_capture_path, rot.c_str());
+                moe_capture = fopen(moe_capture_path, "wb");
+                moe_capture_bytes = 0;
             }
         }
     }
@@ -1773,6 +2456,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
 
+    sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
+    sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
+
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
@@ -1805,7 +2491,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
+    for (int i = 0; i < sched->splits_capacity; i++) {
+        free(sched->splits[i].inputs);
+    }
     free(sched->splits);
+    free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
@@ -1877,6 +2567,48 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     sched->is_alloc = true;
 
+    return true;
+}
+
+bool ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const size_t * max_new, size_t * sizes) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+    GGML_ASSERT(!sched->is_alloc);
+
+    sched->cur_copy = sched->next_copy;
+    sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
+
+    // the ONE split of this graph (splitting rewrites node inputs to the scheduler's copies, so a
+    // graph must never be split twice)
+    ggml_backend_sched_split_graph(sched, graph);
+
+    // plan the split graph with a throwaway allocator: exact sizes, nothing allocated, and the
+    // live allocator's buffers untouched (a measure-only reserve on it frees what would grow)
+    std::vector<size_t> need(sched->n_backends, 0);
+    ggml_gallocr_t probe = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    ggml_gallocr_reserve_n_size(probe, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, need.data());
+    ggml_gallocr_free(probe);
+    bool fits = true;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sizes) {
+            sizes[b] = need[b];
+        }
+        const size_t held  = ggml_gallocr_get_buffer_size(sched->galloc, b);
+        const size_t extra = need[b] > held ? need[b] - held : 0;
+        if (max_new && extra > max_new[b]) {
+            GGML_LOG_ERROR("%s: the graph needs %.1f MiB more on %s, over the %.1f MiB it may add: not allocating it\n",
+                           __func__, extra/1048576.0, ggml_backend_name(sched->backends[b]), max_new[b]/1048576.0);
+            fits = false;
+        }
+    }
+    if (!fits) {
+        return false;
+    }
+
+    if (!ggml_backend_sched_alloc_splits(sched)) {
+        return false;
+    }
+    sched->is_alloc = true;
     return true;
 }
 

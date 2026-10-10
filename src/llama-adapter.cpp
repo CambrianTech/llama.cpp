@@ -6,6 +6,8 @@
 
 #include <map>
 #include <cassert>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 
@@ -41,7 +43,7 @@ bool llama_adapter_cvec::init(const llama_model & model) {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ hparams.n_layer*ggml_tensor_overhead(),
+                /*.mem_size   =*/ hparams.n_layer()*ggml_tensor_overhead(),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -61,9 +63,9 @@ bool llama_adapter_cvec::init(const llama_model & model) {
     };
 
     // make tensors
-    tensors.reserve(hparams.n_layer);
+    tensors.reserve(hparams.n_layer());
     tensors.push_back(nullptr); // there's never a tensor for layer 0
-    for (size_t il = 1; il < hparams.n_layer; il++) {
+    for (size_t il = 1; il < hparams.n_layer(); il++) {
         ggml_backend_buffer_type_t buft = model.select_buft(il);
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -121,7 +123,7 @@ bool llama_adapter_cvec::apply(
     layer_start = il_start;
     layer_end   = il_end;
 
-    for (size_t il = 1; il < hparams.n_layer; il++) {
+    for (size_t il = 1; il < hparams.n_layer(); il++) {
         assert(tensors[il] != nullptr);
 
         const size_t off = n_embd * (il - 1); // buffer doesn't have data for layer 0, since it's never present
@@ -396,8 +398,11 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         llama_file gguf_file(path_lora, "rb");
         std::vector<uint8_t> read_buf;
         auto set_tensor = [&](ggml_tensor * orig, ggml_tensor * dev) {
-            size_t offs = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), gguf_find_tensor(ctx_gguf.get(), orig->name));
-            size_t size = ggml_nbytes(orig);
+            const size_t offs = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), gguf_find_tensor(ctx_gguf.get(), orig->name));
+            const size_t size = ggml_nbytes(orig);
+            if (offs + size < offs || offs + size > gguf_file.size()) {
+                throw std::runtime_error(format("LoRA tensor '%s' data is not within the file bounds, file is corrupted or incomplete", orig->name));
+            }
             read_buf.resize(size);
             gguf_file.seek(offs, SEEK_SET);
             gguf_file.read_raw(read_buf.data(), size);
@@ -412,7 +417,10 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
     }
 
     // register adapter with model
-    model.loras.insert(&adapter);
+    {
+        std::unique_lock<std::shared_mutex> lock(model.loras_mutex);
+        model.loras.insert(&adapter);
+    }
 
     LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
 }
@@ -477,11 +485,57 @@ void llama_adapter_lora_free(llama_adapter_lora * adapter) {
     }
 
     if (adapter->model != nullptr) {
+        std::unique_lock<std::shared_mutex> lock(adapter->model->loras_mutex);
         adapter->model->loras.erase(adapter);
         adapter->model = nullptr;
     }
 
     delete adapter;
+}
+
+int32_t llama_adapter_lora_save(const struct llama_adapter_lora * adapter, const char * path_lora) {
+    if (adapter == nullptr || adapter->model == nullptr || path_lora == nullptr) {
+        return -1;
+    }
+    LLM_KV llm_kv = LLM_KV(LLM_ARCH_UNKNOWN);
+
+    // One host-side context holds a copy of every A/B tensor: the adapter's own tensors may
+    // live in a device buffer, and gguf writes from host memory.
+    size_t data_size = 0;
+    for (const auto & [name, ab] : adapter->ab_map) {
+        data_size += ggml_nbytes(ab.a) + ggml_nbytes(ab.b);
+    }
+    ggml_init_params params = {
+        /*.mem_size   =*/ 2 * adapter->ab_map.size() * ggml_tensor_overhead() + data_size,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ false,
+    };
+    ggml_context_ptr host { ggml_init(params) };
+    if (!host) {
+        return -1;
+    }
+
+    gguf_context_ptr out { gguf_init_empty() };
+    gguf_set_val_str(out.get(), llm_kv(LLM_KV_GENERAL_TYPE).c_str(), "adapter");
+    gguf_set_val_str(out.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str(), llm_arch_name(adapter->model->arch));
+    gguf_set_val_str(out.get(), llm_kv(LLM_KV_ADAPTER_TYPE).c_str(), "lora");
+    gguf_set_val_f32(out.get(), llm_kv(LLM_KV_ADAPTER_LORA_ALPHA).c_str(), adapter->alpha);
+
+    for (const auto & [name, ab] : adapter->ab_map) {
+        for (const ggml_tensor * src : { ab.a, ab.b }) {
+            ggml_tensor * copy = ggml_dup_tensor(host.get(), src);
+            ggml_set_name(copy, src->name);
+            ggml_backend_tensor_get(src, copy->data, 0, ggml_nbytes(src));
+            gguf_add_tensor(out.get(), copy);
+        }
+    }
+
+    if (!gguf_write_to_file(out.get(), path_lora, false)) {
+        LLAMA_LOG_ERROR("%s: failed to write %s\n", __func__, path_lora);
+        return -1;
+    }
+    LLAMA_LOG_INFO("%s: wrote %zu LoRA tensors to %s\n", __func__, adapter->ab_map.size() * 2, path_lora);
+    return 0;
 }
 
 uint64_t llama_adapter_get_alora_n_invocation_tokens(const struct llama_adapter_lora * adapter) {

@@ -154,6 +154,8 @@ extern "C" {
         bool buffer_from_host_ptr;
         // event synchronization
         bool events;
+        // mmap is supported for loading
+        bool mmap_support;
     };
 
     // all the device properties
@@ -206,6 +208,15 @@ extern "C" {
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
+
+    // [MOE-GATHER #23] "ggml_backend_moe_gather_entry": build ONE entry of the expert base table
+    // (ggml_mul_mat_id_gather's src[3]) for a cache slot living at `slot_off` inside `slot_buf`,
+    // to be consumed by a MUL_MAT_ID whose (device-side) src0 is `src0_cpy`. The REPRESENTATION is
+    // backend-owned: Metal returns a GPU-VA byte delta relative to src0_cpy's tensor start (MSL
+    // addresses through the bound src0 pointer); CUDA returns an absolute device pointer. Returns
+    // false when the slot is not addressable by this backend (caller falls back to the copy path).
+    typedef bool (*ggml_backend_moe_gather_entry_t)(const struct ggml_tensor * src0_cpy,
+        ggml_backend_buffer_t slot_buf, size_t slot_off, int64_t * entry);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
@@ -338,7 +349,12 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
     // Allocate and compute graph on the backend scheduler
-    GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+    GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // As ggml_backend_sched_alloc_graph, but the graph is split ONCE, planned with a throwaway
+    // allocator, and allocated only if no backend's buffer would grow by more than max_new[b]
+    // bytes (max_new may be NULL: no limit). sizes (may be NULL) receives each backend's planned
+    // buffer size. Returns false, allocating nothing, when a limit is exceeded or allocation fails.
+    GGML_API bool                 ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const size_t * max_new, size_t * sizes); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
@@ -381,11 +397,15 @@ extern "C" {
         //   - most tensors have n_segments == 1 and a contiguous slice of the tensor data
         //   - some tensors have an inhomogenenous data layout along the split axis,
         //     those tensors are divided into segments which are each individually split across devices
-        //   - ne has one entry per segment and device that add up to ggml_tensor::ne for that axis,
-        //     the outer/inner loops are over segments/devices like [seg0_dev0, seg0_dev1, seg1_dev0, seg1_dev1],
+        //   - ne has one entry per segment and device and that segment repeats nr times,
+        //     in total when accounting for repetitions the segments add up to ggml_tensor::ne for that axis,
+        //     the outer/inner loops are over segments/devices like [seg0_dev0_r0, seg0_dev1_r0, seg0_dev0_r1, seg0_dev1_r1, seg1_dev0_r0, seg1_dev1_r0],
         //   - for example, a transformer may have a fused QKV matrix rather than 3 matrices, those would be 3 separate segments
-        //     that each need to be split individually across devices so that each device gets a slice of Q, K, and V
+        //     that each need to be split individually across devices so that each device gets a slice of Q, K, and V,
+        //     the Q matrix can be larger than the K and V matrices so this can either be expressed as 3 segments or as 2 segments
+        //     where the segment for K/V repeats twice
         int64_t  ne[16*GGML_BACKEND_META_MAX_DEVICES];
+        uint32_t nr[16];
         uint32_t n_segments;
     };
 

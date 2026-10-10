@@ -79,6 +79,10 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
+
+    // lookups that found no buffer while THIS context encoded its current graph (counted by the
+    // encode blocks through ggml_metal_nil_sink_set; read once every block has finished)
+    uint64_t nil_lookups;
 };
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -133,7 +137,11 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
-    res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
+    // Continuum default: keep the Metal backend GPU-resident but avoid
+    // optimistic graph rewrites that throw Objective-C exceptions across the
+    // Rust FFI boundary on qwen3.5/Gated-Delta-Net models. Operators can opt
+    // back in explicitly when validating a newer Metal/llama.cpp stack.
+    res->use_fusion      = getenv("GGML_METAL_FUSION_ENABLE") != nil && getenv("GGML_METAL_FUSION_DISABLE") == nil;
     res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
 
     {
@@ -146,11 +154,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->debug_fusion = val ? atoi(val) : 0;
     }
 
-    res->use_graph_optimize = true;
-
-    if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
-        res->use_graph_optimize = false;
-    }
+    res->use_graph_optimize = getenv("GGML_METAL_GRAPH_OPTIMIZE_ENABLE") != NULL && getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") == NULL;
 
     memset(res->fuse_cnt, 0, sizeof(res->fuse_cnt));
 
@@ -441,6 +445,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         return GGML_STATUS_FAILED;
     }
 
+    // a lookup that finds no buffer during this graph's encode means some op ran on the wrong
+    // memory: the graph is reported failed, never as a success computed on stale bytes
+    __atomic_store_n(&ctx->nil_lookups, 0, __ATOMIC_RELAXED);
+
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
 
@@ -611,6 +619,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
     }
 
+    if (__atomic_load_n(&ctx->nil_lookups, __ATOMIC_RELAXED) != 0) {
+        GGML_LOG_ERROR("%s: %llu tensor lookup(s) found no buffer while encoding this graph: its result is not trusted\n",
+                __func__, (unsigned long long) __atomic_load_n(&ctx->nil_lookups, __ATOMIC_RELAXED));
+        return GGML_STATUS_FAILED;
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -704,6 +718,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->debug_graph,
             ctx->debug_fusion);
 
+        ggml_metal_nil_sink_set(&ctx->nil_lookups); // this block's lookups count against this graph
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
             if (res == 0) {
@@ -712,6 +727,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
             idx += res - 1;
         }
+        ggml_metal_nil_sink_set(NULL);
 
         ggml_metal_op_free(ctx_op);
 

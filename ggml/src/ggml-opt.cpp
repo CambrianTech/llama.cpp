@@ -6,11 +6,17 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cinttypes>
 #include <map>
+#include <cstring>
+#include <functional>
 #include <random>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct ggml_opt_dataset {
@@ -28,6 +34,10 @@ struct ggml_opt_dataset {
 };
 
 struct ggml_opt_context {
+    // why the last ggml_opt_alloc refused ("" when it did not)
+    std::string                refusal;
+    // forward nodes named with this prefix are kept; the rest are recomputed (empty = keep all)
+    std::string                checkpoint_prefix;
     ggml_backend_sched_t       backend_sched        = nullptr;
     ggml_cgraph              * allocated_graph      = nullptr;
     ggml_cgraph              * allocated_graph_copy = nullptr;
@@ -54,10 +64,29 @@ struct ggml_opt_context {
     struct ggml_cgraph * gb_grad = nullptr;
     struct ggml_cgraph * gb_opt  = nullptr;
     bool static_graphs           = false;
+    size_t alloc_budget          = 0; // bytes a graph may add on a non-CPU device; 0 = the device's own free figure
+    size_t peak_graph_bytes      = 0; // largest graph measured by the preflight on a non-CPU device
     bool eval_ready              = false;
+    // Accumulators and momenta belong to a PARAMETER (or to the loss), never to a node index: a
+    // graph built per step may differ in topology from the first one (the training walk's chunks
+    // with and without a prefix, its reverse pass with GRAD leaves and a surrogate term), and an
+    // index would bind one tensor's accumulator to whatever node took that index. grad_accs is
+    // the current graph's view of them, rebuilt by every ggml_opt_build.
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_grad_acc;
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_m;
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_v;
+    struct ggml_tensor * loss_grad_acc = nullptr;
+    bool accumulators_created          = false;
+
+    // ggml_opt_set_next_step: a caller-driven period, for the next graph only
+    bool                 next_manual     = false;
+    bool                 next_period_end = false;
+    float                next_loss_scale = 1.0f;
+    struct ggml_tensor * next_extra_loss = nullptr;
+    bool                 period_fresh    = true; // the next backward starts a period (zeroed gradients)
+    // the gradients of the evaluated graph's GRAD leaves, readable until the next alloc
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> leaf_grads;
     std::vector<struct ggml_tensor *> grad_accs;
-    std::vector<struct ggml_tensor *> grad_m;
-    std::vector<struct ggml_tensor *> grad_v;
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
@@ -74,6 +103,9 @@ struct ggml_opt_context {
 struct ggml_opt_result {
     int64_t              ndata    = 0;
     std::vector<float>   loss;
+    // rows behind each entry of `loss`: batches may differ in size (a training window with
+    // outputs only at its labelled positions), so a per-datapoint mean is weighted by them
+    std::vector<int64_t> ndata_batch;
     std::vector<int32_t> pred;
     int64_t              ncorrect = 0;
 
@@ -256,7 +288,143 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*checkpoint_prefix =*/ nullptr,
     };
+}
+
+// Gradient checkpointing, ported from ggml's former ggml_build_backward_gradient_checkpointing
+// (llama.cpp #2632, removed with the optimizer rewrite) onto the current graph layout, where
+// gradients live on the cgraph by hash slot. The backward nodes of g (nodes [n_fwd, n_nodes))
+// stop reading forward intermediates: each one is replaced by a recompute clone rooted at the
+// nearest checkpoint, and the clones are placed just before their first consumer. The forward
+// originals are then dead after their forward use, so the allocator reuses their memory.
+static ggml_tensor * ggml_opt_view_root(ggml_tensor * t) {
+    while (t != nullptr && t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static ggml_tensor * ggml_opt_recompute_node(
+        ggml_context * ctx, const std::unordered_set<ggml_tensor *> & forward,
+        const std::unordered_set<ggml_tensor *> & keep, std::unordered_map<ggml_tensor *, ggml_tensor *> & clones,
+        ggml_tensor * node) {
+    if (node == nullptr || !forward.count(node) || keep.count(node)) {
+        return node;
+    }
+    // keep is also every node that READS a buffer the forward pass writes in place (a recurrent
+    // state, a cache): recomputed after that write it would read the advanced value, not the
+    // one the original read (measured on a qwen35 delta-net: losses diverged until this)
+    if (node->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT)) {
+        return node;
+    }
+    switch (node->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_CPY:      // a write into another tensor (a cache): side effect, never repeated
+        case GGML_OP_SET_ROWS:
+            return node;
+        default:
+            break;
+    }
+    if (auto it = clones.find(node); it != clones.end()) {
+        return it->second;
+    }
+    ggml_tensor * clone = ggml_new_tensor(ctx, node->type, GGML_MAX_DIMS, node->ne);
+    clone->op    = node->op;
+    clone->flags = node->flags & ~(GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_LOSS);
+    memcpy(clone->op_params, node->op_params, sizeof(node->op_params));
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+        clone->nb[k] = node->nb[k];
+    }
+    clones[node] = clone; // before recursing: a graph is acyclic, this only memoises
+    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+        clone->src[k] = ggml_opt_recompute_node(ctx, forward, keep, clones, node->src[k]);
+    }
+    if (node->view_src != nullptr) {
+        // a view of the recomputed source, not of the original (which is freed)
+        clone->view_src  = ggml_opt_recompute_node(ctx, forward, keep, clones, node->view_src);
+        clone->view_offs = node->view_offs;
+    }
+    ggml_format_name(clone, "%s (recompute)", ggml_get_name(node));
+    return clone;
+}
+
+static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, const char * prefix) {
+    std::unordered_set<ggml_tensor *> forward;
+    std::unordered_set<ggml_tensor *> keep;
+    std::unordered_set<ggml_tensor *> mutated; // roots of the buffers the forward pass writes in place
+    const size_t plen = strlen(prefix);
+    for (int i = 0; i < n_fwd; ++i) {
+        ggml_tensor * node = g->nodes[i];
+        forward.insert(node);
+        // A write in place: a copy into another tensor, or any computing op that is a view of
+        // its source (an in-place op: ggml_*_inplace writes its result over src). A recompute
+        // clone reading such a buffer, or writing into a shared clone, would see a different
+        // value than the original did (Metal, 2026-10-06: a deterministic qwen35 run moved by
+        // 6.8e-4 with recompute on until in-place ops counted here).
+        const bool view_op = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
+        if (node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS || (node->view_src != nullptr && !view_op)) {
+            mutated.insert(ggml_opt_view_root(node));
+        }
+    }
+    for (int i = 0; i < n_fwd; ++i) {
+        ggml_tensor * node = g->nodes[i];
+        bool reads_mutated = false;
+        for (int k = 0; k < GGML_MAX_SRC && !reads_mutated; ++k) {
+            reads_mutated = node->src[k] != nullptr && mutated.count(ggml_opt_view_root(node->src[k]));
+        }
+        if (strncmp(ggml_get_name(node), prefix, plen) == 0 || (node->flags & GGML_TENSOR_FLAG_LOSS) ||
+                (node->flags & GGML_TENSOR_FLAG_OUTPUT) || reads_mutated ||
+                (node->view_src != nullptr && mutated.count(ggml_opt_view_root(node)))) {
+            keep.insert(node);
+        }
+    }
+    if (keep.empty()) {
+        return; // no checkpoint named: nothing to rewrite
+    }
+    std::unordered_map<ggml_tensor *, ggml_tensor *> clones;
+    std::vector<ggml_tensor *> backward(g->nodes + n_fwd, g->nodes + g->n_nodes);
+    for (ggml_tensor * node : backward) {
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            node->src[k] = ggml_opt_recompute_node(ctx, forward, keep, clones, node->src[k]);
+        }
+        if (node->view_src != nullptr) {
+            node->view_src = ggml_opt_recompute_node(ctx, forward, keep, clones, node->view_src);
+        }
+    }
+    if (clones.empty()) {
+        return;
+    }
+    // re-order: forward nodes as they were, then each backward node after the clones it needs
+    std::vector<ggml_tensor *> order(g->nodes, g->nodes + n_fwd);
+    std::unordered_set<ggml_tensor *> placed;
+    std::unordered_set<ggml_tensor *> is_clone;
+    for (auto & kv : clones) {
+        is_clone.insert(kv.second);
+    }
+    std::function<void(ggml_tensor *)> place = [&](ggml_tensor * t) {
+        if (t == nullptr || !is_clone.count(t) || placed.count(t)) {
+            return;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            place(t->src[k]);
+        }
+        place(t->view_src);
+        placed.insert(t);
+        order.push_back(t);
+        ggml_hash_insert(&g->visited_hash_set, t);
+    };
+    for (ggml_tensor * node : backward) {
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            place(node->src[k]);
+        }
+        place(node->view_src);
+        order.push_back(node);
+    }
+    GGML_ASSERT((int) order.size() <= g->size && "recompute clones overflow the graph: raise the training node budget");
+    std::copy(order.begin(), order.end(), g->nodes);
+    g->n_nodes = (int) order.size();
 }
 
 static ggml_tensor * map_tensor(std::map<ggml_tensor *, ggml_tensor *> & tensor_map, ggml_context * ctx, ggml_tensor * tensor) {
@@ -405,7 +573,9 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_set_name(opt_ctx->labels, "labels");
             opt_ctx->loss = ggml_cross_entropy_loss(ctx_results, opt_ctx->outputs, opt_ctx->labels);
             ggml_set_name(opt_ctx->loss, "loss_cross_entropy");
-            if (opt_ctx->opt_period > 1) {
+            if (opt_ctx->next_manual) {
+                // weighted by the caller below, beside its extra term
+            } else if (opt_ctx->opt_period > 1) {
                 opt_ctx->loss = ggml_scale(ctx_results, opt_ctx->loss, 1.0f / opt_ctx->opt_period);
                 ggml_set_name(opt_ctx->loss, "loss_cross_entropy_scaled");
             }
@@ -430,8 +600,24 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     }
     ggml_set_output(opt_ctx->loss);
-    ggml_set_loss(opt_ctx->loss);
-    ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
+    if (opt_ctx->next_manual) {
+        GGML_ASSERT(!opt_ctx->static_graphs && "a caller-driven period needs graphs built per step");
+        GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+        // the loss the backward differentiates: the caller's weight of this graph's loss, plus
+        // its extra term; opt_ctx->loss stays the unweighted loss the result reports
+        struct ggml_tensor * total = ggml_scale(ctx_results, opt_ctx->loss, opt_ctx->next_loss_scale);
+        if (opt_ctx->next_extra_loss) {
+            GGML_ASSERT(ggml_is_scalar(opt_ctx->next_extra_loss) && opt_ctx->next_extra_loss->type == GGML_TYPE_F32);
+            total = ggml_add(ctx_results, total, opt_ctx->next_extra_loss);
+        }
+        ggml_set_name(total, "loss_total");
+        ggml_set_loss(total);
+        ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
+        ggml_build_forward_expand(opt_ctx->gf, total);
+    } else {
+        ggml_set_loss(opt_ctx->loss);
+        ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
+    }
 
     if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY) {
         opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
@@ -455,32 +641,41 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         return;
     }
 
-    if (opt_ctx->grad_accs.empty()) {
+    if (!opt_ctx->accumulators_created) {
         GGML_ASSERT(opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_GRAD);
+        opt_ctx->accumulators_created = true;
 
-        const int n_nodes = opt_ctx->gf->n_nodes;
-        opt_ctx->grad_accs.resize(n_nodes);
-        for (int i = 0; i < n_nodes; ++i) {
+        // created once, in ctx_static, for the parameters of the first graph: every later graph
+        // trains the same parameters (asserted below), whatever else its topology holds
+        for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
-            if ((accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) || (node->flags & GGML_TENSOR_FLAG_LOSS)) {
-                opt_ctx->grad_accs[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-            } else {
-                opt_ctx->grad_accs[i] = nullptr;
+            if (node->flags & GGML_TENSOR_FLAG_LOSS) {
+                opt_ctx->loss_grad_acc = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+            }
+            if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
+                continue;
+            }
+            if (accumulate) {
+                opt_ctx->param_grad_acc[node] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+            }
+            if (need_momenta && opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_OPT) {
+                opt_ctx->param_m[node] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                opt_ctx->param_v[node] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
             }
         }
+    }
 
-        if (need_momenta && opt_ctx->build_type_alloc >= GGML_OPT_BUILD_TYPE_OPT) {
-            opt_ctx->grad_m.resize(n_nodes);
-            opt_ctx->grad_v.resize(n_nodes);
-            for (int i = 0; i < n_nodes; ++i) {
-                ggml_tensor * node = opt_ctx->gf->nodes[i];
-                if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-                    opt_ctx->grad_m[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-                    opt_ctx->grad_v[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-                } else {
-                    opt_ctx->grad_m[i] = nullptr;
-                    opt_ctx->grad_v[i] = nullptr;
-                }
+    // this graph's view of the accumulators, by tensor
+    opt_ctx->grad_accs.assign(opt_ctx->gf->n_nodes, nullptr);
+    for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+        ggml_tensor * node = opt_ctx->gf->nodes[i];
+        if (node->flags & GGML_TENSOR_FLAG_LOSS) {
+            opt_ctx->grad_accs[i] = opt_ctx->loss_grad_acc;
+        } else if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+            GGML_ASSERT((!accumulate || opt_ctx->param_grad_acc.count(node)) &&
+                "a graph trains a parameter the optimizer context was not built with");
+            if (accumulate) {
+                opt_ctx->grad_accs[i] = opt_ctx->param_grad_acc.at(node);
             }
         }
     }
@@ -488,6 +683,20 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
     ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    opt_ctx->leaf_grads.clear();
+    for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+        ggml_tensor * node = opt_ctx->gf->nodes[i];
+        if (node->flags & GGML_TENSOR_FLAG_GRAD) {
+            ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_grad, node);
+            if (grad) {
+                ggml_set_output(grad); // read back after the step: the allocator must not reuse it
+                opt_ctx->leaf_grads[node] = grad;
+            }
+        }
+    }
+    if (!opt_ctx->checkpoint_prefix.empty()) {
+        ggml_opt_checkpoint(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->gf->n_nodes, opt_ctx->checkpoint_prefix.c_str());
+    }
 
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
@@ -516,8 +725,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             struct ggml_tensor * m = nullptr;
             struct ggml_tensor * v = nullptr;
             if (need_momenta) {
-                m = opt_ctx->grad_m[i];
-                v = opt_ctx->grad_v[i];
+                m = opt_ctx->param_m.at(node);
+                v = opt_ctx->param_v.at(node);
                 ggml_format_name(m, "AdamW m for %s", node->name);
                 ggml_format_name(v, "AdamW v for %s", node->name);
             }
@@ -559,6 +768,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
+    result->checkpoint_prefix = params.checkpoint_prefix ? params.checkpoint_prefix : "";
 
     GGML_ASSERT(result->opt_period >= 1);
 
@@ -591,6 +801,19 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     ggml_free(opt_ctx->ctx_cpu);
     ggml_free(opt_ctx->ctx_copy);
     delete opt_ctx;
+}
+
+void ggml_opt_set_next_step(ggml_opt_context_t opt_ctx, bool period_end, float loss_scale, struct ggml_tensor * extra_loss) {
+    GGML_ASSERT(!opt_ctx->eval_ready && "set the next step before ggml_opt_alloc");
+    opt_ctx->next_manual     = true;
+    opt_ctx->next_period_end = period_end;
+    opt_ctx->next_loss_scale = loss_scale;
+    opt_ctx->next_extra_loss = extra_loss;
+}
+
+struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * leaf) {
+    const auto it = opt_ctx->leaf_grads.find(leaf);
+    return it == opt_ctx->leaf_grads.end() ? nullptr : it->second;
 }
 
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
@@ -647,6 +870,7 @@ void ggml_opt_result_free(ggml_opt_result_t result) {
 void ggml_opt_result_reset(ggml_opt_result_t result) {
     result->ndata = 0;
     result->loss.clear();
+    result->ndata_batch.clear();
     result->pred.clear();
     result->ncorrect = 0;
 }
@@ -666,27 +890,33 @@ void ggml_opt_result_loss(ggml_opt_result_t result, double * loss, double * unc)
 
     double sum         = 0.0;
     double sum_squared = 0.0;
+    double weight_sum  = 0.0;
 
-    for (const float & loss : result->loss) {
+    for (size_t i = 0; i < result->loss.size(); ++i) {
         // If the loss is per datapoint it was scaled by 1.0f/opt_period for each physical batch.
-        const float loss_scaled = result->loss_per_datapoint ? loss*result->opt_period : loss;
-        sum         += loss_scaled;
-        sum_squared += loss_scaled*loss_scaled;
+        const float loss_scaled = result->loss_per_datapoint ? result->loss[i]*result->opt_period : result->loss[i];
+        // A per-datapoint loss is a mean over that batch's rows: batches of different sizes
+        // weigh by their rows, so the epoch's loss is the mean over every row, never a mean
+        // of per-batch means. A summed loss carries its rows already (weight 1).
+        const double w = result->loss_per_datapoint && i < result->ndata_batch.size() ? double(result->ndata_batch[i]) : 1.0;
+        sum         += w*loss_scaled;
+        sum_squared += w*loss_scaled*loss_scaled;
+        weight_sum  += w;
     }
 
-    const double mean = sum/nbatches;
+    const double mean = weight_sum > 0.0 ? sum/weight_sum : 0.0;
     *loss = result->loss_per_datapoint ? mean : sum;
 
     if (!unc) {
         return;
     }
 
-    if (nbatches < 2) {
+    if (nbatches < 2 || !(weight_sum > 0.0)) {
         *unc = NAN;
         return;
     }
 
-    const double var_sum = sum_squared/nbatches - mean*mean; // variance without Bessel's correction, i.e. nbatches/(nbatches-1)
+    const double var_sum = sum_squared/weight_sum - mean*mean; // weighted variance without Bessel's correction, i.e. nbatches/(nbatches-1)
     *unc = result->loss_per_datapoint ? sqrt(var_sum / (nbatches - 1)) : sqrt(var_sum * nbatches/(nbatches - 1));
 }
 
@@ -722,12 +952,22 @@ void ggml_opt_prepare_alloc(
     opt_ctx->outputs     = outputs;
 }
 
-void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
+void ggml_opt_set_alloc_budget(ggml_opt_context_t opt_ctx, size_t bytes) {
+    opt_ctx->alloc_budget = bytes;
+}
+
+size_t ggml_opt_peak_graph_bytes(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->peak_graph_bytes;
+}
+
+bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
     if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
-    if (backward) {
+    if (backward && opt_ctx->next_manual) {
+        opt_ctx->build_type = opt_ctx->next_period_end ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
+    } else if (backward) {
         const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
         opt_ctx->build_type = opt_i_next == 0 ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
     } else {
@@ -736,6 +976,16 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (!opt_ctx->static_graphs) {
         ggml_opt_build(opt_ctx);
+
+        // Graphs built per step keep their gradient accumulators in ctx_static across graphs,
+        // and the reset above found no graph to reset (gb_grad is rebuilt every step). Without
+        // this, a period's step applied the SUM of every gradient since the run began, since
+        // each backward adds into the accumulator in place (test-opt-dynamic-accum).
+        if (backward && (opt_ctx->next_manual ? opt_ctx->period_fresh : opt_ctx->opt_i == 0)) {
+            for (auto & [param, acc] : opt_ctx->param_grad_acc) {
+                ggml_set_zero(acc);
+            }
+        }
     }
 
     struct ggml_cgraph * graph = nullptr;
@@ -754,7 +1004,7 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
     if (opt_ctx->allocated_graph == graph) {
         opt_ctx->eval_ready = true;
-        return;
+        return true;
     }
 
     ggml_backend_sched_reset(opt_ctx->backend_sched); // clear allocation of previous graph
@@ -773,10 +1023,109 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         opt_ctx->allocated_graph_copy = graph;
     }
 
-    ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    opt_ctx->refusal.clear();
+
+    // A training graph with a node the device cannot run is refused BEFORE anything is allocated.
+    // For inference the scheduler falls back to another backend; inside a training graph that
+    // fallback is not contained (measured on the 5090 2026-10-06: a viewed SQR placed on the CPU
+    // aborted the scheduler on a cache view pinned to CUDA0), and a kernel run on an input it does
+    // not support aborts the whole process, the SERVING process when training runs in place.
+    // supports_op stays the one place that knows what a backend can run; a training graph only
+    // turns its "no" into a refused job instead of a fallback.
+    if (backward) {
+        ggml_backend_sched_t sched  = opt_ctx->backend_sched;
+        ggml_backend_t       device = ggml_backend_sched_get_backend(sched, 0);
+        ggml_backend_dev_t   dev    = device ? ggml_backend_get_device(device) : nullptr;
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_cgraph * g = opt_ctx->allocated_graph_copy;
+            for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+                ggml_tensor * node = ggml_graph_node(g, i);
+                switch (node->op) {
+                    case GGML_OP_NONE: case GGML_OP_VIEW: case GGML_OP_RESHAPE:
+                    case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+                        continue; // metadata, no kernel
+                    default:
+                        break;
+                }
+                // Refuse only a node NO backend of the scheduler can run. A device "no" with
+                // another backend's "yes" falls back as it always has: Metal has no GET_ROWS_BACK
+                // and runs it on the CPU (the M5 2026-10-06, refused by the first version of this
+                // check). supports_op is truthful, so a "yes" is a kernel that will not abort.
+                bool runnable = false;
+                for (int b = 0; b < ggml_backend_sched_get_n_backends(sched) && !runnable; ++b) {
+                    runnable = ggml_backend_supports_op(ggml_backend_sched_get_backend(sched, b), node);
+                }
+                if (!runnable) {
+                    const ggml_tensor * s0 = node->src[0];
+                    opt_ctx->refusal = std::string("the training graph has a node no backend can run (")
+                        + ggml_backend_name(device) + " included): " + ggml_op_desc(node) + " '" + node->name + "'"
+                        + (s0 ? std::string(" on '") + s0->name + "'" + (ggml_is_contiguous(s0) ? "" : " (a non-contiguous view)") : std::string())
+                        + "; nothing was allocated and serving is unaffected";
+                    GGML_LOG_ERROR("%s: %s\n", __func__, opt_ctx->refusal.c_str());
+                    return false;
+                }
+            }
+        }
+    }
+
+    // A training graph that cannot fit must be refused BEFORE it is allocated. Attempting it is not
+    // contained: on the 5090 (2026-09-27) a 75 GB graph's failed CUDA allocation spilled into host
+    // memory, exhausted the machine's commit and aborted the continuum core beside it. Each
+    // backend may grow by its device's free memory (capped by the caller's budget on GPUs: on
+    // Windows/WDDM a CUDA device reports nearly the whole card free beside other processes) minus
+    // allocator slack; the CPU device reports free system RAM, so host spill is covered too.
+    {
+        ggml_backend_sched_t sched = opt_ctx->backend_sched;
+        const int n = ggml_backend_sched_get_n_backends(sched);
+        std::vector<size_t> max_new(n, SIZE_MAX);
+        std::vector<size_t> sizes(n, 0);
+        for (int i = 0; i < n; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+            if (dev == nullptr) {
+                continue;
+            }
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            // A backend with no memory of its own (BLAS reports free = total = 0: Accelerate
+            // on a Mac, OpenBLAS anywhere) computes in HOST buffers, so its allowance is the
+            // host's, as the CPU device reports it. With 0 the gate refused every training
+            // graph on a Metal+BLAS build at the first window (the M5, 2026-10-05: "needs
+            // 150.4 MiB more on BLAS, over the 0.0 MiB it may add") while 40 GB sat free.
+            bool host_backed = false;
+            if (total == 0) {
+                for (int j = 0; j < n; ++j) {
+                    ggml_backend_dev_t cpu = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, j));
+                    if (cpu != nullptr && ggml_backend_dev_type(cpu) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        ggml_backend_dev_memory(cpu, &free, &total);
+                        host_backed = true;
+                        break;
+                    }
+                }
+            }
+            if (opt_ctx->alloc_budget > 0 && !host_backed && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                free = std::min(free, opt_ctx->alloc_budget);
+            }
+            const size_t margin = std::min<size_t>(free, 512u*1024*1024); // allocator slack
+            max_new[i] = free - margin;
+        }
+        const bool ok = ggml_backend_sched_alloc_graph_within(sched, opt_ctx->allocated_graph_copy, max_new.data(), sizes.data());
+        for (int i = 0; i < n; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
+            if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                opt_ctx->peak_graph_bytes = std::max(opt_ctx->peak_graph_bytes, sizes[i]);
+            }
+        }
+        if (!ok) {
+            ggml_backend_sched_reset(sched);
+            opt_ctx->allocated_graph = nullptr;
+            opt_ctx->eval_ready      = false;
+            return false;
+        }
+    }
     opt_ctx->allocated_graph = graph;
 
     opt_ctx->eval_ready = true;
+    return true;
 }
 
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
@@ -821,9 +1170,25 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
-    ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    const enum ggml_status status = ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    if (status != GGML_STATUS_SUCCESS) {
+        // the step's gradients (and the optimizer update inside this graph) were computed on
+        // memory the backend says it did not have: the run must stop, never continue on them
+        opt_ctx->refusal = std::string("the backend failed to compute the training graph (") + ggml_status_to_string(status)
+            + "): this step's gradients are not trusted, so the run stopped and nothing was written";
+        GGML_LOG_ERROR("%s: %s\n", __func__, opt_ctx->refusal.c_str());
+    }
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
     opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+    if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {
+        opt_ctx->period_fresh = true;
+    } else if (opt_ctx->allocated_graph == opt_ctx->gb_grad) {
+        opt_ctx->period_fresh = false;
+    }
+    opt_ctx->next_manual     = false;
+    opt_ctx->next_period_end = false;
+    opt_ctx->next_loss_scale = 1.0f;
+    opt_ctx->next_extra_loss = nullptr;
 
     if (!opt_ctx->static_graphs) {
         opt_ctx->gf                   = nullptr;
@@ -848,8 +1213,8 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     }
 
     const int64_t ndata = opt_ctx->outputs->ne[1];
-    GGML_ASSERT(result->ndata == ndata*int64_t(result->loss.size()) && "varying batch size not supported");
     result->ndata += ndata;
+    result->ndata_batch.push_back(ndata);
 
     GGML_ASSERT(ggml_is_scalar(opt_ctx->loss));
     GGML_ASSERT(opt_ctx->loss->type == GGML_TYPE_F32);
@@ -905,7 +1270,7 @@ void ggml_opt_epoch(
     int64_t ibatch = 0;
     int64_t t_loop_start = ggml_time_us();
     for (; ibatch < ibatch_split; ++ibatch) {
-        ggml_opt_alloc(opt_ctx, /*backward =*/ true);
+        GGML_ASSERT(ggml_opt_alloc(opt_ctx, /*backward =*/ true) && "the training graph does not fit in device memory");
         ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
         ggml_opt_eval(opt_ctx, result_train);
         if (callback_train) {
@@ -914,7 +1279,7 @@ void ggml_opt_epoch(
     }
     t_loop_start = ggml_time_us();
     for (; ibatch < nbatches; ++ibatch) {
-        ggml_opt_alloc(opt_ctx, /*backward =*/ false);
+        GGML_ASSERT(ggml_opt_alloc(opt_ctx, /*backward =*/ false) && "the evaluation graph does not fit in device memory");
         ggml_opt_dataset_get_batch(dataset, inputs, labels, ibatch);
         ggml_opt_eval(opt_ctx, result_eval);
         if (callback_eval) {
@@ -1091,4 +1456,8 @@ GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type o) {
         default:
             return "undefined";
     };
+}
+
+const char * ggml_opt_refusal(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->refusal.c_str();
 }
