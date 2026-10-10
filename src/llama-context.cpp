@@ -3983,7 +3983,10 @@ void llama_context::opt_epoch_iter(
                         __func__, cc.c0, span, opt_walk_horizon);
                 opt_alloc_failed.store(false);
                 opt_stop_requested.store(false);
-                // the rewind's decode is a plain forward, as before the first try: no walk flags
+                // the rewind's decode is a plain forward, as before the first try: no walk flags.
+                // walk_grad_from is not restored here because the loop's first statements recompute
+                // it from the shrunken horizon (cc.grad_from, then cparams.walk_grad_from) before the
+                // retried train_chunk runs.
                 const bool surrogate       = cparams.walk_surrogate;
                 const bool state_surrogate = cparams.walk_state_surrogate;
                 cparams.walk_exact     = false;
