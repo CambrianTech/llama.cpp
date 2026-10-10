@@ -3925,26 +3925,36 @@ void llama_context::opt_epoch_iter(
             }
             // attention: pop the cache to [0, c0); recurrent: restore the state at the chunk's
             // checkpoint and decode forward to its start (that decode rebuilds the attention K/V
-            // in between too, under the same adapter: the same values)
-            const size_t   cp    = recr != nullptr ? (size_t) j - (size_t) j % stride : (size_t) j;
-            const uint32_t p_pop = chunks[cp].c0;
-            const bool popped = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, p_pop, -1)) : memory->seq_rm(0, p_pop, -1);
-            if (!popped) {
-                LLAMA_LOG_ERROR("%s: could not pop the cache to [0, %u) for the reverse pass\n", __func__, p_pop);
-                opt_stop_requested.store(true);
+            // in between too, under the same adapter: the same values). Run again before every
+            // retry below: a refused chunk graph is refused AFTER its ubatch was applied, so the
+            // chunk's cells already sit in the cache and the recurrent cell's position has moved
+            // to the chunk's end; retrying on top of that fails to prepare the ubatch at all
+            // (the 5090, 2026-10-10: "init_batch: failed to prepare attention ubatches" after
+            // "retrying at 512", and the epoch stopped instead of shrinking the horizon).
+            const auto rewind = [&]() -> bool {
+                const size_t   cp    = recr != nullptr ? (size_t) j - (size_t) j % stride : (size_t) j;
+                const uint32_t p_pop = chunks[cp].c0;
+                const bool popped = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, p_pop, -1)) : memory->seq_rm(0, p_pop, -1);
+                if (!popped) {
+                    LLAMA_LOG_ERROR("%s: could not pop the cache to [0, %u) for the reverse pass\n", __func__, p_pop);
+                    opt_stop_requested.store(true);
+                    return false;
+                }
+                if (recr != nullptr) {
+                    if (snaps[cp].empty) {
+                        recr->seq_rm(0, -1, -1); // the first chunk starts from a zero state
+                    } else {
+                        state_rows(true, snaps[cp]);
+                    }
+                    if (p_pop < c.c0 && !decode_span(p_pop, c.c0)) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            if (!rewind()) {
                 ok = false;
                 break;
-            }
-            if (recr != nullptr) {
-                if (snaps[cp].empty) {
-                    recr->seq_rm(0, -1, -1); // the first chunk starts from a zero state
-                } else {
-                    state_rows(true, snaps[cp]);
-                }
-                if (p_pop < c.c0 && !decode_span(p_pop, c.c0)) {
-                    ok = false;
-                    break;
-                }
             }
             cparams.walk_exact     = true;
             cparams.walk_surrogate = c.surrogate;
@@ -3973,6 +3983,24 @@ void llama_context::opt_epoch_iter(
                         __func__, cc.c0, span, opt_walk_horizon);
                 opt_alloc_failed.store(false);
                 opt_stop_requested.store(false);
+                // the rewind's decode is a plain forward, as before the first try: no walk flags.
+                // walk_grad_from is not restored here because the loop's first statements recompute
+                // it from the shrunken horizon (cc.grad_from, then cparams.walk_grad_from) before the
+                // retried train_chunk runs.
+                const bool surrogate       = cparams.walk_surrogate;
+                const bool state_surrogate = cparams.walk_state_surrogate;
+                cparams.walk_exact     = false;
+                cparams.walk_grad_from = 0;
+                cparams.walk_surrogate = false;
+                cparams.walk_state_surrogate = false;
+                const bool rewound = rewind();
+                cparams.walk_exact     = true;
+                cparams.walk_surrogate = surrogate;
+                cparams.walk_state_surrogate = state_surrogate;
+                if (!rewound) {
+                    ok = false;
+                    break;
+                }
             }
             opt_walk_horizon_used = opt_walk_horizon;
             cparams.walk_exact     = false;
