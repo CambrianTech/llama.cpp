@@ -10,6 +10,8 @@
 //      exact walk in 4 chunks must match it, and the plain walk in 4 chunks must not
 //   2. context, then a reply (a masked window, the walk's real case): the exact walk in 4 chunks
 //      must take the step it takes with one chunk per run, and the plain walk must not
+//   7. per-layer recompute under the exact walk: the same masked window takes the same step with
+//      the layer outputs as checkpoints as without them, in a smaller chunk graph
 //
 // Run on a pure-attention model and on a hybrid (attention + gated delta-net):
 //   test-walk-exact -m Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf
@@ -55,6 +57,9 @@ static uint32_t g_walk_horizon     = 0;
 static size_t   g_device_budget    = 0;
 static size_t   g_last_graph_bytes = 0;
 static uint32_t g_last_horizon     = 0;
+// per-layer recompute (llama_opt_params::recompute): the layer outputs are the backward pass's
+// checkpoints, so a chunk holds one layer's activations instead of every layer's
+static bool     g_recompute        = false;
 
 // counts the recurrent memory's "non-consecutive token position" warnings: a state restore that
 // leaves the cell's position at the window's end makes every next chunk read as non-consecutive
@@ -136,6 +141,7 @@ static std::vector<float> step_delta(const common_params & params, llama_model *
     lopt.adapter         = adapter;
     lopt.walk_exact      = exact;
     lopt.walk_horizon    = g_walk_horizon;
+    lopt.recompute       = g_recompute;
     llama_opt_set_memory_budget(ctx, g_device_budget);
     llama_opt_init(ctx, model, lopt);
     llama_opt_set_walk_host_budget(ctx, host_budget);
@@ -292,6 +298,34 @@ int main(int argc, char ** argv) {
         }
         if (same_step(compare("context + reply: plain walk in 4 chunks vs the exact walk", plain4, runs))) {
             fprintf(stderr, "FAILED: the plain walk matches the exact one: this window cannot tell the two apart\n");
+            ++failures;
+        }
+    }
+
+    {
+        // 7. per-layer recompute under the exact walk. The chunk's activations, every layer's
+        // kept for the backward pass, are what a large model's chunk graph is made of (Kimi's
+        // first exact run on the 5090, 2026-10-10: 5.6 GiB more at chunk 256 under every
+        // gradient horizon from 1155 down to 256). Recompute keeps the layer outputs and rebuilds
+        // the rest in the backward pass, so the step must not move and the graph must shrink.
+        std::vector<uint8_t> reply(WINDOW + 1, 0);
+        for (uint32_t i = WINDOW / 2 + 37; i <= WINDOW; ++i) {
+            reply[i] = 1;
+        }
+        const auto kept  = step_delta(params, model, init, tokens, reply, WINDOW / 4, true);
+        const size_t kept_bytes = g_last_graph_bytes;
+        g_recompute = true;
+        const auto rebuilt = step_delta(params, model, init, tokens, reply, WINDOW / 4, true);
+        const size_t rebuilt_bytes = g_last_graph_bytes;
+        g_recompute = false;
+        printf("  chunk graph: %.1f MiB keeping every layer's activations, %.1f MiB with recompute\n",
+                kept_bytes / 1048576.0, rebuilt_bytes / 1048576.0);
+        if (!same_step(compare("context + reply: exact walk with recompute vs without", rebuilt, kept))) {
+            fprintf(stderr, "FAILED: recompute changed the exact walk's step\n");
+            ++failures;
+        }
+        if (!(rebuilt_bytes < kept_bytes)) {
+            fprintf(stderr, "FAILED: recompute did not shrink the exact walk's chunk graph\n");
             ++failures;
         }
     }
