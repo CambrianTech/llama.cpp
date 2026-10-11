@@ -1755,9 +1755,10 @@ extern "C" {
     // batch): the footprint a run of this shape needs, from the run's own allocation preflight.
     LLAMA_API size_t llama_opt_graph_bytes(struct llama_context * lctx);
 
-    // The bytes this context itself holds on non-host (GPU) buffers: its memory (the K/V cache
-    // for the whole window, and any recurrent state) and its compute buffers, excluding the
-    // model's weights, which it shares. What a training run adds on the device beyond its graph.
+    // The bytes this context's memory holds on non-host (GPU) buffers: the K/V cache for the whole
+    // window, and any recurrent state; not the model's weights, which it shares, nor its compute
+    // buffers, which a training graph is allocated into (llama_opt_graph_bytes covers those).
+    // What a training run adds on the device beyond its graph.
     LLAMA_API size_t llama_opt_context_device_bytes(struct llama_context * lctx);
 
     // Cap, in bytes, the HOST memory the exact walk keeps per training window (0 = no cap): the

@@ -996,8 +996,8 @@ void server_trainer::run(json req, examples_data ex) {
         /*walk_horizon    =*/ (uint32_t) req.value("walk_horizon", (int64_t) 0),
     };
     // THE BUDGET COVERS THE WHOLE RUN (continuum, the 5090, 2026-10-11): the training context's own
-    // device buffers (its Q8_0 K/V for the whole window, and its compute buffers) are allocated
-    // when it is created, before the graph's budget applies, so they were outside the caller's
+    // memory (its Q8_0 K/V for the whole window, and any recurrent state) is allocated when it is
+    // created, before the graph's budget applies, so it was outside the caller's
     // governed lease: ~0.6 GB at a 16,896-token window, growing with the window, beside serving
     // on the same device. The graph gets what the lease leaves after them (at least one byte:
     // 0 means "no budget"), and the preflight refuses a graph over it as before.
@@ -1118,8 +1118,8 @@ void server_trainer::run(json req, examples_data ex) {
     // what the training graph needed on the GPU, measured by its own preflight (also on a refusal:
     // it is the number to size the next attempt, or a caller's admission, by)
     state["graph_mib"] = graph_mib;
-    // what the training context itself held on the GPU (K/V for the window, compute buffers): with
-    // the graph, the whole of what the run added beside serving
+    // what the training context's memory held on the GPU (K/V for the window, recurrent state):
+    // with the graph (which covers the compute buffers), what the run added beside serving
     state["context_mib"] = context_bytes / 1048576.0;
     // what the exact walk kept on the host per window (its K/V gradient and state snapshots)
     state["walk_host_mib"] = walk_host_mib;

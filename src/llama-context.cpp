@@ -4860,8 +4860,11 @@ size_t llama_opt_graph_bytes(struct llama_context * ctx) {
 size_t llama_opt_context_device_bytes(struct llama_context * ctx) {
     size_t bytes = 0;
     for (const auto & [buft, data] : ctx->memory_breakdown()) {
+        // data.context only: the compute buffers are where the training graph is allocated
+        // (the optimizer shares this context's scheduler, whose allocator replaces them with the
+        // graph's), so the graph's measured size already covers them (Cormac on #52)
         if (!ggml_backend_buft_is_host(buft)) {
-            bytes += data.context + data.compute;
+            bytes += data.context;
         }
     }
     return bytes;
