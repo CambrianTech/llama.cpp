@@ -4857,6 +4857,16 @@ size_t llama_opt_graph_bytes(struct llama_context * ctx) {
     return ctx->opt_graph_bytes();
 }
 
+size_t llama_opt_context_device_bytes(struct llama_context * ctx) {
+    size_t bytes = 0;
+    for (const auto & [buft, data] : ctx->memory_breakdown()) {
+        if (!ggml_backend_buft_is_host(buft)) {
+            bytes += data.context + data.compute;
+        }
+    }
+    return bytes;
+}
+
 bool llama_opt_failed(struct llama_context * ctx) {
     return ctx->opt_alloc_failed.load();
 }

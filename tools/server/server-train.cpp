@@ -995,7 +995,14 @@ void server_trainer::run(json req, examples_data ex) {
         /*walk_exact      =*/ req.value("exact", false),
         /*walk_horizon    =*/ (uint32_t) req.value("walk_horizon", (int64_t) 0),
     };
-    llama_opt_set_memory_budget(ctx, budget);
+    // THE BUDGET COVERS THE WHOLE RUN (continuum, the 5090, 2026-10-11): the training context's own
+    // device buffers (its Q8_0 K/V for the whole window, and its compute buffers) are allocated
+    // when it is created, before the graph's budget applies, so they were outside the caller's
+    // governed lease: ~0.6 GB at a 16,896-token window, growing with the window, beside serving
+    // on the same device. The graph gets what the lease leaves after them (at least one byte:
+    // 0 means "no budget"), and the preflight refuses a graph over it as before.
+    const size_t context_bytes = llama_opt_context_device_bytes(ctx);
+    llama_opt_set_memory_budget(ctx, budget == 0 ? 0 : std::max<size_t>(1, budget > context_bytes ? budget - context_bytes : 1));
     // the exact walk's host memory per window: refused by name over the caller's cap
     llama_opt_set_walk_host_budget(ctx, (size_t) req.value("walk_host_budget_mib", (int64_t) 0) << 20);
     llama_opt_init(ctx, model, lopt);
@@ -1111,6 +1118,9 @@ void server_trainer::run(json req, examples_data ex) {
     // what the training graph needed on the GPU, measured by its own preflight (also on a refusal:
     // it is the number to size the next attempt, or a caller's admission, by)
     state["graph_mib"] = graph_mib;
+    // what the training context itself held on the GPU (K/V for the window, compute buffers): with
+    // the graph, the whole of what the run added beside serving
+    state["context_mib"] = context_bytes / 1048576.0;
     // what the exact walk kept on the host per window (its K/V gradient and state snapshots)
     state["walk_host_mib"] = walk_host_mib;
     // the exact walk's gradient horizon as trained (0 = the whole window), smaller where the device
