@@ -86,6 +86,9 @@ struct ggml_opt_context {
     bool                 period_fresh    = true; // the next backward starts a period (zeroed gradients)
     // the gradients of the evaluated graph's GRAD leaves, readable until the next alloc
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> leaf_grads;
+    // ggml_opt_accumulate_grad: GRAD nodes whose gradient adds into a caller's tensor, for the
+    // graph prepared last (ggml_opt_prepare_alloc clears them)
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> next_grad_accs;
     std::vector<struct ggml_tensor *> grad_accs;
 
     int64_t iter               = 1;
@@ -677,6 +680,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             if (accumulate) {
                 opt_ctx->grad_accs[i] = opt_ctx->param_grad_acc.at(node);
             }
+        } else if (const auto it = opt_ctx->next_grad_accs.find(node); it != opt_ctx->next_grad_accs.end()) {
+            opt_ctx->grad_accs[i] = it->second;
         }
     }
 
@@ -686,7 +691,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     opt_ctx->leaf_grads.clear();
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
         ggml_tensor * node = opt_ctx->gf->nodes[i];
-        if (node->flags & GGML_TENSOR_FLAG_GRAD) {
+        if ((node->flags & GGML_TENSOR_FLAG_GRAD) && !opt_ctx->next_grad_accs.count(node)) {
             ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_grad, node);
             if (grad) {
                 ggml_set_output(grad); // read back after the step: the allocator must not reuse it
@@ -809,6 +814,14 @@ void ggml_opt_set_next_step(ggml_opt_context_t opt_ctx, bool period_end, float l
     opt_ctx->next_period_end = period_end;
     opt_ctx->next_loss_scale = loss_scale;
     opt_ctx->next_extra_loss = extra_loss;
+}
+
+void ggml_opt_accumulate_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * tensor, struct ggml_tensor * acc) {
+    GGML_ASSERT(!opt_ctx->eval_ready && "register an accumulator before ggml_opt_alloc");
+    GGML_ASSERT(acc->type == GGML_TYPE_F32 && ggml_are_same_shape(tensor, acc));
+    GGML_ASSERT((acc->view_src ? acc->view_src : acc)->buffer != nullptr && "the accumulator lives in the caller's buffer");
+    ggml_set_grad(tensor);
+    opt_ctx->next_grad_accs[tensor] = acc;
 }
 
 struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * leaf) {
@@ -950,6 +963,7 @@ void ggml_opt_prepare_alloc(
     opt_ctx->gf          = gf;
     opt_ctx->inputs      = inputs;
     opt_ctx->outputs     = outputs;
+    opt_ctx->next_grad_accs.clear(); // registrations belong to the graph prepared last
 }
 
 void ggml_opt_set_alloc_budget(ggml_opt_context_t opt_ctx, size_t bytes) {

@@ -298,6 +298,8 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+# the tiled FLASH_ATTN_EXT backward gives plain attention's gradients on every backend (no model needed)
+llama_build_and_test(test-flash-attn-back.cpp)
 llama_build_and_test(test-moe-gather.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

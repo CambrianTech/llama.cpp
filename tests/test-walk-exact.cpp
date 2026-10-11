@@ -235,6 +235,46 @@ int main(int argc, char ** argv) {
     llama_free(tok_ctx);
     GGML_ASSERT(tokens.size() > REFUSAL_WINDOW + 1);
 
+    // MEASUREMENT MODE (WALK_MEASURE="2048,8192,..."): the device graph per chunk of a context +
+    // reply window (the last 512 positions labelled), on the explicit path (F32 cache, no flash
+    // attention) and through FLASH_ATTN_EXT (f16 cache, flash attention), at each window. Prints a
+    // table and exits; the bytes are the run's own allocation preflight (llama_opt_graph_bytes).
+    if (const char * env = getenv("WALK_MEASURE")) {
+        std::string more = text;
+        while (more.size() < 6 * 65536) {
+            lcg = lcg * 1664525u + 1013904223u;
+            more += words[(lcg >> 16) % 16];
+            more += (lcg >> 8) % 7 == 0 ? ".\n" : " ";
+        }
+        llama_context * tc = make_ctx(params, model, WINDOW);
+        const std::vector<llama_token> long_tokens = common_tokenize(tc, more, true);
+        llama_free(tc);
+        const uint32_t chunk = getenv("WALK_MEASURE_CHUNK") ? (uint32_t) atoi(getenv("WALK_MEASURE_CHUNK")) : 256;
+        g_recompute = getenv("WALK_MEASURE_RECOMPUTE") != nullptr; // per-layer recompute, as the served runs train
+        g_walk_horizon = getenv("WALK_MEASURE_HORIZON") ? (uint32_t) atoi(getenv("WALK_MEASURE_HORIZON")) : 0; // 0 = the whole window
+        printf("  window  chunk  explicit MiB  flash MiB  ratio\n");
+        for (const char * p = env; *p; ) {
+            char * end = nullptr;
+            const uint32_t w = (uint32_t) strtoul(p, &end, 10);
+            p = *end == ',' ? end + 1 : end;
+            if (w == 0 || long_tokens.size() <= w + 1) { break; }
+            g_window = w;
+            std::vector<uint8_t> reply(w + 1, 0);
+            for (uint32_t i = w - 511; i <= w; ++i) reply[i] = 1;
+            double mib[2] = { 0, 0 };
+            const ggml_type types[2] = { GGML_TYPE_F32, GGML_TYPE_F16 };
+            for (int a = 0; a < 2; ++a) {
+                g_cache_type = types[a];
+                step_delta(params, model, init, long_tokens, reply, chunk, true);
+                mib[a] = g_last_graph_bytes / 1048576.0;
+            }
+            g_cache_type = GGML_TYPE_F32;
+            printf("  %6u  %5u  %12.1f  %9.1f  %5.2fx\n", w, chunk, mib[0], mib[1], mib[1] > 0 ? mib[0] / mib[1] : 0.0);
+            fflush(stdout);
+        }
+        return 0;
+    }
+
     int failures = 0;
     {
         // 1. every position labelled: chunk = window is one graph, the true gradient

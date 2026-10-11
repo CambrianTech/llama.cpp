@@ -942,12 +942,11 @@ public:
     // fills before the step and reads after it (llama_context::opt_epoch_iter)
     struct walk_layer {
         int           il;
-        uint32_t      grad_from;   // the GRAD leaves cover cached positions [grad_from, n_past)
         uint32_t      n_past;
-        ggml_tensor * dk = nullptr; // GRAD leaves, zero-filled: their gradient is dL/d(cached K/V)
-        ggml_tensor * dv = nullptr; //   [n_embd_head, n_head_kv, n_past - grad_from], V untransposed
-        ggml_tensor * gk = nullptr; // inputs: the gradient later chunks accumulated on this chunk's
-        ggml_tensor * gv = nullptr; //   own K/V, shaped like k_cur / v_cur (null without a surrogate)
+        ggml_tensor * tk = nullptr; // the cached K/V of [grad_from, n_past) as F32, tapped: their
+        ggml_tensor * tv = nullptr; //   gradient adds into ak / av (ggml_opt_accumulate_grad)
+        ggml_tensor * ak = nullptr; // the accumulator's rows [grad_from, n_past), shaped like tk / tv
+        ggml_tensor * av = nullptr;
     };
     std::vector<walk_layer> t_walk;
     // the recurrent states of a reverse-pass chunk graph, one per state tensor of the memory

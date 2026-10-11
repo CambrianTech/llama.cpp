@@ -5517,6 +5517,13 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+void ggml_flash_attn_ext_set_back_tile(
+        struct ggml_tensor * a,
+        int32_t              tile) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    ggml_set_op_params_i32(a, 4, tile); // scale, max_bias, softcap, prec come first
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -6711,6 +6718,188 @@ static void ggml_sub_or_set(
     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);
 }
 
+// The backward of FLASH_ATTN_EXT, built from ops every backend already has, tiled over the KV
+// positions so its memory is chunk x tile, never chunk x window (continuum 2026-10-11: training's
+// explicit attention held ~4 F32 copies of window x chunk x heads, 75% of a training window's
+// bytes, so training fit a quarter of the window serving runs). Per tile it RECOMPUTES the scores
+// instead of keeping them, in three passes over the tiles: each row's log-sum-exp; then
+// D_i = sum_j p_ij dp_ij; then the gradients. No row-max op is needed: for p = softmax(s),
+// log sum exp(s) = sum p * (s - log p), which soft_max computes stably, and the tiles' values
+// combine by the same identity. Masked (-inf) scores are clamped to a finite floor first, so a
+// row a tile masks entirely contributes exp(floor) = 0 instead of 0/0.
+#define GGML_FA_BACK_TILE_DEFAULT 4096
+#define GGML_FA_BACK_FLOOR        -1.0e9f
+#define GGML_FA_BACK_EPS           1.0e-30f
+
+// per tile: the scores (8 ops) recomputed in each of three passes, the log-sum-exp (6), D (5) and the
+// gradients (~25 with the transposes and the group sums), padded; plus the passes' fixed ops
+#define GGML_FA_BACK_NODES_PER_TILE 96
+#define GGML_FA_BACK_NODES_FIXED    32
+
+size_t ggml_flash_attn_ext_back_n_nodes(int64_t n_kv, int32_t tile) {
+    if (tile <= 0) {
+        tile = GGML_FA_BACK_TILE_DEFAULT;
+    }
+    const int64_t nt = (n_kv + tile - 1) / tile;
+    return (size_t) (nt * GGML_FA_BACK_NODES_PER_TILE + GGML_FA_BACK_NODES_FIXED);
+}
+
+// a K or V tile at F32: a mixed product (F16 x F32) converts the F32 side to F16 before the dot,
+// so an F16 cache would round the queries and gradients the backward multiplies them with. Per
+// tile, so the copy is tile-sized, never window-sized.
+static struct ggml_tensor * ggml_fa_back_f32(struct ggml_context * ctx, struct ggml_tensor * t) {
+    return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
+}
+
+// every product in the backward asks for F32 precision: a backend that stages through half would
+// round the scores and the gradients ~1e-3 per product (Metal's default mul_mm)
+static struct ggml_tensor * ggml_fa_back_mm(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
+    struct ggml_tensor * r = ggml_mul_mat(ctx, a, b);
+    ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+    return r;
+}
+
+// the scores of KV positions [j0, j0+n) for every query row, as [n, N, H] F32: scaled, masked,
+// and clamped to a finite floor so a fully masked row stays finite
+static struct ggml_tensor * ggml_fa_back_scores(struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k,
+        struct ggml_tensor * mask, float scale, int64_t j0, int64_t n) {
+    struct ggml_tensor * kt = ggml_fa_back_f32(ctx, ggml_view_3d(ctx, k, k->ne[0], n, k->ne[2], k->nb[1], k->nb[2], j0*k->nb[1]));
+    struct ggml_tensor * s  = ggml_fa_back_mm(ctx, kt, q); // [n, N, H]
+    s = ggml_scale(ctx, s, scale);
+    if (mask) {
+        struct ggml_tensor * m = ggml_view_4d(ctx, mask, n, q->ne[1], mask->ne[2], mask->ne[3],
+                mask->nb[1], mask->nb[2], mask->nb[3], j0*mask->nb[0]);
+        s = ggml_add(ctx, s, ggml_cast(ctx, m, GGML_TYPE_F32));
+    }
+    return ggml_clamp(ctx, s, GGML_FA_BACK_FLOOR, INFINITY);
+}
+
+// log-sum-exp over rows (ne0) of s, by the softmax identity above
+static struct ggml_tensor * ggml_fa_back_lse(struct ggml_context * ctx, struct ggml_tensor * s) {
+    struct ggml_tensor * p  = ggml_soft_max(ctx, s);
+    struct ggml_tensor * lp = ggml_log(ctx, ggml_scale_bias(ctx, p, 1.0f, GGML_FA_BACK_EPS));
+    return ggml_sum_rows(ctx, ggml_mul(ctx, p, ggml_sub(ctx, s, lp)));
+}
+
+// heads [D, T, H] -> their KV heads [D, T, Hkv], summing each KV head's group of query heads
+// (the broadcast mul_mat uses: query head h reads KV head h / (H / Hkv))
+static struct ggml_tensor * ggml_fa_back_group_sum(struct ggml_context * ctx, struct ggml_tensor * t, int64_t n_head_kv) {
+    if (t->ne[2] == n_head_kv) {
+        return t;
+    }
+    const int64_t g = t->ne[2] / n_head_kv;
+    struct ggml_tensor * v = ggml_view_4d(ctx, t, t->ne[0], t->ne[1], n_head_kv, g, t->nb[1], t->nb[2]*g, t->nb[2], 0);
+    return ggml_repeat_back(ctx, v, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, t->ne[0], t->ne[1], n_head_kv, 1));
+}
+
+// tiles joined along ne1 by halves, so a long window copies O(n log n), not O(n^2)
+static struct ggml_tensor * ggml_fa_back_join(struct ggml_context * ctx, struct ggml_tensor ** parts, int n) {
+    if (n == 1) {
+        return parts[0];
+    }
+    const int h = n / 2;
+    return ggml_concat(ctx, ggml_fa_back_join(ctx, parts, h), ggml_fa_back_join(ctx, parts + h, n - h), 1);
+}
+
+static void ggml_flash_attn_ext_backward(
+        struct ggml_context * ctx, struct ggml_cgraph * cgraph, struct ggml_tensor * tensor, struct ggml_tensor * grad,
+        size_t isrc0, size_t isrc1, size_t isrc2, bool dq_needed, bool dk_needed, bool dv_needed) {
+    struct ggml_tensor * q    = tensor->src[0]; // [D,  N, H,   1]
+    struct ggml_tensor * k    = tensor->src[1]; // [D,  M, Hkv, 1]
+    struct ggml_tensor * v    = tensor->src[2]; // [Dv, M, Hkv, 1]
+    struct ggml_tensor * mask = tensor->src[3]; // [M', N', 1|H, 1] F16, or NULL
+
+    float scale, max_bias, softcap;
+    memcpy(&scale,    (const float *) tensor->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (const float *) tensor->op_params + 1, sizeof(float));
+    memcpy(&softcap,  (const float *) tensor->op_params + 2, sizeof(float));
+    GGML_ASSERT(max_bias == 0.0f && "flash_attn_ext backward: ALiBi is not implemented");
+    GGML_ASSERT(softcap  == 0.0f && "flash_attn_ext backward: logit softcap is not implemented");
+    GGML_ASSERT(tensor->src[4] == NULL && "flash_attn_ext backward: sinks are not implemented");
+    GGML_ASSERT(q->ne[3] == 1 && "flash_attn_ext backward: one sequence stream");
+
+    int32_t tile = ggml_get_op_params_i32(tensor, 4);
+    if (tile <= 0) {
+        tile = GGML_FA_BACK_TILE_DEFAULT;
+    }
+    const int64_t M   = k->ne[1];
+    const int64_t Hkv = k->ne[2];
+    const int     nt  = (int) ((M + tile - 1) / tile);
+
+    // the output's gradient as [Dv, N, H]
+    struct ggml_tensor * dO = ggml_cont(ctx, ggml_permute(ctx, grad, 0, 2, 1, 3));
+
+    // pass 1 of 3: each row's log-sum-exp over the whole window
+    struct ggml_tensor * lse = NULL;
+    {
+        struct ggml_tensor * lz = NULL;
+        for (int t = 0; t < nt; ++t) {
+            const int64_t j0 = (int64_t) t * tile;
+            const int64_t n  = MIN(tile, M - j0);
+            struct ggml_tensor * l = ggml_fa_back_lse(ctx, ggml_fa_back_scores(ctx, q, k, mask, scale, j0, n)); // [1, N, H]
+            lz = lz ? ggml_concat(ctx, lz, l, 0) : l;
+        }
+        lse = nt == 1 ? lz : ggml_fa_back_lse(ctx, lz);
+    }
+
+    // pass 2 of 3: D_i = sum_j p_ij dp_ij, [1, N, H], from the SAME F32 recomputation the gradients use, never
+    // from the forward's output (D_i = dO_i . O_i only when O is exactly sum_j p_ij v_j): a
+    // flash-attention forward that accumulates at reduced precision (Metal, CUDA's tensor-core
+    // kernels) would otherwise put its rounding into every ds_ij, inconsistently with the p_ij
+    // recomputed here (test-walk-exact on the M5, 2026-10-11).
+    struct ggml_tensor * dvec = NULL;
+    for (int t = 0; t < nt; ++t) {
+        const int64_t j0 = (int64_t) t * tile;
+        const int64_t n  = MIN(tile, M - j0);
+        struct ggml_tensor * vt = ggml_fa_back_f32(ctx, ggml_view_3d(ctx, v, v->ne[0], n, Hkv, v->nb[1], v->nb[2], j0*v->nb[1]));
+        struct ggml_tensor * p  = ggml_exp(ctx, ggml_sub(ctx, ggml_fa_back_scores(ctx, q, k, mask, scale, j0, n), lse));
+        struct ggml_tensor * d  = ggml_sum_rows(ctx, ggml_mul(ctx, p, ggml_fa_back_mm(ctx, vt, dO)));
+        dvec = dvec ? ggml_add(ctx, dvec, d) : d;
+    }
+
+    // transposed once, for the matmuls below ([N, D, H]): every backend has a batched,
+    // head-broadcasting mul_mat, while a batched out_prod is not universal
+    struct ggml_tensor * qT  = dk_needed ? ggml_cont(ctx, ggml_transpose(ctx, q))  : NULL;
+    struct ggml_tensor * dOT = dv_needed ? ggml_cont(ctx, ggml_transpose(ctx, dO)) : NULL;
+
+    // pass 3 of 3: the gradients, tile by tile
+    struct ggml_tensor *  dq = NULL;
+    struct ggml_tensor ** dk = (struct ggml_tensor **) alloca(sizeof(struct ggml_tensor *) * nt);
+    struct ggml_tensor ** dv = (struct ggml_tensor **) alloca(sizeof(struct ggml_tensor *) * nt);
+    for (int t = 0; t < nt; ++t) {
+        const int64_t j0 = (int64_t) t * tile;
+        const int64_t n  = MIN(tile, M - j0);
+        struct ggml_tensor * kt = ggml_fa_back_f32(ctx, ggml_view_3d(ctx, k, k->ne[0], n, Hkv, k->nb[1], k->nb[2], j0*k->nb[1]));
+        struct ggml_tensor * vt = ggml_fa_back_f32(ctx, ggml_view_3d(ctx, v, v->ne[0], n, Hkv, v->nb[1], v->nb[2], j0*v->nb[1]));
+        struct ggml_tensor * p  = ggml_exp(ctx, ggml_sub(ctx, ggml_fa_back_scores(ctx, q, k, mask, scale, j0, n), lse));            // [n, N, H]
+        struct ggml_tensor * dp = ggml_fa_back_mm(ctx, vt, dO);                                         // [n, N, H]
+        struct ggml_tensor * ds = ggml_scale(ctx, ggml_mul(ctx, p, ggml_sub(ctx, dp, dvec)), scale);    // [n, N, H]
+        if (dq_needed) {
+            // dq[d,i] = sum_j k[d,j] ds[j,i]
+            struct ggml_tensor * g = ggml_fa_back_mm(ctx, ggml_cont(ctx, ggml_transpose(ctx, kt)), ds); // [D, N, H]
+            dq = dq ? ggml_add(ctx, dq, g) : g;
+        }
+        if (dk_needed) {
+            // dk[d,j] = sum_i q[d,i] ds[j,i]
+            dk[t] = ggml_fa_back_group_sum(ctx, ggml_fa_back_mm(ctx, qT, ggml_cont(ctx, ggml_transpose(ctx, ds))), Hkv); // [D, n, Hkv]
+        }
+        if (dv_needed) {
+            // dv[d,j] = sum_i dO[d,i] p[j,i]
+            dv[t] = ggml_fa_back_group_sum(ctx, ggml_fa_back_mm(ctx, dOT, ggml_cont(ctx, ggml_transpose(ctx, p))), Hkv); // [Dv, n, Hkv]
+        }
+    }
+
+    if (dq_needed) {
+        ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape_4d(ctx, ggml_cont(ctx, dq), q->ne[0], q->ne[1], q->ne[2], q->ne[3]));
+    }
+    if (dk_needed) {
+        ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape_4d(ctx, ggml_fa_back_join(ctx, dk, nt), k->ne[0], k->ne[1], k->ne[2], k->ne[3]));
+    }
+    if (dv_needed) {
+        ggml_add_or_set(ctx, cgraph, isrc2, ggml_reshape_4d(ctx, ggml_fa_back_join(ctx, dv, nt), v->ne[0], v->ne[1], v->ne[2], v->ne[3]));
+    }
+}
+
 static void ggml_compute_backward(
         struct ggml_context * ctx, struct ggml_cgraph * cgraph, int i, const bool * grads_needed) {
     struct ggml_tensor * tensor = cgraph->nodes[i];
@@ -7294,6 +7483,10 @@ static void ggml_compute_backward(
                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
                 } //break;
             }
+        } break;
+        case GGML_OP_FLASH_ATTN_EXT: {
+            ggml_flash_attn_ext_backward(ctx, cgraph, tensor, grad, isrc0, isrc1, isrc2,
+                    src0_needs_grads, src1_needs_grads, src2_needs_grads);
         } break;
         case GGML_OP_NONE: {
             // noop
@@ -8083,7 +8276,7 @@ void ggml_set_param(struct ggml_tensor * tensor) {
 }
 
 void ggml_set_grad(struct ggml_tensor * tensor) {
-    GGML_ASSERT(tensor->op == GGML_OP_NONE);
+    // any tensor: a leaf whose gradient is read back, or a node tapped for the gradient on its value
     tensor->flags |= GGML_TENSOR_FLAG_GRAD;
 }
 

@@ -654,7 +654,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
-        GGML_TENSOR_FLAG_GRAD    = 32, // ...needs its gradient computed, but no optimizer updates it (a leaf whose gradient is read back)
+        GGML_TENSOR_FLAG_GRAD    = 32, // ...needs its gradient computed, but no optimizer updates it (read back, or accumulated into a caller's tensor)
     };
 
     enum ggml_tri_type {
@@ -2463,6 +2463,18 @@ extern "C" {
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
+
+    // the KV positions per tile of FLASH_ATTN_EXT's backward pass (0 = the default): the backward
+    // recomputes each tile's scores, so its memory is queries x tile, never queries x window
+    GGML_API void ggml_flash_attn_ext_set_back_tile(
+            struct ggml_tensor * a,
+            int32_t              tile);
+
+    // an upper bound on the graph nodes FLASH_ATTN_EXT's backward adds for n_kv KV positions at
+    // `tile` (0 = the default): a caller sizing a training graph counts them with its own
+    GGML_API size_t ggml_flash_attn_ext_back_n_nodes(
+            int64_t              n_kv,
+            int32_t              tile);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

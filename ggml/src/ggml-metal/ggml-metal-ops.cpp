@@ -2622,7 +2622,12 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //    default: break;
         //}
 
-        ggml_metal_encode_mul_mm(ctx, op);
+        // GGML_PREC_F32 on an F32 x F32 product is honored with the float-staged kernel (CUDA honors
+        // the same request): the default stages through half, ~1e-3 relative per product, which the
+        // training backward cannot afford (flash attention's tiled backward, continuum 2026-10-11)
+        const bool fp32 = !props_dev->has_tensor && ggml_get_op_params_i32(op, 0) == GGML_PREC_F32 &&
+                          op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+        ggml_metal_encode_mul_mm(ctx, op, fp32);
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
 
@@ -3412,7 +3417,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // the shared memory needed for the simdgroups to load the KV cache
         // each thread loads (dequantizes) 16 head elements, there are 32 threads in th SG
         //
-#define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(ne00 + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + is_q*(16*32*(nsg)))*(sizeof(float)/2), 16))
+        // the F32 kernels hold the query as float (kernels/fa.metal, QH): twice the halves per element
+        const int qh = !use_kv_f16 && op->src[1]->type == GGML_TYPE_F32 ? 2 : 1;
+#define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(qh*ne00 + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + is_q*(16*32*(nsg)))*(sizeof(float)/2), 16))
 
         //int64_t nsgmax = 4;
         //

@@ -15,12 +15,17 @@ struct llama_cparams {
 
     // THE EXACT WALK (llama_context::opt_epoch_iter, walk_exact): a chunk's training graph in
     // the reverse pass. walk_grad_from: the first cached prefix position whose K/V carry a
-    // gradient (positions [walk_grad_from, n_past) attend through a GRAD leaf; [0,
+    // gradient (positions [walk_grad_from, n_past) attend through a gradient tap; [0,
     // walk_grad_from) stay constants). walk_surrogate: later chunks accumulated a gradient on
     // this chunk's own K/V, so its graph adds the surrogate term that carries it in.
+    // walk_acc_k / walk_acc_v: per layer, dL/d(cached K / V) of the window, [n_embd_*_gqa,
+    // window] F32 in host memory (null for a recurrent layer); a chunk's backward adds its prefix's
+    // share into rows [walk_grad_from, n_past) and its surrogate reads its own rows.
     bool     walk_exact     = false;
     uint32_t walk_grad_from = 0;
     bool     walk_surrogate = false;
+    ggml_tensor * const * walk_acc_k = nullptr;
+    ggml_tensor * const * walk_acc_v = nullptr;
     // a later chunk's gradient sits on the recurrent state this chunk leaves
     bool     walk_state_surrogate = false;
     uint32_t n_ctx_seq;       // context for a single sequence

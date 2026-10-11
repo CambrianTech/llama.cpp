@@ -2578,10 +2578,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    // A training graph takes the explicit path, which has a backward (FLASH_ATTN_EXT has none),
-    // even in a context created with flash attention: there the walk's context decodes use
-    // flash attention and the cache stores V un-transposed, so it can be quantized.
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && !cparams.training;
+    // A training graph reads attention through FLASH_ATTN_EXT too, whose backward is tiled over
+    // the KV positions and recomputes each tile's scores (ggml_flash_attn_ext_backward): memory
+    // queries x tile instead of the explicit path's ~4 F32 copies of queries x window x heads,
+    // which were ~75% of a 27B's training graph (continuum, the 5090, 2026-10-11). The backward
+    // covers plain scaled attention; a model with ALiBi, a logit softcap, sinks or MLA trains on
+    // the explicit path, which has a backward for all of them.
+    const bool fa_back_ok = !cparams.training ||
+        (hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap && sinks == nullptr && v_mla == nullptr);
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && fa_back_ok;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2589,12 +2594,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
-        if (k->type == GGML_TYPE_F32) {
+        // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn).
+        // A training graph keeps its chunk's own K/V at F32 (every flash-attention backend takes
+        // F32 K/V): an F16 cast there rounded the trained K/V and moved the step (test-walk-exact,
+        // 2026-10-11: cosine 0.9969 against the one-graph reference at an f16 cache, 1.0000 at F32)
+        if (!cparams.training && k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
 
-        if (v->type == GGML_TYPE_F32) {
+        if (!cparams.training && v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
@@ -2604,6 +2612,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+        if (cparams.training) {
+            ggml_flash_attn_ext_set_back_tile(cur, 0); // the backward's default tile
+        }
 
         if (v_mla) {
 #if 0
@@ -2875,18 +2886,27 @@ ggml_tensor * llm_graph_context::build_attn(
         };
         if (cparams.walk_exact) {
             // THE EXACT WALK's chunk graph. The prefix positions [grad_from, n_past) are the
-            // cached values PLUS a zero GRAD leaf, so the backward yields dL/d(cached K/V) for
-            // them without copying the cache; earlier positions stay constants. The chunk's own
-            // K/V meet the gradient later chunks put on them through the surrogate
-            // <k_cur, gk> + <v_cur, gv>: its gradient on k_cur / v_cur IS gk / gv, which the
-            // backward carries through this chunk into the adapter and into its own prefix.
+            // cached values as this chunk's (F32) K/V, TAPPED: the backward adds dL/d(cached K/V) for them straight
+            // into the window's accumulator (cparams.walk_acc_k / _v, host memory), so nothing
+            // window-sized outlives its layer on the device; earlier positions stay constants.
+            // The chunk's own K/V meet the gradient later chunks put on them through the surrogate
+            // <k_cur, gk> + <v_cur, gv>, gk / gv being the accumulator's rows for this chunk: its
+            // gradient on k_cur / v_cur IS gk / gv, which the backward carries through this chunk
+            // into the adapter and into its own prefix.
             // At a quantized or f16 cache the prefix's gradient is taken at the cache's values and
             // applied to the chunk's own full-precision K/V: straight-through. Measured
             // (test-walk-exact, q8_0 and f16 caches): cosine 0.998 against one graph, the same as
             // at an F32 cache, so training reads the numbers serving runs on (Joel: align the bit
             // depth to inference).
             const int64_t g0 = std::min<int64_t>(cparams.walk_grad_from, n_past);
-            llm_graph_result::walk_layer io = { il, (uint32_t) g0, (uint32_t) n_past };
+            llm_graph_result::walk_layer io = { il, (uint32_t) n_past };
+            ggml_tensor * acc_k = cparams.walk_acc_k[il];
+            ggml_tensor * acc_v = cparams.walk_acc_v[il];
+            // rows [p0, p0 + n) of a layer's accumulator, shaped like that span's K / V
+            auto acc_rows = [&](ggml_tensor * acc, const ggml_tensor * like, int64_t p0) {
+                return ggml_view_3d(ctx0, acc, like->ne[0], like->ne[1], like->ne[2],
+                        like->ne[0]*sizeof(float), acc->nb[1], p0*acc->nb[1]);
+            };
             // [const prefix][gradient prefix][this chunk]: the order the cells hold them in
             std::vector<ggml_tensor *> k_parts, v_parts;
             if (g0 > 0) {
@@ -2894,20 +2914,15 @@ ggml_tensor * llm_graph_context::build_attn(
                 v_parts.push_back(v_span(0, g0));
             }
             if (n_past > g0) {
-                ggml_tensor * kc = ggml_cont(ctx0, ggml_cast(ctx0, k_span(g0, n_past), GGML_TYPE_F32));
-                ggml_tensor * vc = ggml_cont(ctx0, ggml_cast(ctx0, v_span(g0, n_past), GGML_TYPE_F32));
-                io.dk = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, kc->ne[0], kc->ne[1], kc->ne[2], 1);
-                io.dv = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, vc->ne[0], vc->ne[1], vc->ne[2], 1);
-                ggml_format_name(io.dk, "walk_dk-%d", il);
-                ggml_format_name(io.dv, "walk_dv-%d", il);
-                ggml_set_input(io.dk);
-                ggml_set_input(io.dv);
-                ggml_set_grad(io.dk);
-                ggml_set_grad(io.dv);
-                ggml_tensor * kg = ggml_add(ctx0, kc, io.dk);
-                ggml_tensor * vg = ggml_add(ctx0, vc, io.dv);
-                k_parts.push_back(kg->type != k_cur->type ? ggml_cast(ctx0, kg, k_cur->type) : kg);
-                v_parts.push_back(vg->type != v_cur->type ? ggml_cast(ctx0, vg, v_cur->type) : vg);
+                GGML_ASSERT(k_cur->type == GGML_TYPE_F32 && v_cur->type == GGML_TYPE_F32);
+                io.tk = k_span(g0, n_past);
+                io.tv = v_span(g0, n_past);
+                ggml_format_name(io.tk, "walk_tk-%d", il);
+                ggml_format_name(io.tv, "walk_tv-%d", il);
+                io.ak = acc_rows(acc_k, io.tk, g0);
+                io.av = acc_rows(acc_v, io.tv, g0);
+                k_parts.push_back(io.tk);
+                v_parts.push_back(io.tv);
             }
             k_parts.push_back(k_cur);
             v_parts.push_back(v_cur);
@@ -2918,17 +2933,13 @@ ggml_tensor * llm_graph_context::build_attn(
                 v = ggml_concat(ctx0, v, v_parts[i], 2);
             }
             if (cparams.walk_surrogate) {
-                io.gk = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, k_cur->ne[0], k_cur->ne[1], k_cur->ne[2]);
-                io.gv = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, v_cur->ne[0], v_cur->ne[1], v_cur->ne[2]);
-                ggml_format_name(io.gk, "walk_gk-%d", il);
-                ggml_format_name(io.gv, "walk_gv-%d", il);
-                ggml_set_input(io.gk);
-                ggml_set_input(io.gv);
+                ggml_tensor * gk = acc_rows(acc_k, k_cur, n_past);
+                ggml_tensor * gv = acc_rows(acc_v, v_cur, n_past);
                 ggml_tensor * k32 = k_cur->type == GGML_TYPE_F32 ? k_cur : ggml_cast(ctx0, k_cur, GGML_TYPE_F32);
                 ggml_tensor * v32 = v_cur->type == GGML_TYPE_F32 ? v_cur : ggml_cast(ctx0, v_cur, GGML_TYPE_F32);
                 ggml_tensor * term = ggml_add(ctx0,
-                        ggml_sum(ctx0, ggml_mul(ctx0, k32, io.gk)),
-                        ggml_sum(ctx0, ggml_mul(ctx0, v32, io.gv)));
+                        ggml_sum(ctx0, ggml_mul(ctx0, k32, gk)),
+                        ggml_sum(ctx0, ggml_mul(ctx0, v32, gv)));
                 res->t_walk_surrogate = res->t_walk_surrogate ? ggml_add(ctx0, res->t_walk_surrogate, term) : term;
             }
             res->t_walk.push_back(io);
