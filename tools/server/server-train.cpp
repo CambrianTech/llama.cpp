@@ -460,61 +460,6 @@ json server_trainer::start(const json & body_in) {
             return json::object({{"ok", false}, {"error", why}});
         }
     }
-    if (body.contains("examples")) {
-        if (body.contains("text")) {
-            return json::object({{"ok", false}, {"error", "give \"text\" or \"examples\", not both"}});
-        }
-        if (!body.at("examples").is_array() || body.at("examples").empty()) {
-            return json::object({{"ok", false}, {"error", "\"examples\" must be a non-empty array"}});
-        }
-        if (body.contains("parse_special") && !(body.at("parse_special").is_boolean() && body.at("parse_special").get<bool>())) {
-            return json::object({{"ok", false}, {"error", "\"examples\" are rendered through the chat template, so their control tokens are always parsed (drop \"parse_special\")"}});
-        }
-        if (!render_chat) {
-            return json::object({{"ok", false}, {"error", "this server has no chat template to render \"examples\" with; send \"text\""}});
-        }
-        const std::string fit = body.contains("fit") && body.at("fit").is_string() ? body.at("fit").get<std::string>() : std::string();
-        if (body.contains("fit") && fit != "middle" && fit != "left") {
-            return json::object({{"ok", false}, {"error",
-                "\"fit\" must be \"middle\" (keep the system and tool head and her reply, drop the oldest history), "
-                "\"left\" (keep the tail that ends her reply), or absent (refuse a long example)"}});
-        }
-        std::string why;
-        if (!prepare_examples(body.at("examples"), render_chat, llama_model_get_vocab(model),
-                              (int64_t) body.value("window", 256.0), fit, prepared, why)) {
-            return json::object({{"ok", false}, {"error", why}});
-        }
-        // The GRAPH is sized to the data, the ceiling to serving (Codex on continuum #4498): the
-        // caller's window is the served context an example may use whole, but the training
-        // context holds activations for every position of its window, so a 61,696-token window
-        // around 15k-token examples reserves four times the memory any step touches. The
-        // window used is the longest fitted example rounded up to the context granularity,
-        // never above what was asked; status reports both.
-        {
-            size_t longest = 0;
-            for (const auto & t : prepared.tokens) {
-                longest = std::max(longest, t.size());
-            }
-            const int64_t asked = (int64_t) body.value("window", 256.0);
-            const int64_t need  = std::max<int64_t>(256, (((int64_t) longest - 1) + 255) / 256 * 256);
-            body["window_asked"] = asked;
-            if (need < asked) {
-                body["window"] = need;
-            }
-        }
-        body["n_examples"] = prepared.tokens.size();
-        body["n_truncated"] = prepared.truncated;
-        body["n_skipped"] = prepared.skipped;
-        // WHICH examples, by their index in the request: the caller clears only what the run
-        // reports it trained, and keeps a skipped one for a larger window
-        body["kept_indices"] = prepared.kept;
-        body["truncated_indices"] = prepared.truncated_at;
-        body["skipped_indices"] = prepared.skipped_at;
-        body.erase("examples");
-    }
-    if (prepared.tokens.empty() && (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty())) {
-        return json::object({{"ok", false}, {"error", "\"text\" or \"examples\" (the training corpus) is required"}});
-    }
     if (!body.contains("out") || !body.at("out").is_string() || body.at("out").get<std::string>().empty()) {
         return json::object({{"ok", false}, {"error", "\"out\" (the adapter file name to write) is required"}});
     }
@@ -546,14 +491,91 @@ json server_trainer::start(const json & body_in) {
     if (body.contains("parse_special") && !body.at("parse_special").is_boolean()) {
         return json::object({{"ok", false}, {"error", "\"parse_special\" must be true or false"}});
     }
-    std::unique_lock<std::mutex> lock(mu);
-    bool expected = false;
-    if (!running.compare_exchange_strong(expected, true)) {
-        return json::object({{"ok", false}, {"error", "a training run is already in progress"}});
+    // ACK BEFORE PREPARE (continuum card 93ffc555): the run is claimed, and visible by its "out",
+    // BEFORE its examples are rendered and tokenized. That prepare took ~13 s per lived turn beside
+    // serving (the 5090, 2026-10-11), so a caller whose POST timed out while it ran saw the PREVIOUS
+    // run's state, failed a job the engine then trained, and nothing adopted the gene. Now GET
+    // /train answers "preparing" with this out within milliseconds of the POST arriving, so a
+    // caller reconciles by the run's identity instead of guessing from a clock. A refusal after the
+    // claim releases it and leaves the run's own error, under its out, in the state.
+    {
+        std::lock_guard<std::mutex> claim_lock(mu);
+        bool expected = false;
+        if (!running.compare_exchange_strong(expected, true)) {
+            return json::object({{"ok", false}, {"error", "a training run is already in progress"}});
+        }
     }
     if (worker.joinable()) {
         worker.join();
     }
+    {
+        std::lock_guard<std::mutex> claim_lock(mu);
+        state = json::object({{"state", "preparing"}, {"out", body.at("out")}, {"epochs", json::array()}});
+    }
+    auto refuse = [&](const std::string & why) {
+        {
+            std::lock_guard<std::mutex> claim_lock(mu);
+            state = json::object({{"state", "error"}, {"out", body.at("out")}, {"error", why}, {"epochs", json::array()}});
+        }
+        running.store(false);
+        return json::object({{"ok", false}, {"error", why}});
+    };
+    if (body.contains("examples")) {
+        if (body.contains("text")) {
+            return refuse("give \"text\" or \"examples\", not both");
+        }
+        if (!body.at("examples").is_array() || body.at("examples").empty()) {
+            return refuse("\"examples\" must be a non-empty array");
+        }
+        if (body.contains("parse_special") && !(body.at("parse_special").is_boolean() && body.at("parse_special").get<bool>())) {
+            return refuse("\"examples\" are rendered through the chat template, so their control tokens are always parsed (drop \"parse_special\")");
+        }
+        if (!render_chat) {
+            return refuse("this server has no chat template to render \"examples\" with; send \"text\"");
+        }
+        const std::string fit = body.contains("fit") && body.at("fit").is_string() ? body.at("fit").get<std::string>() : std::string();
+        if (body.contains("fit") && fit != "middle" && fit != "left") {
+            return refuse("\"fit\" must be \"middle\" (keep the system and tool head and her reply, drop the oldest history), "
+                "\"left\" (keep the tail that ends her reply), or absent (refuse a long example)");
+        }
+        std::string why;
+        if (!prepare_examples(body.at("examples"), render_chat, llama_model_get_vocab(model),
+                              (int64_t) body.value("window", 256.0), fit, prepared, why)) {
+            return refuse(why);
+        }
+        // The GRAPH is sized to the data, the ceiling to serving (Codex on continuum #4498): the
+        // caller's window is the served context an example may use whole, but the training
+        // context holds activations for every position of its window, so a 61,696-token window
+        // around 15k-token examples reserves four times the memory any step touches. The
+        // window used is the longest fitted example rounded up to the context granularity,
+        // never above what was asked; status reports both.
+        {
+            size_t longest = 0;
+            for (const auto & t : prepared.tokens) {
+                longest = std::max(longest, t.size());
+            }
+            const int64_t asked = (int64_t) body.value("window", 256.0);
+            const int64_t need  = std::max<int64_t>(256, (((int64_t) longest - 1) + 255) / 256 * 256);
+            body["window_asked"] = asked;
+            if (need < asked) {
+                body["window"] = need;
+            }
+        }
+        body["n_examples"] = prepared.tokens.size();
+        body["n_truncated"] = prepared.truncated;
+        body["n_skipped"] = prepared.skipped;
+        // WHICH examples, by their index in the request: the caller clears only what the run
+        // reports it trained, and keeps a skipped one for a larger window
+        body["kept_indices"] = prepared.kept;
+        body["truncated_indices"] = prepared.truncated_at;
+        body["skipped_indices"] = prepared.skipped_at;
+        body.erase("examples");
+    }
+    if (prepared.tokens.empty() && (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty())) {
+        return refuse("\"text\" or \"examples\" (the training corpus) is required");
+    }
+    // claimed above, before the prepare: preparing becomes starting
+    std::unique_lock<std::mutex> lock(mu);
     state = json::object({{"state", "starting"}, {"out", body.at("out")}, {"epochs", json::array()}});
     state["window"] = body.value("window", (int64_t) 256);
     if (body.contains("window_asked")) {
