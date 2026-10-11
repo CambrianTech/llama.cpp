@@ -20,6 +20,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cinttypes>
@@ -28,6 +29,22 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+
+// Continuum fork: an adapter file's revision (size, mtime in ns since the epoch; (0, 0) when it
+// cannot be read), stored in a saved slot's `.lora` sidecar so a restore refuses a page computed
+// under different weights at the same path.
+static std::pair<uint64_t, int64_t> lora_file_revision(const std::string & path) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return {0, 0};
+    }
+    const auto mtime = std::filesystem::last_write_time(path, ec);
+    if (ec) {
+        return {0, 0};
+    }
+    return {(uint64_t) size, (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(mtime.time_since_epoch()).count()};
+}
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -2558,14 +2575,16 @@ private:
                         std::ofstream out(lora_path, std::ios::binary | std::ios::trunc);
                         auto put = [&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); };
                         const uint32_t magic   = 0x4C4F5241u; // 'LORA'
-                        const uint32_t version = 1;
+                        const uint32_t version = 2;
                         const uint32_t n_lora  = (uint32_t) slot->lora.size();
                         put(&magic, sizeof(magic)); put(&version, sizeof(version)); put(&n_lora, sizeof(n_lora));
                         for (const auto & l : slot->lora) {
                             const uint32_t n_path = (uint32_t) l.path.size();
+                            const auto     rev    = lora_file_revision(l.path);
                             put(&n_path, sizeof(n_path));
                             put(l.path.data(), n_path);
                             put(&l.scale, sizeof(l.scale));
+                            put(&rev.first, sizeof(rev.first)); put(&rev.second, sizeof(rev.second));
                         }
                         if (!out) {
                             SLT_WRN(*slot, "adapter sidecar could not be written: %s (this page will not restore)\n", lora_path.c_str());
@@ -2619,7 +2638,7 @@ private:
                             auto get = [&](void * ptr, size_t n) { in.read(reinterpret_cast<char *>(ptr), n); ok = ok && (bool) in; };
                             uint32_t magic = 0, version = 0, n_lora = 0;
                             get(&magic, sizeof(magic)); get(&version, sizeof(version)); get(&n_lora, sizeof(n_lora));
-                            ok = ok && magic == 0x4C4F5241u && version == 1 && n_lora == page_lora.size();
+                            ok = ok && magic == 0x4C4F5241u && version == 2 && n_lora == page_lora.size();
                             for (uint32_t i = 0; ok && i < n_lora; ++i) {
                                 uint32_t n_path = 0;
                                 get(&n_path, sizeof(n_path));
@@ -2629,7 +2648,13 @@ private:
                                 get(path.data(), n_path);
                                 float scale = 0.0f;
                                 get(&scale, sizeof(scale));
-                                ok = ok && path == page_lora[i].path && std::isfinite(scale);
+                                uint64_t size = 0; int64_t mtime = 0;
+                                get(&size, sizeof(size)); get(&mtime, sizeof(mtime));
+                                // the same file AS LOADED: a gene adopted in place (same path, new weights)
+                                // is another adapter, and KV computed under the old weights is not its own;
+                                // an unreadable file proves nothing, so it refuses (BigMama on #54)
+                                const auto rev = lora_file_revision(page_lora[i].path);
+                                ok = ok && path == page_lora[i].path && std::isfinite(scale) && rev.first != 0 && size == rev.first && mtime == rev.second;
                                 if (ok) page_lora[i].scale = scale;
                             }
                             if (!ok) {
