@@ -432,8 +432,10 @@ json server_trainer::start(const json & body_in) {
         else if (epochs < 1 || epochs > 100 || epochs != (int64_t) epochs)   why = "epochs must be an integer in [1, 100]";
         else if (!(lr > 0 && lr <= 1))                               why = "lr must be in (0, 1]";
         else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
-        else if (body.contains("chunk") && !(num("chunk", 0) >= 256 && num("chunk", 0) == (int64_t) num("chunk", 0) && (int64_t) num("chunk", 0) % 256 == 0))
-                                                                     why = "chunk must be a multiple of 256, at least 256: the most tokens one training step holds in one graph";
+        else if (body.contains("chunk") && !(num("chunk", 0) == (int64_t) num("chunk", 0) &&
+                                              ((int64_t) num("chunk", 0) == 64 || (int64_t) num("chunk", 0) == 128 ||
+                                               ((int64_t) num("chunk", 0) >= 256 && (int64_t) num("chunk", 0) % 256 == 0))))
+                                                                     why = "chunk must be 64, 128, or a multiple of 256: the most tokens one training step holds in one graph, and a divisor of the window";
         else if (body.contains("exact") && !body.at("exact").is_boolean())
                                                                      why = "exact must be true or false: the exact walk (one step per window on its whole loss) or the per-chunk walk";
         else if (body.contains("walk_host_budget_mib") && !(num("walk_host_budget_mib", 0) >= 1 && num("walk_host_budget_mib", 0) == (int64_t) num("walk_host_budget_mib", 0)))
@@ -813,9 +815,19 @@ json server_trainer::status() const {
 }
 
 // The training chunk: the largest multiple of 256 that divides the window and is at most the
-// asked chunk (at least 256; the window is a multiple of 256, so 256 always divides it). The
-// context must be a whole number of batches (llama_context::opt_init).
+// asked chunk; under 256, 128 or 64 (the window is a multiple of 256, so each divides it). The
+// context must be a whole number of batches (llama_context::opt_init). Why under 256
+// (continuum, the 5090, 2026-10-11): with no flash-attention backward the explicit scores are
+// window x chunk x heads per attention layer, and at chunk 256 they were ~75% of a 27B's
+// training graph; a smaller chunk trades step time for a window that holds her whole turns.
+// A gated delta-net layer pads to its own 64-token chunk, so 64 is its floor too.
 static uint32_t train_chunk_for(uint32_t window, uint32_t asked) {
+    if (asked < 128) {
+        return 64;
+    }
+    if (asked < 256) {
+        return 128;
+    }
     const uint32_t blocks = window / 256;
     for (uint32_t g = std::min(blocks, std::max(asked / 256, 1u)); g >= 1; --g) {
         if (blocks % g == 0) {
@@ -983,7 +995,14 @@ void server_trainer::run(json req, examples_data ex) {
         /*walk_exact      =*/ req.value("exact", false),
         /*walk_horizon    =*/ (uint32_t) req.value("walk_horizon", (int64_t) 0),
     };
-    llama_opt_set_memory_budget(ctx, budget);
+    // THE BUDGET COVERS THE WHOLE RUN (continuum, the 5090, 2026-10-11): the training context's own
+    // memory (its Q8_0 K/V for the whole window, and any recurrent state) is allocated when it is
+    // created, before the graph's budget applies, so it was outside the caller's
+    // governed lease: ~0.6 GB at a 16,896-token window, growing with the window, beside serving
+    // on the same device. The graph gets what the lease leaves after them (at least one byte:
+    // 0 means "no budget"), and the preflight refuses a graph over it as before.
+    const size_t context_bytes = llama_opt_context_device_bytes(ctx);
+    llama_opt_set_memory_budget(ctx, budget == 0 ? 0 : std::max<size_t>(1, budget > context_bytes ? budget - context_bytes : 1));
     // the exact walk's host memory per window: refused by name over the caller's cap
     llama_opt_set_walk_host_budget(ctx, (size_t) req.value("walk_host_budget_mib", (int64_t) 0) << 20);
     llama_opt_init(ctx, model, lopt);
@@ -1099,6 +1118,9 @@ void server_trainer::run(json req, examples_data ex) {
     // what the training graph needed on the GPU, measured by its own preflight (also on a refusal:
     // it is the number to size the next attempt, or a caller's admission, by)
     state["graph_mib"] = graph_mib;
+    // what the training context's memory held on the GPU (K/V for the window, recurrent state):
+    // with the graph (which covers the compute buffers), what the run added beside serving
+    state["context_mib"] = context_bytes / 1048576.0;
     // what the exact walk kept on the host per window (its K/V gradient and state snapshots)
     state["walk_host_mib"] = walk_host_mib;
     // the exact walk's gradient horizon as trained (0 = the whole window), smaller where the device
