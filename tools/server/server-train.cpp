@@ -432,8 +432,10 @@ json server_trainer::start(const json & body_in) {
         else if (epochs < 1 || epochs > 100 || epochs != (int64_t) epochs)   why = "epochs must be an integer in [1, 100]";
         else if (!(lr > 0 && lr <= 1))                               why = "lr must be in (0, 1]";
         else if (!(val >= 0 && val < 1))                             why = "val_split must be in [0, 1)";
-        else if (body.contains("chunk") && !(num("chunk", 0) >= 256 && num("chunk", 0) == (int64_t) num("chunk", 0) && (int64_t) num("chunk", 0) % 256 == 0))
-                                                                     why = "chunk must be a multiple of 256, at least 256: the most tokens one training step holds in one graph";
+        else if (body.contains("chunk") && !(num("chunk", 0) == (int64_t) num("chunk", 0) &&
+                                              ((int64_t) num("chunk", 0) == 64 || (int64_t) num("chunk", 0) == 128 ||
+                                               ((int64_t) num("chunk", 0) >= 256 && (int64_t) num("chunk", 0) % 256 == 0))))
+                                                                     why = "chunk must be 64, 128, or a multiple of 256: the most tokens one training step holds in one graph, and a divisor of the window";
         else if (body.contains("exact") && !body.at("exact").is_boolean())
                                                                      why = "exact must be true or false: the exact walk (one step per window on its whole loss) or the per-chunk walk";
         else if (body.contains("walk_host_budget_mib") && !(num("walk_host_budget_mib", 0) >= 1 && num("walk_host_budget_mib", 0) == (int64_t) num("walk_host_budget_mib", 0)))
@@ -813,9 +815,19 @@ json server_trainer::status() const {
 }
 
 // The training chunk: the largest multiple of 256 that divides the window and is at most the
-// asked chunk (at least 256; the window is a multiple of 256, so 256 always divides it). The
-// context must be a whole number of batches (llama_context::opt_init).
+// asked chunk; under 256, 128 or 64 (the window is a multiple of 256, so each divides it). The
+// context must be a whole number of batches (llama_context::opt_init). Why under 256
+// (continuum, the 5090, 2026-10-11): with no flash-attention backward the explicit scores are
+// window x chunk x heads per attention layer, and at chunk 256 they were ~75% of a 27B's
+// training graph; a smaller chunk trades step time for a window that holds her whole turns.
+// A gated delta-net layer pads to its own 64-token chunk, so 64 is its floor too.
 static uint32_t train_chunk_for(uint32_t window, uint32_t asked) {
+    if (asked < 128) {
+        return 64;
+    }
+    if (asked < 256) {
+        return 128;
+    }
     const uint32_t blocks = window / 256;
     for (uint32_t g = std::min(blocks, std::max(asked / 256, 1u)); g >= 1; --g) {
         if (blocks % g == 0) {
