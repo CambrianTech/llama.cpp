@@ -1062,6 +1062,8 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
+    mutable ggml_tensor * inp_train_rows = nullptr; // build_inp_train_rows, once per graph
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
@@ -1179,6 +1181,14 @@ struct llm_graph_context {
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
+
+    // A training chunk's cache rows: I32 [n_tokens], its positions (in the walk a position
+    // is its cell). One per graph, shared by every attention layer.
+    ggml_tensor * build_inp_train_rows() const;
+
+    // Whether this layer's attention runs through FLASH_ATTN_EXT: the one decision
+    // build_attn_mha makes and a training graph reads to attend to the cache in place.
+    bool uses_flash_attn(ggml_tensor * kq_b, ggml_tensor * sinks, ggml_tensor * v_mla) const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;

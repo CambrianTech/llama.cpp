@@ -7210,6 +7210,16 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_transpose(ctx, grad));
             }
         } break;
+        case GGML_OP_SET_ROWS: {
+            // result = the destination (src2) with its rows src1 replaced by src0. The gradient
+            // on src0 is the result's gradient at those rows. The destination's gradient (the
+            // result's everywhere else) is not built: a written buffer (a cache) is a constant.
+            GGML_ASSERT(!src2_needs_grads && "set_rows: the destination it writes carries no gradient");
+            if (src0_needs_grads) {
+                GGML_ASSERT(src1->type == GGML_TYPE_I32 && "set_rows backward gathers with I32 row indices");
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_get_rows(ctx, grad, src1), src0));
+            }
+        } break;
         case GGML_OP_GET_ROWS: {
             if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_get_rows_back(ctx, grad, src1, src0));
@@ -7675,7 +7685,13 @@ void ggml_build_backward_expand(
             if (!node->src[j] || ignore_src[j] || !grads_needed[ggml_hash_find(&cgraph->visited_hash_set, node->src[j])]) {
                 continue;
             }
-            GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16);
+            // A gradient is F32 whatever its tensor's type. A quantized source is admitted where
+            // the backward only re-shapes the gradient or casts its tile to F32 (a training graph
+            // that attends to a q8_0 cache in place, as serving does); every other op needs float.
+            const bool shapes_only = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_FLASH_ATTN_EXT;
+            GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16 ||
+                (shapes_only && ggml_is_quantized(node->src[j]->type)));
             node_needs_grad = true;
             break;
         }
@@ -7685,7 +7701,8 @@ void ggml_build_backward_expand(
 
         // inplace operations are currently not supported
         GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
-            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
+            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_SET_ROWS);
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
         GGML_ASSERT(ihash != GGML_HASHSET_FULL);

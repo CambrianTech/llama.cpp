@@ -196,10 +196,6 @@ static agreement compare(const char * what, const std::vector<float> & a, const 
 // Measured on the 1.5B Q4_K_M (5090): the exact walk agrees with one graph at cosine 0.998 and
 // norm 0.995 (what is left is the quantized matmuls' batch-size variance: a 128-row chunk and a
 // 512-row graph take different kernels); the plain walk sits at cosine 0.81, norm 2.1.
-// the served cache types' bar (see 1b). Measured on the 5090: f16 0.9986 (1.5B) / 0.9981 (hybrid),
-// q8_0 0.9978 / 0.9979, against F32's 0.998: the straight-through approximation costs nothing
-// measurable, so the bar sits just under F32's own agreement.
-static const double STRAIGHT_THROUGH_COSINE = 0.99;
 
 static bool same_step(const agreement & r) {
     return r.cosine > 0.995 && std::fabs(r.norm_ratio - 1.0) < 0.02;
@@ -305,21 +301,25 @@ int main(int argc, char ** argv) {
         }
     }
     {
-        // 1b. the served cache types: the walk reads the prefix at the cache's precision and its
-        // gradient is taken there, then applied to the chunk's own full-precision K/V (straight-
-        // through). Measured against the same one-graph reference, which never reads the cache.
+        // 1b. the served cache types. Training attends to the cache in place, as serving does:
+        // every K/V it reads, the chunk's own included, is at the cache's precision, and the
+        // gradient passes straight through the cast. Two claims, measured apart: the walk is
+        // EXACT at that precision (against one graph reading the same cache), and what the
+        // precision itself costs against the F32 gradient (printed, the served model's own).
         std::vector<uint8_t> all(WINDOW + 1, 1);
         all[0] = 0;
-        const auto ref = step_delta(params, model, init, tokens, all, WINDOW, false);
+        const auto truth = step_delta(params, model, init, tokens, all, WINDOW, false);
         for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
             g_cache_type = t;
+            const auto one   = step_delta(params, model, init, tokens, all, WINDOW, false);
             const auto exact = step_delta(params, model, init, tokens, all, WINDOW / 4, true);
             g_cache_type = GGML_TYPE_F32;
-            const agreement r = compare((std::string("all labelled, ") + ggml_type_name(t) + " cache: exact walk in 4 chunks vs one graph").c_str(), exact, ref);
-            if (!(r.cosine > STRAIGHT_THROUGH_COSINE)) {
-                fprintf(stderr, "FAILED: at a %s cache the exact walk's step strays from the window's gradient (cosine %.4f)\n", ggml_type_name(t), r.cosine);
+            const std::string name = std::string("all labelled, ") + ggml_type_name(t) + " cache: ";
+            if (!same_step(compare((name + "exact walk in 4 chunks vs one graph at the same cache").c_str(), exact, one))) {
+                fprintf(stderr, "FAILED: at a %s cache the exact walk is not the window's gradient\n", ggml_type_name(t));
                 ++failures;
             }
+            compare((name + "one graph vs the F32 gradient (the cache's own precision)").c_str(), one, truth);
         }
     }
     {

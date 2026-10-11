@@ -2411,6 +2411,24 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     return cur;
 }
 
+bool llm_graph_context::uses_flash_attn(ggml_tensor * kq_b, ggml_tensor * sinks, ggml_tensor * v_mla) const {
+    const bool fa_back_ok = !cparams.training ||
+        (hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap && sinks == nullptr && v_mla == nullptr);
+    return cparams.flash_attn && kq_b == nullptr && fa_back_ok;
+}
+
+ggml_tensor * llm_graph_context::build_inp_train_rows() const {
+    if (inp_train_rows == nullptr) {
+        auto inp = std::make_unique<llm_graph_input_pos>(1);
+        inp->pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->pos);
+        ggml_set_name(inp->pos, "train_rows");
+        inp_train_rows = inp->pos;
+        res->add_input(std::move(inp));
+    }
+    return inp_train_rows;
+}
+
 ggml_tensor * llm_graph_context::build_inp_pos() const {
     auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
 
@@ -2584,9 +2602,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     // which were ~75% of a 27B's training graph (continuum, the 5090, 2026-10-11). The backward
     // covers plain scaled attention; a model with ALiBi, a logit softcap, sinks or MLA trains on
     // the explicit path, which has a backward for all of them.
-    const bool fa_back_ok = !cparams.training ||
-        (hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap && sinks == nullptr && v_mla == nullptr);
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && fa_back_ok;
+    const bool use_flash_attn = uses_flash_attn(kq_b, sinks, v_mla);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2852,7 +2868,50 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k;
     ggml_tensor * v;
-    if (cparams.training) {
+    if (cparams.training && uses_flash_attn(kq_b, sinks, v_mla)) {
+        // THE TRAINING GRAPH IS THE SERVING GRAPH. This chunk writes its K/V into the cache
+        // exactly as serving does (SET_ROWS, the cache's own type) and attention reads the
+        // cache in place: no copy of the context, at any window. The walk decoded the window
+        // into the cache under the same adapter, so the write is idempotent; the backward
+        // gathers this chunk's gradient from the rows it wrote (SET_ROWS backward). In the
+        // exact walk the write is TAPPED (cparams.walk_acc_k / _v): the backward adds
+        // dL/d(cached K/V) of the whole window into the host accumulator, and reads its own
+        // rows back from it, so what later chunks put on them reaches the adapter through
+        // this chunk with no surrogate term. A quantized or f16 cache trains on the values
+        // serving reads; its gradient passes straight through the cast.
+        const int64_t n_tokens = k_cur->ne[2];
+        const int64_t n_past   = ubatch.pos[0];
+        const int64_t n_win    = n_past + n_tokens;
+        ggml_tensor * rows = build_inp_train_rows();
+        llm_graph_result::walk_layer io = { il, (uint32_t) n_past };
+        // the window's cells [0, n_win) of one layer's cache with this chunk's rows written
+        auto write = [&](ggml_tensor * all, ggml_tensor * cur, ggml_tensor * acc, ggml_tensor *& tap, ggml_tensor *& tap_acc) {
+            const int64_t n_embd = cur->ne[0]*cur->ne[1];
+            GGML_ASSERT(all->ne[3] == 1 && "a training context reads one stream");
+            GGML_ASSERT(ggml_row_size(cur->type, cur->ne[0]) == cur->nb[1]);
+            ggml_tensor * win = ggml_view_2d(ctx0, all, n_embd, n_win, all->nb[2], 0);
+            ggml_tensor * w   = ggml_set_rows(ctx0, win, ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[2], 0), rows);
+            if (acc != nullptr) {
+                tap     = w;
+                tap_acc = ggml_view_2d(ctx0, acc, n_embd, n_win, acc->nb[1], 0);
+            }
+            return ggml_reshape_3d(ctx0, w, cur->ne[0], cur->ne[1], n_win);
+        };
+        ggml_tensor * v_all = mctx_cur->get_v(ctx0, il);
+        GGML_ASSERT(v_all->nb[1] <= v_all->nb[2] && "a flash-attention cache holds V untransposed");
+        const bool tapped = cparams.walk_exact;
+        k = write(mctx_cur->get_k(ctx0, il), k_cur, tapped ? cparams.walk_acc_k[il] : nullptr, io.tk, io.ak);
+        v = write(v_all,                     v_cur, tapped ? cparams.walk_acc_v[il] : nullptr, io.tv, io.av);
+        if (tapped) {
+            res->t_walk.push_back(io);
+        }
+        if (kq_mask->ne[0] > n_win) {
+            kq_mask = ggml_cont(ctx0, ggml_view_4d(ctx0, kq_mask, n_win, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+                    kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0));
+        }
+    } else if (cparams.training) {
+        // EXPLICIT ATTENTION (a layer FLASH_ATTN_EXT's backward does not cover yet: ALiBi, a
+        // logit softcap, sinks, a KQ bias, MLA) reads a copy of the context instead.
         // A backward pass cannot go through the cache: the write is an in-place SET_ROWS
         // and the read is a view of a leaf. So this ubatch's K/V are attended to directly,
         // and carry the gradient. The context before it (positions [0, n_past), decoded into
