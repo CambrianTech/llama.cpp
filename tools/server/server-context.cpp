@@ -3490,8 +3490,18 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
+                            // Continuum fork: ONE info line per resume decision (see below), so why a prompt
+                            // re-prefilled is readable from a default log (continuum card c6640f7b: every
+                            // restore of a hybrid model's page re-prefilled from ~0 while checkpoints before
+                            // the divergence existed, and every line saying why was trace-level).
+                            const int    resume_lcp     = n_past;
+                            const size_t resume_n_ckpt  = slot.prompt.checkpoints.size();
+                            llama_pos    resume_pos_min = -1;
+                            const char * resume_outcome = "prefix kept, no checkpoint needed";
+                            int64_t      resume_ckpt_n  = -1;
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                resume_pos_min = pos_min;
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
@@ -3568,6 +3578,8 @@ private:
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        resume_outcome = "restored a checkpoint";
+                                        resume_ckpt_n  = it->n_tokens;
                                     }
 
                                     if (do_reset) {
@@ -3575,8 +3587,18 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                        resume_outcome = "full re-prefill: no checkpoint passed the search";
                                     }
                                 }
+                            } else if (n_past == 0 && slot.prompt.n_tokens() > 0) {
+                                resume_outcome = "full re-prefill: no common prefix";
+                            }
+
+                            if (resume_n_ckpt > 0 || resume_lcp > 0) {
+                                SLT_INF(slot, "resume: %s (lcp = %d, pos_min = %d, pos_min_thold = %d, n_swa = %d, "
+                                        "checkpoints = %zu, chosen n_tokens = %" PRId64 ", n_past now = %d of %d)\n",
+                                        resume_outcome, resume_lcp, resume_pos_min, pos_min_thold, n_swa,
+                                        resume_n_ckpt, resume_ckpt_n, n_past, slot.task->n_tokens());
                             }
 
                             {
