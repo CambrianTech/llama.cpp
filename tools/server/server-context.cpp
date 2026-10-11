@@ -20,6 +20,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -1646,20 +1647,22 @@ private:
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // process per-request lora adapters
-        if (!task.params.lora.empty()) {
-            auto task_loras = construct_lora_list(task.params.lora);
+        // Continuum fork: a task with no per-request adapters runs the server's own, and goes through
+        // the SAME change check: upstream assigned them without it, so a slot whose KV was computed
+        // under a persona's adapters was reused by an adapter-free turn as if they had never applied.
+        {
+            auto task_loras = task.params.lora.empty() ? params_base.lora_adapters
+                                                       : construct_lora_list(task.params.lora);
             if (!are_lora_equal(task_loras, slot.lora)) {
                 // if lora has changed, check to see if the cache should be cleared
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
-                    SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
+                    SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task_loras.size());
                     slot.prompt.clear();
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
                 slot.lora = task_loras;
             }
-        } else {
-            slot.lora = params_base.lora_adapters;
         }
 
         // if using alora, make sure it's only a single one requested and active
@@ -2543,6 +2546,32 @@ private:
                         }
                     }
 
+                    // Continuum fork: the ADAPTER VECTOR is part of the register file too. The state was
+                    // computed under slot->lora; a restore that does not bring it back leaves the slot
+                    // labelled with whatever ran there last, so the next turn under the page's own
+                    // adapters reads as a lora change and launch_slot_with_task clears the restored KV
+                    // (the 5090, 2026-10-10: every gene turn re-prefilled after a restore). Written as
+                    // (path, scale) per loaded adapter, in load order; read back only when the server
+                    // has the same adapters loaded.
+                    {
+                        const std::string lora_path = filepath + ".lora";
+                        std::ofstream out(lora_path, std::ios::binary | std::ios::trunc);
+                        auto put = [&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); };
+                        const uint32_t magic   = 0x4C4F5241u; // 'LORA'
+                        const uint32_t version = 1;
+                        const uint32_t n_lora  = (uint32_t) slot->lora.size();
+                        put(&magic, sizeof(magic)); put(&version, sizeof(version)); put(&n_lora, sizeof(n_lora));
+                        for (const auto & l : slot->lora) {
+                            const uint32_t n_path = (uint32_t) l.path.size();
+                            put(&n_path, sizeof(n_path));
+                            put(l.path.data(), n_path);
+                            put(&l.scale, sizeof(l.scale));
+                        }
+                        if (!out) {
+                            SLT_WRN(*slot, "adapter sidecar could not be written: %s (this page will not restore)\n", lora_path.c_str());
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2578,6 +2607,36 @@ private:
 
                     size_t nread = 0;
                     try {
+                        // Continuum fork: the adapters the state was computed under (see SLOT_SAVE), read
+                        // FIRST so a page whose identity is unknown or foreign never touches the KV. A
+                        // page without them cannot be reused safely (its KV may belong to other adapters),
+                        // so it is refused: the caller's cold prefill is correct; a mislabelled reuse is not.
+                        std::vector<common_adapter_lora_info> page_lora = params_base.lora_adapters; // copy: ptr, task_name, prompt_prefix
+                        {
+                            const std::string lora_path = filepath + ".lora";
+                            std::ifstream in(lora_path, std::ios::binary);
+                            bool ok = (bool) in;
+                            auto get = [&](void * ptr, size_t n) { in.read(reinterpret_cast<char *>(ptr), n); ok = ok && (bool) in; };
+                            uint32_t magic = 0, version = 0, n_lora = 0;
+                            get(&magic, sizeof(magic)); get(&version, sizeof(version)); get(&n_lora, sizeof(n_lora));
+                            ok = ok && magic == 0x4C4F5241u && version == 1 && n_lora == page_lora.size();
+                            for (uint32_t i = 0; ok && i < n_lora; ++i) {
+                                uint32_t n_path = 0;
+                                get(&n_path, sizeof(n_path));
+                                ok = ok && n_path <= 4096;
+                                if (!ok) break;
+                                std::string path(n_path, '\0');
+                                get(path.data(), n_path);
+                                float scale = 0.0f;
+                                get(&scale, sizeof(scale));
+                                ok = ok && path == page_lora[i].path && std::isfinite(scale);
+                                if (ok) page_lora[i].scale = scale;
+                            }
+                            if (!ok) {
+                                throw std::runtime_error("the page's adapter identity is missing or does not match the loaded adapters: " + lora_path);
+                            }
+                        }
+
                         size_t n_packed = 0;
                         llama_tokens packed;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
@@ -2602,6 +2661,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->lora = std::move(page_lora);
                         // Continuum fork: bring the context checkpoints back with the state (see
                         // SLOT_SAVE). Any defect in the sidecar leaves the slot exactly as a
                         // pre-fork restore left it — valid tokens + state, no checkpoints.
