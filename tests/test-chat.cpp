@@ -7197,6 +7197,24 @@ static void test_train_fit_left() {
           "the head plus her last exchange is never dropped");
     check(train_fit_droppable({"user", "assistant", "user", "assistant"}, {true, false, true, true}) == 0,
           "with no system head, the oldest message drops");
+
+    // what this catches: /train and /train/measure each dropping history by their own copy of the
+    // rule (continuum 2026-10-11: an estimate kept 62 of 311 where the engine kept 54). One step
+    // drops a WHOLE exchange (the user prompt through her reply, its tool calls and results), and
+    // repeating it leaves exactly the system head plus her last exchange, the smallest window.
+    json convo = json::array({
+        json::object({{"role", "system"}, {"content", "s"}}),
+        json::object({{"role", "user"}, {"content", "u1"}}),
+        json::object({{"role", "assistant"}, {"content", "a1"}}),
+        json::object({{"role", "tool"}, {"content", "t1"}}),
+        json::object({{"role", "user"}, {"content", "u2"}}),
+        json::object({{"role", "assistant"}, {"content", "a2"}}),
+    });
+    std::vector<bool> tr = {true, true, false, true, true, true};
+    check(train_fit_drop_oldest(convo, tr), "the oldest exchange drops");
+    check(convo.size() == 3 && convo[1].at("content") == "u2" && tr.size() == 3,
+          "u1, her reply a1 and its tool result t1 leave together");
+    check(!train_fit_drop_oldest(convo, tr) && convo.size() == 3, "the head plus her last exchange stays");
 }
 
 // Optional CPU integration check: test-chat --train-control MODEL.gguf EMPTY_OUTPUT_DIR

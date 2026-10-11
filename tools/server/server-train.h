@@ -96,11 +96,20 @@ public:
         // tail that ends the last trained turn kept), and examples that could not fit (skipped)
         int64_t truncated = 0;
         int64_t skipped   = 0;
+        // the request index of each trained example (one per `tokens` entry), and of the ones
+        // cut and the ones skipped: the caller clears only what trained
+        std::vector<int64_t> kept;
+        std::vector<int64_t> truncated_at;
+        std::vector<int64_t> skipped_at;
     };
     ~server_trainer();
 
     // Starts a run on a worker thread; refuses (ok=false) while one is running or on bad input.
     common_json start(const common_json & body_in);
+    // Measures "examples" against "window" by the same fit rule a run trains by, training
+    // nothing: per example its full and smallest trainable length and whether it would be kept,
+    // truncated or skipped. Lets a caller send only what a window can train.
+    common_json measure(const common_json & body) const;
     common_json status() const;
     // Stops the running job at its next training window (no adapter is written); ok=false when
     // nothing is running.
@@ -203,3 +212,7 @@ bool train_fit_left(std::vector<llama_token> & toks, std::vector<uint8_t> & loss
 // message to drop (after the leading system messages, before the user message her last trained
 // turn answers), or npos when nothing droppable is left.
 size_t train_fit_droppable(const std::vector<std::string> & roles, const std::vector<bool> & trained);
+
+// "fit": "middle", one step: drop the oldest whole exchange (from train_fit_droppable up to the
+// next user message) from `messages` and `trained`; false when nothing droppable is left.
+bool train_fit_drop_oldest(common_json & messages, std::vector<bool> & trained);
