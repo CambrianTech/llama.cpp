@@ -3356,6 +3356,8 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        // the raw common prefix with the slot's tokens, before any reuse adjustment (#56)
+                        int resume_raw_lcp = -1;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3411,6 +3413,7 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                resume_raw_lcp = n_past;
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -3494,7 +3497,7 @@ private:
                             // re-prefilled is readable from a default log (continuum card c6640f7b: every
                             // restore of a hybrid model's page re-prefilled from ~0 while checkpoints before
                             // the divergence existed, and every line saying why was trace-level).
-                            const int    resume_lcp     = n_past;
+                            const int    resume_lcp     = n_past; // after context reuse and alora adjustments
                             const size_t resume_n_ckpt  = slot.prompt.checkpoints.size();
                             llama_pos    resume_pos_min = -1;
                             const char * resume_outcome = "prefix kept, no checkpoint needed";
@@ -3591,14 +3594,19 @@ private:
                                     }
                                 }
                             } else if (n_past == 0 && slot.prompt.n_tokens() > 0) {
-                                resume_outcome = "full re-prefill: no common prefix";
+                                resume_outcome = slot.task->params.cache_prompt
+                                    ? "full re-prefill: no common prefix"
+                                    : "full re-prefill: cache_prompt is off";
                             }
 
-                            if (resume_n_ckpt > 0 || resume_lcp > 0) {
-                                SLT_INF(slot, "resume: %s (lcp = %d, pos_min = %d, pos_min_thold = %d, n_swa = %d, "
-                                        "checkpoints = %zu, chosen n_tokens = %" PRId64 ", n_past now = %d of %d)\n",
-                                        resume_outcome, resume_lcp, resume_pos_min, pos_min_thold, n_swa,
-                                        resume_n_ckpt, resume_ckpt_n, n_past, slot.task->n_tokens());
+                            // whenever the slot held anything to resume from: a restored page with no
+                            // checkpoints and no common prefix is exactly the case that must be seen
+                            if (slot.prompt.n_tokens() > 0) {
+                                SLT_INF(slot, "resume: %s (raw lcp = %d, lcp after reuse = %d, slot tokens = %d, pos_min = %d, "
+                                        "pos_min_thold = %d, n_swa = %d, checkpoints = %zu, chosen n_tokens = %" PRId64
+                                        ", n_past now = %d of %d)\n",
+                                        resume_outcome, resume_raw_lcp, resume_lcp, slot.prompt.n_tokens(), resume_pos_min,
+                                        pos_min_thold, n_swa, resume_n_ckpt, resume_ckpt_n, n_past, slot.task->n_tokens());
                             }
 
                             {
