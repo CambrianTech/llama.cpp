@@ -5421,6 +5421,19 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->post_train_measure = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        const json r = ctx_server.trainer ? ctx_server.trainer->measure(body)
+                                           : json::object({{"ok", false}, {"error", "no model is loaded"}});
+        if (!r.value("ok", false)) {
+            res->error(format_error_response(r.value("error", std::string("measure refused")), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok(r);
+        return res;
+    };
+
     this->post_train_cancel = [this](const server_http_req &) {
         auto res = create_response();
         const json r = ctx_server.trainer ? ctx_server.trainer->cancel()

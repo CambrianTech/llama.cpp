@@ -200,96 +200,146 @@ size_t train_fit_droppable(const std::vector<std::string> & roles, const std::ve
     return head < anchor ? head : std::string::npos;
 }
 
+// Drops the oldest WHOLE exchange "middle" may drop (see train_fit_droppable): from there up to
+// the next user message, so the user prompt, her reply, its tool calls and their results leave
+// together and the conversation keeps the role alternation strict templates enforce (Codex on
+// #29). false when nothing droppable is left: the head plus her last exchange.
+bool train_fit_drop_oldest(json & messages, std::vector<bool> & trained) {
+    std::vector<std::string> roles;
+    for (const auto & m : messages) {
+        roles.push_back(m.is_object() ? m.value("role", std::string()) : std::string());
+    }
+    const size_t d = train_fit_droppable(roles, trained);
+    if (d == std::string::npos) {
+        return false;
+    }
+    do {
+        messages.erase(d); // a JSON array erases by index
+        trained.erase(trained.begin() + d);
+    } while (d < messages.size() && messages[d].is_object() && messages[d].value("role", std::string()) != "user");
+    return true;
+}
+
+enum class example_fit { kept, truncated, skipped, invalid };
+
+// ONE example against a window: the rule /train trains by and /train/measure reports, so the two
+// cannot disagree (continuum, 2026-10-11: a core's own token estimate kept 62 of Kimi's 311 lived
+// turns where this rule kept 54, so only this rule may decide what trains). `full` is its rendered
+// length before anything is dropped; `min`, when asked, the smallest window it trains in. On kept
+// or truncated, `toks` and `loss` are the example as it trains.
+static example_fit fit_example(const json & ex, const std::string & at, const server_trainer::render_fn & render,
+                               const llama_vocab * vocab, int64_t window, const std::string & fit,
+                               std::vector<llama_token> & toks, std::vector<uint8_t> & loss,
+                               int64_t & full, int64_t * min, std::string & why) {
+    json messages;
+    if (ex.is_object() && ex.contains("messages") && ex.at("messages").is_array() && !ex.at("messages").empty()) {
+        messages = ex.at("messages");
+    } else if (ex.is_object() && ex.contains("prompt") && ex.at("prompt").is_string()
+               && ex.contains("completion") && ex.at("completion").is_string()) {
+        messages = json::array({ json::object({{"role", "user"},      {"content", ex.at("prompt")}}),
+                                 json::object({{"role", "assistant"}, {"content", ex.at("completion")}}) });
+    } else {
+        why = at + " needs \"prompt\" and \"completion\" strings, or a non-empty \"messages\" array";
+        return example_fit::invalid;
+    }
+    // "tools": the tool definitions the turn was served with, so the rendered prompt is the
+    // one the model saw (a served turn's system block lists them).
+    // A "tools" that is not an array is refused, like a non-boolean "train": ignoring it
+    // would train a prompt without the tool block the turn was served with (Cormac on #22).
+    if (ex.is_object() && ex.contains("tools") && !ex.at("tools").is_array()) {
+        why = at + ".tools must be an array";
+        return example_fit::invalid;
+    }
+    const json tools = ex.is_object() && ex.contains("tools") ? ex.at("tools") : json::array();
+    // "train": false on a message keeps an assistant turn as CONTEXT without training it:
+    // a lived turn carries her earlier replies as history, and those are not this lesson.
+    // The key is ours, so it is read here and removed before the template sees the message.
+    std::vector<bool> trained(messages.size(), true);
+    for (size_t k = 0; k < messages.size(); ++k) {
+        if (messages[k].is_object() && messages[k].contains("train")) {
+            if (!messages[k].at("train").is_boolean()) {
+                why = at + ".messages[" + std::to_string(k) + "].train must be a boolean";
+                return example_fit::invalid;
+            }
+            trained[k] = messages[k].at("train").get<bool>();
+            messages[k].erase("train");
+        }
+    }
+    toks.clear();
+    loss.clear();
+    if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
+        return example_fit::invalid;
+    }
+    full = (int64_t) toks.size();
+    if (min != nullptr) {
+        // the smallest window it trains in: every droppable exchange dropped (under "middle";
+        // any other fit drops nothing, so its smallest window is its whole length)
+        *min = full;
+        json m = messages;
+        std::vector<bool> tr = trained;
+        bool dropped = false;
+        while (fit == "middle" && train_fit_drop_oldest(m, tr)) {
+            dropped = true;
+        }
+        if (dropped) {
+            std::vector<llama_token> t;
+            std::vector<uint8_t>     l;
+            if (!render_example(m, tr, tools, render, vocab, at, t, l, why)) {
+                return example_fit::invalid;
+            }
+            *min = (int64_t) t.size();
+        }
+    }
+    bool cut = false;
+    if (fit == "left" && (int64_t) toks.size() > window + 1) {
+        const bool bos = llama_vocab_get_add_bos(vocab) && !toks.empty() && toks[0] == llama_vocab_bos(vocab);
+        if (!train_fit_left(toks, loss, window, bos)) {
+            return example_fit::skipped;
+        }
+        cut = true;
+    }
+    while ((int64_t) toks.size() > window + 1) {
+        if (fit.empty()) {
+            why = at + " is " + std::to_string(toks.size()) + " tokens; one example is one window, and this window holds "
+                + std::to_string(window + 1) + " (raise \"window\", split the example, or send \"fit\")";
+            return example_fit::invalid;
+        }
+        if (!train_fit_drop_oldest(messages, trained)) {
+            return example_fit::skipped; // the head plus her last exchange alone overflow the window
+        }
+        cut = true;
+        if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
+            return example_fit::invalid;
+        }
+    }
+    if (std::count(loss.begin() + 1, loss.end(), (uint8_t) 1) == 0) {
+        why = at + ": its assistant turns tokenize to nothing to learn";
+        return example_fit::invalid;
+    }
+    return cut ? example_fit::truncated : example_fit::kept;
+}
+
 static bool prepare_examples(const json & examples, const server_trainer::render_fn & render, const llama_vocab * vocab,
                              int64_t window, const std::string & fit, server_trainer::examples_data & out, std::string & why) {
     for (size_t i = 0; i < examples.size(); ++i) {
-        const std::string at = "examples[" + std::to_string(i) + "]";
-        const json & ex = examples[i];
-        json messages;
-        if (ex.is_object() && ex.contains("messages") && ex.at("messages").is_array() && !ex.at("messages").empty()) {
-            messages = ex.at("messages");
-        } else if (ex.is_object() && ex.contains("prompt") && ex.at("prompt").is_string()
-                   && ex.contains("completion") && ex.at("completion").is_string()) {
-            messages = json::array({ json::object({{"role", "user"},      {"content", ex.at("prompt")}}),
-                                     json::object({{"role", "assistant"}, {"content", ex.at("completion")}}) });
-        } else {
-            why = at + " needs \"prompt\" and \"completion\" strings, or a non-empty \"messages\" array";
-            return false;
-        }
-        // "tools": the tool definitions the turn was served with, so the rendered prompt is the
-        // one the model saw (a served turn's system block lists them).
-        // A "tools" that is not an array is refused, like a non-boolean "train": ignoring it
-        // would train a prompt without the tool block the turn was served with (Cormac on #22).
-        if (ex.is_object() && ex.contains("tools") && !ex.at("tools").is_array()) {
-            why = at + ".tools must be an array";
-            return false;
-        }
-        const json tools = ex.is_object() && ex.contains("tools") ? ex.at("tools") : json::array();
-        // "train": false on a message keeps an assistant turn as CONTEXT without training it:
-        // a lived turn carries her earlier replies as history, and those are not this lesson.
-        // The key is ours, so it is read here and removed before the template sees the message.
-        std::vector<bool> trained(messages.size(), true);
-        for (size_t k = 0; k < messages.size(); ++k) {
-            if (messages[k].is_object() && messages[k].contains("train")) {
-                if (!messages[k].at("train").is_boolean()) {
-                    why = at + ".messages[" + std::to_string(k) + "].train must be a boolean";
-                    return false;
-                }
-                trained[k] = messages[k].at("train").get<bool>();
-                messages[k].erase("train");
-            }
-        }
         std::vector<llama_token> toks;
         std::vector<uint8_t>     loss;
-        if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
-            return false;
-        }
-        bool cut = false;
-        bool skip = false;
-        if (fit == "left" && (int64_t) toks.size() > window + 1) {
-            const bool bos = llama_vocab_get_add_bos(vocab) && !toks.empty() && toks[0] == llama_vocab_bos(vocab);
-            if (!train_fit_left(toks, loss, window, bos)) {
+        int64_t full = 0;
+        switch (fit_example(examples[i], "examples[" + std::to_string(i) + "]", render, vocab, window, fit, toks, loss, full, nullptr, why)) {
+            case example_fit::invalid:
+                return false;
+            case example_fit::skipped:
                 ++out.skipped;
+                out.skipped_at.push_back((int64_t) i);
                 continue;
-            }
-            ++out.truncated;
-        }
-        while ((int64_t) toks.size() > window + 1) {
-            if (fit.empty()) {
-                why = at + " is " + std::to_string(toks.size()) + " tokens; one example is one window, and this window holds "
-                    + std::to_string(window + 1) + " (raise \"window\", split the example, or send \"fit\")";
-                return false;
-            }
-            std::vector<std::string> roles;
-            for (const auto & m : messages) {
-                roles.push_back(m.is_object() ? m.value("role", std::string()) : std::string());
-            }
-            const size_t d = train_fit_droppable(roles, trained);
-            if (d == std::string::npos) {
-                skip = true; // the head plus her last exchange alone overflow the window
+            case example_fit::truncated:
+                ++out.truncated;
+                out.truncated_at.push_back((int64_t) i);
                 break;
-            }
-            // drop the oldest WHOLE exchange: from d up to the next user message, so the user
-            // prompt, her reply, its tool calls and their results leave together and the
-            // conversation keeps the role alternation strict templates enforce (Codex on #29)
-            do {
-                messages.erase(d); // a JSON array erases by index
-                trained.erase(trained.begin() + d);
-            } while (d < messages.size() && messages[d].is_object() && messages[d].value("role", std::string()) != "user");
-            cut = true;
-            if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
-                return false;
-            }
+            case example_fit::kept:
+                break;
         }
-        if (skip) {
-            ++out.skipped;
-            continue;
-        }
-        if (std::count(loss.begin() + 1, loss.end(), (uint8_t) 1) == 0) {
-            why = at + ": its assistant turns tokenize to nothing to learn";
-            return false;
-        }
-        out.truncated += cut ? 1 : 0;
+        out.kept.push_back((int64_t) i);
         out.tokens.push_back(std::move(toks));
         out.loss.push_back(std::move(loss));
     }
@@ -299,6 +349,52 @@ static bool prepare_examples(const json & examples, const server_trainer::render
         return false;
     }
     return true;
+}
+
+json server_trainer::measure(const json & body) const {
+    if (params_base.train_dir.empty()) {
+        return json::object({{"ok", false}, {"error", "training is disabled on this server (start it with --train-dir DIR to enable /train)"}});
+    }
+    if (!body.contains("examples") || !body.at("examples").is_array() || body.at("examples").empty()) {
+        return json::object({{"ok", false}, {"error", "\"examples\" must be a non-empty array"}});
+    }
+    if (!render_chat) {
+        return json::object({{"ok", false}, {"error", "this server has no chat template to render \"examples\" with"}});
+    }
+    if (!body.contains("window") || !body.at("window").is_number_integer()) {
+        return json::object({{"ok", false}, {"error", "\"window\" must be an integer: the window to measure the examples against"}});
+    }
+    const int64_t window = body.at("window").get<int64_t>();
+    if (window < 256 || window > (int64_t) llama_model_n_ctx_train(model) || window % 256 != 0) {
+        return json::object({{"ok", false}, {"error", "window must be a multiple of 256, at least 256 and at most the model's trained context ("
+            + std::to_string(llama_model_n_ctx_train(model)) + ")"}});
+    }
+    const std::string fit = body.contains("fit") && body.at("fit").is_string() ? body.at("fit").get<std::string>() : std::string();
+    if (body.contains("fit") && fit != "middle" && fit != "left") {
+        return json::object({{"ok", false}, {"error", "\"fit\" must be \"middle\", \"left\", or absent"}});
+    }
+    json rows = json::array();
+    const json & examples = body.at("examples");
+    for (size_t i = 0; i < examples.size(); ++i) {
+        std::vector<llama_token> toks;
+        std::vector<uint8_t>     loss;
+        int64_t full = 0;
+        int64_t min  = 0;
+        std::string why;
+        const example_fit r = fit_example(examples[i], "examples[" + std::to_string(i) + "]", render_chat, llama_model_get_vocab(model),
+                                          window, fit, toks, loss, full, &min, why);
+        if (r == example_fit::invalid) {
+            return json::object({{"ok", false}, {"error", why}});
+        }
+        rows.push_back(json::object({
+            {"index", (int64_t) i},
+            {"tokens_full", full},
+            {"tokens_min", min},
+            {"tokens_trained", r == example_fit::skipped ? (int64_t) 0 : (int64_t) toks.size()},
+            {"fit", r == example_fit::kept ? "kept" : r == example_fit::truncated ? "truncated" : "skipped"},
+        }));
+    }
+    return json::object({{"ok", true}, {"window", window}, {"examples", rows}});
 }
 
 json server_trainer::start(const json & body_in) {
@@ -407,6 +503,11 @@ json server_trainer::start(const json & body_in) {
         body["n_examples"] = prepared.tokens.size();
         body["n_truncated"] = prepared.truncated;
         body["n_skipped"] = prepared.skipped;
+        // WHICH examples, by their index in the request: the caller clears only what the run
+        // reports it trained, and keeps a skipped one for a larger window
+        body["kept_indices"] = prepared.kept;
+        body["truncated_indices"] = prepared.truncated_at;
+        body["skipped_indices"] = prepared.skipped_at;
         body.erase("examples");
     }
     if (prepared.tokens.empty() && (!body.contains("text") || !body.at("text").is_string() || body.at("text").get<std::string>().empty())) {
@@ -460,6 +561,11 @@ json server_trainer::start(const json & body_in) {
         state["examples"] = body.at("n_examples");
         state["examples_truncated"] = body.value("n_truncated", (int64_t) 0);
         state["examples_skipped"] = body.value("n_skipped", (int64_t) 0);
+        for (const char * key : {"kept_indices", "truncated_indices", "skipped_indices"}) {
+            if (body.contains(key)) {
+                state[key] = body.at(key);
+            }
+        }
     }
     pause_requested = false;
     paused = false;
