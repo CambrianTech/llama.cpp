@@ -308,6 +308,12 @@ static ggml_tensor * ggml_opt_view_root(ggml_tensor * t) {
     return t;
 }
 
+// A CPY whose destination is its own result (ggml_cast) writes no other tensor: it is a pure
+// conversion, recomputed like any op. A CPY into another tensor (a cache write) is a side effect.
+static bool ggml_opt_is_cast(const ggml_tensor * node) {
+    return node->op == GGML_OP_CPY && node->src[1] == node;
+}
+
 static ggml_tensor * ggml_opt_recompute_node(
         ggml_context * ctx, const std::unordered_set<ggml_tensor *> & forward,
         const std::unordered_set<ggml_tensor *> & keep, std::unordered_map<ggml_tensor *, ggml_tensor *> & clones,
@@ -323,9 +329,13 @@ static ggml_tensor * ggml_opt_recompute_node(
     }
     switch (node->op) {
         case GGML_OP_NONE:
-        case GGML_OP_CPY:      // a write into another tensor (a cache): side effect, never repeated
         case GGML_OP_SET_ROWS:
             return node;
+        case GGML_OP_CPY:      // a write into another tensor (a cache): side effect, never repeated
+            if (!ggml_opt_is_cast(node)) {
+                return node;
+            }
+            break;
         default:
             break;
     }
@@ -367,7 +377,7 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
         // 6.8e-4 with recompute on until in-place ops counted here).
         const bool view_op = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
                              node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
-        if (node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS || (node->view_src != nullptr && !view_op)) {
+        if ((node->op == GGML_OP_CPY && !ggml_opt_is_cast(node)) || node->op == GGML_OP_SET_ROWS || (node->view_src != nullptr && !view_op)) {
             mutated.insert(ggml_opt_view_root(node));
         }
     }
@@ -411,7 +421,9 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
             return;
         }
         for (int k = 0; k < GGML_MAX_SRC; ++k) {
-            place(t->src[k]);
+            if (t->src[k] != t) { // a cast is its own destination
+                place(t->src[k]);
+            }
         }
         place(t->view_src);
         placed.insert(t);
