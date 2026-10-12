@@ -230,6 +230,14 @@ extern "C" {
     // for a GRAD leaf (ggml_set_grad) of the evaluated graph, or NULL when the graph has none.
     GGML_API struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * leaf);
 
+    // For the graph last given to ggml_opt_prepare_alloc: its backward ADDS the gradient on `tensor`
+    // (a node of that graph, flagged GRAD by this call) into `acc`, an F32 tensor of the same shape
+    // in a buffer the caller owns and zeroes, instead of keeping it in the compute buffer for
+    // ggml_opt_leaf_grad. Nothing gradient-sized outlives its consumer on the device: the
+    // accumulator may live in host memory while the graph runs on a GPU. The optimizer never
+    // zeroes it, except at its own first allocation, which precedes any accumulation.
+    GGML_API void ggml_opt_accumulate_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * tensor, struct ggml_tensor * acc);
+
     // ############################################################################
     // ## The high-level functions start here. They do not depend on any private ##
     // ## functions or structs and can be copied to and adapted for user code.   ##

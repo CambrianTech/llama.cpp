@@ -150,7 +150,8 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 
-# the exact walk trains on the window's whole gradient whatever the chunking (needs -m <pure attention model>)
+# the exact walk trains on the window's whole gradient whatever the chunking: run on a pure-attention AND a
+# hybrid model (-m), on a GPU backend as well as the CPU (a hybrid passed on the CPU while Metal tore its state)
 llama_build(test-walk-exact.cpp)
 
 # GGML_TENSOR_FLAG_GRAD: a leaf whose gradient the backward computes, never optimized (the walk reads the cached prefix K/V gradient)
@@ -168,6 +169,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
+    llama_build_and_test(test-walk-plan.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -298,6 +300,8 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+# the tiled FLASH_ATTN_EXT backward gives plain attention's gradients on every backend (no model needed)
+llama_build_and_test(test-flash-attn-back.cpp)
 llama_build_and_test(test-moe-gather.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

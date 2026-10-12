@@ -236,6 +236,14 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
+    // one window's walk (llama-context-opt.cpp)
+    struct opt_walk;
+
+    // stops the epoch on a failure: llama_opt_failed, and llama_opt_failure reads `why` (empty
+    // for the memory gate, which the exact walk answers by shrinking its horizon); `what` names
+    // the step that failed, for the log
+    void opt_fail(std::string why, const std::string & what = "");
+
     //
     // output
     //
@@ -278,6 +286,9 @@ private:
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
+
+    // the graph type this context's type builds (decoder, or the MTP head)
+    llm_graph_type graph_type() const;
 
     llm_graph_cb graph_get_cb() const;
 

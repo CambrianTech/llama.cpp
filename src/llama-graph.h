@@ -942,19 +942,19 @@ public:
     // fills before the step and reads after it (llama_context::opt_epoch_iter)
     struct walk_layer {
         int           il;
-        uint32_t      grad_from;   // the GRAD leaves cover cached positions [grad_from, n_past)
         uint32_t      n_past;
-        ggml_tensor * dk = nullptr; // GRAD leaves, zero-filled: their gradient is dL/d(cached K/V)
-        ggml_tensor * dv = nullptr; //   [n_embd_head, n_head_kv, n_past - grad_from], V untransposed
-        ggml_tensor * gk = nullptr; // inputs: the gradient later chunks accumulated on this chunk's
-        ggml_tensor * gv = nullptr; //   own K/V, shaped like k_cur / v_cur (null without a surrogate)
+        ggml_tensor * tk = nullptr; // the cached K/V of [grad_from, n_past) as F32, tapped: their
+        ggml_tensor * tv = nullptr; //   gradient adds into ak / av (ggml_opt_accumulate_grad)
+        ggml_tensor * ak = nullptr; // the accumulator's rows [grad_from, n_past), shaped like tk / tv
+        ggml_tensor * av = nullptr;
     };
     std::vector<walk_layer> t_walk;
     // the recurrent states of a reverse-pass chunk graph, one per state tensor of the memory
     // (a layer's conv state r_l and its recurrent state s_l): the chain runs through them too
     struct walk_state {
         ggml_tensor * cache = nullptr; // the memory's state tensor this entry belongs to
-        ggml_tensor * ds    = nullptr; // GRAD leaf, zero-filled, on the state ENTERING the chunk
+        ggml_tensor * tap   = nullptr; // the state ENTERING the chunk, tapped: its gradient adds into the
+                                       //   walk's host accumulator for this state (ggml_opt_accumulate_grad)
         ggml_tensor * gs    = nullptr; // input: the gradient later chunks put on the state it LEAVES
     };
     std::vector<walk_state> t_walk_state;
@@ -1062,6 +1062,8 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    mutable ggml_tensor * inp_train_rows = nullptr; // build_inp_train_rows, once per graph
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1180,6 +1182,14 @@ struct llm_graph_context {
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
+
+    // A training chunk's cache rows: I32 [n_tokens], its positions (in the walk a position
+    // is its cell). One per graph, shared by every attention layer.
+    ggml_tensor * build_inp_train_rows() const;
+
+    // Whether this layer's attention runs through FLASH_ATTN_EXT: the one decision
+    // build_attn_mha makes and a training graph reads to attend to the cache in place.
+    bool uses_flash_attn(ggml_tensor * kq_b, ggml_tensor * sinks, ggml_tensor * v_mla) const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;

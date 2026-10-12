@@ -22,12 +22,14 @@
 #include "llama.h"
 #include "../src/llama-adapter.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <map>
 #include <cstdlib>
 #include <cstdio>
 #include <string>
+#include <chrono>
 #include <vector>
 
 static const float    LR     = 1e-3f; // an SGD step is linear in the gradient at any lr
@@ -122,6 +124,21 @@ static std::vector<float> adapter_params(const llama_adapter_lora * adapter) {
     return out;
 }
 
+// the name and length of each tensor adapter_params lays out, in the same order
+static std::vector<std::pair<std::string, size_t>> adapter_layout(const llama_adapter_lora * adapter) {
+    std::map<std::string, const llama_adapter_lora_weight *> sorted;
+    for (const auto & [name, w] : adapter->ab_map) {
+        sorted[name] = &w;
+    }
+    std::vector<std::pair<std::string, size_t>> out;
+    for (const auto & [name, w] : sorted) {
+        out.emplace_back(name + ".a", (size_t) ggml_nelements(w->a));
+        out.emplace_back(name + ".b", (size_t) ggml_nelements(w->b));
+    }
+    return out;
+}
+static std::vector<std::pair<std::string, size_t>> g_layout;
+
 // one SGD step from the fresh adapter: the step itself, -lr * the gradient it took
 static std::vector<float> step_delta(const common_params & params, llama_model * model, const std::string & init,
                                      const std::vector<llama_token> & tokens, const std::vector<uint8_t> & labelled,
@@ -129,6 +146,7 @@ static std::vector<float> step_delta(const common_params & params, llama_model *
     llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
     GGML_ASSERT(adapter != nullptr);
     const std::vector<float> before = adapter_params(adapter);
+    g_layout = adapter_layout(adapter);
 
     llama_context * ctx = make_ctx(params, model, chunk);
     float scale = 1.0f;
@@ -193,13 +211,32 @@ static agreement compare(const char * what, const std::vector<float> & a, const 
     return r;
 }
 
+// a step that strays names where: the tensors whose own cosine is lowest, so a wrong op
+// shows as the layers (recurrent or attention, which depth) that carry it
+static void worst_tensors(const std::vector<float> & a, const std::vector<float> & ref, int n) {
+    std::vector<std::pair<double, std::string>> rows;
+    size_t off = 0;
+    for (const auto & [name, len] : g_layout) {
+        double dot = 0.0, na = 0.0, nr = 0.0;
+        for (size_t i = off; i < off + len; ++i) {
+            dot += (double) a[i] * ref[i];
+            na  += (double) a[i] * a[i];
+            nr  += (double) ref[i] * ref[i];
+        }
+        off += len;
+        if (na > 0.0 && nr > 0.0) {
+            rows.emplace_back(dot / std::sqrt(na * nr), name + " norm ratio " + std::to_string(std::sqrt(na / nr)));
+        }
+    }
+    std::sort(rows.begin(), rows.end());
+    for (int i = 0; i < n && i < (int) rows.size(); ++i) {
+        printf("    worst: cosine %.4f %s\n", rows[i].first, rows[i].second.c_str());
+    }
+}
+
 // Measured on the 1.5B Q4_K_M (5090): the exact walk agrees with one graph at cosine 0.998 and
 // norm 0.995 (what is left is the quantized matmuls' batch-size variance: a 128-row chunk and a
 // 512-row graph take different kernels); the plain walk sits at cosine 0.81, norm 2.1.
-// the served cache types' bar (see 1b). Measured on the 5090: f16 0.9986 (1.5B) / 0.9981 (hybrid),
-// q8_0 0.9978 / 0.9979, against F32's 0.998: the straight-through approximation costs nothing
-// measurable, so the bar sits just under F32's own agreement.
-static const double STRAIGHT_THROUGH_COSINE = 0.99;
 
 static bool same_step(const agreement & r) {
     return r.cosine > 0.995 && std::fabs(r.norm_ratio - 1.0) < 0.02;
@@ -216,7 +253,9 @@ int main(int argc, char ** argv) {
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     GGML_ASSERT(model != nullptr);
 
-    const std::string init = "test-walk-exact.init.gguf";
+    // one file per run: two runs in one directory (a measurement beside an exactness check)
+    // overwrote each other's adapter and failed to load it (the M5, 2026-10-11)
+    const std::string init = "test-walk-exact." + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".init.gguf";
     GGML_ASSERT(common_lora_write_fresh(model, init, 8, 16, { "attn_q", "attn_v" }, 42));
 
     // words in a fixed pseudo-random order: a window the model cannot already predict, so its
@@ -235,6 +274,47 @@ int main(int argc, char ** argv) {
     llama_free(tok_ctx);
     GGML_ASSERT(tokens.size() > REFUSAL_WINDOW + 1);
 
+    // MEASUREMENT MODE (WALK_MEASURE="2048,8192,..."): the device graph per chunk of a context +
+    // reply window (the last 512 positions labelled), on the explicit path (F32 cache, no flash
+    // attention) and through FLASH_ATTN_EXT (f16 cache, flash attention), at each window. Prints a
+    // table and exits; the bytes are the run's own allocation preflight (llama_opt_graph_bytes).
+    if (const char * env = getenv("WALK_MEASURE")) {
+        std::string more = text;
+        while (more.size() < 6 * 65536) {
+            lcg = lcg * 1664525u + 1013904223u;
+            more += words[(lcg >> 16) % 16];
+            more += (lcg >> 8) % 7 == 0 ? ".\n" : " ";
+        }
+        llama_context * tc = make_ctx(params, model, WINDOW);
+        const std::vector<llama_token> long_tokens = common_tokenize(tc, more, true);
+        llama_free(tc);
+        const uint32_t chunk = getenv("WALK_MEASURE_CHUNK") ? (uint32_t) atoi(getenv("WALK_MEASURE_CHUNK")) : 256;
+        g_recompute = getenv("WALK_MEASURE_RECOMPUTE") != nullptr; // per-layer recompute, as the served runs train
+        g_walk_horizon = getenv("WALK_MEASURE_HORIZON") ? (uint32_t) atoi(getenv("WALK_MEASURE_HORIZON")) : 0; // 0 = the whole window
+        printf("  window  chunk  explicit MiB  flash MiB  ratio\n");
+        for (const char * p = env; *p; ) {
+            char * end = nullptr;
+            const uint32_t w = (uint32_t) strtoul(p, &end, 10);
+            p = *end == ',' ? end + 1 : end;
+            if (w == 0 || long_tokens.size() <= w + 1) { break; }
+            g_window = w;
+            std::vector<uint8_t> reply(w + 1, 0);
+            for (uint32_t i = w - 511; i <= w; ++i) reply[i] = 1;
+            double mib[2] = { 0, 0 };
+            const ggml_type types[2] = { GGML_TYPE_F32, GGML_TYPE_F16 };
+            for (int a = 0; a < 2; ++a) {
+                g_cache_type = types[a];
+                step_delta(params, model, init, long_tokens, reply, chunk, true);
+                mib[a] = g_last_graph_bytes / 1048576.0;
+            }
+            g_cache_type = GGML_TYPE_F32;
+            printf("  %6u  %5u  %12.1f  %9.1f  %5.2fx\n", w, chunk, mib[0], mib[1], mib[1] > 0 ? mib[0] / mib[1] : 0.0);
+            fflush(stdout);
+        }
+        std::remove(init.c_str());
+        return 0;
+    }
+
     int failures = 0;
     {
         // 1. every position labelled: chunk = window is one graph, the true gradient
@@ -246,6 +326,7 @@ int main(int argc, char ** argv) {
         const auto plain = step_delta(params, model, init, tokens, all, WINDOW / 4, false);
         if (!same_step(compare("all labelled: exact walk in 4 chunks vs one graph", exact, ref))) {
             fprintf(stderr, "FAILED: the exact walk's step is not the window's gradient\n");
+            worst_tensors(exact, ref, 24);
             ++failures;
         }
         if (same_step(compare("all labelled: plain walk in 4 chunks vs one graph", plain, ref))) {
@@ -265,21 +346,25 @@ int main(int argc, char ** argv) {
         }
     }
     {
-        // 1b. the served cache types: the walk reads the prefix at the cache's precision and its
-        // gradient is taken there, then applied to the chunk's own full-precision K/V (straight-
-        // through). Measured against the same one-graph reference, which never reads the cache.
+        // 1b. the served cache types. Training attends to the cache in place, as serving does:
+        // every K/V it reads, the chunk's own included, is at the cache's precision, and the
+        // gradient passes straight through the cast. Two claims, measured apart: the walk is
+        // EXACT at that precision (against one graph reading the same cache), and what the
+        // precision itself costs against the F32 gradient (printed, the served model's own).
         std::vector<uint8_t> all(WINDOW + 1, 1);
         all[0] = 0;
-        const auto ref = step_delta(params, model, init, tokens, all, WINDOW, false);
+        const auto truth = step_delta(params, model, init, tokens, all, WINDOW, false);
         for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
             g_cache_type = t;
+            const auto one   = step_delta(params, model, init, tokens, all, WINDOW, false);
             const auto exact = step_delta(params, model, init, tokens, all, WINDOW / 4, true);
             g_cache_type = GGML_TYPE_F32;
-            const agreement r = compare((std::string("all labelled, ") + ggml_type_name(t) + " cache: exact walk in 4 chunks vs one graph").c_str(), exact, ref);
-            if (!(r.cosine > STRAIGHT_THROUGH_COSINE)) {
-                fprintf(stderr, "FAILED: at a %s cache the exact walk's step strays from the window's gradient (cosine %.4f)\n", ggml_type_name(t), r.cosine);
+            const std::string name = std::string("all labelled, ") + ggml_type_name(t) + " cache: ";
+            if (!same_step(compare((name + "exact walk in 4 chunks vs one graph at the same cache").c_str(), exact, one))) {
+                fprintf(stderr, "FAILED: at a %s cache the exact walk is not the window's gradient\n", ggml_type_name(t));
                 ++failures;
             }
+            compare((name + "one graph vs the F32 gradient (the cache's own precision)").c_str(), one, truth);
         }
     }
     {

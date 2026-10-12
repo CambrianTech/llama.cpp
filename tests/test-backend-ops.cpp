@@ -10431,7 +10431,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // packed qkv projection, several sequences (the atomic dq/dk accumulation across heads)
     for (auto [hc, hs, nt, ns, kd, kk, vr, st] : std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t, bool, int64_t, int, bool>>{
              {2, 16, 10, 1, true, 1, 3, false}, {2, 32, 7, 2, false, 2, 3, true}, {2, 64, 40, 2, true, 3, 3, true},
-             {2, 128, 33, 1, false, 1, 3, true}, {3, 32, 17, 2, true, 1, 2, true}}) {
+             {2, 128, 33, 1, false, 1, 3, true}, {3, 32, 17, 2, true, 1, 2, true},
+             // the 4B hybrid's own layer at one walk chunk: 16 key heads shared 2 ways, 512 tokens
+             {16, 128, 512, 1, false, 1, 2, true}}) {
         test_cases.emplace_back(new test_gated_delta_net_back(hc, hs, nt, ns, kd, kk, vr, st));
     }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

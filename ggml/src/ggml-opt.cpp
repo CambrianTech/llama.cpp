@@ -86,6 +86,9 @@ struct ggml_opt_context {
     bool                 period_fresh    = true; // the next backward starts a period (zeroed gradients)
     // the gradients of the evaluated graph's GRAD leaves, readable until the next alloc
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> leaf_grads;
+    // ggml_opt_accumulate_grad: GRAD nodes whose gradient adds into a caller's tensor, for the
+    // graph prepared last (ggml_opt_prepare_alloc clears them)
+    std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> next_grad_accs;
     std::vector<struct ggml_tensor *> grad_accs;
 
     int64_t iter               = 1;
@@ -305,6 +308,12 @@ static ggml_tensor * ggml_opt_view_root(ggml_tensor * t) {
     return t;
 }
 
+// A CPY whose destination is its own result (ggml_cast) writes no other tensor: it is a pure
+// conversion, recomputed like any op. A CPY into another tensor (a cache write) is a side effect.
+static bool ggml_opt_is_cast(const ggml_tensor * node) {
+    return node->op == GGML_OP_CPY && node->src[1] == node;
+}
+
 static ggml_tensor * ggml_opt_recompute_node(
         ggml_context * ctx, const std::unordered_set<ggml_tensor *> & forward,
         const std::unordered_set<ggml_tensor *> & keep, std::unordered_map<ggml_tensor *, ggml_tensor *> & clones,
@@ -320,9 +329,13 @@ static ggml_tensor * ggml_opt_recompute_node(
     }
     switch (node->op) {
         case GGML_OP_NONE:
-        case GGML_OP_CPY:      // a write into another tensor (a cache): side effect, never repeated
         case GGML_OP_SET_ROWS:
             return node;
+        case GGML_OP_CPY:      // a write into another tensor (a cache): side effect, never repeated
+            if (!ggml_opt_is_cast(node)) {
+                return node;
+            }
+            break;
         default:
             break;
     }
@@ -364,7 +377,7 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
         // 6.8e-4 with recompute on until in-place ops counted here).
         const bool view_op = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
                              node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
-        if (node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS || (node->view_src != nullptr && !view_op)) {
+        if ((node->op == GGML_OP_CPY && !ggml_opt_is_cast(node)) || node->op == GGML_OP_SET_ROWS || (node->view_src != nullptr && !view_op)) {
             mutated.insert(ggml_opt_view_root(node));
         }
     }
@@ -408,7 +421,9 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
             return;
         }
         for (int k = 0; k < GGML_MAX_SRC; ++k) {
-            place(t->src[k]);
+            if (t->src[k] != t) { // a cast is its own destination
+                place(t->src[k]);
+            }
         }
         place(t->view_src);
         placed.insert(t);
@@ -677,6 +692,8 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             if (accumulate) {
                 opt_ctx->grad_accs[i] = opt_ctx->param_grad_acc.at(node);
             }
+        } else if (const auto it = opt_ctx->next_grad_accs.find(node); it != opt_ctx->next_grad_accs.end()) {
+            opt_ctx->grad_accs[i] = it->second;
         }
     }
 
@@ -686,7 +703,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     opt_ctx->leaf_grads.clear();
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
         ggml_tensor * node = opt_ctx->gf->nodes[i];
-        if (node->flags & GGML_TENSOR_FLAG_GRAD) {
+        if ((node->flags & GGML_TENSOR_FLAG_GRAD) && !opt_ctx->next_grad_accs.count(node)) {
             ggml_tensor * grad = ggml_graph_get_grad(opt_ctx->gb_grad, node);
             if (grad) {
                 ggml_set_output(grad); // read back after the step: the allocator must not reuse it
@@ -809,6 +826,14 @@ void ggml_opt_set_next_step(ggml_opt_context_t opt_ctx, bool period_end, float l
     opt_ctx->next_period_end = period_end;
     opt_ctx->next_loss_scale = loss_scale;
     opt_ctx->next_extra_loss = extra_loss;
+}
+
+void ggml_opt_accumulate_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * tensor, struct ggml_tensor * acc) {
+    GGML_ASSERT(!opt_ctx->eval_ready && "register an accumulator before ggml_opt_alloc");
+    GGML_ASSERT(acc->type == GGML_TYPE_F32 && ggml_are_same_shape(tensor, acc));
+    GGML_ASSERT((acc->view_src ? acc->view_src : acc)->buffer != nullptr && "the accumulator lives in the caller's buffer");
+    ggml_set_grad(tensor);
+    opt_ctx->next_grad_accs[tensor] = acc;
 }
 
 struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * leaf) {
@@ -950,6 +975,7 @@ void ggml_opt_prepare_alloc(
     opt_ctx->gf          = gf;
     opt_ctx->inputs      = inputs;
     opt_ctx->outputs     = outputs;
+    opt_ctx->next_grad_accs.clear(); // registrations belong to the graph prepared last
 }
 
 void ggml_opt_set_alloc_budget(ggml_opt_context_t opt_ctx, size_t bytes) {
