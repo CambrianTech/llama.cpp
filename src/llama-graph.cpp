@@ -3628,15 +3628,12 @@ ggml_tensor * llm_graph_context::build_rs(
     // {state_size, rs_size} -> {state_size, n_seqs}
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
     if (cparams.training && cparams.walk_exact) {
-        // THE EXACT WALK: the state entering the chunk is the cached one PLUS a zero GRAD leaf,
-        // so the backward yields dL/d(entry state): the gradient the previous chunk's exit takes
+        // THE EXACT WALK: the state entering the chunk is tapped, so the backward adds
+        // dL/d(entry state), the gradient the previous chunk's exit takes, into a host
+        // accumulator the moment it is computed: no GRAD leaf, and no backward output held
+        // to the end of the graph for a readback
         GGML_ASSERT(output_states->type == GGML_TYPE_F32 && "the exact walk carries an F32 recurrent state");
-        ggml_tensor * ds = ggml_new_tensor(ctx0, GGML_TYPE_F32, GGML_MAX_DIMS, output_states->ne);
-        ggml_format_name(ds, "walk_ds-%s", s->name);
-        ggml_set_input(ds);
-        ggml_set_grad(ds);
-        output_states = ggml_add(ctx0, output_states, ds);
-        res->walk_state_of(s).ds = ds;
+        res->walk_state_of(s).tap = output_states;
     }
     ggml_build_forward_expand(gf, output_states);
 

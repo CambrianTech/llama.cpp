@@ -3515,19 +3515,21 @@ void llama_context::opt_epoch_iter(
         float    loss_scale; // its labelled positions over the window's
     };
     const exact_chunk * xc = nullptr;
-    // per layer: dL/d(cached K) and dL/d(cached V) of the window, [n_embd_*_gqa, position] F32
-    // in host memory (null for a recurrent layer); every chunk's backward adds into it in place.
-    // The graph reads it through cparams, which never outlives it: whatever way the walk returns.
+    // THE EXACT WALK's gradients, in host memory, each added into in place by the backward:
+    // per attention layer dL/d(cached K) and dL/d(cached V) of the window, [n_embd_*_gqa,
+    // position] F32 (null for a recurrent layer), which the graph reads through cparams (never
+    // outliving it, whatever way the walk returns); per recurrent state tensor (a layer's conv
+    // state r_l and its recurrent state s_l) dL/d(the state entering the chunk trained last),
+    // which is what the chunk before it puts on the state it leaves (state_ready once one is in)
     struct walk_acc_t {
         llama_cparams &            cp;
         std::vector<ggml_tensor *> k, v;
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> state;
+        bool                       state_ready = false;
         ggml_context_ptr           ctx;
         ggml_backend_buffer_ptr    buf;
         ~walk_acc_t() { cp.walk_acc_k = nullptr; cp.walk_acc_v = nullptr; }
-    } walk_acc { cparams, {}, {}, nullptr, nullptr };
-    // per recurrent state tensor: dL/d(the state the chunk just before leaves), from the chunk
-    // trained last (each chunk's exit state feeds exactly one chunk, the next)
-    std::unordered_map<const ggml_tensor *, std::vector<float>> walk_gstate;
+    } walk_acc { cparams, {}, {}, {}, false, nullptr, nullptr };
 
     // one training chunk [pos_ctx, pos_ctx + n_tokens): forward and backward over it alone,
     // attending to the cached context before it
@@ -3622,6 +3624,11 @@ void llama_context::opt_epoch_iter(
                         ggml_opt_accumulate_grad(opt_ctx, io.tv, io.av);
                     }
                 }
+                for (const auto & ws : res->t_walk_state) {
+                    if (ws.tap) {
+                        ggml_opt_accumulate_grad(opt_ctx, ws.tap, walk_acc.state.at(ws.cache));
+                    }
+                }
             }
             if (!ggml_opt_alloc(opt_ctx, train)) {
                 const char * why = ggml_opt_refusal(opt_ctx);
@@ -3659,15 +3666,15 @@ void llama_context::opt_epoch_iter(
                 GGML_ASSERT(row == n_outputs);
             }
             if (xc != nullptr) {
+                // the later chunk's dL/d(entry state) is this chunk's exit gradient; then the
+                // accumulator takes this chunk's own
                 for (const auto & ws : res->t_walk_state) {
-                    if (ws.ds) {
-                        ggml_backend_tensor_memset(ws.ds, 0, 0, ggml_nbytes(ws.ds));
-                    }
+                    ggml_tensor * acc = walk_acc.state.at(ws.cache);
                     if (ws.gs) {
-                        const auto it = walk_gstate.find(ws.cache);
-                        GGML_ASSERT(it != walk_gstate.end() && it->second.size() == (size_t) ggml_nelements(ws.gs));
-                        ggml_backend_tensor_set(ws.gs, it->second.data(), 0, ggml_nbytes(ws.gs));
+                        GGML_ASSERT(ggml_nbytes(acc) == ggml_nbytes(ws.gs));
+                        ggml_backend_tensor_set(ws.gs, acc->data, 0, ggml_nbytes(ws.gs));
                     }
+                    memset(acc->data, 0, ggml_nbytes(acc));
                 }
             }
             ggml_opt_eval(opt_ctx, xc != nullptr && xc->n_labels == 0 ? nullptr : result);
@@ -3680,18 +3687,8 @@ void llama_context::opt_epoch_iter(
                 opt_stop_requested.store(true);
                 return false;
             }
-            if (xc != nullptr) {
-                // dL/d(entry state): what the previous chunk's exit state takes in its surrogate
-                for (const auto & ws : res->t_walk_state) {
-                    if (!ws.ds) {
-                        continue;
-                    }
-                    ggml_tensor * grad = ggml_opt_leaf_grad(opt_ctx, ws.ds);
-                    GGML_ASSERT(grad != nullptr && grad->type == GGML_TYPE_F32 && ggml_is_contiguous(grad));
-                    auto & g = walk_gstate[ws.cache];
-                    g.resize(ggml_nelements(grad));
-                    ggml_backend_tensor_get(grad, g.data(), 0, ggml_nbytes(grad));
-                }
+            if (xc != nullptr && !res->t_walk_state.empty()) {
+                walk_acc.state_ready = true;
             }
             if (callback && !(xc != nullptr && xc->n_labels == 0)) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_batch + 1, ndata_in_loop, t_loop_start);
@@ -3752,7 +3749,7 @@ void llama_context::opt_epoch_iter(
             return;
         }
         // A recurrent model's state is carried the same way, one chunk at a time: the state
-        // entering a chunk is a GRAD leaf, the state it leaves meets the next chunk's gradient
+        // entering a chunk is tapped into a host accumulator, the state it leaves meets the next chunk's gradient
         // (build_rs, build_walk_state_exit). The reverse pass restores each chunk's entry state
         // from a host snapshot taken at its boundary in the forward pass.
         std::vector<exact_chunk> chunks;
@@ -3839,10 +3836,17 @@ void llama_context::opt_epoch_iter(
             const uint32_t n_layer = model.hparams.n_layer();
             walk_acc.k.assign(n_layer, nullptr);
             walk_acc.v.assign(n_layer, nullptr);
-            walk_acc.ctx.reset(ggml_init({ 2*n_layer*ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true }));
+            walk_acc.ctx.reset(ggml_init({ 4*n_layer*ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true }));
+            walk_acc.state.clear();
+            walk_acc.state_ready = false;
             for (uint32_t il = 0; il < n_layer; ++il) {
                 if (model.hparams.is_recr(il)) {
-                    continue; // a recurrent layer has no K/V: its state carries the chain
+                    // a recurrent layer has no K/V: its state carries the chain, one sequence's row
+                    if (recr != nullptr) {
+                        walk_acc.state[recr->r_l[il]] = ggml_new_tensor_2d(walk_acc.ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_r(), 1);
+                        walk_acc.state[recr->s_l[il]] = ggml_new_tensor_2d(walk_acc.ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_s(), 1);
+                    }
+                    continue;
                 }
                 walk_acc.k[il] = ggml_new_tensor_2d(walk_acc.ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_k_gqa(il), last_label + 1);
                 walk_acc.v[il] = ggml_new_tensor_2d(walk_acc.ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_v_gqa(il), last_label + 1);
@@ -3861,50 +3865,25 @@ void llama_context::opt_epoch_iter(
         }
 
         // the window as the adapter now reads it, chunk by chunk: a recurrent model's state is
-        // snapshotted at each chunk's start (empty before the first: it starts from zero)
-        struct state_snapshot {
-            bool                            empty = true;
-            llama_pos                       pos   = -1; // the cell's last position at the snapshot
-            std::vector<std::vector<float>> r, s;       // per layer
+        // checkpointed at each chunk's start through the sequence-state API (the recurrent part
+        // only, PARTIAL_ONLY), after waiting for the queued decode; a restore puts back the
+        // cell's position with its rows, and an empty checkpoint (before the first chunk)
+        // restores the zero state. A hand-rolled per-layer copy here skipped that wait and, on
+        // Metal, carried a torn mid-graph state into the reverse pass (2026-10-11).
+        std::vector<std::vector<uint8_t>> snaps(recr != nullptr ? chunks.size() : 0);
+        const llama_state_seq_flags state_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        auto save_state = [&](std::vector<uint8_t> & snap) {
+            synchronize();
+            snap.resize(state_seq_get_size(0, state_flags));
+            GGML_ASSERT(state_seq_get_data(0, snap.data(), snap.size(), state_flags) == snap.size());
         };
-        std::vector<state_snapshot> snaps(recr != nullptr ? chunks.size() : 0);
-        auto state_rows = [&](bool write, state_snapshot & snap) {
-            const int32_t cell = recr->cells[0].tail; // the cell holding sequence 0's state
-            if (!write) {
-                snap.empty = cell < 0;
-                snap.pos   = cell < 0 ? -1 : recr->cells[cell].pos;
-                snap.r.assign(recr->r_l.size(), {});
-                snap.s.assign(recr->s_l.size(), {});
-            }
-            if (cell < 0) {
-                return;
-            }
-            // the restored state is the state AFTER snap.pos, so the cell says so: left at the
-            // window's end, the next ubatch read as non-consecutive ("position 65640 after 66345")
-            if (write) {
-                recr->cells[cell].pos = snap.pos;
-            }
-            for (size_t il = 0; il < recr->r_l.size(); ++il) {
-                for (int kind = 0; kind < 2; ++kind) {
-                    ggml_tensor * t = kind == 0 ? recr->r_l[il] : recr->s_l[il];
-                    if (t == nullptr) {
-                        continue;
-                    }
-                    GGML_ASSERT(t->type == GGML_TYPE_F32);
-                    auto & row = kind == 0 ? snap.r[il] : snap.s[il];
-                    const size_t bytes = t->nb[1];
-                    if (write) {
-                        ggml_backend_tensor_set(t, row.data(), (size_t) cell*bytes, bytes);
-                    } else {
-                        row.resize(t->ne[0]);
-                        ggml_backend_tensor_get(t, row.data(), (size_t) cell*bytes, bytes);
-                    }
-                }
-            }
+        auto load_state = [&](const std::vector<uint8_t> & snap) {
+            synchronize();
+            GGML_ASSERT(state_seq_set_data(0, snap.data(), snap.size(), state_flags) == snap.size());
         };
         for (size_t j = 0; j < chunks.size(); ++j) {
             if (recr != nullptr && j % stride == 0) {
-                state_rows(false, snaps[j]);
+                save_state(snaps[j]);
             }
             if (!decode_span(chunks[j].c0, chunks[j].c0 + chunks[j].n)) {
                 return;
@@ -3938,11 +3917,7 @@ void llama_context::opt_epoch_iter(
                     return false;
                 }
                 if (recr != nullptr) {
-                    if (snaps[cp].empty) {
-                        recr->seq_rm(0, -1, -1); // the first chunk starts from a zero state
-                    } else {
-                        state_rows(true, snaps[cp]);
-                    }
+                    load_state(snaps[cp]);
                     if (p_pop < c.c0 && !decode_span(p_pop, c.c0)) {
                         return false;
                     }
@@ -3955,7 +3930,7 @@ void llama_context::opt_epoch_iter(
             }
             cparams.walk_exact     = true;
             cparams.walk_surrogate = c.surrogate;
-            cparams.walk_state_surrogate = recr != nullptr && j < (int64_t) chunks.size() - 1 && !walk_gstate.empty();
+            cparams.walk_state_surrogate = recr != nullptr && j < (int64_t) chunks.size() - 1 && walk_acc.state_ready;
             // THE HORIZON FITS THE DEVICE. Its GRAD leaves are the chunk graph's largest growth
             // with the window (layers x horizon x (k + v) floats, twice with their gradient); the
             // graph preflight refuses a chunk that does not fit before allocating anything, so a
@@ -4005,7 +3980,7 @@ void llama_context::opt_epoch_iter(
             cparams.walk_surrogate = false;
             cparams.walk_state_surrogate = false;
         }
-        walk_gstate.clear();
+        walk_acc.state_ready = false;
         return;
     }
 

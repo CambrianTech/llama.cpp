@@ -22,12 +22,14 @@
 #include "llama.h"
 #include "../src/llama-adapter.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <map>
 #include <cstdlib>
 #include <cstdio>
 #include <string>
+#include <chrono>
 #include <vector>
 
 static const float    LR     = 1e-3f; // an SGD step is linear in the gradient at any lr
@@ -122,6 +124,21 @@ static std::vector<float> adapter_params(const llama_adapter_lora * adapter) {
     return out;
 }
 
+// the name and length of each tensor adapter_params lays out, in the same order
+static std::vector<std::pair<std::string, size_t>> adapter_layout(const llama_adapter_lora * adapter) {
+    std::map<std::string, const llama_adapter_lora_weight *> sorted;
+    for (const auto & [name, w] : adapter->ab_map) {
+        sorted[name] = &w;
+    }
+    std::vector<std::pair<std::string, size_t>> out;
+    for (const auto & [name, w] : sorted) {
+        out.emplace_back(name + ".a", (size_t) ggml_nelements(w->a));
+        out.emplace_back(name + ".b", (size_t) ggml_nelements(w->b));
+    }
+    return out;
+}
+static std::vector<std::pair<std::string, size_t>> g_layout;
+
 // one SGD step from the fresh adapter: the step itself, -lr * the gradient it took
 static std::vector<float> step_delta(const common_params & params, llama_model * model, const std::string & init,
                                      const std::vector<llama_token> & tokens, const std::vector<uint8_t> & labelled,
@@ -129,6 +146,7 @@ static std::vector<float> step_delta(const common_params & params, llama_model *
     llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
     GGML_ASSERT(adapter != nullptr);
     const std::vector<float> before = adapter_params(adapter);
+    g_layout = adapter_layout(adapter);
 
     llama_context * ctx = make_ctx(params, model, chunk);
     float scale = 1.0f;
@@ -193,6 +211,29 @@ static agreement compare(const char * what, const std::vector<float> & a, const 
     return r;
 }
 
+// a step that strays names where: the tensors whose own cosine is lowest, so a wrong op
+// shows as the layers (recurrent or attention, which depth) that carry it
+static void worst_tensors(const std::vector<float> & a, const std::vector<float> & ref, int n) {
+    std::vector<std::pair<double, std::string>> rows;
+    size_t off = 0;
+    for (const auto & [name, len] : g_layout) {
+        double dot = 0.0, na = 0.0, nr = 0.0;
+        for (size_t i = off; i < off + len; ++i) {
+            dot += (double) a[i] * ref[i];
+            na  += (double) a[i] * a[i];
+            nr  += (double) ref[i] * ref[i];
+        }
+        off += len;
+        if (na > 0.0 && nr > 0.0) {
+            rows.emplace_back(dot / std::sqrt(na * nr), name + " norm ratio " + std::to_string(std::sqrt(na / nr)));
+        }
+    }
+    std::sort(rows.begin(), rows.end());
+    for (int i = 0; i < n && i < (int) rows.size(); ++i) {
+        printf("    worst: cosine %.4f %s\n", rows[i].first, rows[i].second.c_str());
+    }
+}
+
 // Measured on the 1.5B Q4_K_M (5090): the exact walk agrees with one graph at cosine 0.998 and
 // norm 0.995 (what is left is the quantized matmuls' batch-size variance: a 128-row chunk and a
 // 512-row graph take different kernels); the plain walk sits at cosine 0.81, norm 2.1.
@@ -212,7 +253,9 @@ int main(int argc, char ** argv) {
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     GGML_ASSERT(model != nullptr);
 
-    const std::string init = "test-walk-exact.init.gguf";
+    // one file per run: two runs in one directory (a measurement beside an exactness check)
+    // overwrote each other's adapter and failed to load it (the M5, 2026-10-11)
+    const std::string init = "test-walk-exact." + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".init.gguf";
     GGML_ASSERT(common_lora_write_fresh(model, init, 8, 16, { "attn_q", "attn_v" }, 42));
 
     // words in a fixed pseudo-random order: a window the model cannot already predict, so its
@@ -268,6 +311,7 @@ int main(int argc, char ** argv) {
             printf("  %6u  %5u  %12.1f  %9.1f  %5.2fx\n", w, chunk, mib[0], mib[1], mib[1] > 0 ? mib[0] / mib[1] : 0.0);
             fflush(stdout);
         }
+        std::remove(init.c_str());
         return 0;
     }
 
@@ -282,6 +326,7 @@ int main(int argc, char ** argv) {
         const auto plain = step_delta(params, model, init, tokens, all, WINDOW / 4, false);
         if (!same_step(compare("all labelled: exact walk in 4 chunks vs one graph", exact, ref))) {
             fprintf(stderr, "FAILED: the exact walk's step is not the window's gradient\n");
+            worst_tensors(exact, ref, 24);
             ++failures;
         }
         if (same_step(compare("all labelled: plain walk in 4 chunks vs one graph", plain, ref))) {

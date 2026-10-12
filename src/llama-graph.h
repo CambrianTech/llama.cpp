@@ -953,7 +953,8 @@ public:
     // (a layer's conv state r_l and its recurrent state s_l): the chain runs through them too
     struct walk_state {
         ggml_tensor * cache = nullptr; // the memory's state tensor this entry belongs to
-        ggml_tensor * ds    = nullptr; // GRAD leaf, zero-filled, on the state ENTERING the chunk
+        ggml_tensor * tap   = nullptr; // the state ENTERING the chunk, tapped: its gradient adds into the
+                                       //   walk's host accumulator for this state (ggml_opt_accumulate_grad)
         ggml_tensor * gs    = nullptr; // input: the gradient later chunks put on the state it LEAVES
     };
     std::vector<walk_state> t_walk_state;
