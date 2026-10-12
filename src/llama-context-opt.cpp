@@ -1,6 +1,7 @@
 // Training: llama_context's optimizer members (opt_init, opt_epoch, the walk in
 // opt_epoch_iter) and the llama_opt_* interface, apart from inference so each reads as one concern.
 #include "llama-context.h"
+#include "llama-walk.h"
 
 #include "ggml.h"
 #include "llama-batch.h"
@@ -128,6 +129,469 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
 }
 
+// THE WALK (Fable's design, continuum 2026-10-06): one pass over a window in one context. A run
+// with no label is context she did not write: a plain decode into the cache, no backward. A
+// labelled run is her reply: it trains in chunks of n_batch, each attending to everything before
+// it read from the cache as a constant (build_attn, cparams.training), then the reply is decoded
+// into the cache under the adapter as it now is, so the next reply sees it. Memory is chunk x
+// window, never window x window, so her whole lived window trains. Nothing after the last label
+// is computed. One per window; a member of the context, so it runs on the context's own state.
+struct llama_context::opt_walk {
+    llama_context                  & lctx;
+    ggml_opt_dataset_t               dataset;
+    ggml_opt_result_t                result;
+    const std::vector<llama_token> & tokens;
+    const std::vector<llama_token> & labels;
+    llama_batch                    & batch;
+    ggml_opt_epoch_callback          callback;
+    bool                             train;
+    int64_t                          idata_in_loop;
+    int64_t                          ndata_in_loop;
+    int64_t                          t_loop_start;
+    uint32_t                         n_ctx;
+    uint32_t                         n_batch;
+    llama_walk_plan                  plan;
+
+    // a recurrent part (pure recurrent or hybrid) carries its state across chunks; a hybrid's
+    // attention part removes a chunk's cells like a plain cache
+    llama_memory_recurrent * recr = nullptr;
+    llama_kv_cache         * attn = nullptr;
+
+    bool first_unit = true;
+    // THE EXACT WALK's chunk being trained (null in the plain walk) and its host gradients
+    const llama_walk_chunk * xc = nullptr;
+    llama_walk_acc           acc;
+
+    opt_walk(llama_context & lctx, ggml_opt_dataset_t dataset, ggml_opt_result_t result,
+            const std::vector<llama_token> & tokens, const std::vector<llama_token> & labels, llama_batch & batch,
+            ggml_opt_epoch_callback callback, bool train, int64_t idata_in_loop, int64_t ndata_in_loop, int64_t t_loop_start,
+            uint32_t n_ctx, uint32_t n_batch)
+        : lctx(lctx), dataset(dataset), result(result), tokens(tokens), labels(labels), batch(batch), callback(callback),
+          train(train), idata_in_loop(idata_in_loop), ndata_in_loop(ndata_in_loop), t_loop_start(t_loop_start),
+          n_ctx(n_ctx), n_batch(n_batch), plan(llama_walk_plan::of(labels, n_ctx, n_batch)) {}
+
+    bool yield_point();
+    bool decode_span(uint32_t p0, uint32_t p1);
+    bool train_chunk(uint32_t pos_ctx, uint32_t n_chunk);
+    void run_exact();
+    void run_plain();
+
+    // the exact walk's graph flags in cparams, which build_attn and build_rs read
+    void set_flags(bool exact, uint32_t grad_from, bool surrogate, bool state_surrogate) {
+        lctx.cparams.walk_exact           = exact;
+        lctx.cparams.walk_grad_from       = grad_from;
+        lctx.cparams.walk_surrogate       = surrogate;
+        lctx.cparams.walk_state_surrogate = state_surrogate;
+    }
+};
+
+// THE YIELD POINT IS THE CHUNK, not the window: a turn that arrives mid-walk waits for one chunk,
+// never for the whole example (measured on the 5090: one callback per example made a turn wait for
+// its entire walk, 1.2-1.8 s on a 1.5B at 15k and 13.5 s on Fable's run). The first unit is the
+// window's own boundary, which opt_epoch has already offered.
+bool llama_context::opt_walk::yield_point() {
+    if (first_unit) {
+        first_unit = false;
+    } else if (lctx.opt_step_callback && !lctx.opt_step_callback(train, lctx.opt_step_callback_data)) {
+        lctx.opt_stop_requested.store(true);
+    }
+    return !lctx.opt_stop_requested.load(std::memory_order_relaxed);
+}
+
+// a plain inference decode of [p0, p1) into the cache: the training graph's attention never
+// writes the cache, so context and finished replies reach it this way
+bool llama_context::opt_walk::decode_span(uint32_t p0, uint32_t p1) {
+    llama_cparams & cparams = lctx.cparams;
+    const bool training = cparams.training;
+    cparams.training = false;
+    lctx.gf_res_prev->reset();
+    bool ok = true;
+    for (uint32_t c0 = p0; c0 < p1 && ok; c0 += n_batch) {
+        if (!yield_point()) {
+            cparams.training = training;
+            lctx.gf_res_prev->reset();
+            return false; // stopped or cancelled at a chunk boundary: not a decode failure
+        }
+        const uint32_t c1 = std::min(c0 + n_batch, p1);
+        llama_walk_fill(batch, tokens, c0, c1 - c0);
+        batch.logits[c1 - c0 - 1] = true;
+        ok = lctx.decode(batch) == 0;
+    }
+    cparams.training = training;
+    lctx.gf_res_prev->reset();
+    if (!ok) {
+        LLAMA_LOG_ERROR("%s: the context decode of [%u, %u) failed\n", __func__, p0, p1);
+    }
+    return ok;
+}
+
+// one training chunk [pos_ctx, pos_ctx + n_chunk): forward and backward over it alone, attending
+// to the cached context before it
+bool llama_context::opt_walk::train_chunk(uint32_t pos_ctx, uint32_t n_chunk) {
+    const llama_model & model   = lctx.model;
+    llama_cparams     & cparams = lctx.cparams;
+    ggml_opt_context_t  opt_ctx = lctx.opt_ctx;
+
+    llama_walk_fill(batch, tokens, pos_ctx, n_chunk);
+    for (uint32_t pos_batch = 0; pos_batch < n_chunk; ++pos_batch) {
+        // an exact walk's context chunk has no label but still trains (its K/V carry later
+        // chunks' gradient): one output row, weighted zero, so the graph has its loss
+        batch.logits[pos_batch] = labels[pos_ctx + pos_batch] >= 0
+            || (xc != nullptr && xc->n_labels == 0 && pos_batch + 1 == n_chunk);
+    }
+
+    // output_all = false: the batch's own logits flags decide which rows exist
+    if (!lctx.balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, false)) {
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        return false;
+    }
+
+    lctx.n_queued_tokens += lctx.balloc->get_n_tokens();
+
+    lctx.embd_seq.clear();
+
+    const uint32_t n_outputs_all = lctx.balloc->get_n_outputs();
+    // Unreachable: the walk trains only chunks of a labelled run. It RETURNS from the whole
+    // window, since a later chunk would need this one in the cache.
+    if (n_outputs_all == 0) {
+        LLAMA_LOG_ERROR("%s: a training batch with no labelled position (every label masked): nothing to learn from it\n", __func__);
+        return false;
+    }
+
+    auto mctx = lctx.memory->init_batch(*lctx.balloc, cparams.n_ubatch, true);
+    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
+        return false;
+    }
+
+    // reserve output buffer
+    if (lctx.output_reserve(n_outputs_all) < n_outputs_all) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+        GGML_ABORT("TODO: handle this error");
+    };
+
+    uint32_t pos_batch = 0;
+    do {
+        const auto & ubatch = mctx->get_ubatch();
+
+        // the labelled rows of this ubatch, as decode counts its outputs
+        {
+            uint32_t n_outputs_ubatch = 0;
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                n_outputs_ubatch += (uint32_t) (ubatch.output[i] != 0);
+            }
+            lctx.n_outputs = n_outputs_ubatch;
+        }
+
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
+            return false;
+        }
+
+        auto * res = lctx.gf_res_prev.get();
+
+        const auto gparams = lctx.graph_params(res, ubatch, mctx.get(), lctx.graph_type());
+
+        res->reset();
+
+        auto * gf = model.build_graph(gparams);
+
+        struct ggml_context * ctx_compute_opt;
+        {
+            const size_t size_gf = ggml_graph_size(gf);
+            const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+            struct ggml_init_params params = {
+                /*.mem_size   =*/ size_meta,
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ctx_compute_opt = ggml_init(params);
+        }
+        ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+        if (xc != nullptr) {
+            ggml_opt_set_next_step(opt_ctx, xc->period_end, xc->loss_scale, res->t_walk_surrogate);
+            for (const auto & io : res->t_walk) {
+                if (io.tk) {
+                    ggml_opt_accumulate_grad(opt_ctx, io.tk, io.ak);
+                    ggml_opt_accumulate_grad(opt_ctx, io.tv, io.av);
+                }
+            }
+            for (const auto & ws : res->t_walk_state) {
+                if (ws.tap) {
+                    ggml_opt_accumulate_grad(opt_ctx, ws.tap, acc.state.at(ws.cache));
+                }
+            }
+        }
+        if (!ggml_opt_alloc(opt_ctx, train)) {
+            ggml_free(ctx_compute_opt);
+            lctx.opt_fail(ggml_opt_refusal(opt_ctx),
+                std::string("the ") + (train ? "training" : "evaluation") + " graph was refused (window " + std::to_string(n_ctx) + ")");
+            return false;
+        }
+
+        res->set_inputs(&ubatch);
+        {
+            // one-hot rows for the labelled positions only, in the order the ubatch emits its
+            // outputs (the same order the logits rows take)
+            struct ggml_tensor * labels_t = ggml_opt_labels(opt_ctx);
+            GGML_ASSERT(labels_t->ne[1] == (int64_t) lctx.n_outputs);
+            ggml_set_zero(labels_t);
+            const float onef = 1.0f;
+            uint32_t row = 0;
+            for (uint32_t pos_ubatch = 0; pos_ubatch < ubatch.n_tokens; ++pos_ubatch) {
+                if (ubatch.output[pos_ubatch] == 0) {
+                    continue;
+                }
+                const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
+                // an exact walk's context chunk: its one row has no label (weighted zero)
+                GGML_ASSERT((xc != nullptr && labels[ilabel] < 0) || (labels[ilabel] >= 0 && labels[ilabel] < labels_t->ne[0]));
+                if (labels[ilabel] >= 0) {
+                    ggml_backend_tensor_set(labels_t, &onef, (row*labels_t->ne[0] + labels[ilabel])*sizeof(float), sizeof(float));
+                }
+                ++row;
+            }
+            GGML_ASSERT(row == lctx.n_outputs);
+        }
+        if (xc != nullptr) {
+            // the later chunk's dL/d(entry state) is this chunk's exit gradient; then the
+            // accumulator takes this chunk's own
+            for (const auto & ws : res->t_walk_state) {
+                ggml_tensor * a = acc.state.at(ws.cache);
+                if (ws.gs) {
+                    GGML_ASSERT(ggml_nbytes(a) == ggml_nbytes(ws.gs));
+                    ggml_backend_tensor_set(ws.gs, a->data, 0, ggml_nbytes(ws.gs));
+                }
+                memset(a->data, 0, ggml_nbytes(a));
+            }
+        }
+        ggml_opt_eval(opt_ctx, xc != nullptr && xc->n_labels == 0 ? nullptr : result);
+        if (const char * why = ggml_opt_refusal(opt_ctx); why[0] != '\0') {
+            // the backend failed the graph (ggml_opt_eval): the run fails, as a refused graph does
+            ggml_free(ctx_compute_opt);
+            lctx.opt_fail(why);
+            return false;
+        }
+        if (xc != nullptr && !res->t_walk_state.empty()) {
+            acc.state_ready = true;
+        }
+        if (callback && !(xc != nullptr && xc->n_labels == 0)) {
+            callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_batch + 1, ndata_in_loop, t_loop_start);
+        }
+        ggml_free(ctx_compute_opt);
+
+        pos_batch += ubatch.n_tokens;
+    } while (mctx->next());
+    return true;
+}
+
+// THE EXACT WALK. The plain walk steps per chunk and stops the gradient at every chunk boundary: a
+// reply learns only through its own chunk's K/V, never through what an earlier chunk computed for
+// it. Here the window is decoded once under the adapter as it is, then trained in REVERSE: each
+// chunk's graph attends to the cache, with its last walk_horizon prefix positions behind a
+// gradient tap, and adds the surrogate <K, G> + <V, G> on its own K/V, where G is what every later
+// chunk put there. Its backward then carries that gradient through itself into the adapter and
+// into its own prefix's G. ONE optimizer step per window, on the gradient of the window's loss
+// (exact within the horizon). Memory stays chunk x window; the cost is one decode plus one forward
+// and backward per chunk, context chunks included.
+// THE INVARIANT THAT MAKES THE REVERSE PASS VALID (Fable): the adapter does not change between the
+// forward decode and the last chunk's backward. One optimizer step per window, taken by the chunk
+// the reverse pass trains last, is what keeps each chunk's recomputed K/V (and recurrent state)
+// equal to the cached values its successors attended to; a step inside the window would make
+// every surrogate a gradient of a different function.
+// A recurrent model's state is carried the same way, one chunk at a time: the state entering a
+// chunk is tapped into a host accumulator, the state it leaves meets the next chunk's gradient
+// (build_rs, build_walk_state_exit). The reverse pass restores each chunk's entry state from a
+// checkpoint taken at its boundary in the forward pass.
+void llama_context::opt_walk::run_exact() {
+    // Each window starts from the REQUESTED horizon: a halving that fit one window's device budget
+    // must not shrink every later window and epoch, which may be shorter (Fable).
+    lctx.opt_walk_horizon = lctx.opt_walk_horizon_req;
+    // A recurrent context with rollback slots keeps several states per sequence; the walk carries
+    // exactly one. Refused by name, never asserted: training runs inside the serving process, and
+    // an assert there takes serving down (2026-10-07 04:09Z on the 5090).
+    if (recr != nullptr && lctx.cparams.n_rs_seq > 0) {
+        lctx.opt_fail("the exact walk needs a training context with no recurrent rollback slots (n_rs_seq = 0, it has "
+            + std::to_string(lctx.cparams.n_rs_seq) + "): create the training context with n_rs_seq = 0");
+        return;
+    }
+    plan.mark_exact(recr != nullptr, lctx.opt_walk_horizon);
+    const std::vector<llama_walk_chunk> & chunks = plan.chunks;
+    const uint32_t n_pos = (uint32_t) plan.last_label + 1;
+
+    // THE HOST BUDGET (llama_walk_plan::stride_for): the K/V accumulators and the recurrent state
+    // checkpoints are both known before anything runs
+    const size_t kv_bytes    = llama_walk_acc::kv_bytes(lctx.model.hparams, n_pos);
+    const size_t state_bytes = llama_walk_acc::state_bytes(recr);
+    const size_t budget      = lctx.opt_walk_host_budget;
+    const size_t stride      = plan.stride_for(budget, kv_bytes, state_bytes);
+    const size_t bytes       = plan.host_bytes(stride, kv_bytes, state_bytes);
+    lctx.opt_walk_host_bytes = std::max(lctx.opt_walk_host_bytes, bytes);
+    if (budget > 0 && bytes > budget) {
+        char why[512];
+        snprintf(why, sizeof(why),
+            "the exact walk needs %.1f MiB of host memory for this window (%u positions, the K/V gradient alone), over its budget of %.1f MiB: "
+            "the K/V gradient grows with the window; neither the horizon nor the chunk size changes it",
+            bytes/1048576.0, n_pos, budget/1048576.0);
+        lctx.opt_fail(why);
+        return;
+    }
+    if (stride > 1) {
+        LLAMA_LOG_INFO("%s: the exact walk checkpoints the recurrent state every %zu chunks to fit %.1f MiB of host memory (%.1f MiB)\n",
+                __func__, stride, budget/1048576.0, bytes/1048576.0);
+    }
+    if (!acc.init(lctx.model.hparams, recr, n_pos, lctx.cparams)) {
+        lctx.opt_fail("the exact walk's gradient accumulator (host memory) could not be allocated");
+        return;
+    }
+
+    // the window as the adapter now reads it, chunk by chunk: a recurrent model's state is
+    // checkpointed at each chunk's start through the sequence-state API (the recurrent part only,
+    // PARTIAL_ONLY), after waiting for the queued decode; a restore puts back the cell's position
+    // with its rows, and an empty checkpoint (before the first chunk) restores the zero state. A
+    // hand-rolled per-layer copy here skipped that wait and, on Metal, carried a torn mid-graph
+    // state into the reverse pass (2026-10-11).
+    std::vector<std::vector<uint8_t>> snaps(recr != nullptr ? chunks.size() : 0);
+    const llama_state_seq_flags state_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    for (size_t j = 0; j < chunks.size(); ++j) {
+        if (recr != nullptr && j % stride == 0) {
+            lctx.synchronize();
+            snaps[j].resize(lctx.state_seq_get_size(0, state_flags));
+            GGML_ASSERT(lctx.state_seq_get_data(0, snaps[j].data(), snaps[j].size(), state_flags) == snaps[j].size());
+        }
+        if (!decode_span(chunks[j].c0, chunks[j].c0 + chunks[j].n)) {
+            return;
+        }
+    }
+    for (int64_t j = (int64_t) chunks.size() - 1; j >= plan.first; --j) {
+        const llama_walk_chunk & c = chunks[j];
+        if (!c.needed) {
+            continue;
+        }
+        if (!yield_point()) {
+            break;
+        }
+        // attention: pop the cache to [0, c0); recurrent: restore the state at the chunk's
+        // checkpoint and decode forward to its start (that decode rebuilds the attention K/V in
+        // between too, under the same adapter: the same values). Run again before every retry
+        // below: a refused chunk graph is refused AFTER its ubatch was applied, so the chunk's
+        // cells already sit in the cache and the recurrent cell's position has moved to the
+        // chunk's end; retrying on top of that fails to prepare the ubatch at all (the 5090,
+        // 2026-10-10: "init_batch: failed to prepare attention ubatches" after "retrying at 512",
+        // and the epoch stopped instead of shrinking the horizon). Always a plain decode: the
+        // walk's graph flags are off whenever it runs.
+        const auto rewind = [&]() -> bool {
+            const size_t   cp    = recr != nullptr ? (size_t) j - (size_t) j % stride : (size_t) j;
+            const uint32_t p_pop = chunks[cp].c0;
+            const bool popped = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, p_pop, -1)) : lctx.memory->seq_rm(0, p_pop, -1);
+            if (!popped) {
+                LLAMA_LOG_ERROR("%s: could not pop the cache to [0, %u) for the reverse pass\n", __func__, p_pop);
+                lctx.opt_stop_requested.store(true);
+                return false;
+            }
+            if (recr != nullptr) {
+                lctx.synchronize();
+                GGML_ASSERT(lctx.state_seq_set_data(0, snaps[cp].data(), snaps[cp].size(), state_flags) == snaps[cp].size());
+                if (p_pop < c.c0 && !decode_span(p_pop, c.c0)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (!rewind()) {
+            break;
+        }
+        const bool state_surrogate = recr != nullptr && j < (int64_t) chunks.size() - 1 && acc.state_ready;
+        // THE HORIZON FITS THE DEVICE. Its gradient taps are the chunk graph's largest growth with
+        // the window (layers x horizon x (k + v) floats, twice with their gradient); the graph
+        // preflight refuses a chunk that does not fit before allocating anything, so a memory
+        // refusal halves the horizon (whole chunks) and the chunk is tried again; every later
+        // chunk keeps the smaller one. The forward still attends to the whole window and the
+        // recurrent state is carried exactly; only attention gradient past the horizon is dropped.
+        // A refusal at a horizon of one chunk, or for a node the device cannot run, stands.
+        llama_walk_chunk cc = c;
+        bool ok;
+        for (;;) {
+            cc.grad_from = llama_walk_plan::grad_from(cc.c0, lctx.opt_walk_horizon);
+            set_flags(true, cc.grad_from, c.surrogate, state_surrogate);
+            xc = &cc;
+            ok = train_chunk(cc.c0, cc.n);
+            xc = nullptr;
+            set_flags(false, 0, false, false);
+            const uint32_t span = cc.c0 - cc.grad_from;
+            if (ok || !lctx.opt_failure.empty() || !lctx.opt_alloc_failed.load() || span <= n_batch) {
+                break;
+            }
+            lctx.opt_walk_horizon = std::max<uint32_t>(n_batch, (span/2)/n_batch*n_batch);
+            LLAMA_LOG_WARN("%s: the chunk at %u did not fit with a gradient horizon of %u positions: retrying at %u\n",
+                    __func__, cc.c0, span, lctx.opt_walk_horizon);
+            lctx.opt_alloc_failed.store(false);
+            lctx.opt_stop_requested.store(false);
+            if (!rewind()) {
+                ok = false;
+                break;
+            }
+        }
+        lctx.opt_walk_horizon_used = lctx.opt_walk_horizon;
+        if (!ok) {
+            break;
+        }
+    }
+    acc.state_ready = false;
+}
+
+// THE PLAIN WALK: each labelled chunk steps on its own gradient, then joins the context
+void llama_context::opt_walk::run_plain() {
+    const int64_t last_label = plan.last_label;
+    for (const llama_walk_chunk & c : plan.chunks) {
+        if (lctx.opt_stop_requested.load(std::memory_order_relaxed)) {
+            return;
+        }
+        const uint32_t c0 = c.c0;
+        const uint32_t c1 = c.c0 + c.n;
+        if (c.n_labels == 0) {
+            if (!decode_span(c0, c1)) {
+                return;
+            }
+            continue;
+        }
+        // The training forward advances a recurrent state in place, and a recurrent memory
+        // cannot remove a partial range: snapshot the state to the scratch sequence first
+        // (Fable), restore it after, then the decode below advances it from where the context
+        // left it. The cache's own copy-on-write keeps it on the device; the state is per
+        // sequence and small.
+        const bool snapshot = recr != nullptr && c1 <= (uint32_t) last_label;
+        if (!yield_point()) {
+            return;
+        }
+        if (snapshot) {
+            recr->seq_cp(0, 1, -1, -1);
+        }
+        if (!train_chunk(c0, c.n)) {
+            return;
+        }
+        if (snapshot) {
+            recr->seq_rm(0, -1, -1);
+            recr->seq_cp(1, 0, -1, -1);
+            recr->seq_rm(1, -1, -1);
+        }
+        // the chunk joins the context under the adapter as it now is: the training graph never
+        // writes the cache, so its cells hold nothing until this decode
+        if (c1 <= (uint32_t) last_label) {
+            // drop the chunk's empty cells from the attention memory, then decode them for real
+            const bool removed = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, c0, -1)) : lctx.memory->seq_rm(0, c0, -1);
+            if (!removed) {
+                LLAMA_LOG_ERROR("%s: could not remove the trained chunk [%u, %u) from the cache before decoding it\n", __func__, c0, c1);
+                lctx.opt_stop_requested.store(true);
+                return;
+            }
+            if (!decode_span(c0, c1)) {
+                lctx.opt_stop_requested.store(true);
+                return;
+            }
+        }
+    }
+}
+
 void llama_context::opt_epoch_iter(
         ggml_opt_dataset_t               dataset,
         ggml_opt_result_t                result,
@@ -145,607 +609,37 @@ void llama_context::opt_epoch_iter(
 
     memory->clear(true);
 
-    // THE WALK (Fable's design, continuum 2026-10-06): one pass over the window in one
-    // context. A run with no label is context she did not write: a plain decode into the
-    // cache, no backward. A labelled run is her reply: it trains in chunks of n_batch, each
-    // attending to everything before it read from the cache as a constant (build_attn,
-    // cparams.training), then the reply is decoded into the cache under the adapter as it
-    // now is, so the next reply sees it. Memory is chunk x window, never window x window, so
-    // her whole lived window trains. Nothing after the last label is computed.
-    int64_t last_label = -1;
-    for (int64_t i = (int64_t) n_ctx - 1; i >= 0; --i) {
-        if (labels_sparse[i] >= 0) {
-            last_label = i;
-            break;
-        }
-    }
-    if (last_label < 0) {
+    opt_walk walk(*this, dataset, result, tokens, labels_sparse, batch, callback, train,
+        idata_in_loop, ndata_in_loop, t_loop_start, n_ctx, n_batch);
+    if (walk.plan.last_label < 0) {
         LLAMA_LOG_ERROR("%s: a training window with no labelled position: nothing to learn from it\n", __func__);
         return;
     }
-
-    // THE YIELD POINT IS THE CHUNK, not the window: a turn that arrives mid-walk waits for one
-    // chunk, never for the whole example (measured on the 5090: one callback per example made a
-    // turn wait for its entire walk, 1.2-1.8 s on a 1.5B at 15k and 13.5 s on Fable's run). The
-    // first unit is the window's own boundary, which opt_epoch has already offered.
-    bool first_unit = true;
-    auto yield_point = [&]() -> bool {
-        if (first_unit) {
-            first_unit = false;
-        } else if (opt_step_callback && !opt_step_callback(train, opt_step_callback_data)) {
-            opt_stop_requested.store(true);
-        }
-        return !opt_stop_requested.load(std::memory_order_relaxed);
-    };
-
-    // a plain inference decode of [p0, p1) into the cache: the training graph's attention
-    // never writes the cache, so context and finished replies reach it this way
-    auto decode_span = [&](uint32_t p0, uint32_t p1) -> bool {
-        const bool training = cparams.training;
-        cparams.training = false;
-        gf_res_prev->reset();
-        bool ok = true;
-        for (uint32_t c0 = p0; c0 < p1 && ok; c0 += n_batch) {
-            if (!yield_point()) {
-                cparams.training = training;
-                gf_res_prev->reset();
-                return false; // stopped or cancelled at a chunk boundary: not a decode failure
-            }
-            const uint32_t c1 = std::min(c0 + n_batch, p1);
-            batch.n_tokens = c1 - c0;
-            for (uint32_t i = 0; i < c1 - c0; ++i) {
-                batch.token   [i]    = tokens[c0 + i];
-                batch.pos     [i]    = c0 + i;
-                batch.n_seq_id[i]    = 1;
-                batch.seq_id  [i][0] = 0;
-                batch.logits  [i]    = i + 1 == c1 - c0;
-            }
-            const int rc = decode(batch);
-            ok = rc == 0;
-        }
-        cparams.training = training;
-        gf_res_prev->reset();
-        if (!ok) {
-            LLAMA_LOG_ERROR("%s: the context decode of [%u, %u) failed\n", __func__, p0, p1);
-        }
-        return ok;
-    };
-
-    // THE EXACT WALK's state for the chunk being trained (null in the plain walk): its place in
-    // the window's one optimizer period, and the gradient accumulated on the window's cached K/V
-    struct exact_chunk {
-        uint32_t c0;
-        uint32_t n;
-        uint32_t n_labels;
-        uint32_t grad_from;  // its gradient taps cover cached positions [grad_from, c0)
-        bool     surrogate;  // a later chunk's gradient sits on its own K/V
-        bool     needed;
-        bool     period_end; // the window's optimizer step
-        float    loss_scale; // its labelled positions over the window's
-    };
-    const exact_chunk * xc = nullptr;
-    // THE EXACT WALK's gradients, in host memory, each added into in place by the backward:
-    // per attention layer dL/d(cached K) and dL/d(cached V) of the window, [n_embd_*_gqa,
-    // position] F32 (null for a recurrent layer), which the graph reads through cparams (never
-    // outliving it, whatever way the walk returns); per recurrent state tensor (a layer's conv
-    // state r_l and its recurrent state s_l) dL/d(the state entering the chunk trained last),
-    // which is what the chunk before it puts on the state it leaves (state_ready once one is in)
-    struct walk_acc_t {
-        llama_cparams &            cp;
-        std::vector<ggml_tensor *> k, v;
-        std::unordered_map<const ggml_tensor *, ggml_tensor *> state;
-        bool                       state_ready = false;
-        ggml_context_ptr           ctx;
-        ggml_backend_buffer_ptr    buf;
-        ~walk_acc_t() { cp.walk_acc_k = nullptr; cp.walk_acc_v = nullptr; }
-    } walk_acc { cparams, {}, {}, {}, false, nullptr, nullptr };
-
-    // one training chunk [pos_ctx, pos_ctx + n_tokens): forward and backward over it alone,
-    // attending to the cached context before it
-    auto train_chunk = [&](uint32_t pos_ctx, uint32_t n_chunk) -> bool {
-        batch.n_tokens = n_chunk;
-        for (uint32_t pos_batch = 0; pos_batch < n_chunk; ++pos_batch) {
-            batch.token   [pos_batch]    = tokens[pos_ctx + pos_batch];
-            batch.pos     [pos_batch]    = pos_ctx + pos_batch;
-            batch.n_seq_id[pos_batch]    = 1;
-            batch.seq_id  [pos_batch][0] = 0;
-            // an exact walk's context chunk has no label but still trains (its K/V carry later
-            // chunks' gradient): one output row, weighted zero, so the graph has its loss
-            batch.logits  [pos_batch]    = labels_sparse[pos_ctx + pos_batch] >= 0
-                || (xc != nullptr && xc->n_labels == 0 && pos_batch + 1 == n_chunk);
-        }
-
-        // output_all = false: the batch's own logits flags decide which rows exist
-        if (!balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, false)) {
-            LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
-            return false;
-        }
-
-        const uint32_t n_tokens_all = balloc->get_n_tokens();
-
-        n_queued_tokens += n_tokens_all;
-
-        embd_seq.clear();
-
-        const uint32_t n_outputs_all = balloc->get_n_outputs();
-        // Unreachable: the walk below trains only chunks of a labelled run. It RETURNS from the
-        // whole window, since a later chunk would need this one in the cache.
-        if (n_outputs_all == 0) {
-            LLAMA_LOG_ERROR("%s: a training batch with no labelled position (every label masked): nothing to learn from it\n", __func__);
-            return false;
-        }
-
-        auto mctx = memory->init_batch(*balloc, cparams.n_ubatch, true);
-        if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
-            return false;
-        }
-
-        // reserve output buffer
-        if (output_reserve(n_outputs_all) < n_outputs_all) {
-            LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
-            GGML_ABORT("TODO: handle this error");
-        };
-
-        uint32_t pos_batch = 0;
-        do {
-            const auto & ubatch = mctx->get_ubatch();
-
-            // the labelled rows of this ubatch, as decode counts its outputs
-            {
-                uint32_t n_outputs_ubatch = 0;
-                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                    n_outputs_ubatch += (uint32_t) (ubatch.output[i] != 0);
-                }
-                n_outputs = n_outputs_ubatch;
-            }
-
-            if (!mctx->apply()) {
-                LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
-                return false;
-            }
-
-            auto * res = gf_res_prev.get();
-
-            const auto gparams = graph_params(res, ubatch, mctx.get(), graph_type());
-
-            res->reset();
-
-            auto * gf = model.build_graph(gparams);
-
-            struct ggml_context * ctx_compute_opt;
-            {
-                const size_t size_gf = ggml_graph_size(gf);
-                const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
-                struct ggml_init_params params = {
-                    /*.mem_size   =*/ size_meta,
-                    /*.mem_buffer =*/ nullptr,
-                    /*.no_alloc   =*/ true,
-                };
-                ctx_compute_opt = ggml_init(params);
-            }
-            ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
-            if (xc != nullptr) {
-                ggml_opt_set_next_step(opt_ctx, xc->period_end, xc->loss_scale, res->t_walk_surrogate);
-                for (const auto & io : res->t_walk) {
-                    if (io.tk) {
-                        ggml_opt_accumulate_grad(opt_ctx, io.tk, io.ak);
-                        ggml_opt_accumulate_grad(opt_ctx, io.tv, io.av);
-                    }
-                }
-                for (const auto & ws : res->t_walk_state) {
-                    if (ws.tap) {
-                        ggml_opt_accumulate_grad(opt_ctx, ws.tap, walk_acc.state.at(ws.cache));
-                    }
-                }
-            }
-            if (!ggml_opt_alloc(opt_ctx, train)) {
-                const char * why = ggml_opt_refusal(opt_ctx);
-                opt_failure = why;
-                LLAMA_LOG_ERROR("%s: the %s graph was refused (window %u): %s: stopping the epoch\n",
-                                __func__, train ? "training" : "evaluation", n_ctx,
-                                why[0] ? why : "it does not fit in device memory");
-                ggml_free(ctx_compute_opt);
-                opt_alloc_failed.store(true);
-                opt_stop_requested.store(true);
-                return false;
-            }
-
-            res->set_inputs(&ubatch);
-            {
-                // one-hot rows for the labelled positions only, in the order the ubatch
-                // emits its outputs (the same order the logits rows take)
-                struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
-                GGML_ASSERT(labels->ne[1] == (int64_t) n_outputs);
-                ggml_set_zero(labels);
-                const float onef = 1.0f;
-                uint32_t row = 0;
-                for (uint32_t pos_ubatch = 0; pos_ubatch < ubatch.n_tokens; ++pos_ubatch) {
-                    if (ubatch.output[pos_ubatch] == 0) {
-                        continue;
-                    }
-                    const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                    // an exact walk's context chunk: its one row has no label (weighted zero)
-                    GGML_ASSERT((xc != nullptr && labels_sparse[ilabel] < 0) || (labels_sparse[ilabel] >= 0 && labels_sparse[ilabel] < labels->ne[0]));
-                    if (labels_sparse[ilabel] >= 0) {
-                        ggml_backend_tensor_set(labels, &onef, (row*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
-                    }
-                    ++row;
-                }
-                GGML_ASSERT(row == n_outputs);
-            }
-            if (xc != nullptr) {
-                // the later chunk's dL/d(entry state) is this chunk's exit gradient; then the
-                // accumulator takes this chunk's own
-                for (const auto & ws : res->t_walk_state) {
-                    ggml_tensor * acc = walk_acc.state.at(ws.cache);
-                    if (ws.gs) {
-                        GGML_ASSERT(ggml_nbytes(acc) == ggml_nbytes(ws.gs));
-                        ggml_backend_tensor_set(ws.gs, acc->data, 0, ggml_nbytes(ws.gs));
-                    }
-                    memset(acc->data, 0, ggml_nbytes(acc));
-                }
-            }
-            ggml_opt_eval(opt_ctx, xc != nullptr && xc->n_labels == 0 ? nullptr : result);
-            if (const char * why = ggml_opt_refusal(opt_ctx); why[0] != '\0') {
-                // the backend failed the graph (ggml_opt_eval): the run fails, as a refused graph does
-                opt_failure = why;
-                LLAMA_LOG_ERROR("%s: %s: stopping the epoch\n", __func__, why);
-                ggml_free(ctx_compute_opt);
-                opt_alloc_failed.store(true);
-                opt_stop_requested.store(true);
-                return false;
-            }
-            if (xc != nullptr && !res->t_walk_state.empty()) {
-                walk_acc.state_ready = true;
-            }
-            if (callback && !(xc != nullptr && xc->n_labels == 0)) {
-                callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_batch + 1, ndata_in_loop, t_loop_start);
-            }
-            ggml_free(ctx_compute_opt);
-
-            pos_batch += ubatch.n_tokens;
-        } while (mctx->next());
-        return true;
-    };
-
-    // a recurrent part (pure recurrent or hybrid) is snapshotted around each training chunk;
-    // a hybrid's attention part removes the chunk's cells like a plain cache
-    llama_memory_recurrent * recr = nullptr;
-    llama_kv_cache         * attn = nullptr;
     if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
-        recr = hybrid->get_mem_recr();
-        attn = hybrid->get_mem_attn();
+        walk.recr = hybrid->get_mem_recr();
+        walk.attn = hybrid->get_mem_attn();
     } else {
-        recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
+        walk.recr = dynamic_cast<llama_memory_recurrent *>(memory.get());
     }
-    // the plain walk snapshots a recurrent state into a scratch sequence; the exact walk keeps host snapshots
-    if (recr != nullptr && cparams.n_seq_max < 2 && !(train && opt_walk_exact)) {
+    if (train && opt_walk_exact) {
+        walk.run_exact();
+        return;
+    }
+    // the plain walk snapshots a recurrent state into a scratch sequence
+    if (walk.recr != nullptr && cparams.n_seq_max < 2) {
         LLAMA_LOG_ERROR("%s: a recurrent model trains with a scratch sequence for its state snapshot: create the training context with n_seq_max >= 2\n", __func__);
         opt_stop_requested.store(true);
         return;
     }
+    walk.run_plain();
+}
 
-    if (train && opt_walk_exact) {
-        // THE EXACT WALK. The plain walk below steps per chunk and stops the gradient at every
-        // chunk boundary: a reply learns only through its own chunk's K/V, never through what
-        // an earlier chunk computed for it. Here the window is decoded once under the adapter
-        // as it is, then trained in REVERSE: each chunk's graph attends to the cache, with its
-        // last walk_horizon prefix positions behind a GRAD leaf, and adds the surrogate
-        // <K, G> + <V, G> on its own K/V, where G is what every later chunk put there. Its
-        // backward then carries that gradient through itself into the adapter and into its own
-        // prefix's G. ONE optimizer step per window, on the gradient of the window's loss
-        // (exact within the horizon). Memory stays chunk x window; the cost is one decode plus
-        // one forward and backward per chunk, context chunks included.
-        // THE INVARIANT THAT MAKES THE REVERSE PASS VALID (Fable): the adapter does not change
-        // between the forward decode and the last chunk's backward. One optimizer step per window,
-        // taken by the chunk the reverse pass trains last, is what keeps each chunk's recomputed
-        // K/V (and recurrent state) equal to the cached values its successors attended to; a step
-        // inside the window would make every surrogate a gradient of a different function.
-        //
-        // Each window starts from the REQUESTED horizon: a halving that fit one window's device
-        // budget must not shrink every later window and epoch, which may be shorter (Fable).
-        opt_walk_horizon = opt_walk_horizon_req;
-        // A recurrent context with rollback slots keeps several states per sequence; the walk
-        // carries exactly one. Refused by name, never asserted: training runs inside the serving
-        // process, and an assert there takes serving down (2026-10-07 04:09Z on the 5090).
-        if (recr != nullptr && cparams.n_rs_seq > 0) {
-            opt_failure = "the exact walk needs a training context with no recurrent rollback slots (n_rs_seq = 0, it has "
-                + std::to_string(cparams.n_rs_seq) + "): create the training context with n_rs_seq = 0";
-            LLAMA_LOG_ERROR("%s: %s\n", __func__, opt_failure.c_str());
-            opt_alloc_failed.store(true);
-            opt_stop_requested.store(true);
-            return;
-        }
-        // A recurrent model's state is carried the same way, one chunk at a time: the state
-        // entering a chunk is tapped into a host accumulator, the state it leaves meets the next chunk's gradient
-        // (build_rs, build_walk_state_exit). The reverse pass restores each chunk's entry state
-        // from a host snapshot taken at its boundary in the forward pass.
-        std::vector<exact_chunk> chunks;
-        uint32_t n_labels_window = 0;
-        for (uint32_t p = 0; p <= (uint32_t) last_label; ) {
-            const bool labelled = labels_sparse[p] >= 0;
-            uint32_t end = p;
-            while (end <= (uint32_t) last_label && (labels_sparse[end] >= 0) == labelled) {
-                ++end;
-            }
-            for (uint32_t c0 = p; c0 < end; c0 += n_batch) {
-                const uint32_t c1 = std::min(c0 + n_batch, end);
-                chunks.push_back({ c0, c1 - c0, labelled ? c1 - c0 : 0, 0, false, false, false, 0.0f });
-                n_labels_window += labelled ? c1 - c0 : 0;
-            }
-            p = end;
-        }
-        // which chunks train, and how far back each one's gradient reaches
-        uint32_t reach = UINT32_MAX; // the lowest position a later trained chunk's gradient reaches
-        int64_t  first = -1;         // the last chunk the reverse pass trains: the step
-        for (int64_t j = (int64_t) chunks.size() - 1; j >= 0; --j) {
-            exact_chunk & c = chunks[j];
-            c.surrogate = reach < c.c0 + c.n;
-            // a recurrent state reaches every later chunk: a chunk before a trained one trains
-            c.needed    = c.n_labels > 0 || c.surrogate || (recr != nullptr && first >= 0);
-            if (!c.needed) {
-                continue;
-            }
-            c.grad_from  = opt_walk_horizon == 0 || c.c0 < opt_walk_horizon ? 0 : c.c0 - opt_walk_horizon;
-            c.loss_scale = (float) c.n_labels / (float) n_labels_window;
-            reach = std::min(reach, c.grad_from);
-            first = j;
-        }
-        GGML_ASSERT(first >= 0);
-        chunks[first].period_end = true;
-
-        // THE HOST BUDGET (Fable): the accumulators are layers x positions x (k + v) floats, and a
-        // recurrent state is checkpointed every `stride` chunks (one sequence's state rows each;
-        // the first chunk's entry is the zero state and costs nothing). Both are known before
-        // anything runs. Under a budget the stride is the smallest that fits: the reverse pass
-        // rebuilds a chunk's entry state by decoding forward from its checkpoint, so a longer
-        // stride trades host memory for decode, never for exactness.
-        size_t stride = 1;
-        {
-            size_t kv_bytes = 0;
-            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
-                if (!model.hparams.is_recr(il)) {
-                    kv_bytes += (size_t) (last_label + 1)*(model.hparams.n_embd_k_gqa(il) + model.hparams.n_embd_v_gqa(il))*sizeof(float);
-                }
-            }
-            size_t state = 0;
-            if (recr != nullptr) {
-                for (size_t il = 0; il < recr->r_l.size(); ++il) {
-                    state += recr->r_l[il] ? recr->r_l[il]->nb[1] : 0;
-                    state += recr->s_l[il] ? recr->s_l[il]->nb[1] : 0;
-                }
-            }
-            auto bytes_at = [&](size_t s) { return kv_bytes + ((chunks.size() + s - 1)/s - 1)*state; };
-            if (opt_walk_host_budget > 0) {
-                while (stride < chunks.size() && bytes_at(stride) > opt_walk_host_budget) {
-                    ++stride;
-                }
-            }
-            const size_t bytes = bytes_at(stride);
-            opt_walk_host_bytes = std::max(opt_walk_host_bytes, bytes);
-            if (opt_walk_host_budget > 0 && bytes > opt_walk_host_budget) {
-                char why[512];
-                snprintf(why, sizeof(why),
-                    "the exact walk needs %.1f MiB of host memory for this window (%lld positions, the K/V gradient alone), over its budget of %.1f MiB: "
-                    "the K/V gradient grows with the window; neither the horizon nor the chunk size changes it",
-                    bytes/1048576.0, (long long) (last_label + 1), opt_walk_host_budget/1048576.0);
-                opt_failure = why;
-                LLAMA_LOG_ERROR("%s: %s\n", __func__, opt_failure.c_str());
-                opt_alloc_failed.store(true);
-                opt_stop_requested.store(true);
-                return;
-            }
-            if (stride > 1) {
-                LLAMA_LOG_INFO("%s: the exact walk checkpoints the recurrent state every %zu chunks to fit %.1f MiB of host memory (%.1f MiB)\n",
-                        __func__, stride, opt_walk_host_budget/1048576.0, bytes/1048576.0);
-            }
-        }
-        {
-            const uint32_t n_layer = model.hparams.n_layer();
-            walk_acc.k.assign(n_layer, nullptr);
-            walk_acc.v.assign(n_layer, nullptr);
-            walk_acc.ctx.reset(ggml_init({ 4*n_layer*ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true }));
-            walk_acc.state.clear();
-            walk_acc.state_ready = false;
-            for (uint32_t il = 0; il < n_layer; ++il) {
-                if (model.hparams.is_recr(il)) {
-                    // a recurrent layer has no K/V: its state carries the chain, one sequence's row
-                    if (recr != nullptr) {
-                        walk_acc.state[recr->r_l[il]] = ggml_new_tensor_2d(walk_acc.ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_r(), 1);
-                        walk_acc.state[recr->s_l[il]] = ggml_new_tensor_2d(walk_acc.ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_s(), 1);
-                    }
-                    continue;
-                }
-                walk_acc.k[il] = ggml_new_tensor_2d(walk_acc.ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_k_gqa(il), last_label + 1);
-                walk_acc.v[il] = ggml_new_tensor_2d(walk_acc.ctx.get(), GGML_TYPE_F32, model.hparams.n_embd_v_gqa(il), last_label + 1);
-            }
-            walk_acc.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(walk_acc.ctx.get(), ggml_backend_cpu_buffer_type()));
-            if (!walk_acc.buf) {
-                opt_failure = "the exact walk's gradient accumulator (host memory) could not be allocated";
-                LLAMA_LOG_ERROR("%s: %s\n", __func__, opt_failure.c_str());
-                opt_alloc_failed.store(true);
-                opt_stop_requested.store(true);
-                return;
-            }
-            ggml_backend_buffer_clear(walk_acc.buf.get(), 0);
-            cparams.walk_acc_k = walk_acc.k.data();
-            cparams.walk_acc_v = walk_acc.v.data();
-        }
-
-        // the window as the adapter now reads it, chunk by chunk: a recurrent model's state is
-        // checkpointed at each chunk's start through the sequence-state API (the recurrent part
-        // only, PARTIAL_ONLY), after waiting for the queued decode; a restore puts back the
-        // cell's position with its rows, and an empty checkpoint (before the first chunk)
-        // restores the zero state. A hand-rolled per-layer copy here skipped that wait and, on
-        // Metal, carried a torn mid-graph state into the reverse pass (2026-10-11).
-        std::vector<std::vector<uint8_t>> snaps(recr != nullptr ? chunks.size() : 0);
-        const llama_state_seq_flags state_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-        auto save_state = [&](std::vector<uint8_t> & snap) {
-            synchronize();
-            snap.resize(state_seq_get_size(0, state_flags));
-            GGML_ASSERT(state_seq_get_data(0, snap.data(), snap.size(), state_flags) == snap.size());
-        };
-        auto load_state = [&](const std::vector<uint8_t> & snap) {
-            synchronize();
-            GGML_ASSERT(state_seq_set_data(0, snap.data(), snap.size(), state_flags) == snap.size());
-        };
-        for (size_t j = 0; j < chunks.size(); ++j) {
-            if (recr != nullptr && j % stride == 0) {
-                save_state(snaps[j]);
-            }
-            if (!decode_span(chunks[j].c0, chunks[j].c0 + chunks[j].n)) {
-                return;
-            }
-        }
-        bool ok = true;
-        for (int64_t j = (int64_t) chunks.size() - 1; j >= first && ok; --j) {
-            const exact_chunk & c = chunks[j];
-            if (!c.needed) {
-                continue;
-            }
-            if (!yield_point()) {
-                ok = false;
-                break;
-            }
-            // attention: pop the cache to [0, c0); recurrent: restore the state at the chunk's
-            // checkpoint and decode forward to its start (that decode rebuilds the attention K/V
-            // in between too, under the same adapter: the same values). Run again before every
-            // retry below: a refused chunk graph is refused AFTER its ubatch was applied, so the
-            // chunk's cells already sit in the cache and the recurrent cell's position has moved
-            // to the chunk's end; retrying on top of that fails to prepare the ubatch at all
-            // (the 5090, 2026-10-10: "init_batch: failed to prepare attention ubatches" after
-            // "retrying at 512", and the epoch stopped instead of shrinking the horizon).
-            const auto rewind = [&]() -> bool {
-                const size_t   cp    = recr != nullptr ? (size_t) j - (size_t) j % stride : (size_t) j;
-                const uint32_t p_pop = chunks[cp].c0;
-                const bool popped = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, p_pop, -1)) : memory->seq_rm(0, p_pop, -1);
-                if (!popped) {
-                    LLAMA_LOG_ERROR("%s: could not pop the cache to [0, %u) for the reverse pass\n", __func__, p_pop);
-                    opt_stop_requested.store(true);
-                    return false;
-                }
-                if (recr != nullptr) {
-                    load_state(snaps[cp]);
-                    if (p_pop < c.c0 && !decode_span(p_pop, c.c0)) {
-                        return false;
-                    }
-                }
-                return true;
-            };
-            if (!rewind()) {
-                ok = false;
-                break;
-            }
-            cparams.walk_exact     = true;
-            cparams.walk_surrogate = c.surrogate;
-            cparams.walk_state_surrogate = recr != nullptr && j < (int64_t) chunks.size() - 1 && walk_acc.state_ready;
-            // THE HORIZON FITS THE DEVICE. Its GRAD leaves are the chunk graph's largest growth
-            // with the window (layers x horizon x (k + v) floats, twice with their gradient); the
-            // graph preflight refuses a chunk that does not fit before allocating anything, so a
-            // memory refusal halves the horizon (whole chunks) and the chunk is tried again; every
-            // later chunk keeps the smaller one. The forward still attends to the whole window and
-            // the recurrent state is carried exactly; only attention gradient past the horizon is
-            // dropped. A refusal at a horizon of one chunk, or for a node the device cannot run,
-            // stands.
-            exact_chunk cc = c;
-            for (;;) {
-                cc.grad_from = opt_walk_horizon == 0 || cc.c0 < opt_walk_horizon ? 0 : cc.c0 - opt_walk_horizon;
-                cparams.walk_grad_from = cc.grad_from;
-                xc = &cc;
-                ok = train_chunk(cc.c0, cc.n);
-                xc = nullptr;
-                const uint32_t span = cc.c0 - cc.grad_from;
-                if (ok || !opt_failure.empty() || !opt_alloc_failed.load() || span <= n_batch) {
-                    break;
-                }
-                opt_walk_horizon = std::max<uint32_t>(n_batch, (span/2)/n_batch*n_batch);
-                LLAMA_LOG_WARN("%s: the chunk at %u did not fit with a gradient horizon of %u positions: retrying at %u\n",
-                        __func__, cc.c0, span, opt_walk_horizon);
-                opt_alloc_failed.store(false);
-                opt_stop_requested.store(false);
-                // the rewind's decode is a plain forward, as before the first try: no walk flags.
-                // walk_grad_from is not restored here because the loop's first statements recompute
-                // it from the shrunken horizon (cc.grad_from, then cparams.walk_grad_from) before the
-                // retried train_chunk runs.
-                const bool surrogate       = cparams.walk_surrogate;
-                const bool state_surrogate = cparams.walk_state_surrogate;
-                cparams.walk_exact     = false;
-                cparams.walk_grad_from = 0;
-                cparams.walk_surrogate = false;
-                cparams.walk_state_surrogate = false;
-                const bool rewound = rewind();
-                cparams.walk_exact     = true;
-                cparams.walk_surrogate = surrogate;
-                cparams.walk_state_surrogate = state_surrogate;
-                if (!rewound) {
-                    ok = false;
-                    break;
-                }
-            }
-            opt_walk_horizon_used = opt_walk_horizon;
-            cparams.walk_exact     = false;
-            cparams.walk_grad_from = 0;
-            cparams.walk_surrogate = false;
-            cparams.walk_state_surrogate = false;
-        }
-        walk_acc.state_ready = false;
-        return;
-    }
-
-    uint32_t pos = 0;
-    while (pos <= (uint32_t) last_label && !opt_stop_requested.load(std::memory_order_relaxed)) {
-        const bool labelled = labels_sparse[pos] >= 0;
-        uint32_t end = pos;
-        while (end <= (uint32_t) last_label && (labels_sparse[end] >= 0) == labelled) {
-            ++end;
-        }
-        if (!labelled) {
-            if (!decode_span(pos, end)) {
-                return;
-            }
-        } else {
-            for (uint32_t c0 = pos; c0 < end; c0 += n_batch) {
-                const uint32_t c1 = std::min(c0 + n_batch, end);
-                // The training forward advances a recurrent state in place, and a recurrent
-                // memory cannot remove a partial range: snapshot the state to the scratch
-                // sequence first (Fable), restore it after, then the decode below advances it
-                // from where the context left it. The state is per sequence and small.
-                const bool snapshot = recr != nullptr && c1 <= (uint32_t) last_label;
-                if (!yield_point()) {
-                    return;
-                }
-                if (snapshot) {
-                    recr->seq_cp(0, 1, -1, -1);
-                }
-                if (!train_chunk(c0, c1 - c0)) {
-                    return;
-                }
-                if (snapshot) {
-                    recr->seq_rm(0, -1, -1);
-                    recr->seq_cp(1, 0, -1, -1);
-                    recr->seq_rm(1, -1, -1);
-                }
-                // the chunk joins the context under the adapter as it now is: the training
-                // graph never writes the cache, so its cells hold nothing until this decode
-                if (c1 <= (uint32_t) last_label) {
-                    // the chunk's cells hold no K/V (the training graph never writes the
-                    // cache): drop them from the attention memory, then decode them for real
-                    const bool removed = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, c0, -1)) : memory->seq_rm(0, c0, -1);
-                    if (!removed) {
-                        LLAMA_LOG_ERROR("%s: could not remove the trained chunk [%u, %u) from the cache before decoding it\n", __func__, c0, c1);
-                        opt_stop_requested.store(true);
-                        return;
-                    }
-                    if (!decode_span(c0, c1)) {
-                        opt_stop_requested.store(true);
-                        return;
-                    }
-                }
-            }
-        }
-        pos = end;
-    }
+void llama_context::opt_fail(std::string why, const std::string & what) {
+    LLAMA_LOG_ERROR("%s: %s%s%s: stopping the epoch\n", __func__, what.c_str(), what.empty() ? "" : ": ",
+            why.empty() ? "it does not fit in device memory" : why.c_str());
+    opt_failure = std::move(why);
+    opt_alloc_failed.store(true);
+    opt_stop_requested.store(true);
 }
 
 void llama_context::opt_epoch(
@@ -769,48 +663,31 @@ void llama_context::opt_epoch(
     std::vector<llama_token>        tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
 
-    int64_t idata = 0;
-
-    int64_t t_loop_start = ggml_time_us();
-    int64_t ndata_in_loop = idata_split*ubatch_per_ctx;
-    for (; idata < idata_split; ++idata) {
-        if (opt_stop_requested.load(std::memory_order_relaxed)) {
-            break;
+    // the training range [0, idata_split), then the evaluation range [idata_split, ndata)
+    const struct {
+        bool                    train;
+        int64_t                 i0, i1;
+        ggml_opt_result_t       result;
+        ggml_opt_epoch_callback callback;
+    } ranges[] = {
+        { true,  0,           idata_split, result_train, callback_train },
+        { false, idata_split, ndata,       result_eval,  callback_eval  },
+    };
+    for (const auto & r : ranges) {
+        const int64_t t_loop_start  = ggml_time_us();
+        const int64_t ndata_in_loop = (r.i1 - r.i0)*ubatch_per_ctx;
+        for (int64_t idata = r.i0; idata < r.i1; ++idata) {
+            if (opt_step_callback && !opt_stop_requested.load(std::memory_order_relaxed)
+                    && !opt_step_callback(r.train, opt_step_callback_data)) {
+                opt_stop_requested.store(true);
+            }
+            if (opt_stop_requested.load(std::memory_order_relaxed)) {
+                break;
+            }
+            ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
+            opt_epoch_iter(dataset, r.result, tokens, labels_sparse, batch,
+                r.callback, r.train, (idata - r.i0)*ubatch_per_ctx, ndata_in_loop, t_loop_start);
         }
-        constexpr bool train = true;
-        const int64_t idata_in_loop = idata*ubatch_per_ctx;
-
-        if (opt_step_callback && !opt_step_callback(train, opt_step_callback_data)) {
-            opt_stop_requested.store(true);
-        }
-        if (opt_stop_requested.load(std::memory_order_relaxed)) {
-            break;
-        }
-
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
-            callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
-    }
-
-    t_loop_start = ggml_time_us();
-    ndata_in_loop = (ndata - idata_split)*ubatch_per_ctx;
-    for (; idata < ndata; ++idata) {
-        if (opt_stop_requested.load(std::memory_order_relaxed)) {
-            break;
-        }
-        constexpr bool train = false;
-        const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
-
-        if (opt_step_callback && !opt_step_callback(train, opt_step_callback_data)) {
-            opt_stop_requested.store(true);
-        }
-        if (opt_stop_requested.load(std::memory_order_relaxed)) {
-            break;
-        }
-
-        ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
-        opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, batch,
-            callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
     }
 
     llama_batch_free(batch);
