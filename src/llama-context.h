@@ -279,6 +279,9 @@ private:
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
 
+    // the graph type this context's type builds (decoder, or the MTP head)
+    llm_graph_type graph_type() const;
+
     llm_graph_cb graph_get_cb() const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
