@@ -505,6 +505,31 @@ json server_trainer::start(const json & body_in) {
             return json::object({{"ok", false}, {"error", "a training run is already in progress"}});
         }
     }
+    // THE CLAIM IS RELEASED ON EVERY EXIT THAT DOES NOT HAND IT TO THE WORKER (continuum card
+    // 48029d24). `refuse` releases it on a refusal, but an exception thrown after the claim (a
+    // json::type_error from a body field, std::system_error from std::thread) used to escape with
+    // `running` still true: /train named this run "preparing" forever and refused every later
+    // start as "already in progress" until the server restarted. `settled` is set by `refuse` and
+    // by the hand-off; this guard releases only a claim nothing else settled, so it can never
+    // release a later run's claim. Declared before `lock` below, so `lock` (on `mu`) is gone
+    // before this destructor takes `mu`.
+    struct claim_guard {
+        server_trainer & trainer;
+        const json &     body;
+        bool             settled = false;
+        ~claim_guard() {
+            if (settled) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> claim_lock(trainer.mu);
+                trainer.state = json::object({{"state", "error"}, {"out", body.value("out", json())},
+                    {"error", "the start failed after it claimed the run (an exception); the claim is released"},
+                    {"epochs", json::array()}});
+            }
+            trainer.running.store(false);
+        }
+    } claim{*this, body};
     if (worker.joinable()) {
         worker.join();
     }
@@ -513,6 +538,7 @@ json server_trainer::start(const json & body_in) {
         state = json::object({{"state", "preparing"}, {"out", body.at("out")}, {"epochs", json::array()}});
     }
     auto refuse = [&](const std::string & why) {
+        claim.settled = true;
         {
             std::lock_guard<std::mutex> claim_lock(mu);
             state = json::object({{"state", "error"}, {"out", body.at("out")}, {"error", why}, {"epochs", json::array()}});
@@ -615,6 +641,7 @@ json server_trainer::start(const json & body_in) {
     window_ms_samples.clear();
     window_ms_max = 0;
     worker = std::thread([this, body, ex = std::move(prepared)]() mutable { run(std::move(body), std::move(ex)); });
+    claim.settled = true; // handed to the worker, which owns `running` from here
     lock.unlock();
     return json::object({{"ok", true}, {"status", status()}});
 }
