@@ -941,6 +941,40 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 
+// K/V cache formats a context may be given, by name: the ONE parser (--cache-type-k/v and /train)
+const std::vector<ggml_type> & common_kv_cache_types();
+std::string common_kv_cache_types_str();
+ggml_type   common_kv_cache_type_from_str(const std::string & s); // throws on an unknown name
+
+// The training context's K/V format and where it came from: "requested" (the /train caller),
+// "serving" (serving's own resolved format) or "default" (neither was usable; Q8_0). Recorded in
+// the run's receipt beside serving's format (continuum card 6edd495c).
+struct common_training_kv {
+    ggml_type   type_k = GGML_TYPE_Q8_0;
+    ggml_type   type_v = GGML_TYPE_Q8_0;
+    std::string source;
+};
+
+// Resolve the training context's K/V format: the requested one (both names, or neither) if
+// training has been measured with it and the model can hold it; else serving's if so; else the
+// default. Only a REQUESTED format is refused (false, with `why`); serving's never is.
+bool common_training_kv_resolve(
+        const llama_model   * model,
+        const common_params & serving,
+        const std::string   & requested_k,
+        const std::string   & requested_v,
+        common_training_kv  & out,
+        std::string         & why);
+
+// The training context: serving's params with only the training mode's differences
+// (no rollback slots, one chunk per batch/ubatch, a scratch sequence in a unified cache,
+// logits for every token, flash attention for the context decodes, no embeddings).
+struct llama_context_params common_context_params_for_training(
+        const common_params      & serving,
+        uint32_t                   window,
+        uint32_t                   chunk,
+        const common_training_kv & kv);
+
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 

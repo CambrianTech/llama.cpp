@@ -889,13 +889,6 @@ void server_trainer::run(json req, examples_data ex) {
     // governed lease); without it the driver's own free figure, which on Windows is not physical
     const size_t      budget  = (size_t) (req.value("memory_budget_mib", 0.0) * 1024.0 * 1024.0);
 
-    // The training context: the SAME model, its own graph; flash attention has no backward.
-    llama_context_params cparams = common_context_params_to_llama(params_base);
-    // NO ROLLBACK SLOTS. Serving keeps recurrent-state snapshots for speculative decoding's
-    // rollback (n_rs_seq, from the MTP draft); a training context never rolls back, and the exact
-    // walk carries one recurrent state per sequence. Inherited, they crashed the 5090's serving
-    // process on Kimi's first exact run (2026-10-07 04:09Z: the delta-net invariant asserted).
-    cparams.n_rs_seq = 0;
     // The context holds the whole window; one training chunk is one batch is one ubatch, the
     // largest multiple of 256 that divides the window and is at most the caller's "chunk" (the
     // memory gate's S). Context she did not write is decoded; her replies train chunk by chunk,
@@ -904,28 +897,19 @@ void server_trainer::run(json req, examples_data ex) {
     // (Fable); the window's whole length as one chunk is the window x window memory the walk
     // exists to avoid.
     const uint32_t chunk = train_chunk_for(window, (uint32_t) req.value("chunk", (int64_t) 512));
-    cparams.n_ctx           = window;
-    cparams.n_batch         = chunk;
-    cparams.n_ubatch        = chunk;
-    // two sequences: 0 is the walk; 1 is the scratch a recurrent state is snapshotted into
-    // around each training chunk (llama_context::opt_epoch_iter). Unified, so the attention
-    // cache stays one stream of the window, not one per sequence.
-    cparams.n_seq_max       = 2;
-    cparams.kv_unified      = true;
-    // Flash attention ON for the context: the walk's context decodes use it, and the cache then
-    // stores V un-transposed, which a quantized V cache requires. The training graphs build
-    // explicit attention regardless (build_attn_mha under cparams.training).
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    // F16: the cache holds only CONSTANTS (the context before a chunk, read by build_attn and
-    // cast to F32 where it joins the chunk). The chunk's own K/V, the ones with a gradient and
-    // the only ones OUT_PROD sees, are F32 in the graph and never cached during training.
-    cparams.type_k          = GGML_TYPE_Q8_0;
-    cparams.type_v          = GGML_TYPE_Q8_0;
-    cparams.embeddings      = false;
-    // training reads logits for every token of the window; the serving params cap outputs per
-    // ubatch to what sampling needs (a server-computed limit), which a training batch overruns
-    cparams.n_outputs_max         = 0;   // = n_batch
-    cparams.n_outputs_max_per_seq = 0;   // = n_outputs_max
+    // The training context: the SAME model, its own graph, built from serving's params by the one
+    // shared derivation. Its K/V format is resolved, never forced: requested, else serving's, else
+    // the default, each only where training has a measured run with it (common_training_kv_resolve).
+    common_training_kv kv;
+    {
+        std::string why;
+        if (!common_training_kv_resolve(model, params_base, req.value("cache_type_k", std::string()),
+                                        req.value("cache_type_v", std::string()), kv, why)) {
+            fail(why);
+            return;
+        }
+    }
+    const llama_context_params cparams = common_context_params_for_training(params_base, window, chunk, kv);
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (ctx == nullptr) {
@@ -1018,7 +1002,7 @@ void server_trainer::run(json req, examples_data ex) {
         /*walk_horizon    =*/ (uint32_t) req.value("walk_horizon", (int64_t) 0),
     };
     // THE BUDGET COVERS THE WHOLE RUN (continuum, the 5090, 2026-10-11): the training context's own
-    // memory (its Q8_0 K/V for the whole window, and any recurrent state) is allocated when it is
+    // memory (its K/V for the whole window, and any recurrent state) is allocated when it is
     // created, before the graph's budget applies, so it was outside the caller's
     // governed lease: ~0.6 GB at a 16,896-token window, growing with the window, beside serving
     // on the same device. The graph gets what the lease leaves after them (at least one byte:
@@ -1143,6 +1127,10 @@ void server_trainer::run(json req, examples_data ex) {
     // what the training context's memory held on the GPU (K/V for the window, recurrent state):
     // with the graph (which covers the compute buffers), what the run added beside serving
     state["context_mib"] = context_bytes / 1048576.0;
+    // the two K/V formats beside each other, and why training's is what it is: serving's own, a
+    // requested one, or the default where serving's has no measured training run
+    state["training_cache"] = { {"type_k", ggml_type_name(kv.type_k)}, {"type_v", ggml_type_name(kv.type_v)}, {"source", kv.source} };
+    state["serving_cache"]  = { {"type_k", ggml_type_name(params_base.cache_type_k)}, {"type_v", ggml_type_name(params_base.cache_type_v)} };
     // what the exact walk kept on the host per window (its K/V gradient and state snapshots)
     state["walk_host_mib"] = walk_host_mib;
     // the exact walk's gradient horizon as trained (0 = the whole window), smaller where the device

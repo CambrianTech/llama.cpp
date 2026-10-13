@@ -1721,6 +1721,138 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+const std::vector<ggml_type> & common_kv_cache_types() {
+    static const std::vector<ggml_type> types = {
+        GGML_TYPE_F32,
+        GGML_TYPE_F16,
+        GGML_TYPE_BF16,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q4_0,
+        GGML_TYPE_Q4_1,
+        GGML_TYPE_IQ4_NL,
+        GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1,
+    };
+    return types;
+}
+
+std::string common_kv_cache_types_str() {
+    std::ostringstream msg;
+    const auto & types = common_kv_cache_types();
+    for (const auto & type : types) {
+        msg << ggml_type_name(type) << (&type == &types.back() ? "" : ", ");
+    }
+    return msg.str();
+}
+
+ggml_type common_kv_cache_type_from_str(const std::string & s) {
+    for (const auto & type : common_kv_cache_types()) {
+        if (ggml_type_name(type) == s) {
+            return type;
+        }
+    }
+    throw std::runtime_error("Unsupported cache type: " + s);
+}
+
+// The formats a training context has been RUN with, each with a measured learning curve: F16
+// (c424b00c3) and Q8_0 (a8a235df5, 1.5B chunk 256: forward loss 0.74694 against the previous
+// engine's 0.74658; eval 0.621 -> 0.454 over 3 epochs). The cache holds only constants (the context before a chunk, cast to F32
+// where it joins the chunk), but a coarser format's effect on learning is a measurement, not an
+// assumption: until its curve is posted beside these, it is not a training format.
+static bool common_training_kv_measured(ggml_type t) {
+    return t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0;
+}
+
+bool common_training_kv_resolve(
+        const llama_model   * model,
+        const common_params & serving,
+        const std::string   & requested_k,
+        const std::string   & requested_v,
+        common_training_kv  & out,
+        std::string         & why) {
+    // the training context always runs its context decodes with flash attention
+    const auto usable = [&](ggml_type k, ggml_type v, std::string & reason) {
+        if (!common_training_kv_measured(k) || !common_training_kv_measured(v)) {
+            reason = std::string("training has no measured run with a ") + ggml_type_name(k) + "/" + ggml_type_name(v)
+                   + " cache (measured: f16, q8_0)";
+            return false;
+        }
+        char buf[256];
+        if (!llama_kv_cache_types_check(model, k, v, /*flash_attn=*/ true, buf, sizeof(buf))) {
+            reason = buf;
+            return false;
+        }
+        return true;
+    };
+    if (requested_k.empty() != requested_v.empty()) {
+        why = "a training cache format names both cache_type_k and cache_type_v, or neither";
+        return false;
+    }
+    if (!requested_k.empty()) {
+        ggml_type k;
+        ggml_type v;
+        try {
+            k = common_kv_cache_type_from_str(requested_k);
+            v = common_kv_cache_type_from_str(requested_v);
+        } catch (const std::exception & e) {
+            why = std::string(e.what()) + " (allowed: " + common_kv_cache_types_str() + ")";
+            return false;
+        }
+        std::string reason;
+        if (!usable(k, v, reason)) {
+            why = "the requested training cache " + requested_k + "/" + requested_v + " can't be used: " + reason;
+            return false;
+        }
+        out = { k, v, "requested" };
+        return true;
+    }
+    std::string reason;
+    if (usable(serving.cache_type_k, serving.cache_type_v, reason)) {
+        out = { serving.cache_type_k, serving.cache_type_v, "serving" };
+        return true;
+    }
+    if (!usable(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, reason)) {
+        why = "no training cache format fits this model: " + reason;
+        return false;
+    }
+    out = { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "default" };
+    return true;
+}
+
+struct llama_context_params common_context_params_for_training(
+        const common_params      & serving,
+        uint32_t                   window,
+        uint32_t                   chunk,
+        const common_training_kv & kv) {
+    llama_context_params cparams = common_context_params_to_llama(serving);
+    // NO ROLLBACK SLOTS. Serving keeps recurrent-state snapshots for speculative decoding's
+    // rollback (n_rs_seq, from the MTP draft); a training context never rolls back, and the exact
+    // walk carries one recurrent state per sequence. Inherited, they crashed the 5090's serving
+    // process on Kimi's first exact run (2026-10-07 04:09Z: the delta-net invariant asserted).
+    cparams.n_rs_seq        = 0;
+    // the context holds the whole window; one training chunk is one batch is one ubatch
+    cparams.n_ctx           = window;
+    cparams.n_batch         = chunk;
+    cparams.n_ubatch        = chunk;
+    // two sequences: 0 is the walk; 1 is the scratch a recurrent state is snapshotted into
+    // around each training chunk (llama_context::opt_epoch_iter). Unified, so the attention
+    // cache stays one stream of the window, not one per sequence.
+    cparams.n_seq_max       = 2;
+    cparams.kv_unified      = true;
+    // Flash attention ON for the context: the walk's context decodes use it, and the cache then
+    // stores V un-transposed, which a quantized V cache requires. The training graphs build
+    // explicit attention regardless (build_attn_mha under cparams.training).
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cparams.type_k          = kv.type_k;
+    cparams.type_v          = kv.type_v;
+    cparams.embeddings      = false;
+    // training reads logits for every token of the window; the serving params cap outputs per
+    // ubatch to what sampling needs (a server-computed limit), which a training batch overruns
+    cparams.n_outputs_max         = 0;   // = n_batch
+    cparams.n_outputs_max_per_seq = 0;   // = n_outputs_max
+    return cparams;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 

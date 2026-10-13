@@ -532,6 +532,16 @@ extern "C" {
 
     LLAMA_API void llama_model_free(struct llama_model * model);
 
+    // Whether a K/V cache format can hold this model's attention (flash_attn = the context's
+    // resolved setting). The same check context creation refuses by. On false, `why` names the rule.
+    LLAMA_API bool llama_kv_cache_types_check(
+            const struct llama_model * model,
+                      enum ggml_type   type_k,
+                      enum ggml_type   type_v,
+                                bool   flash_attn,
+                                char * why,
+                              size_t   why_len);
+
     LLAMA_API struct llama_context * llama_init_from_model(
                      struct llama_model * model,
             struct llama_context_params   params);
