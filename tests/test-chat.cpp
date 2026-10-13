@@ -7277,6 +7277,46 @@ static int test_train_control(const char * model_path, const char * output_dir) 
     require(trainer.start(req).at("ok").get<bool>(), "baseline refused");
     const auto baseline = wait_for(done);
 
+    // what this catches (continuum card 48029d24): an exception thrown AFTER the claim. "yield"
+    // is read with body.value(..., true), so a string there throws json::type_error once the run
+    // is claimed and prepared. The claim must be released (state "error" under this out, and the
+    // next start accepted), never left "preparing" with every later start refused as "already in
+    // progress" until a restart.
+    {
+        json bad = req;
+        bad["out"] = "thrown.gguf";
+        bad["yield"] = "not a bool";
+        bool threw = false;
+        try {
+            trainer.start(bad);
+        } catch (const std::exception &) { // nlohmann's type_error is a std::exception; `json` here is common_json
+            threw = true;
+        }
+        require(threw, "a non-bool yield must throw after the claim (the case under test)");
+        const auto after = trainer.status();
+        require(after.value("state", "") == "error" && after.value("out", "") == "thrown.gguf",
+                "the thrown start leaves its error under its own out, not 'preparing'");
+        json next = req;
+        next["out"] = "after-throw.gguf";
+        require(trainer.start(next).at("ok").get<bool>(), "the claim was released: the next start is accepted");
+        wait_for(done);
+
+        // and the refusal path: an empty "examples" is refused by `refuse` AFTER the claim, which
+        // must release it the same way (and settle the guard only once released)
+        json refused = req;
+        refused.erase("text");
+        refused["examples"] = json::array();
+        refused["out"] = "refused.gguf";
+        require(!trainer.start(refused).at("ok").get<bool>(), "an empty examples array is refused");
+        const auto after_refusal = trainer.status();
+        require(after_refusal.value("state", "") == "error" && after_refusal.value("out", "") == "refused.gguf",
+                "the refusal leaves its error under its own out");
+        json again = req;
+        again["out"] = "after-refusal.gguf";
+        require(trainer.start(again).at("ok").get<bool>(), "the refused claim was released: the next start is accepted");
+        wait_for(done);
+    }
+
     // Block after two updates, then exercise manual pause separately from serving admission.
     calls.store(0);
     hold_at.store(3);
