@@ -206,6 +206,11 @@ struct llama_context {
     // why it was refused, copied from ggml_opt_refusal when the epoch stops (llama_opt_failure);
     // empty for the memory gate
     std::string opt_failure;
+    // the last chunk refused for memory: where in the window it sat and how long it was
+    // (llama_opt_last_refusal), so a late failure names the chunk that did not fit
+    bool     opt_refused     = false;
+    uint32_t opt_refused_pos = 0;
+    uint32_t opt_refused_n   = 0;
     // what training may add per GPU device (llama_opt_set_memory_budget); 0 = no cap
     size_t opt_memory_budget = 0;
     // the exact walk's host memory per window (llama_opt_set_walk_host_budget); 0 = no cap

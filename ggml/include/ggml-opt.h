@@ -208,6 +208,10 @@ extern "C" {
     // run of this shape needs, measured by the run itself.
     GGML_API size_t ggml_opt_peak_graph_bytes(ggml_opt_context_t opt_ctx);
 
+    // the last memory refusal: the bytes the refused device's graph needed, and the bytes it was
+    // allowed to add at that moment (0, 0 when no graph was refused for memory)
+    GGML_API void ggml_opt_last_refusal_bytes(ggml_opt_context_t opt_ctx, size_t * need, size_t * allowance);
+
     // do forward pass, increment result if not NULL, do backward pass if allocated
     GGML_API void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result);
 

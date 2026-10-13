@@ -1755,6 +1755,12 @@ extern "C" {
     // batch): the footprint a run of this shape needs, from the run's own allocation preflight.
     LLAMA_API size_t llama_opt_graph_bytes(struct llama_context * lctx);
 
+    // The last training chunk refused for memory, if any: its position in the window and length,
+    // the bytes its graph needed on the refusing device, and what that device allowed it to add
+    // at that moment. Returns false when no chunk was refused for memory.
+    LLAMA_API bool llama_opt_last_refusal(struct llama_context * lctx, uint32_t * pos, uint32_t * n_tokens,
+                                          size_t * need, size_t * allowance);
+
     // The bytes this context's memory holds on non-host (GPU) buffers: the K/V cache for the whole
     // window, and any recurrent state; not the model's weights, which it shares, nor its compute
     // buffers, which a training graph is allocated into (llama_opt_graph_bytes covers those).

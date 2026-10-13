@@ -1154,6 +1154,13 @@ void server_trainer::run(json req, examples_data ex) {
     const bool    no_fit    = llama_opt_failed(ctx);
     // copied before llama_free: the refusal names a node the device cannot run, when that was it
     const std::string refusal = llama_opt_failure(ctx);
+    // THE CHUNK THAT DID NOT FIT, when one didn't (continuum 34d574fc, Codex root): where in the
+    // window it sat, what its graph needed and what the device allowed at that moment. A refusal
+    // at the deepest chunk with a need above the run's earlier peak, and a refusal of an ordinary
+    // chunk because the allowance dropped (serving took memory), read differently here.
+    uint32_t refused_pos = 0, refused_n = 0;
+    size_t   refused_need = 0, refused_allow = 0;
+    const bool refused_chunk = llama_opt_last_refusal(ctx, &refused_pos, &refused_n, &refused_need, &refused_allow);
     const double  graph_mib = llama_opt_graph_bytes(ctx) / 1048576.0;
     const double  walk_host_mib = llama_opt_walk_host_bytes(ctx) / 1048576.0;
     const int64_t walk_horizon  = llama_opt_walk_horizon(ctx);
@@ -1174,6 +1181,12 @@ void server_trainer::run(json req, examples_data ex) {
     // could not hold the requested one
     if (req.value("exact", false)) {
         state["walk_horizon"] = walk_horizon;
+    }
+    if (no_fit && refused_chunk) {
+        state["refused_chunk_pos"]     = refused_pos;
+        state["refused_chunk_tokens"]  = refused_n;
+        state["refused_need_mib"]      = refused_need / 1048576.0;
+        state["refused_allowance_mib"] = refused_allow / 1048576.0;
     }
     if (no_fit) {
         state["state"] = "error";

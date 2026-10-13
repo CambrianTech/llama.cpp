@@ -66,6 +66,11 @@ struct ggml_opt_context {
     bool static_graphs           = false;
     size_t alloc_budget          = 0; // bytes a graph may add on a non-CPU device; 0 = the device's own free figure
     size_t peak_graph_bytes      = 0; // largest graph measured by the preflight on a non-CPU device
+    // the last memory refusal: what the refused device's graph needed, and what it was allowed to
+    // add at that moment (free memory, capped by the budget, minus slack). Kept apart from
+    // `refusal`, which stays empty for a memory refusal (callers retry on that).
+    size_t refused_need_bytes    = 0;
+    size_t refused_allow_bytes   = 0;
     bool eval_ready              = false;
     // Accumulators and momenta belong to a PARAMETER (or to the loss), never to a node index: a
     // graph built per step may differ in topology from the first one (the training walk's chunks
@@ -982,6 +987,11 @@ void ggml_opt_set_alloc_budget(ggml_opt_context_t opt_ctx, size_t bytes) {
     opt_ctx->alloc_budget = bytes;
 }
 
+void ggml_opt_last_refusal_bytes(ggml_opt_context_t opt_ctx, size_t * need, size_t * allowance) {
+    *need      = opt_ctx->refused_need_bytes;
+    *allowance = opt_ctx->refused_allow_bytes;
+}
+
 size_t ggml_opt_peak_graph_bytes(ggml_opt_context_t opt_ctx) {
     return opt_ctx->peak_graph_bytes;
 }
@@ -1142,6 +1152,13 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
             }
         }
         if (!ok) {
+            for (int i = 0; i < n; ++i) {
+                if (sizes[i] > max_new[i]) {
+                    opt_ctx->refused_need_bytes  = sizes[i];
+                    opt_ctx->refused_allow_bytes = max_new[i];
+                    break;
+                }
+            }
             ggml_backend_sched_reset(sched);
             opt_ctx->allocated_graph = nullptr;
             opt_ctx->eval_ready      = false;

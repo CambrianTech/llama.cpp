@@ -323,6 +323,9 @@ bool llama_context::opt_walk::train_chunk(uint32_t pos_ctx, uint32_t n_chunk) {
             }
         }
         if (!ggml_opt_alloc(opt_ctx, train)) {
+            lctx.opt_refused     = true;
+            lctx.opt_refused_pos = pos_ctx;
+            lctx.opt_refused_n   = n_chunk;
             ggml_free(ctx_compute_opt);
             lctx.opt_fail(ggml_opt_refusal(opt_ctx),
                 std::string("the ") + (train ? "training" : "evaluation") + " graph was refused (window " + std::to_string(n_ctx) + ")");
@@ -706,6 +709,9 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {
     ctx->opt_alloc_failed.store(false);
     ctx->opt_failure.clear();
+    ctx->opt_refused     = false;
+    ctx->opt_refused_pos = 0;
+    ctx->opt_refused_n   = 0;
     ctx->opt_init(model, lopt_params);
 }
 
@@ -736,6 +742,17 @@ void llama_opt_set_memory_budget(struct llama_context * ctx, size_t bytes) {
 
 size_t llama_context::opt_graph_bytes() const {
     return opt_ctx ? ggml_opt_peak_graph_bytes(opt_ctx) : 0;
+}
+
+bool llama_opt_last_refusal(struct llama_context * ctx, uint32_t * pos, uint32_t * n_tokens, size_t * need, size_t * allowance) {
+    *pos = ctx->opt_refused_pos;
+    *n_tokens = ctx->opt_refused_n;
+    *need = 0;
+    *allowance = 0;
+    if (ctx->opt_ctx) {
+        ggml_opt_last_refusal_bytes(ctx->opt_ctx, need, allowance);
+    }
+    return ctx->opt_refused;
 }
 
 size_t llama_opt_graph_bytes(struct llama_context * ctx) {
