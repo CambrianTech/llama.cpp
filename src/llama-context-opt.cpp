@@ -317,6 +317,14 @@ bool llama_context::opt_walk::train_chunk(uint32_t pos_ctx, uint32_t n_chunk) {
                 }
             }
             for (const auto & ws : res->t_walk_state) {
+                // a state read without its write reporting the exit (build_walk_state_exit) would drop
+                // the gradient later chunks put on it: a wrong step, silently. Refused by name.
+                if (ws.tap && ws.gs == nullptr && lctx.cparams.walk_state_surrogate) {
+                    ggml_free(ctx_compute_opt);
+                    lctx.opt_fail(std::string("this model's recurrent state write (") + ws.cache->name
+                        + ") does not report its exit to the walk (llm_graph_context::build_walk_state_exit): its gradient across chunks would be dropped");
+                    return false;
+                }
                 if (ws.tap) {
                     ggml_opt_accumulate_grad(opt_ctx, ws.tap, acc.state.at(ws.cache));
                 }
@@ -406,12 +414,13 @@ void llama_context::opt_walk::run_exact() {
     // Each window starts from the REQUESTED horizon: a halving that fit one window's device budget
     // must not shrink every later window and epoch, which may be shorter (Fable).
     lctx.opt_walk_horizon = lctx.opt_walk_horizon_req;
-    // A recurrent context with rollback slots keeps several states per sequence; the walk carries
-    // exactly one. Refused by name, never asserted: training runs inside the serving process, and
-    // an assert there takes serving down (2026-10-07 04:09Z on the 5090).
-    if (recr != nullptr && lctx.cparams.n_rs_seq > 0) {
-        lctx.opt_fail("the exact walk needs a training context with no recurrent rollback slots (n_rs_seq = 0, it has "
-            + std::to_string(lctx.cparams.n_rs_seq) + "): create the training context with n_rs_seq = 0");
+    // A serving context keeps rollback slots for drafts; the walk's graphs keep one state, the live
+    // one (llm_graph_context::rs_keep), so they train in that context. Only a PENDING undo reads a
+    // snapshot instead of the live state: that alone is refused, by name, never asserted, since
+    // training runs inside the serving process (2026-10-07 04:09Z on the 5090).
+    if (recr != nullptr && recr->rollback_pending(0)) {
+        lctx.opt_fail("the exact walk cannot train a sequence with a pending recurrent rollback (n_rs_seq = "
+            + std::to_string(lctx.cparams.n_rs_seq) + "): finish or drop the draft first");
         return;
     }
     plan.mark_exact(recr != nullptr, lctx.opt_walk_horizon);

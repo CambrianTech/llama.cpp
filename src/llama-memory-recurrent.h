@@ -78,6 +78,12 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // an undo of a draft is pending on this sequence: its next read takes a snapshot group, not the
+    // live state (group 0) a training graph reads and writes (llm_graph_context::rs_keep)
+    bool rollback_pending(llama_seq_id seq_id) const {
+        return n_rs_seq > 0 && seq_id >= 0 && (size_t) seq_id < rs_idx.size() && rs_idx[seq_id] != 0;
+    }
+
     // computed before each graph build
     uint32_t n = 0;
 

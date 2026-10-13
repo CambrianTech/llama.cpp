@@ -476,7 +476,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
-    if (cparams.n_rs_seq == 0) {
+    if (rs_keep() == 1) {
         const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
         const int64_t s_slot = 0;
 
@@ -496,12 +496,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
         build_walk_state_exit(conv_states_all, conv_state_last);
     } else {
-        GGML_ASSERT(!cparams.walk_exact && "the exact walk keeps one recurrent state per sequence (n_rs_seq = 0)");
+        GGML_ASSERT(!cparams.walk_exact && "a training graph keeps one recurrent state per sequence (rs_keep)");
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
-        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const int64_t K = rs_keep();
 
         for (int64_t t = 1; t <= K; ++t) {
             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
@@ -545,7 +545,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    const bool keep = rs_keep() > 1;
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
@@ -564,7 +564,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+    const int64_t K = rs_keep();
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);

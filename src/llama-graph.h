@@ -1367,6 +1367,15 @@ struct llm_graph_context {
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
+    // THE ONE RULE for how many recurrent states a graph keeps per sequence, read by every family's
+    // state write (delta-net, mamba, lfm2, bailing) and by the ops that produce snapshots. Serving with
+    // rollback slots keeps K = n_rs_seq + 1 (group g = the state g tokens back, so a draft can be undone);
+    // a context without them, and a TRAINING graph, keep one: the live state, group 0, which is the same
+    // bytes in both layouts. So training reads and writes the state serving reads, in the serving
+    // context; the undo groups it leaves stale are rewritten by the next serving decode, and the walk
+    // refuses a sequence with an undo pending (llama_memory_recurrent::rollback_pending).
+    int64_t rs_keep() const;
+
     // THE EXACT WALK: the state a chunk leaves (`exit`, what is written back to `cache`) meets the
     // gradient later chunks put on it, through the surrogate <exit, gs>. A no-op outside the walk.
     void build_walk_state_exit(ggml_tensor * cache, ggml_tensor * exit) const;
