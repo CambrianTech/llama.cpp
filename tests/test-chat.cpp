@@ -7300,6 +7300,21 @@ static int test_train_control(const char * model_path, const char * output_dir) 
         next["out"] = "after-throw.gguf";
         require(trainer.start(next).at("ok").get<bool>(), "the claim was released: the next start is accepted");
         wait_for(done);
+
+        // and the refusal path: an empty "examples" is refused by `refuse` AFTER the claim, which
+        // must release it the same way (and settle the guard only once released)
+        json refused = req;
+        refused.erase("text");
+        refused["examples"] = json::array();
+        refused["out"] = "refused.gguf";
+        require(!trainer.start(refused).at("ok").get<bool>(), "an empty examples array is refused");
+        const auto after_refusal = trainer.status();
+        require(after_refusal.value("state", "") == "error" && after_refusal.value("out", "") == "refused.gguf",
+                "the refusal leaves its error under its own out");
+        json again = req;
+        again["out"] = "after-refusal.gguf";
+        require(trainer.start(again).at("ok").get<bool>(), "the refused claim was released: the next start is accepted");
+        wait_for(done);
     }
 
     // Block after two updates, then exercise manual pause separately from serving admission.

@@ -498,6 +498,11 @@ json server_trainer::start(const json & body_in) {
     // /train answers "preparing" with this out within milliseconds of the POST arriving, so a
     // caller reconciles by the run's identity instead of guessing from a clock. A refusal after the
     // claim releases it and leaves the run's own error, under its out, in the state.
+    // The state a claim released by an exception leaves behind, built BEFORE the claim (`out`
+    // is validated above) so releasing it later allocates nothing and cannot throw.
+    json failed_after_claim = json::object({{"state", "error"}, {"out", body.at("out")},
+        {"error", "the start failed after it claimed the run (an exception); the claim is released"},
+        {"epochs", json::array()}});
     {
         std::lock_guard<std::mutex> claim_lock(mu);
         bool expected = false;
@@ -509,27 +514,29 @@ json server_trainer::start(const json & body_in) {
     // 48029d24). `refuse` releases it on a refusal, but an exception thrown after the claim (a
     // json::type_error from a body field, std::system_error from std::thread) used to escape with
     // `running` still true: /train named this run "preparing" forever and refused every later
-    // start as "already in progress" until the server restarted. `settled` is set by `refuse` and
-    // by the hand-off; this guard releases only a claim nothing else settled, so it can never
-    // release a later run's claim. Declared before `lock` below, so `lock` (on `mu`) is gone
-    // before this destructor takes `mu`.
+    // start as "already in progress" until the server restarted. `settled` is set only AFTER a
+    // release (by `refuse`) or by the hand-off, so this guard never releases a later run's claim
+    // and never misses one. Its destructor cannot throw (it runs while unwinding; a throw there
+    // terminates the server): the state is moved in, not built, recording it is best-effort, and
+    // `running` is released whatever happens. Declared before `lock` below, so `lock` (on `mu`) is
+    // gone before this destructor takes `mu`.
     struct claim_guard {
         server_trainer & trainer;
-        const json &     body;
+        json             failed_state;
         bool             settled = false;
-        ~claim_guard() {
+        ~claim_guard() noexcept {
             if (settled) {
                 return;
             }
-            {
+            try {
                 std::lock_guard<std::mutex> claim_lock(trainer.mu);
-                trainer.state = json::object({{"state", "error"}, {"out", body.value("out", json())},
-                    {"error", "the start failed after it claimed the run (an exception); the claim is released"},
-                    {"epochs", json::array()}});
+                trainer.state = std::move(failed_state);
+            } catch (...) {
+                // the diagnostic state is best-effort; releasing the claim is not
             }
             trainer.running.store(false);
         }
-    } claim{*this, body};
+    } claim{*this, std::move(failed_after_claim)};
     if (worker.joinable()) {
         worker.join();
     }
@@ -538,12 +545,12 @@ json server_trainer::start(const json & body_in) {
         state = json::object({{"state", "preparing"}, {"out", body.at("out")}, {"epochs", json::array()}});
     }
     auto refuse = [&](const std::string & why) {
-        claim.settled = true;
         {
             std::lock_guard<std::mutex> claim_lock(mu);
             state = json::object({{"state", "error"}, {"out", body.at("out")}, {"error", why}, {"epochs", json::array()}});
         }
         running.store(false);
+        claim.settled = true; // only once released: a throw above leaves the guard to release it
         return json::object({{"ok", false}, {"error", why}});
     };
     if (body.contains("examples")) {
