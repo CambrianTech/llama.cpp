@@ -592,6 +592,13 @@ json server_trainer::start(const json & body_in) {
     std::unique_lock<std::mutex> lock(mu);
     state = json::object({{"state", "starting"}, {"out", body.at("out")}, {"epochs", json::array()}});
     state["window"] = body.value("window", (int64_t) 256);
+    // THE SHAPE THIS RUN WAS ASKED FOR, recorded from its first moment, so every receipt (a
+    // refusal at the context, at a late chunk, or a finished run) says what it measured
+    // (continuum 34d574fc, Codex root on #59).
+    state["context_cache_type"] = body.value("context_cache_type", std::string("q8_0"));
+    state["chunk"]              = body.value("chunk", (int64_t) 512);
+    state["recompute"]          = body.value("recompute", false);
+    state["exact"]              = body.value("exact", false);
     if (body.contains("window_asked")) {
         state["window_asked"] = body.at("window_asked");
     }
@@ -1161,8 +1168,6 @@ void server_trainer::run(json req, examples_data ex) {
     // what the training context's memory held on the GPU (K/V for the window, recurrent state):
     // with the graph (which covers the compute buffers), what the run added beside serving
     state["context_mib"] = context_bytes / 1048576.0;
-    // the K/V type that context was built with, so a measured row says what it measured
-    state["context_cache_type"] = cache_type;
     // what the exact walk kept on the host per window (its K/V gradient and state snapshots)
     state["walk_host_mib"] = walk_host_mib;
     // the exact walk's gradient horizon as trained (0 = the whole window), smaller where the device
