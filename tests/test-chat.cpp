@@ -7289,7 +7289,7 @@ static int test_train_control(const char * model_path, const char * output_dir) 
         bool threw = false;
         try {
             trainer.start(bad);
-        } catch (const json::exception &) {
+        } catch (const std::exception &) { // nlohmann's type_error is a std::exception; `json` here is common_json
             threw = true;
         }
         require(threw, "a non-bool yield must throw after the claim (the case under test)");
