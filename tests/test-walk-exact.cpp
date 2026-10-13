@@ -463,36 +463,21 @@ int main(int argc, char ** argv) {
         }
     }
     if (llama_model_is_hybrid(model)) {
-        // 4. regression for the 5090 crash (2026-10-07 04:09Z): a recurrent context with rollback
-        // slots (serving's, inherited by the training context) made the exact walk ASSERT inside
-        // the serving process. It must refuse by name, and the adapter stays untouched.
-        llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
-        const std::vector<float> before = adapter_params(adapter);
+        // 4. TRAINING IN THE SERVING CONTEXT (Joel, 2026-10-13: "training is basically llama inference with
+        // backprop"). Serving keeps recurrent rollback slots for drafts; a training graph keeps one state, the
+        // live one (llm_graph_context::rs_keep), so a context WITH rollback slots takes the same step as one
+        // without. Was a refusal (the 5090 crash, 2026-10-07 04:09Z), which forced a second training
+        // context beside serving.
+        std::vector<uint8_t> all(WINDOW + 1, 1);
+        const auto without = step_delta(params, model, init, tokens, all, WINDOW / 4, true);
         g_n_rs_seq = 4;
-        llama_context * ctx = make_ctx(params, model, WINDOW / 4);
+        const auto with    = step_delta(params, model, init, tokens, all, WINDOW / 4, true);
         g_n_rs_seq = 0;
-        float scale = 1.0f;
-        GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
-        llama_opt_params lopt{};
-        lopt.param_filter   = llama_opt_param_filter_all;
-        lopt.get_opt_pars   = sgd_pars;
-        lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
-        lopt.adapter        = adapter;
-        lopt.walk_exact     = true;
-        llama_opt_init(ctx, model, lopt);
-        std::vector<std::vector<llama_token>> seqs = { std::vector<llama_token>(tokens.begin(), tokens.begin() + WINDOW + 1) };
-        std::vector<std::vector<uint8_t>>     loss = { std::vector<uint8_t>(WINDOW + 1, 1) };
-        ggml_opt_dataset_t dataset = common_opt_dataset_init_masked(WINDOW, seqs, loss, tokens[0]);
-        llama_opt_epoch(ctx, dataset, nullptr, nullptr, /*idata_split =*/ 1, nullptr, nullptr);
-        const std::string why = llama_opt_failure(ctx);
-        printf("  rollback slots: failed=%d, \"%s\"\n", (int) llama_opt_failed(ctx), why.c_str());
-        if (!llama_opt_failed(ctx) || why.find("rollback") == std::string::npos || adapter_params(adapter) != before) {
-            fprintf(stderr, "FAILED: a recurrent context with rollback slots was not refused by name\n");
+        if (!same_step(compare("rollback slots: exact walk in a context with n_rs_seq 4 vs 0", with, without))) {
+            fprintf(stderr, "FAILED: rollback slots changed the exact walk's step\n");
+            worst_tensors(with, without, 24);
             ++failures;
         }
-        ggml_opt_dataset_free(dataset);
-        llama_free(ctx);
-        llama_adapter_lora_free(adapter);
     }
 
     {

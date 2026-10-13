@@ -3690,6 +3690,11 @@ ggml_tensor * llm_graph_context::build_rs(
                     get_state_rows);
 }
 
+int64_t llm_graph_context::rs_keep() const {
+    const bool training = cparams.training && cparams.walk_exact;
+    return cparams.n_rs_seq > 0 && !training ? (int64_t) cparams.n_rs_seq + 1 : 1;
+}
+
 void llm_graph_context::build_walk_state_exit(ggml_tensor * cache, ggml_tensor * exit) const {
     if (!(cparams.training && cparams.walk_exact && cparams.walk_state_surrogate)) {
         return;
