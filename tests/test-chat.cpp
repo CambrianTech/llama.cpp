@@ -7277,6 +7277,26 @@ static int test_train_control(const char * model_path, const char * output_dir) 
     require(trainer.start(req).at("ok").get<bool>(), "baseline refused");
     const auto baseline = wait_for(done);
 
+    // what this catches (continuum 34d574fc): the training context's K/V type is a request option,
+    // so a dream step can be shaped to fit BESIDE serving. The default stays Q8_0 (the baseline
+    // above names it), an unknown type is refused before any claim, and a Q4_0 context holds
+    // less than the Q8_0 one for the same window: the number a caller sizes a fit by.
+    require(baseline.value("context_cache_type", "") == "q8_0", "the default training context is Q8_0");
+    {
+        json bad = req;
+        bad["out"] = "bad-cache.gguf";
+        bad["context_cache_type"] = "q5_9";
+        require(!trainer.start(bad).at("ok").get<bool>(), "an unknown context_cache_type is refused");
+        json small = req;
+        small["out"] = "q4-context.gguf";
+        small["context_cache_type"] = "q4_0";
+        require(trainer.start(small).at("ok").get<bool>(), "a q4_0 training context starts");
+        const auto q4 = wait_for(done);
+        require(q4.value("context_cache_type", "") == "q4_0", "the run reports the type it was built with");
+        require(q4.value("context_mib", 0.0) < baseline.value("context_mib", 0.0),
+                "a Q4_0 training context holds less than the Q8_0 one at the same window");
+    }
+
     // Block after two updates, then exercise manual pause separately from serving admission.
     calls.store(0);
     hold_at.store(3);

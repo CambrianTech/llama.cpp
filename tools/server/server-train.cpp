@@ -18,6 +18,17 @@ using json = common_json;
 static std::atomic<int64_t>       g_train_batch{0};
 static std::atomic<int64_t>       g_train_batch_max{0};
 
+// The training context's K/V type, by request (continuum 34d574fc: a dream step must fit BESIDE
+// serving, never by borrowing from it). Its cache holds only constants, the context before a
+// chunk; the chunk's own K/V, the ones with a gradient, are F32 in the graph and never cached
+// (see the cparams below). "q8_0" is the default and the only type before this option existed.
+static bool context_cache_type_of(const std::string & name, ggml_type & out) {
+    if (name == "q8_0") { out = GGML_TYPE_Q8_0; return true; }
+    if (name == "q4_0") { out = GGML_TYPE_Q4_0; return true; }
+    if (name == "f16")  { out = GGML_TYPE_F16;  return true; }
+    return false;
+}
+
 static std::vector<std::string> split_targets(const std::string & list) {
     std::vector<std::string> out;
     std::stringstream ss(list);
@@ -444,6 +455,9 @@ json server_trainer::start(const json & body_in) {
                                                                      why = "walk_horizon must be an integer >= 0: how many cached positions before a chunk receive its gradient (0 = the whole window)";
         else if (body.contains("memory_budget_mib") && !(num("memory_budget_mib", 0) >= 1))
                                                                      why = "memory_budget_mib must be >= 1";
+        else if (body.contains("context_cache_type") && !(body.at("context_cache_type").is_string() &&
+                                                          [&] { ggml_type t; return context_cache_type_of(body.at("context_cache_type").get<std::string>(), t); }()))
+                                                                     why = "context_cache_type must be \"q8_0\" (the default), \"q4_0\" or \"f16\": the training context's K/V type";
         else if (body.contains("share_ppm") && !(num("share_ppm", 0) >= 1 && num("share_ppm", 0) <= 1000000 && num("share_ppm", 0) == (int64_t) num("share_ppm", 0)))
                                                                      why = "share_ppm must be an integer in [1, 1000000]: the trainer's share of the lane's time, in parts per million";
         else if (body.contains("max_slowdown_ppm") && !(num("max_slowdown_ppm", 0) >= 1 && num("max_slowdown_ppm", 0) <= 999999 &&
@@ -919,8 +933,12 @@ void server_trainer::run(json req, examples_data ex) {
     // F16: the cache holds only CONSTANTS (the context before a chunk, read by build_attn and
     // cast to F32 where it joins the chunk). The chunk's own K/V, the ones with a gradient and
     // the only ones OUT_PROD sees, are F32 in the graph and never cached during training.
-    cparams.type_k          = GGML_TYPE_Q8_0;
-    cparams.type_v          = GGML_TYPE_Q8_0;
+    // Q8_0 unless the request names another type (validated before the claim).
+    const std::string cache_type = req.value("context_cache_type", std::string("q8_0"));
+    ggml_type cache_ggml = GGML_TYPE_Q8_0;
+    context_cache_type_of(cache_type, cache_ggml);
+    cparams.type_k          = cache_ggml;
+    cparams.type_v          = cache_ggml;
     cparams.embeddings      = false;
     // training reads logits for every token of the window; the serving params cap outputs per
     // ubatch to what sampling needs (a server-computed limit), which a training batch overruns
@@ -1143,6 +1161,8 @@ void server_trainer::run(json req, examples_data ex) {
     // what the training context's memory held on the GPU (K/V for the window, recurrent state):
     // with the graph (which covers the compute buffers), what the run added beside serving
     state["context_mib"] = context_bytes / 1048576.0;
+    // the K/V type that context was built with, so a measured row says what it measured
+    state["context_cache_type"] = cache_type;
     // what the exact walk kept on the host per window (its K/V gradient and state snapshots)
     state["walk_host_mib"] = walk_host_mib;
     // the exact walk's gradient horizon as trained (0 = the whole window), smaller where the device
