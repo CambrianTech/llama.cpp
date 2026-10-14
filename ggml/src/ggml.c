@@ -7942,6 +7942,19 @@ void ggml_graph_reset(struct ggml_cgraph * cgraph) {
     }
 }
 
+void ggml_graph_update_use_counts(struct ggml_cgraph * cgraph) {
+    memset(cgraph->use_counts, 0, cgraph->visited_hash_set.size * sizeof(cgraph->use_counts[0]));
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            struct ggml_tensor * src = cgraph->nodes[i]->src[j];
+            if (src) {
+                const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, src);
+                GGML_ASSERT(pos != GGML_HASHSET_FULL && ggml_bitset_get(cgraph->visited_hash_set.used, pos));
+                cgraph->use_counts[pos]++;
+            }
+        }
+    }
+}
 void ggml_graph_clear(struct ggml_cgraph * cgraph) {
     cgraph->n_leafs = 0;
     cgraph->n_nodes = 0;

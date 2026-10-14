@@ -445,6 +445,7 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
     GGML_ASSERT((int) order.size() <= g->size && "recompute clones overflow the graph: raise the training node budget");
     std::copy(order.begin(), order.end(), g->nodes);
     g->n_nodes = (int) order.size();
+    ggml_graph_update_use_counts(g);
 }
 
 static ggml_tensor * map_tensor(std::map<ggml_tensor *, ggml_tensor *> & tensor_map, ggml_context * ctx, ggml_tensor * tensor) {
