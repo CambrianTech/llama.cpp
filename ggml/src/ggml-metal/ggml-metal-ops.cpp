@@ -3996,7 +3996,9 @@ bool ggml_metal_op_out_prod_supported(const ggml_tensor * op) {
     if (op->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32) {
         return false;
     }
-    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+    // batched and broadcast as the CPU backend defines it (dst per src0 = ne2/ne02, ne3/ne03)
+    if (src1->ne[2] != op->ne[2] || src1->ne[3] != op->ne[3] ||
+        op->ne[2] % src0->ne[2] != 0 || op->ne[3] % src0->ne[3] != 0) {
         return false;
     }
     // src1 as the graph emits it: contiguous rows, or the TRANSPOSED view of the gradient
@@ -4009,8 +4011,12 @@ bool ggml_metal_op_out_prod_supported(const ggml_tensor * op) {
     if (src1->nb[0] != sizeof(float) && src1->nb[1] != sizeof(float)) {
         return false;
     }
-    if (src0->ne[0] % 16 != 0 || src0->ne[0] % ggml_blck_size(src0->type) != 0) {
-        return false; // the dequantizing copy works in 4x4 tiles along whole quant blocks of a row
+    // only a quantized src0 is dequantized, and that copy works in 4x4 tiles along whole quant
+    // blocks of a row; an F32/F16/BF16 src0 copies element-wise at any width. Refusing every
+    // width that is not a multiple of 16 sent each LoRA parameter gradient (rank 8 is ne[0])
+    // to the CPU: 2,732 of 6,112 splits of the 4B training graphs (Fable, 2026-10-13)
+    if (ggml_is_quantized(src0->type) && (src0->ne[0] % 16 != 0 || src0->ne[0] % ggml_blck_size(src0->type) != 0)) {
+        return false;
     }
     switch (src0->type) {
         case GGML_TYPE_F32:
@@ -4046,7 +4052,7 @@ size_t ggml_metal_op_out_prod_extra(const ggml_tensor * op) {
     res += GGML_PAD(rows*ne00*sizeof(float), 256);     // X
     res += GGML_PAD(rows*ne10*sizeof(float), 256);     // Y
     if (rows < src0->ne[1]) {
-        res += GGML_PAD(ggml_nbytes(op), 256);         // P
+        res += GGML_PAD(ne00*ne10*sizeof(float), 256); // P, one slice
     }
     return res;
 }
@@ -4063,20 +4069,14 @@ static ggml_tensor ggml_metal_out_prod_view(const ggml_tensor * like, ggml_type 
     return t;
 }
 
-int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
-    ggml_tensor * op = ctx->node(idx);
-    const ggml_tensor * src0 = op->src[0];
-    const ggml_tensor * src1 = op->src[1];
-
-    GGML_ASSERT(ggml_metal_op_out_prod_supported(op));
-
+// One 2D slice: dst[:, :] = out_prod(src0, src1) for 2D views src0 [ne00, ne01] and src1
+// [ne10, ne01], written at dst_data (inside op). The scratch after op is reused by every slice:
+// each step ends on a memory barrier, so the slices run one after another.
+static void ggml_metal_op_out_prod_slice(ggml_metal_op_t ctx, const ggml_tensor * op,
+        const ggml_tensor * src0, const ggml_tensor * src1, char * dst_data, int64_t rows_blk) {
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
     const int64_t ne10 = src1->ne[0];
-    GGML_ASSERT(src1->ne[1] == ne01);
-    GGML_ASSERT(op->ne[0] == ne00 && op->ne[1] == ne10);
-
-    const int64_t rows_blk = ggml_metal_op_out_prod_block_rows(op);
 
     // scratch after dst, in dst's buffer (ggml_backend_metal_buffer_type_get_alloc_size)
     char * scratch = (char *) op->data + ggml_nbytes(op);
@@ -4132,7 +4132,7 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
         // P = mul_mat(X, Y): [ne00, ne10], contraction over rows
         const bool first = k0 == 0;
         ggml_tensor p = ggml_metal_out_prod_view(op, GGML_TYPE_F32, ne00, ne10,
-                sizeof(float), ne00*sizeof(float), first ? op->data : (void *) p_data);
+                sizeof(float), ne00*sizeof(float), first ? (void *) dst_data : (void *) p_data);
         p.op = GGML_OP_MUL_MAT;
         p.src[0] = &x;
         p.src[1] = &y;
@@ -4146,13 +4146,43 @@ int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
         if (!first) {
             // dst = dst + P
             ggml_tensor d = ggml_metal_out_prod_view(op, GGML_TYPE_F32, ne00, ne10,
-                    sizeof(float), ne00*sizeof(float), op->data);
+                    sizeof(float), ne00*sizeof(float), dst_data);
             ggml_tensor acc = d;
             acc.op = GGML_OP_ADD;
             acc.src[0] = &d;
             acc.src[1] = &p;
             ggml_metal_encode_add(ctx, &acc);
             ggml_metal_op_concurrency_reset(ctx);
+        }
+    }
+}
+
+int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    GGML_ASSERT(ggml_metal_op_out_prod_supported(op));
+    GGML_ASSERT(src1->ne[1] == src0->ne[1]);
+    GGML_ASSERT(op->ne[0] == src0->ne[0] && op->ne[1] == src1->ne[0]);
+
+    const int64_t rows_blk = ggml_metal_op_out_prod_block_rows(op);
+
+    // batched and broadcast as the CPU backend defines it: dst and src1 share dims 2-3, and
+    // src0 is broadcast over them (dps = dst per src0: grouped-query heads). Each slice is the
+    // 2D product; before this, any ne[2] or ne[3] above 1 ran on the CPU (a delta-net
+    // backward on the 4B: most of the training CPU time, 2026-10-13)
+    const int64_t dps2 = op->ne[2]/src0->ne[2];
+    const int64_t dps3 = op->ne[3]/src0->ne[3];
+    for (int64_t i3 = 0; i3 < op->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < op->ne[2]; ++i2) {
+            const int64_t i02 = i2/dps2;
+            const int64_t i03 = i3/dps3;
+            const ggml_tensor a = ggml_metal_out_prod_view(src0, src0->type, src0->ne[0], src0->ne[1],
+                    src0->nb[0], src0->nb[1], (char *) src0->data + i02*src0->nb[2] + i03*src0->nb[3]);
+            const ggml_tensor b = ggml_metal_out_prod_view(src1, GGML_TYPE_F32, src1->ne[0], src1->ne[1],
+                    src1->nb[0], src1->nb[1], (char *) src1->data + i2*src1->nb[2] + i3*src1->nb[3]);
+            ggml_metal_op_out_prod_slice(ctx, op, &a, &b, (char *) op->data + i2*op->nb[2] + i3*op->nb[3], rows_blk);
         }
     }
 
