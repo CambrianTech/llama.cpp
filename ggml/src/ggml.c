@@ -7212,12 +7212,17 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_SET_ROWS: {
             // result = the destination (src2) with its rows src1 replaced by src0. The gradient
-            // on src0 is the result's gradient at those rows. The destination's gradient (the
-            // result's everywhere else) is not built: a written buffer (a cache) is a constant.
-            GGML_ASSERT(!src2_needs_grads && "set_rows: the destination it writes carries no gradient");
-            if (src0_needs_grads) {
+            // on src0 is the result's gradient at those rows; the destination's is the result's
+            // everywhere else (a cache it writes is a constant and needs none).
+            if (src0_needs_grads || src2_needs_grads) {
                 GGML_ASSERT(src1->type == GGML_TYPE_I32 && "set_rows backward gathers with I32 row indices");
+            }
+            if (src0_needs_grads) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_get_rows(ctx, grad, src1), src0));
+            }
+            if (src2_needs_grads) {
+                struct ggml_tensor * replaced = ggml_fill(ctx, ggml_get_rows(ctx, grad, src1), 0.0f);
+                ggml_add_or_set(ctx, cgraph, isrc2, ggml_set_rows(ctx, ggml_dup(ctx, grad), replaced, src1));
             }
         } break;
         case GGML_OP_GET_ROWS: {

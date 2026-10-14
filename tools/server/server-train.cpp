@@ -907,10 +907,8 @@ void server_trainer::run(json req, examples_data ex) {
     cparams.n_ctx           = window;
     cparams.n_batch         = chunk;
     cparams.n_ubatch        = chunk;
-    // two sequences: 0 is the walk; 1 is the scratch a recurrent state is snapshotted into
-    // around each training chunk (llama_context::opt_epoch_iter). Unified, so the attention
-    // cache stays one stream of the window, not one per sequence.
-    cparams.n_seq_max       = 2;
+    // one sequence, the walk (it checkpoints a recurrent state through the sequence-state API)
+    cparams.n_seq_max       = 1;
     cparams.kv_unified      = true;
     // Flash attention ON for the context: the walk's context decodes use it, and the cache then
     // stores V un-transposed, which a quantized V cache requires. The training graphs build

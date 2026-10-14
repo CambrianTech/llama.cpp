@@ -32,26 +32,38 @@ struct llama_walk_chunk {
     float    loss_scale = 0.0f;  // its labelled positions over the window's
 };
 
+// chunks [j0, j1) of the plan: one labelled run, which trains given everything before it as
+// served (the shadow adapter applies to labelled rows only)
+struct llama_walk_run {
+    size_t j0;
+    size_t j1;
+};
+
 struct llama_walk_plan {
     // the window's runs, each cut every n_batch positions from its start; both walks take
     // them in this order. Nothing after the last label is in the plan.
     std::vector<llama_walk_chunk> chunks;
+    std::vector<llama_walk_run>   runs; // the labelled ones, in order
     int64_t  last_label = -1;    // -1: the window has no label, nothing to learn from it
     uint32_t n_labels   = 0;
     int64_t  first      = -1;    // the exact walk's period end: the chunk its reverse pass trains last
 
     static llama_walk_plan of(const std::vector<llama_token> & labels, uint32_t n_ctx, uint32_t n_batch);
 
-    // which chunks the exact walk trains (a labelled one, one a later gradient reaches, and on a
-    // recurrent model every one before a trained one, since the state reaches every later
-    // chunk), how far back each gradient reaches, and the period end
-    void mark_exact(bool recurrent, uint32_t horizon);
+    // positions [begin, end) of a run
+    uint32_t begin(const llama_walk_run & r) const { return chunks[r.j0].c0; }
+    uint32_t end  (const llama_walk_run & r) const { return chunks[r.j1 - 1].c0 + chunks[r.j1 - 1].n; }
+
+    // which chunks the exact walk trains (the labelled ones: the context before a run is her
+    // stable set's and carries no gradient), how far back each gradient reaches (never before
+    // its run's start), and the period end (the first chunk of the last run, trained last)
+    void mark_exact(uint32_t horizon);
 
     // the first cached position a chunk at c0 carries gradient to (horizon 0: the whole prefix)
     static uint32_t grad_from(uint32_t c0, uint32_t horizon);
 
     // THE HOST BUDGET (Fable): the K/V accumulators, plus a recurrent state checkpoint every
-    // `stride` chunks (the first chunk's entry is the zero state and costs nothing)
+    // `stride` chunks of the run being walked (the largest run's)
     size_t host_bytes(size_t stride, size_t kv_bytes, size_t state_bytes) const;
     // the smallest stride under the budget (0: no cap); the reverse pass rebuilds a chunk's
     // entry state by decoding forward from its checkpoint, so a longer stride trades host

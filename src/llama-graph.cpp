@@ -223,6 +223,19 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_label_rows::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(rows && ggml_backend_buffer_is_host(rows->buffer));
+    int32_t * data = (int32_t *) rows->data;
+    int64_t n = 0;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (ubatch->label != nullptr && ubatch->label[i] >= 0) {
+            GGML_ASSERT(n < rows->ne[0]);
+            data[n++] = (int32_t) i;
+        }
+    }
+    GGML_ASSERT(n == rows->ne[0]);
+}
+
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
@@ -1501,6 +1514,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
+    shadow           (params.shadow),
+    n_shadow_rows    (params.n_shadow_rows),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
@@ -1537,7 +1552,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
-        if (lw == nullptr) {
+        if (lw == nullptr || !lora_on(lora.first)) {
             continue;
         }
 
@@ -1550,7 +1565,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 );
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
+        res = lora.first == shadow ? shadow_add(res, ab_cur) : ggml_add(ctx0, res, ab_cur);
     }
 
     return res;
@@ -1573,7 +1588,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     }
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
-        if (lw == nullptr) {
+        if (lw == nullptr || !lora_on(lora.first)) {
             continue;
         }
 
@@ -1588,7 +1603,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
                 );
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
-        res = ggml_add(ctx0, res, ab_cur);
+        res = lora.first == shadow ? shadow_add(res, ab_cur) : ggml_add(ctx0, res, ab_cur);
     }
 
     return res;
@@ -1731,7 +1746,7 @@ ggml_tensor * llm_graph_context::build_ffn(
             return false;
         }
         for (const auto & lora : *loras) {
-            if (lora.first->get_weight(w) != nullptr) {
+            if (lora.first->get_weight(w) != nullptr && lora_on(lora.first)) {
                 return true;
             }
         }
@@ -2352,7 +2367,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
             llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
-            if (lw == nullptr) {
+            if (lw == nullptr || !lora_on(lora.first)) {
                 continue;
             }
 
@@ -2364,7 +2379,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
                         ggml_get_rows(ctx0, lw->a, inp->tokens)
                         ), scale);
 
-            cur = ggml_add(ctx0, cur, inpL_delta);
+            cur = lora.first == shadow ? shadow_add(cur, inpL_delta) : ggml_add(ctx0, cur, inpL_delta);
         }
 
         if (n_embd_inp != n_embd) {
@@ -2427,6 +2442,28 @@ ggml_tensor * llm_graph_context::build_inp_train_rows() const {
         res->add_input(std::move(inp));
     }
     return inp_train_rows;
+}
+
+bool llm_graph_context::lora_on(const llama_adapter_lora * adapter) const {
+    return adapter != shadow || n_shadow_rows > 0;
+}
+
+ggml_tensor * llm_graph_context::shadow_add(ggml_tensor * base, ggml_tensor * term) const {
+    if (inp_label_rows == nullptr) {
+        auto inp = std::make_unique<llm_graph_input_label_rows>();
+        inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_shadow_rows);
+        ggml_set_input(inp->rows);
+        ggml_set_name(inp->rows, "label_rows");
+        inp_label_rows = inp->rows;
+        res->add_input(std::move(inp));
+    }
+    // one row per token: the tokens are base's outermost dimension
+    GGML_ASSERT(ggml_is_contiguous(base) && (n_tokens == 1 || base->ne[ggml_n_dims(base) - 1] == n_tokens));
+    const int64_t n = ggml_nelements(base) / n_tokens;
+    ggml_tensor * b2  = ggml_reshape_2d(ctx0, base, n, n_tokens);
+    ggml_tensor * t2  = ggml_reshape_2d(ctx0, ggml_cont(ctx0, term), n, n_tokens);
+    ggml_tensor * sel = ggml_add(ctx0, ggml_get_rows(ctx0, b2, inp_label_rows), ggml_get_rows(ctx0, t2, inp_label_rows));
+    return ggml_reshape(ctx0, ggml_set_rows(ctx0, ggml_dup(ctx0, b2), sel, inp_label_rows), base);
 }
 
 ggml_tensor * llm_graph_context::build_inp_pos() const {

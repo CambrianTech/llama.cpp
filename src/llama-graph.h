@@ -233,6 +233,17 @@ public:
     const uint32_t n_outputs;
 };
 
+// the ubatch's labelled rows, in order: where the shadow adapter applies (shadow_add)
+class llm_graph_input_label_rows : public llm_graph_input_i {
+public:
+    llm_graph_input_label_rows() = default;
+    virtual ~llm_graph_input_label_rows() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * rows = nullptr; // I32 [n_shadow_rows]
+};
+
 class llm_graph_input_mean : public llm_graph_input_i {
 public:
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}
@@ -783,6 +794,11 @@ struct llm_graph_params {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    // THE SHADOW: the attached adapter being trained (llama_opt_init), the layer that switches on
+    // and off. It applies only to the ubatch's labelled rows (n_shadow_rows of them); a ubatch
+    // with no label never applies it, so serving is the stable set's graph
+    const llama_adapter_lora     * shadow;
+    uint32_t                       n_shadow_rows;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -880,6 +896,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
+            shadow == other.shadow &&
+            n_shadow_rows == other.n_shadow_rows &&
             cross == other.cross;
     }
 };
@@ -1055,6 +1073,8 @@ struct llm_graph_context {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const llama_adapter_lora     * shadow;
+    const uint32_t                 n_shadow_rows;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -1065,6 +1085,7 @@ struct llm_graph_context {
     llm_graph_result * res;
 
     mutable ggml_tensor * inp_train_rows = nullptr; // build_inp_train_rows, once per graph
+    mutable ggml_tensor * inp_label_rows = nullptr; // shadow_add, once per graph
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1187,6 +1208,16 @@ struct llm_graph_context {
     // A training chunk's cache rows: I32 [n_tokens], its positions (in the walk a position
     // is its cell). One per graph, shared by every attention layer.
     ggml_tensor * build_inp_train_rows() const;
+
+    // whether an attached adapter's term is in this graph: every one but the shadow always, the
+    // shadow only when the ubatch has labelled rows
+    bool lora_on(const llama_adapter_lora * adapter) const;
+    // base plus the shadow's term, on the labelled rows only (Cormac, 2026-10-14): those rows of
+    // base and of the term are gathered and added, and written back into a copy of base; every
+    // other row is base, byte for byte. A multiplied 0/1 mask was not: an untrained layer's inf or
+    // NaN times zero is NaN, and x + 0 turns a -0 into +0, on a serving row co-batched with
+    // training.
+    ggml_tensor * shadow_add(ggml_tensor * base, ggml_tensor * term) const;
 
     // Whether this layer's attention runs through FLASH_ATTN_EXT: the one decision
     // build_attn_mha makes and a training graph reads to attend to the cache in place.

@@ -157,16 +157,31 @@ bool llama_batch_allocr::init(
         n_outputs += batch.logits[i] != 0;
     }
 
-    // a labelled position is a training row: its logits row is what the loss reads
+    // a labelled position is a training row: its logits row is what the loss reads. A run of
+    // them trains given everything before it as served (the shadow adapter applies to labelled
+    // rows only) and is restored to her stable set after, so in one batch a sequence's labelled
+    // rows are one run that ends its rows: anything after it would read the run through the
+    // shadow instead of as served.
     if (batch.label) {
+        bool in_run[LLAMA_MAX_SEQ] = {};
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const llama_seq_id s = batch.seq_id[i][0];
             if (batch.label[i] < 0) {
+                if (in_run[s]) {
+                    LLAMA_LOG_ERROR("%s: position %d follows a labelled run of sequence %d in one batch: a run ends its sequence's rows\n", __func__, i, s);
+                    return false;
+                }
                 continue;
             }
             if (batch.logits[i] == 0) {
                 LLAMA_LOG_ERROR("%s: position %d has a label but is not an output: a training row must be output\n", __func__, i);
                 return false;
             }
+            if (batch.n_seq_id[i] != 1) {
+                LLAMA_LOG_ERROR("%s: position %d has a label and %d sequences: a training row belongs to one sequence\n", __func__, i, batch.n_seq_id[i]);
+                return false;
+            }
+            in_run[s] = true;
             ++n_labels;
         }
     }

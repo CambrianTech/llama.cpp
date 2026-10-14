@@ -23,10 +23,14 @@ llama_walk_plan llama_walk_plan::of(const std::vector<llama_token> & labels, uin
         while ((int64_t) end <= plan.last_label && (labels[end] >= 0) == labelled) {
             ++end;
         }
+        const size_t j0 = plan.chunks.size();
         for (uint32_t c0 = p; c0 < end; c0 += n_batch) {
             const uint32_t n = std::min(c0 + n_batch, end) - c0;
             plan.chunks.push_back({ c0, n, labelled ? n : 0 });
             plan.n_labels += labelled ? n : 0;
+        }
+        if (labelled) {
+            plan.runs.push_back({ j0, plan.chunks.size() });
         }
         p = end;
     }
@@ -37,35 +41,44 @@ uint32_t llama_walk_plan::grad_from(uint32_t c0, uint32_t horizon) {
     return horizon == 0 || c0 < horizon ? 0 : c0 - horizon;
 }
 
-void llama_walk_plan::mark_exact(bool recurrent, uint32_t horizon) {
-    uint32_t reach = UINT32_MAX; // the lowest position a later trained chunk's gradient reaches
-    first = -1;
-    for (int64_t j = (int64_t) chunks.size() - 1; j >= 0; --j) {
-        llama_walk_chunk & c = chunks[j];
-        c.surrogate  = reach < c.c0 + c.n;
-        c.needed     = c.n_labels > 0 || c.surrogate || (recurrent && first >= 0);
+void llama_walk_plan::mark_exact(uint32_t horizon) {
+    for (llama_walk_chunk & c : chunks) {
+        c.needed     = false;
+        c.surrogate  = false;
         c.period_end = false;
-        if (!c.needed) {
-            continue;
-        }
-        c.grad_from  = grad_from(c.c0, horizon);
-        c.loss_scale = (float) c.n_labels / (float) n_labels;
-        reach = std::min(reach, c.grad_from);
-        first = j;
     }
-    GGML_ASSERT(first >= 0);
+    for (const llama_walk_run & r : runs) {
+        uint32_t reach = UINT32_MAX; // the lowest position a later chunk of the run reaches
+        for (size_t j = r.j1; j-- > r.j0; ) {
+            llama_walk_chunk & c = chunks[j];
+            c.needed     = true;
+            c.surrogate  = reach < c.c0 + c.n;
+            c.grad_from  = std::max(begin(r), grad_from(c.c0, horizon));
+            c.loss_scale = (float) c.n_labels / (float) n_labels;
+            reach = std::min(reach, c.grad_from);
+        }
+    }
+    GGML_ASSERT(!runs.empty());
+    first = (int64_t) runs.back().j0;
     chunks[first].period_end = true;
 }
 
 size_t llama_walk_plan::host_bytes(size_t stride, size_t kv_bytes, size_t state_bytes) const {
-    const size_t n_checkpoints = chunks.empty() ? 0 : (chunks.size() + stride - 1)/stride - 1;
+    size_t n_checkpoints = 0;
+    for (const llama_walk_run & r : runs) {
+        n_checkpoints = std::max(n_checkpoints, (r.j1 - r.j0 + stride - 1)/stride);
+    }
     return kv_bytes + n_checkpoints*state_bytes;
 }
 
 size_t llama_walk_plan::stride_for(size_t budget, size_t kv_bytes, size_t state_bytes) const {
+    size_t longest = 1;
+    for (const llama_walk_run & r : runs) {
+        longest = std::max(longest, r.j1 - r.j0);
+    }
     size_t stride = 1;
     if (budget > 0) {
-        while (stride < chunks.size() && host_bytes(stride, kv_bytes, state_bytes) > budget) {
+        while (stride < longest && host_bytes(stride, kv_bytes, state_bytes) > budget) {
             ++stride;
         }
     }

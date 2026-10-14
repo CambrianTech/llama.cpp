@@ -2390,9 +2390,12 @@ struct test_set_rows : public test_case {
     const std::array<int, 2> nr23; // broadcast only dims 2 and 3
     const int r; // rows to set
     const bool v; // view (non-contiguous src1)
+    // gradients for both the rows written and the destination, written into a copy of it (the
+    // shadow adapter's row selection, llm_graph_context::shadow_add)
+    const bool grad;
 
     std::string vars() override {
-        return VARS_TO_STR7(type_src, type_dst, type_idx, ne, nr23, r, v);
+        return VARS_TO_STR8(type_src, type_dst, type_idx, ne, nr23, r, v, grad);
     }
 
     test_set_rows(ggml_type type_src,
@@ -2400,8 +2403,8 @@ struct test_set_rows : public test_case {
             ggml_type type_idx,
             std::array<int64_t, 4> ne,
             std::array<int, 2> nr23,
-            int r, bool v = false)
-        : type_src(type_src), type_dst(type_dst), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v) {}
+            int r, bool v = false, bool grad = false)
+        : type_src(type_src), type_dst(type_dst), type_idx(type_idx), ne(ne), nr23(nr23), r(r), v(v), grad(grad) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * dst = ggml_new_tensor_4d(ctx, type_dst, ne[0], ne[1], ne[2]*nr23[0], ne[3]*nr23[1]);
@@ -2409,6 +2412,13 @@ struct test_set_rows : public test_case {
 
         ggml_tensor * src = ggml_new_tensor_4d(ctx, type_src, ne[0], r,     ne[2]*nr23[0], ne[3]*nr23[1]);
         ggml_set_name(src, "src");
+
+        if (grad) {
+            ggml_set_param(dst);
+            ggml_set_param(src);
+            dst = ggml_dup(ctx, dst);
+            ggml_set_name(dst, "copy_of_dst");
+        }
 
         ggml_tensor * row_idxs = ggml_new_tensor_3d(ctx, type_idx, r, ne[2], ne[3]);
         ggml_set_name(row_idxs, "row_idxs");
@@ -8734,6 +8744,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 64, 9, 1, 1 }, { 1, 1 }, 4, false, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (ggml_type type : all_types) {

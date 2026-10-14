@@ -17,6 +17,15 @@ struct llama_ubatch {
         return b_equal_seqs != 0;
     }
 
+    // the training rows (a label >= 0)
+    uint32_t n_labels() const {
+        uint32_t n = 0;
+        for (uint32_t i = 0; label != nullptr && i < n_tokens; ++i) {
+            n += label[i] >= 0;
+        }
+        return n;
+    }
+
     // typical for M-RoPE cases:
     //   0 - sequential position of the tokens/embeddings in the sequence
     //   1 - y position in the image

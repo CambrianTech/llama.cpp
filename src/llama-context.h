@@ -394,12 +394,16 @@ private:
     uint32_t opt_walk_horizon_req = 0; // llama_opt_params::walk_horizon, as requested
     uint32_t opt_walk_horizon = 0;     // this window's: starts at the request, shrinks to fit the device
 
+    // the adapter being trained (llama_opt_params::adapter): applied to labelled rows only
+    // (llm_graph_params::shadow); null when the base itself trains
+    const llama_adapter_lora * opt_shadow = nullptr;
+
     // set by a walk for the decode it drives: whose taps join the graph, where the loss lands,
-    // whether a ubatch without labels still trains (an exact walk's context chunk), and that the
-    // logits rows are the loss's alone (no host copy)
-    opt_walk *        opt_walk_active      = nullptr;
-    ggml_opt_result_t opt_result_active    = nullptr;
-    bool              opt_train_unlabelled = false;
+    // whether its labelled rows only fill the cache (the shadow on, no loss, no backward), and
+    // that the logits rows are the loss's alone (no host copy)
+    opt_walk *        opt_walk_active   = nullptr;
+    ggml_opt_result_t opt_result_active = nullptr;
+    bool              opt_forward_only  = false;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

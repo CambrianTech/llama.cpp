@@ -95,8 +95,7 @@ static llama_context * make_ctx(const common_params & params, llama_model * mode
     cparams.n_ctx           = g_window;
     cparams.n_batch         = chunk;
     cparams.n_ubatch        = chunk;
-    cparams.n_seq_max       = 2;    // the plain walk snapshots a recurrent state into a scratch sequence
-    cparams.kv_unified      = true; // ...and the window keeps every cell
+    cparams.kv_unified      = true; // the window keeps every cell
     // a quantized V cache needs flash attention (it stores V untransposed); training graphs take
     // the explicit path either way
     cparams.flash_attn_type = g_cache_type == GGML_TYPE_F32 ? LLAMA_FLASH_ATTN_TYPE_DISABLED : LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -142,7 +141,8 @@ static std::vector<std::pair<std::string, size_t>> g_layout;
 // one SGD step from the fresh adapter: the step itself, -lr * the gradient it took
 static std::vector<float> step_delta(const common_params & params, llama_model * model, const std::string & init,
                                      const std::vector<llama_token> & tokens, const std::vector<uint8_t> & labelled,
-                                     uint32_t chunk, bool exact, size_t host_budget = 0, size_t * host_bytes = nullptr) {
+                                     uint32_t chunk, bool exact, size_t host_budget = 0, size_t * host_bytes = nullptr,
+                                     std::vector<uint8_t> * state_after = nullptr) {
     llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
     GGML_ASSERT(adapter != nullptr);
     const std::vector<float> before = adapter_params(adapter);
@@ -179,6 +179,10 @@ static std::vector<float> step_delta(const common_params & params, llama_model *
     }
     g_last_graph_bytes = llama_opt_graph_bytes(ctx);
     g_last_horizon     = llama_opt_walk_horizon(ctx);
+    if (state_after) {
+        state_after->resize(llama_state_seq_get_size(ctx, 0));
+        GGML_ASSERT(llama_state_seq_get_data(ctx, state_after->data(), state_after->size(), 0) == state_after->size());
+    }
     ggml_opt_result_free(result);
     ggml_opt_dataset_free(dataset);
     llama_free(ctx);
@@ -190,6 +194,30 @@ static std::vector<float> step_delta(const common_params & params, llama_model *
         d[i] = after[i] - before[i];
     }
     return d;
+}
+
+// her stable self's cache after [0, r0) and then [r0, r1): no adapter, decoded in chunks from
+// each start as the walk decodes them (a matmul's result depends on its batch size), so a walk
+// that restores its run leaves exactly these bytes
+static std::vector<uint8_t> stable_state(const common_params & params, llama_model * model,
+                                         const std::vector<llama_token> & tokens, uint32_t r0, uint32_t r1, uint32_t chunk) {
+    llama_context * ctx = make_ctx(params, model, chunk);
+    llama_batch batch = llama_batch_init(chunk, 0, 1);
+    for (const auto & [p0, p1] : { std::make_pair(0u, r0), std::make_pair(r0, r1) }) {
+        for (uint32_t c0 = p0; c0 < p1; c0 += chunk) {
+            const uint32_t n = std::min(c0 + chunk, p1) - c0;
+            common_batch_clear(batch);
+            for (uint32_t i = 0; i < n; ++i) {
+                common_batch_add(batch, tokens[c0 + i], c0 + i, { 0 }, i + 1 == n);
+            }
+            GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        }
+    }
+    std::vector<uint8_t> state(llama_state_seq_get_size(ctx, 0));
+    GGML_ASSERT(llama_state_seq_get_data(ctx, state.data(), state.size(), 0) == state.size());
+    llama_batch_free(batch);
+    llama_free(ctx);
+    return state;
 }
 
 struct agreement {
@@ -368,8 +396,9 @@ int main(int argc, char ** argv) {
         }
     }
     {
-        // 2. context, then a reply (the walk's real case): the exact walk is invariant to how the
-        // window is chunked, context chunks included (they train through the surrogate alone)
+        // 2. context, then a reply (the walk's real case): the reply trains given the context as
+        // served, so only its own chunks train, and the exact walk is invariant to how the reply
+        // is chunked
         std::vector<uint8_t> reply(WINDOW + 1, 0);
         for (uint32_t i = WINDOW / 2 + 37; i <= WINDOW; ++i) {
             reply[i] = 1;
@@ -384,6 +413,30 @@ int main(int argc, char ** argv) {
         if (same_step(compare("context + reply: plain walk in 4 chunks vs the exact walk", plain4, runs))) {
             fprintf(stderr, "FAILED: the plain walk matches the exact one: this window cannot tell the two apart\n");
             ++failures;
+        }
+    }
+
+    {
+        // 8. what this catches: a walk that leaves the shadow in her cache. The reply's cells
+        // are written under the shadow while it trains, then restored, so after either walk the
+        // sequence (every attention cell, the recurrent state) is byte-identical to her stable
+        // self's decode of the same window: serving never reads what training wrote.
+        std::vector<uint8_t> reply(WINDOW + 1, 0);
+        for (uint32_t i = WINDOW / 2 + 37; i <= WINDOW; ++i) {
+            reply[i] = 1;
+        }
+        const uint32_t r0 = WINDOW / 2 + 36; // the first labelled position (it predicts reply[r0 + 1])
+        const std::vector<uint8_t> want = stable_state(params, model, tokens, r0, WINDOW, WINDOW / 4);
+        for (bool exact : { true, false }) {
+            std::vector<uint8_t> got;
+            step_delta(params, model, init, tokens, reply, WINDOW / 4, exact, 0, nullptr, &got);
+            const bool same = got == want;
+            printf("  cache after the %s walk: %zu bytes, %s her stable decode\n", exact ? "exact" : "plain", got.size(),
+                    same ? "byte-identical to" : "DIFFERS from");
+            if (!same) {
+                fprintf(stderr, "FAILED: the %s walk left the shadow in the cache\n", exact ? "exact" : "plain");
+                ++failures;
+            }
         }
     }
 

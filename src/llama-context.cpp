@@ -1335,14 +1335,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * gf  = res->get_gf();
 
     // a ubatch with labelled rows is a training step on this context's trainable adapter
-    // (llama_opt_init): the same graph with the extras on (opt_ubatch). It is built fresh, and
+    // (llama_opt_init): the same graph with the extras on, the shadow's masked term
+    // (graph_params) and the loss and backward (opt_ubatch). It is built fresh, and
     // cparams.training is part of the reuse key, so a serving graph never reuses it.
     bool train = false;
     if (opt_ctx != nullptr) {
-        train = opt_train_unlabelled;
-        for (uint32_t i = 0; !train && ubatch.label != nullptr && i < ubatch.n_tokens; ++i) {
-            train = ubatch.label[i] >= 0;
-        }
+        train = !opt_forward_only && ubatch.n_labels() > 0;
         cparams.training = train;
     }
 
@@ -2508,6 +2506,8 @@ llm_graph_params llama_context::graph_params(
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
+        /*.shadow      =*/ opt_shadow,
+        /*.n_shadow_rows =*/ opt_shadow != nullptr ? ubatch.n_labels() : 0,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
