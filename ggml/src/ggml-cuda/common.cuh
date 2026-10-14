@@ -452,8 +452,8 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 }
 
-template<int width = WARP_SIZE>
-static __device__ __forceinline__ float warp_reduce_sum(float x) {
+template<int width = WARP_SIZE, typename T>
+static __device__ __forceinline__ T warp_reduce_sum(T x) {
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
@@ -1148,6 +1148,8 @@ struct ggml_cuda_device_info {
         size_t  vmm_granularity;                // granularity of virtual memory
         size_t  total_vram;
         int     warp_size;                      // Number of threads in a dispatch
+        int     max_threads_per_block;
+        int     max_grid_dim_x;
         bool    supports_cooperative_launch;    // whether cooperative launch is supported
         int     physical_device;                // backing physical CUDA device for this (virtual) device
         int     physical_share_count;           // number of (virtual) devices sharing this device's physical GPU
