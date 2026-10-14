@@ -352,6 +352,52 @@ static void mixed_decode(const common_params & params, llama_model * model, cons
     llama_adapter_lora_free(adapter);
 }
 
+static void multi_label_decode(const common_params & params, llama_model * model, const std::string & init,
+                               const std::vector<llama_token> & tokens, bool flash, ggml_type cache_type) {
+    auto step = [&](const std::vector<int> & sequences) {
+        auto cp = common_context_params_to_llama(params);
+        cp.n_ctx = 128;
+        cp.n_batch = cp.n_ubatch = 2;
+        cp.n_seq_max = 2;
+        cp.kv_unified = true;
+        cp.flash_attn_type = flash ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cp.type_k = cp.type_v = cache_type;
+        llama_context * ctx = llama_init_from_model(model, cp);
+        GGML_ASSERT(ctx);
+        llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
+        float scale = 1.0f;
+        GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
+        llama_opt_params op{};
+        op.param_filter = llama_opt_param_filter_all;
+        op.get_opt_pars = sgd_pars;
+        op.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
+        op.adapter = adapter;
+        llama_opt_init(ctx, model, op);
+        const auto before = adapter_params(adapter);
+        llama_batch batch = llama_batch_init(2, 0, 1);
+        for (int seq : sequences) {
+            common_batch_add(batch, tokens[seq], 0, {seq}, true);
+            batch.label[batch.n_tokens - 1] = tokens[seq + 2];
+        }
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        auto delta = adapter_params(adapter);
+        for (size_t i = 0; i < delta.size(); ++i) {
+            delta[i] -= before[i];
+        }
+        llama_batch_free(batch);
+        llama_free(ctx);
+        llama_adapter_lora_free(adapter);
+        return delta;
+    };
+    auto mean = step({0});
+    const auto second = step({1});
+    for (size_t i = 0; i < mean.size(); ++i) {
+        mean[i] = (mean[i] + second[i]) / 2;
+    }
+    const auto joint = step({0, 1});
+    GGML_ASSERT(same_step(compare("two labelled sequences vs mean independent steps", joint, mean)));
+    GGML_ASSERT(same_step(compare("two labelled sequences with reversed row order", step({1, 0}), joint)));
+}
 int main(int argc, char ** argv) {
     common_params params;
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
@@ -385,6 +431,8 @@ int main(int argc, char ** argv) {
     GGML_ASSERT(tokens.size() > REFUSAL_WINDOW + 1);
 
     if (getenv("WALK_MIXED_ONLY")) {
+        multi_label_decode(params, model, init, tokens, false, GGML_TYPE_F32);
+        multi_label_decode(params, model, init, tokens, true, GGML_TYPE_Q8_0);
         mixed_decode(params, model, init, tokens, false, GGML_TYPE_F32);
         for (ggml_type cache : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
             mixed_decode(params, model, init, tokens, true, cache);
@@ -439,7 +487,9 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    const bool recompute_only = getenv("WALK_RECOMPUTE_ONLY") != nullptr;
     int failures = 0;
+    if (!recompute_only) {
     {
         // 1. every position labelled: chunk = window is one graph, the true gradient
         std::vector<uint8_t> all(WINDOW + 1, 1);
@@ -536,6 +586,8 @@ int main(int argc, char ** argv) {
         }
     }
 
+    }
+
     {
         // 7. per-layer recompute under the exact walk. The chunk's activations, every layer's
         // kept for the backward pass, are what a large model's chunk graph is made of (Kimi's
@@ -558,12 +610,15 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "FAILED: recompute changed the exact walk's step\n");
             ++failures;
         }
-        if (!(rebuilt_bytes < kept_bytes)) {
+        if (kept_bytes == 0 && rebuilt_bytes == 0) {
+            printf("  chunk graph reduction: unavailable (device-only allocation counter)\n");
+        } else if (!(rebuilt_bytes < kept_bytes)) {
             fprintf(stderr, "FAILED: recompute did not shrink the exact walk's chunk graph\n");
             ++failures;
         }
     }
 
+    if (!recompute_only) {
     {
         // 3. the host budget: a window whose accumulators and snapshots exceed it refuses by
         // name before anything runs, and the adapter is untouched
@@ -690,6 +745,8 @@ int main(int argc, char ** argv) {
             llama_adapter_lora_free(adapter);
         }
         g_window = WINDOW;
+    }
+
     }
 
     std::remove(init.c_str());
