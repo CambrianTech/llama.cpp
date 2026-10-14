@@ -132,41 +132,37 @@ static __global__ void fattn_back_q(fattn_back_args a) {
     for (int x = thread; x < 16*a.D; x += 4*WARP_SIZE) { gradient[x] = 0.0f; }
     if (thread < 16) { maxima[thread] = -INFINITY; sums[thread] = deltas[thread] = 0.0; }
     __syncthreads();
-    // Normalize, compute D, then accumulate dS*K directly rather than subtract large moments.
-    for (int phase = 0; phase < 3; ++phase) {
+    // Accumulate normalized dP with the online maximum, then form dS in F32.
+    for (int phase = 0; phase < 2; ++phase) {
         for (int base = 0; base < a.M; base += 32) {
             fattn_back_store_tile(fattn_back_product<GGML_TYPE_F32, TK>(q, k, row, base + col, a.D), scores, col);
-            if (phase) {
-                fattn_back_store_tile(fattn_back_product<GGML_TYPE_F32, TV>(d, v, row, base + col, a.Dv), products, col);
-            }
+            fattn_back_store_tile(fattn_back_product<GGML_TYPE_F32, TV>(d, v, row, base + col, a.Dv), products, col);
             __syncthreads();
-            if (thread < 16 && row + thread < a.N) {
-                const int i = row + thread;
-                const size_t index = (size_t) h*a.N + i;
-                for (int t = 0; t < 32; ++t) {
-                    const int j = base + t;
-                    const float mask = j < a.M ? fattn_back_mask(a, j, i, h) : -INFINITY;
-                    const float s = mask == -INFINITY ? -INFINITY : scores[thread*32 + t]*a.scale + mask;
-                    if (phase == 0) {
-                        if (s == -INFINITY) { continue; }
-                        const double next = fmax(maxima[thread], (double) s);
-                        sums[thread] = sums[thread]*exp(maxima[thread] - next) + exp((double) s - next);
-                        maxima[thread] = next;
-                    } else {
-                        const float lse = a.lse[index];
-                        const float p = s == -INFINITY || lse == -INFINITY ? 0.0f : expf(s - lse);
-                        if (phase == 1) {
-                            if (p) { deltas[thread] += (double) p*products[thread*32 + t]; }
-                        } else {
-                            scores[thread*32 + t] = p ? p*(products[thread*32 + t] - a.delta[index])*a.scale : 0.0f;
-                        }
+            for (int r = threadIdx.y; r < 16; r += blockDim.y) {
+                const int j = base + threadIdx.x;
+                const int i = row + r;
+                const float mask = j < a.M && i < a.N ? fattn_back_mask(a, j, i, h) : -INFINITY;
+                const float score = mask == -INFINITY ? -INFINITY : scores[r*32 + threadIdx.x]*a.scale + mask;
+                if (phase == 0) {
+                    const double next = fmax(maxima[r], (double) warp_reduce_max(score));
+                    const double weight = score == -INFINITY ? 0.0 : exp((double) score - next);
+                    const double total = warp_reduce_sum(weight);
+                    const double weighted = warp_reduce_sum(weight ? weight*products[r*32 + threadIdx.x] : 0.0);
+                    if (threadIdx.x == 0 && next != -INFINITY) {
+                        const double rescale = exp(maxima[r] - next);
+                        sums[r] = sums[r]*rescale + total;
+                        deltas[r] = deltas[r]*rescale + weighted;
+                        maxima[r] = next;
                     }
+                } else {
+                    const size_t index = (size_t) h*a.N + i;
+                    const float lse = i < a.N ? a.lse[index] : -INFINITY;
+                    const float p = score == -INFINITY || lse == -INFINITY ? 0.0f : expf(score - lse);
+                    scores[r*32 + threadIdx.x] = p ? p*(products[r*32 + threadIdx.x] - a.delta[index])*a.scale : 0.0f;
                 }
-            } else if (thread < 16 && phase == 2) {
-                for (int t = 0; t < 32; ++t) { scores[thread*32 + t] = 0.0f; }
             }
             __syncthreads();
-            if (phase == 2) {
+            if (phase == 1) {
                 const fattn_back_matrix ds {(const char *) scores, 32*sizeof(float), sizeof(float), 16, 32, false};
                 const fattn_back_matrix kt {k.data + base*k.row_stride, k.row_stride, k.col_stride, a.D, min(32, a.M - base), true};
                 for (int feature = col; feature < a.D; feature += 32) {
@@ -179,10 +175,11 @@ static __global__ void fattn_back_q(fattn_back_args a) {
             }
             __syncthreads();
         }
-        if (thread < 16 && row + thread < a.N) {
+        if (phase == 0 && thread < 16 && row + thread < a.N) {
             const size_t index = (size_t) h*a.N + row + thread;
-            if (phase == 0) { a.lse[index] = maxima[thread] == -INFINITY ? -INFINITY : (float) (maxima[thread] + log(sums[thread])); }
-            if (phase == 1) { a.delta[index] = (float) deltas[thread]; }
+            const float lse = maxima[thread] == -INFINITY ? -INFINITY : (float) (maxima[thread] + log(sums[thread]));
+            a.lse[index] = lse;
+            a.delta[index] = lse == -INFINITY ? 0.0f : (float) (deltas[thread]*exp(maxima[thread] - (double) lse));
         }
         __syncthreads();
     }

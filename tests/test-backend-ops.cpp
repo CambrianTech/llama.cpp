@@ -545,6 +545,7 @@ struct test_result {
     double      time_us;
     double      flops;
     double      bandwidth_gb_s;
+    bool        work_estimate_available = true;
     size_t      memory_kb;
     int         n_runs;
     std::string device_description;
@@ -594,7 +595,7 @@ struct test_result {
         static const std::vector<std::string> fields = {
             "test_time", "build_commit",  "backend_name", "op_name", "op_params",      "test_mode", "supported",
             "passed",    "error_message", "time_us",      "flops",   "bandwidth_gb_s", "memory_kb", "n_runs",
-            "device_description", "backend_reg_name"
+            "device_description", "backend_reg_name", "work_estimate_available"
         };
         return fields;
     }
@@ -602,7 +603,7 @@ struct test_result {
     enum field_type { STRING, BOOL, INT, FLOAT };
 
     static field_type get_field_type(const std::string & field) {
-        if (field == "supported" || field == "passed") {
+        if (field == "supported" || field == "passed" || field == "work_estimate_available") {
             return BOOL;
         }
         if (field == "memory_kb" || field == "n_runs") {
@@ -630,7 +631,8 @@ struct test_result {
                  std::to_string(memory_kb),
                  std::to_string(n_runs),
                  device_description,
-                 backend_reg_name };
+                 backend_reg_name,
+                 std::to_string(work_estimate_available) };
     }
 };
 
@@ -978,7 +980,9 @@ struct console_printer : public printer {
 
         printf("    %8d runs - %8.2f us/run - ", result.n_runs, result.time_us);
 
-        if (result.flops > 0) {
+        if (!result.work_estimate_available) {
+            printf("work estimate unavailable");
+        } else if (result.flops > 0) {
             auto format_flops = [](double flops) -> std::string {
                 char buf[256];
                 if (flops >= 1e12) {
@@ -1221,6 +1225,8 @@ struct test_case {
         GGML_UNUSED(t);
         return 0;
     }
+
+    virtual bool work_estimate_available() { return true; }
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
@@ -1657,6 +1663,10 @@ struct test_case {
 
         test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, true, "", avg_time_us,
                            calculated_flops, calculated_bandwidth, calculated_memory_kb, total_runs);
+        result.work_estimate_available = work_estimate_available();
+        if (!result.work_estimate_available) {
+            result.flops = result.bandwidth_gb_s = 0.0;
+        }
 
         if (output_printer) {
             output_printer->print_test_result(result);
@@ -7613,11 +7623,7 @@ struct test_flash_attn_back : public test_case {
         }
     }
 
-    uint64_t op_flops(ggml_tensor *) override {
-        // QK twice for normalization/dQ, QK again for dKV, plus dP and gradient products.
-        // Count dense arithmetic; mask skips, reductions and exponentials are excluded.
-        return uint64_t(nh)*nb*kv*(11*hs + 6*dv);
-    }
+    bool work_estimate_available() override { return false; }
 
     double err(const ggml_tensor * t, const float * actual, const float * reference, size_t n) override {
         if (t->op != GGML_OP_FLASH_ATTN_BACK) { return test_case::err(actual, reference, n); }
