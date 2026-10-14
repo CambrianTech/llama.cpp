@@ -2647,15 +2647,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn).
-        // A training graph keeps its chunk's own K/V at F32 (every flash-attention backend takes
-        // F32 K/V): an F16 cast there rounded the trained K/V and moved the step (test-walk-exact,
-        // 2026-10-11: cosine 0.9969 against the one-graph reference at an f16 cache, 1.0000 at F32)
-        if (!cparams.training && k->type == GGML_TYPE_F32) {
+        // Direct decode uses serving precision for every row. The walk keeps its chunk's F32 K/V
+        // for its existing gradient comparison against a single graph.
+        if ((!cparams.training || !cparams.walk_active) && k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
 
-        if (!cparams.training && v->type == GGML_TYPE_F32) {
+        if ((!cparams.training || !cparams.walk_active) && v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
@@ -2905,7 +2903,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k;
     ggml_tensor * v;
-    if (cparams.training && uses_flash_attn(kq_b, sinks, v_mla)) {
+    if (cparams.training && cparams.walk_active && uses_flash_attn(kq_b, sinks, v_mla)) {
         // THE TRAINING GRAPH IS THE SERVING GRAPH. This chunk writes its K/V into the cache
         // exactly as serving does (SET_ROWS, the cache's own type) and attention reads the
         // cache in place: no copy of the context, at any window. The walk decoded the run
@@ -2953,7 +2951,7 @@ ggml_tensor * llm_graph_context::build_attn(
             kq_mask = ggml_cont(ctx0, ggml_view_4d(ctx0, kq_mask, n_win, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
                     kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0));
         }
-    } else if (cparams.training) {
+    } else if (cparams.training && cparams.walk_active) {
         // EXPLICIT ATTENTION (a layer FLASH_ATTN_EXT's backward does not cover yet: ALiBi, a
         // logit softcap, sinks, a KQ bias, MLA) reads a copy of the context instead.
         // A backward pass cannot go through the cache: the write is an in-place SET_ROWS
@@ -3048,11 +3046,13 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_tensor * written_k = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        ggml_tensor * written_v = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        ggml_build_forward_expand(gf, written_k);
+        ggml_build_forward_expand(gf, written_v);
 
-        k = mctx_cur->get_k(ctx0, il);
-        v = mctx_cur->get_v(ctx0, il);
+        k = mctx_cur->get_k(ctx0, il, cparams.training ? written_k : nullptr);
+        v = mctx_cur->get_v(ctx0, il, cparams.training ? written_v : nullptr);
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);

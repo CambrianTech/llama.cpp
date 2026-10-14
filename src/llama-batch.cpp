@@ -56,7 +56,15 @@ bool llama_batch_allocr::init(
     }
 
     if (batch.seq_id) {
+        if (!batch.n_seq_id) {
+            LLAMA_LOG_ERROR("%s: sequence IDs require sequence counts\n", __func__);
+            return false;
+        }
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.n_seq_id[i] <= 0 || batch.n_seq_id[i] > (int32_t) n_seq_max || !batch.seq_id[i]) {
+                LLAMA_LOG_ERROR("%s: invalid sequence list at position %d\n", __func__, i);
+                return false;
+            }
             for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
                 if (batch.seq_id && (batch.seq_id[i][s] < 0 || batch.seq_id[i][s] >= (llama_seq_id) n_seq_max)) {
                     LLAMA_LOG_ERROR("%s: invalid seq_id[%d][%d] = %d >= %d\n", __func__, i, s, batch.seq_id[i][s], (llama_seq_id) n_seq_max);
@@ -165,11 +173,17 @@ bool llama_batch_allocr::init(
     if (batch.label) {
         bool in_run[LLAMA_MAX_SEQ] = {};
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.label[i] < -1 || (batch.label[i] >= 0 && (uint32_t) batch.label[i] >= vocab.n_tokens())) {
+                LLAMA_LOG_ERROR("%s: invalid label[%d] = %d\n", __func__, i, batch.label[i]);
+                return false;
+            }
             const llama_seq_id s = batch.seq_id[i][0];
             if (batch.label[i] < 0) {
-                if (in_run[s]) {
-                    LLAMA_LOG_ERROR("%s: position %d follows a labelled run of sequence %d in one batch: a run ends its sequence's rows\n", __func__, i, s);
-                    return false;
+                for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
+                    if (in_run[batch.seq_id[i][j]]) {
+                        LLAMA_LOG_ERROR("%s: position %d follows a labelled run of sequence %d in one batch: a run ends its sequence's rows\n", __func__, i, batch.seq_id[i][j]);
+                        return false;
+                    }
                 }
                 continue;
             }

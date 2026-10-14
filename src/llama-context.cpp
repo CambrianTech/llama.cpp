@@ -1342,6 +1342,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (opt_ctx != nullptr) {
         train = !opt_forward_only && ubatch.n_labels() > 0;
         cparams.training = train;
+        cparams.walk_active = opt_walk_active != nullptr;
     }
 
     // the new graph parameters
@@ -1715,6 +1716,34 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
+    }
+
+    if (balloc->get_n_labels() > 0) {
+        if (!opt_ctx) {
+            LLAMA_LOG_ERROR("%s: labelled rows require an initialized optimizer\n", __func__);
+            return -1;
+        }
+        auto * recurrent = dynamic_cast<llama_memory_recurrent *>(memory.get());
+        auto * attention = dynamic_cast<llama_kv_cache *>(memory.get());
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            recurrent = hybrid->get_mem_recr();
+            attention = hybrid->get_mem_attn();
+        }
+        if (attention && !attention->supports_row_gradients()) {
+            LLAMA_LOG_ERROR("%s: cache row indices exceed the backward gather's index range\n", __func__);
+            return -1;
+        }
+        if (attention && cparams.flash_attn && attention->get_n_stream() != 1) {
+            LLAMA_LOG_ERROR("%s: flash attention backward requires a unified cache stream\n", __func__);
+            return -1;
+        }
+        const auto & batch = balloc->get_batch();
+        for (int32_t i = 0; recurrent && i < batch.n_tokens; ++i) {
+            if (batch.label[i] >= 0 && recurrent->rollback_pending(batch.seq_id[i][0])) {
+                LLAMA_LOG_ERROR("%s: sequence %d has pending rollback before training\n", __func__, batch.seq_id[i][0]);
+                return -1;
+            }
+        }
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();

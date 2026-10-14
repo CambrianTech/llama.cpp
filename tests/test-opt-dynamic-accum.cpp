@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
 
@@ -181,11 +182,162 @@ static void run_manual() {
     ggml_backend_free(cpu);
 }
 
+static void run_out_prod_broadcast(ggml_type type, bool transpose) {
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    CHECK(cpu != nullptr);
+    ggml_init_params cp = { 32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(cp);
+    ggml_tensor * input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 32, 2, 2, 2);
+    ggml_tensor * a = ggml_cast(ctx, input, type);
+    ggml_tensor * decoded = ggml_cast(ctx, a, GGML_TYPE_F32);
+    ggml_tensor * b_storage = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, transpose ? 2 : 1, transpose ? 1 : 2, 4, 4);
+    ggml_tensor * b = transpose ? ggml_transpose(ctx, b_storage) : b_storage;
+    ggml_tensor * out = ggml_out_prod(ctx, a, b);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    ggml_build_forward_expand(graph, decoded);
+    CHECK(ggml_backend_supports_op(cpu, out));
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+    float av[32 * 2 * 2 * 2], bv[2 * 4 * 4];
+    for (int batch = 0; batch < 4; ++batch) {
+        for (int row = 0; row < 2; ++row) {
+            for (int x = 0; x < 32; ++x) {
+                av[(batch * 2 + row) * 32 + x] = float((batch + 1) * (row + 1));
+            }
+        }
+    }
+    for (int batch = 0; batch < 16; ++batch) {
+        bv[batch * 2] = float(batch + 1);
+        bv[batch * 2 + 1] = -float(batch + 2);
+    }
+    ggml_backend_tensor_set(input, av, 0, sizeof(av));
+    ggml_backend_tensor_set(b_storage, bv, 0, sizeof(bv));
+    CHECK(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+    float actual[32 * 4 * 4];
+    ggml_backend_tensor_get(out, actual, 0, sizeof(actual));
+    ggml_backend_tensor_get(decoded, av, 0, sizeof(av));
+    for (int z = 0; z < 4; ++z) {
+        for (int y = 0; y < 4; ++y) {
+            const int a_batch = (z / 2) * 2 + y / 2;
+            const int b_batch = z * 4 + y;
+            for (int x = 0; x < 32; ++x) {
+                const float expected = av[a_batch * 64 + x] * bv[b_batch * 2]
+                    + av[a_batch * 64 + 32 + x] * bv[b_batch * 2 + 1];
+                if (std::fabs(actual[b_batch * 32 + x] - expected) >= 1e-4f) {
+                    fprintf(stderr, "out_prod type=%s transpose=%d y=%d z=%d actual=%g expected=%g\n",
+                            ggml_type_name(type), transpose, y, z, actual[b_batch * 32 + x], expected);
+                }
+                CHECK(std::fabs(actual[b_batch * 32 + x] - expected) < 1e-4f);
+            }
+        }
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(cpu);
+}
+
+static void run_cache_view_gradient(ggml_type type) {
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    ggml_backend_t backends[] = { cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_init_params sp = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * storage = ggml_init(sp);
+    ggml_tensor * weights = ggml_new_tensor_2d(storage, GGML_TYPE_F32, 32, 1);
+    ggml_tensor * cache = ggml_new_tensor_2d(storage, type, 32, 4);
+    ggml_set_param(weights);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(storage, cpu);
+    float values[32];
+    for (float & value : values) { value = 1.0f; }
+    ggml_backend_tensor_set(weights, values, 0, sizeof(values));
+    ggml_backend_tensor_memset(cache, 0, 0, ggml_nbytes(cache));
+    ggml_opt_params params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_SUM);
+    params.optimizer = GGML_OPT_OPTIMIZER_TYPE_SGD;
+    params.get_opt_pars = sgd_pars;
+    ggml_opt_context_t opt = ggml_opt_init(params);
+    ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
+    ggml_context * ctx = ggml_init(cp);
+    ggml_tensor * row = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(row);
+    ggml_tensor * written = ggml_set_rows(ctx, cache, weights, row);
+    ggml_tensor * view = ggml_view_2d(ctx, written, 32, 1, written->nb[1], 2 * written->nb[1]);
+    view = ggml_cast(ctx, view, GGML_TYPE_F32);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+    ggml_build_forward_expand(graph, view);
+    ggml_opt_prepare_alloc(opt, ctx, graph, row, view);
+    CHECK(ggml_opt_alloc(opt, true));
+    const int32_t index = 2;
+    ggml_backend_tensor_set(row, &index, 0, sizeof(index));
+    ggml_opt_eval(opt, nullptr);
+    CHECK(ggml_opt_refusal(opt)[0] == '\0');
+    ggml_backend_tensor_get(weights, values, 0, sizeof(values));
+    for (float value : values) { CHECK(std::fabs(value - (1.0f - LR)) < 1e-6f); }
+    ggml_opt_free(opt);
+    ggml_free(ctx);
+    ggml_backend_buffer_free(buf);
+    ggml_free(storage);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+}
+
+static void run_label_projection() {
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    CHECK(cpu != nullptr);
+    ggml_backend_t backends[] = { cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_init_params sp = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * storage = ggml_init(sp);
+    ggml_tensor * weights = ggml_new_tensor_2d(storage, GGML_TYPE_F32, 2, 3);
+    ggml_set_param(weights);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(storage, cpu);
+    const float before[] = { 8.0f, -8.0f, 0.0f, 0.0f, -8.0f, 8.0f };
+    ggml_backend_tensor_set(weights, before, 0, sizeof(before));
+    ggml_opt_params params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS);
+    params.optimizer = GGML_OPT_OPTIMIZER_TYPE_SGD;
+    params.get_opt_pars = sgd_pars;
+    ggml_opt_context_t opt = ggml_opt_init(params);
+    ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
+    ggml_context * graph_ctx = ggml_init(cp);
+    ggml_tensor * logits = ggml_scale(graph_ctx, weights, 1.0f);
+    ggml_set_output(logits);
+    ggml_tensor * rows = ggml_new_tensor_1d(graph_ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(rows);
+    ggml_tensor * objective = ggml_get_rows(graph_ctx, logits, rows);
+    ggml_cgraph * gf = ggml_new_graph_custom(graph_ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+    ggml_build_forward_expand(gf, logits);
+    ggml_opt_prepare_alloc(opt, graph_ctx, gf, rows, objective);
+    CHECK(ggml_opt_alloc(opt, true));
+    const int32_t row = 1, target = 0;
+    ggml_backend_tensor_set(rows, &row, 0, sizeof(row));
+    ggml_backend_tensor_set(ggml_opt_labels(opt), &target, 0, sizeof(target));
+    ggml_opt_eval(opt, nullptr);
+    CHECK(ggml_opt_refusal(opt)[0] == '\0');
+    float after[6], served[6];
+    ggml_backend_tensor_get(weights, after, 0, sizeof(after));
+    ggml_backend_tensor_get(logits, served, 0, sizeof(served));
+    for (int i = 0; i < 6; ++i) {
+        const float delta = i == 2 ? LR * 0.5f : i == 3 ? -LR * 0.5f : 0.0f;
+        CHECK(std::fabs(after[i] - before[i] - delta) < 1e-6f);
+        CHECK(served[i] == before[i]);
+    }
+    ggml_opt_free(opt);
+    ggml_free(graph_ctx);
+    ggml_backend_buffer_free(buf);
+    ggml_free(storage);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+}
+
 int main() {
     ggml_backend_load_all();
     run(1);
     run(2);
     run_manual();
+    run_label_projection();
+    for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        run_cache_view_gradient(type);
+        run_out_prod_broadcast(type, false);
+        run_out_prod_broadcast(type, true);
+    }
     printf("test-opt-dynamic-accum: OK\n");
     return 0;
 }

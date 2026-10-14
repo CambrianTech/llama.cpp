@@ -158,6 +158,8 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    bool supports_row_gradients() const;
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -175,8 +177,8 @@ public:
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_tensor * written = nullptr) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, ggml_tensor * written = nullptr) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -372,8 +374,8 @@ public:
     ggml_type type_v() const;
 
     // get views of the current state of the cache
-    ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
-    ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k(ggml_context * ctx, int32_t il, ggml_tensor * written = nullptr) const;
+    ggml_tensor * get_v(ggml_context * ctx, int32_t il, ggml_tensor * written = nullptr) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

@@ -1208,8 +1208,7 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     if (backward) {
         ggml_backend_sched_t sched  = opt_ctx->backend_sched;
         ggml_backend_t       device = ggml_backend_sched_get_backend(sched, 0);
-        ggml_backend_dev_t   dev    = device ? ggml_backend_get_device(device) : nullptr;
-        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        if (device != nullptr) {
             ggml_cgraph * g = opt_ctx->allocated_graph_copy;
             for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
                 ggml_tensor * node = ggml_graph_node(g, i);

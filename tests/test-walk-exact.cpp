@@ -21,6 +21,8 @@
 #include "common.h"
 #include "llama.h"
 #include "../src/llama-adapter.h"
+#include "../src/llama-memory-hybrid.h"
+#include "../src/llama-memory-recurrent.h"
 
 #include <algorithm>
 #include <cmath>
@@ -270,6 +272,86 @@ static bool same_step(const agreement & r) {
     return r.cosine > 0.995 && std::fabs(r.norm_ratio - 1.0) < 0.02;
 }
 
+static std::vector<uint8_t> sequence_state(llama_context * ctx, llama_seq_id seq) {
+    std::vector<uint8_t> bytes(llama_state_seq_get_size(ctx, seq));
+    GGML_ASSERT(llama_state_seq_get_data(ctx, bytes.data(), bytes.size(), seq) == bytes.size());
+    return bytes;
+}
+
+static void mixed_decode(const common_params & params, llama_model * model, const std::string & init,
+                         const std::vector<llama_token> & tokens, bool flash, ggml_type cache_type, uint32_t undo = 0) {
+    auto cp = common_context_params_to_llama(params);
+    cp.n_ctx = 128;
+    cp.n_batch = cp.n_ubatch = undo ? 8 : 2;
+    cp.n_seq_max = 2;
+    cp.kv_unified = true;
+    cp.n_rs_seq = undo;
+    cp.flash_attn_type = flash ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    cp.type_k = cp.type_v = cache_type;
+    llama_context * ctx = llama_init_from_model(model, cp);
+    GGML_ASSERT(ctx);
+    llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
+    float scale = 1.0f;
+    GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
+    llama_opt_params op{};
+    op.param_filter = llama_opt_param_filter_all;
+    op.get_opt_pars = sgd_pars;
+    op.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
+    op.adapter = adapter;
+    llama_batch batch = llama_batch_init(2, 0, 1);
+    common_batch_add(batch, tokens[0], 0, {0}, true);
+    common_batch_add(batch, tokens[1], 0, {1}, true);
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    const auto reference_neighbor = sequence_state(ctx, 1);
+    const auto reference_target = sequence_state(ctx, 0);
+    batch.label[0] = tokens[2];
+    batch.pos[0] = batch.pos[1] = 1;
+    GGML_ASSERT(llama_decode(ctx, batch) != 0);
+    GGML_ASSERT(sequence_state(ctx, 0) == reference_target && sequence_state(ctx, 1) == reference_neighbor);
+    llama_memory_clear(llama_get_memory(ctx), true);
+    batch.pos[0] = batch.pos[1] = 0;
+    llama_opt_init(ctx, model, op);
+    const auto initial_weights = adapter_params(adapter);
+    batch.label[0] = tokens[2];
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    GGML_ASSERT(llama_get_logits_ith(ctx, 0) && llama_get_logits_ith(ctx, 1));
+    const auto neighbor = sequence_state(ctx, 1);
+    GGML_ASSERT(neighbor == reference_neighbor);
+    const auto trained = sequence_state(ctx, 0);
+    GGML_ASSERT(neighbor != trained);
+    const auto weights = adapter_params(adapter);
+    GGML_ASSERT(weights != initial_weights);
+    common_batch_clear(batch);
+    common_batch_add(batch, tokens[2], 1, {0}, true);
+    batch.label[0] = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    GGML_ASSERT(llama_decode(ctx, batch) != 0);
+    GGML_ASSERT(sequence_state(ctx, 0) == trained && sequence_state(ctx, 1) == neighbor);
+    GGML_ASSERT(adapter_params(adapter) == weights);
+    batch.label[0] = tokens[3];
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    GGML_ASSERT(sequence_state(ctx, 1) == neighbor);
+    GGML_ASSERT(adapter_params(adapter) != weights);
+    if (undo) {
+        auto * memory = llama_get_memory(ctx);
+        auto * recurrent = dynamic_cast<llama_memory_recurrent *>(memory);
+        if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory)) {
+            recurrent = hybrid->get_mem_recr();
+        }
+        GGML_ASSERT(recurrent);
+        recurrent->set_rs_idx(0, 1);
+        const auto pending = sequence_state(ctx, 0);
+        const auto pending_weights = adapter_params(adapter);
+        batch.pos[0] = 2;
+        GGML_ASSERT(llama_decode(ctx, batch) != 0);
+        GGML_ASSERT(sequence_state(ctx, 0) == pending && sequence_state(ctx, 1) == neighbor);
+        GGML_ASSERT(adapter_params(adapter) == pending_weights);
+    }
+    printf("mixed decode flash=%d cache=%s undo=%u: same-position sequences, neighbour preservation, admission refusal OK\n", flash, ggml_type_name(cache_type), undo);
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_adapter_lora_free(adapter);
+}
+
 int main(int argc, char ** argv) {
     common_params params;
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
@@ -301,6 +383,20 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> tokens = common_tokenize(tok_ctx, text, true);
     llama_free(tok_ctx);
     GGML_ASSERT(tokens.size() > REFUSAL_WINDOW + 1);
+
+    if (getenv("WALK_MIXED_ONLY")) {
+        mixed_decode(params, model, init, tokens, false, GGML_TYPE_F32);
+        for (ggml_type cache : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            mixed_decode(params, model, init, tokens, true, cache);
+        }
+        if (llama_model_is_hybrid(model) || llama_model_is_recurrent(model)) {
+            mixed_decode(params, model, init, tokens, true, GGML_TYPE_Q8_0, 2);
+        }
+        std::remove(init.c_str());
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
 
     // MEASUREMENT MODE (WALK_MEASURE="2048,8192,..."): the device graph per chunk of a context +
     // reply window (the last 512 positions labelled), on the explicit path (F32 cache, no flash
