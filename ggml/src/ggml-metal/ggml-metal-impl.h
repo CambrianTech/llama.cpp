@@ -905,13 +905,24 @@ typedef struct {
 } ggml_metal_kargs_cross_entropy_loss;
 
 // a per-row backward with one scalar parameter (eps for RMS_NORM_BACK, scale for SOFT_MAX_BACK)
+// rows are addressed through each source's own strides, so a strided view (a per-head norm)
+// is read in place
 typedef struct {
     int32_t  ne00;
-    uint64_t nb01;
-    uint64_t nb11;
-    uint64_t nb1;
+    uint64_t nb01, nb02, nb03;
+    uint64_t nb11, nb12, nb13;
+    uint64_t nb1,  nb2,  nb3;
     float    param;
 } ggml_metal_kargs_row_back;
+
+// GET_ROWS_BACK: dst = 0, then dst[:, ids[i]] += src0[:, i] for each i (the gradient of a row
+// gather; in a training graph, the selection of the output rows)
+typedef struct {
+    int32_t  ne00; // row width
+    int32_t  nr;   // number of ids
+    uint64_t nb01;
+    uint64_t nb1;
+} ggml_metal_kargs_get_rows_back;
 
 typedef struct {
     int64_t  ne00;
@@ -1144,6 +1155,10 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  lp0; // left padding per dim: dst[i] = src[i - lp]
+    int32_t  lp1;
+    int32_t  lp2;
+    int32_t  lp3;
 } ggml_metal_kargs_pad;
 
 typedef struct {
