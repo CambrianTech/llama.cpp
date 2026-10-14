@@ -5,6 +5,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "ggml-opt.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -223,17 +224,35 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-void llm_graph_input_label_rows::set_input(const llama_ubatch * ubatch) {
-    GGML_ASSERT(rows && ggml_backend_buffer_is_host(rows->buffer));
-    int32_t * data = (int32_t *) rows->data;
-    int64_t n = 0;
-    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-        if (ubatch->label != nullptr && ubatch->label[i] >= 0) {
-            GGML_ASSERT(n < rows->ne[0]);
-            data[n++] = (int32_t) i;
+void llm_graph_input_training_rows::set_input(const llama_ubatch * ubatch) {
+    const auto map = ubatch->rows();
+    if (public_rows) {
+        GGML_ASSERT(public_rows->ne[0] == (int64_t) map.public_rows.size());
+        ggml_backend_tensor_set(public_rows, map.public_rows.data(), 0, ggml_nbytes(public_rows));
+    }
+    if (label_rows) {
+        GGML_ASSERT(label_rows->ne[0] == (int64_t) map.label_rows.size());
+        ggml_backend_tensor_set(label_rows, map.label_rows.data(), 0, ggml_nbytes(label_rows));
+    }
+    if (shadow_rows && shadow_rows->buffer) {
+        ggml_backend_tensor_set(shadow_rows, map.label_rows.data(), 0, ggml_nbytes(shadow_rows));
+    }
+    if (public_shadow_rows && public_shadow_rows->buffer) {
+        std::vector<int32_t> local;
+        for (size_t i = 0; i < map.public_rows.size(); ++i) {
+            if (ubatch->label[map.public_rows[i]] >= 0) {
+                local.push_back((int32_t) i);
+            }
+        }
+        ggml_backend_tensor_set(public_shadow_rows, local.data(), 0, ggml_nbytes(public_shadow_rows));
+    }
+    for (auto * rows : slice_shadow_rows) {
+        if (rows->buffer) {
+            std::vector<int32_t> local(rows->ne[0]);
+            std::iota(local.begin(), local.end(), 0);
+            ggml_backend_tensor_set(rows, local.data(), 0, ggml_nbytes(rows));
         }
     }
-    GGML_ASSERT(n == rows->ne[0]);
 }
 
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
@@ -1346,6 +1365,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_loss_slices.clear();
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -2448,24 +2468,89 @@ bool llm_graph_context::lora_on(const llama_adapter_lora * adapter) const {
     return adapter != shadow || n_shadow_rows > 0;
 }
 
-ggml_tensor * llm_graph_context::shadow_add(ggml_tensor * base, ggml_tensor * term) const {
-    if (inp_label_rows == nullptr) {
-        auto inp = std::make_unique<llm_graph_input_label_rows>();
-        inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_shadow_rows);
-        ggml_set_input(inp->rows);
-        ggml_set_name(inp->rows, "label_rows");
-        inp_label_rows = inp->rows;
+llm_graph_input_training_rows * llm_graph_context::training_rows() const {
+    if (!inp_training_rows) {
+        auto inp = std::make_unique<llm_graph_input_training_rows>();
+        inp_training_rows = inp.get();
         res->add_input(std::move(inp));
+    }
+    return inp_training_rows;
+}
+
+ggml_tensor * llm_graph_context::shadow_add(ggml_tensor * base, ggml_tensor * term) const {
+    if (training_rows()->shadow_rows == nullptr) {
+        auto * inp = training_rows();
+        inp->shadow_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_shadow_rows);
+        ggml_set_input(inp->shadow_rows);
+        ggml_set_name(inp->shadow_rows, "label_rows");
     }
     // one row per token: the tokens are base's outermost dimension
     GGML_ASSERT(ggml_is_contiguous(base) && (n_tokens == 1 || base->ne[ggml_n_dims(base) - 1] == n_tokens));
     const int64_t n = ggml_nelements(base) / n_tokens;
-    ggml_tensor * b2  = ggml_reshape_2d(ctx0, base, n, n_tokens);
-    ggml_tensor * t2  = ggml_reshape_2d(ctx0, ggml_cont(ctx0, term), n, n_tokens);
-    ggml_tensor * sel = ggml_add(ctx0, ggml_get_rows(ctx0, b2, inp_label_rows), ggml_get_rows(ctx0, t2, inp_label_rows));
-    return ggml_reshape(ctx0, ggml_set_rows(ctx0, ggml_dup(ctx0, b2), sel, inp_label_rows), base);
+    ggml_tensor * b2  = ggml_n_dims(base) <= 2 ? base : ggml_reshape_2d(ctx0, base, n, n_tokens);
+    ggml_tensor * t2  = ggml_n_dims(term) <= 2 ? term : ggml_reshape_2d(ctx0, ggml_cont(ctx0, term), n, n_tokens);
+    ggml_tensor * sel = ggml_add(ctx0, ggml_get_rows(ctx0, b2, training_rows()->shadow_rows), ggml_get_rows(ctx0, t2, training_rows()->shadow_rows));
+    ggml_tensor * updated = ggml_set_rows(ctx0, ggml_dup(ctx0, b2), sel, training_rows()->shadow_rows);
+    return ggml_n_dims(base) <= 2 ? updated : ggml_reshape(ctx0, updated, base);
 }
 
+bool llm_graph_context::build_training_head() const {
+    if (!cparams.training && n_shadow_rows == 0) {
+        return true;
+    }
+    if (!res->t_embd || !res->t_logits || pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        return false;
+    }
+    const auto map = ubatch.rows();
+    auto * input = training_rows();
+    if (cparams.training) {
+        input->label_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, map.label_rows.size());
+        ggml_set_input(input->label_rows);
+    }
+    if (!map.public_rows.empty()) {
+        input->public_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, map.public_rows.size());
+        ggml_set_input(input->public_rows);
+    }
+    // Preserve the existing training head's allocation budget.
+    constexpr size_t head_slice_bytes = 64u*1024*1024;
+    const int64_t rows = std::max<int64_t>(1, head_slice_bytes / (sizeof(float) * res->t_logits->ne[0]));
+    const int64_t loss_rows = cparams.training ? map.label_rows.size() : n_tokens;
+    res->t_loss_slices.resize((loss_rows + rows - 1) / rows);
+    if (input->shadow_rows) {
+        size_t public_labels = 0;
+        for (int32_t row : map.public_rows) {
+            public_labels += ubatch.label[row] >= 0;
+        }
+        if (public_labels) {
+            input->public_shadow_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, public_labels);
+            ggml_set_input(input->public_shadow_rows);
+        }
+        for (int64_t r0 = 0; r0 < loss_rows; r0 += rows) {
+            auto * local = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, std::min(rows, loss_rows - r0));
+            ggml_set_input(local);
+            input->slice_shadow_rows.push_back(local);
+        }
+    }
+    ggml_tensor * public_logits = nullptr;
+    const int count = ggml_opt_project_head(ctx0, gf, res->t_embd, res->t_logits, input->shadow_rows,
+            input->public_rows, input->label_rows, input->public_shadow_rows,
+            input->slice_shadow_rows.empty() ? nullptr : input->slice_shadow_rows.data(), rows, &public_logits,
+            res->t_loss_slices.data(), res->t_loss_slices.size());
+    if (!count) {
+        res->t_loss_slices.clear();
+        return false;
+    }
+    res->t_logits = public_logits;
+    if (cparams.embeddings && input->public_rows) {
+        res->t_embd = ggml_get_rows(ctx0, res->t_embd, input->public_rows);
+        ggml_build_forward_expand(gf, res->t_embd);
+    }
+    if (cparams.embeddings_nextn && cparams.embeddings_nextn_masked && input->public_rows) {
+        res->t_h_nextn = ggml_get_rows(ctx0, res->t_h_nextn, input->public_rows);
+        ggml_build_forward_expand(gf, res->t_h_nextn);
+    }
+    return true;
+}
 ggml_tensor * llm_graph_context::build_inp_pos() const {
     auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
 

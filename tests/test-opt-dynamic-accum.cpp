@@ -279,45 +279,93 @@ static void run_cache_view_gradient(ggml_type type) {
     ggml_backend_free(cpu);
 }
 
-static void run_label_projection() {
+static void run_label_projection(bool projected) {
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     CHECK(cpu != nullptr);
     ggml_backend_t backends[] = { cpu };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
     ggml_init_params sp = { 8 * ggml_tensor_overhead(), nullptr, true };
     ggml_context * storage = ggml_init(sp);
-    ggml_tensor * weights = ggml_new_tensor_2d(storage, GGML_TYPE_F32, 2, 3);
+    ggml_tensor * weights = ggml_new_tensor_2d(storage, GGML_TYPE_F32, 2, 4);
+    ggml_tensor * identity = ggml_new_tensor_2d(storage, GGML_TYPE_F32, 2, 2);
     ggml_set_param(weights);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(storage, cpu);
-    const float before[] = { 8.0f, -8.0f, 0.0f, 0.0f, -8.0f, 8.0f };
+    const float before[] = { 8.0f, -8.0f, 0.5f, -0.5f, -8.0f, 8.0f, 0.25f, 0.75f };
+    const float eye[] = { 1, 0, 0, 1 };
     ggml_backend_tensor_set(weights, before, 0, sizeof(before));
+    ggml_backend_tensor_set(identity, eye, 0, sizeof(eye));
     ggml_opt_params params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS);
     params.optimizer = GGML_OPT_OPTIMIZER_TYPE_SGD;
     params.get_opt_pars = sgd_pars;
     ggml_opt_context_t opt = ggml_opt_init(params);
     ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
     ggml_context * graph_ctx = ggml_init(cp);
-    ggml_tensor * logits = ggml_scale(graph_ctx, weights, 1.0f);
-    ggml_set_output(logits);
-    ggml_tensor * rows = ggml_new_tensor_1d(graph_ctx, GGML_TYPE_I32, 1);
+    ggml_tensor * base = ggml_mul_mat(graph_ctx, identity, weights);
+    ggml_mul_mat_set_prec(base, GGML_PREC_F32);
+    ggml_tensor * rows = ggml_new_tensor_1d(graph_ctx, GGML_TYPE_I32, 2);
+    ggml_tensor * public_rows = ggml_new_tensor_1d(graph_ctx, GGML_TYPE_I32, 3);
     ggml_set_input(rows);
-    ggml_tensor * objective = ggml_get_rows(graph_ctx, logits, rows);
+    ggml_set_input(public_rows);
+    ggml_tensor * selected = ggml_add(graph_ctx, ggml_get_rows(graph_ctx, base, rows),
+            ggml_get_rows(graph_ctx, ggml_scale(graph_ctx, base, 0.25f), rows));
+    ggml_tensor * logits = ggml_set_rows(graph_ctx, ggml_dup(graph_ctx, base), selected, rows);
     ggml_cgraph * gf = ggml_new_graph_custom(graph_ctx, GGML_DEFAULT_GRAPH_SIZE, true);
     ggml_build_forward_expand(gf, logits);
-    ggml_opt_prepare_alloc(opt, graph_ctx, gf, rows, objective);
+    ggml_tensor * public_logits = nullptr;
+    ggml_tensor * public_shadow = nullptr;
+    ggml_tensor * local_shadow[2] = {};
+    if (projected) {
+        public_shadow = ggml_new_tensor_1d(graph_ctx, GGML_TYPE_I32, 1);
+        ggml_set_input(public_shadow);
+        for (auto & local : local_shadow) {
+            local = ggml_new_tensor_1d(graph_ctx, GGML_TYPE_I32, 1);
+            ggml_set_input(local);
+        }
+        ggml_tensor * slices[2];
+        CHECK(ggml_opt_project_head(graph_ctx, gf, weights, logits, rows, public_rows, rows,
+                public_shadow, local_shadow, 1, &public_logits, slices, 2) == 2);
+        ggml_opt_prepare_alloc_slices(opt, graph_ctx, gf, rows, slices, 2);
+    } else {
+        public_logits = ggml_get_rows(graph_ctx, logits, public_rows);
+        ggml_build_forward_expand(gf, public_logits);
+        ggml_opt_prepare_alloc(opt, graph_ctx, gf, rows, ggml_get_rows(graph_ctx, logits, rows));
+    }
+    ggml_set_output(public_logits);
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        auto * node = ggml_graph_node(gf, i);
+        if (node->op == GGML_OP_MUL_MAT) {
+            CHECK(node->op_params[0] == GGML_PREC_F32);
+        }
+    }
     CHECK(ggml_opt_alloc(opt, true));
-    const int32_t row = 1, target = 0;
-    ggml_backend_tensor_set(rows, &row, 0, sizeof(row));
-    ggml_backend_tensor_set(ggml_opt_labels(opt), &target, 0, sizeof(target));
+    const int32_t labels[] = { 1, 3 }, public_ids[] = { 2, 1, 0 }, targets[] = { 0, 1 };
+    ggml_backend_tensor_set(rows, labels, 0, sizeof(labels));
+    ggml_backend_tensor_set(public_rows, public_ids, 0, sizeof(public_ids));
+    if (projected) {
+        const int32_t public_label = 1, local_label = 0;
+        ggml_backend_tensor_set(public_shadow, &public_label, 0, sizeof(public_label));
+        for (auto * local : local_shadow) {
+            ggml_backend_tensor_set(local, &local_label, 0, sizeof(local_label));
+        }
+    }
+    ggml_backend_tensor_set(ggml_opt_labels(opt), targets, 0, sizeof(targets));
     ggml_opt_eval(opt, nullptr);
     CHECK(ggml_opt_refusal(opt)[0] == '\0');
-    float after[6], served[6];
+    float after[8], served[6];
     ggml_backend_tensor_get(weights, after, 0, sizeof(after));
-    ggml_backend_tensor_get(logits, served, 0, sizeof(served));
-    for (int i = 0; i < 6; ++i) {
-        const float delta = i == 2 ? LR * 0.5f : i == 3 ? -LR * 0.5f : 0.0f;
-        CHECK(std::fabs(after[i] - before[i] - delta) < 1e-6f);
-        CHECK(served[i] == before[i]);
+    ggml_backend_tensor_get(public_logits, served, 0, sizeof(served));
+    for (int row = 0; row < 4; ++row) {
+        const bool labelled = row == 1 || row == 3;
+        const float p0 = 1.0f / (1.0f + std::exp(1.25f * (before[2*row + 1] - before[2*row])));
+        const float delta = labelled ? LR * 1.25f * ((row == 1 ? 1.0f : 0.0f) - p0) / 2 : 0;
+        CHECK(std::fabs(after[2*row] - before[2*row] - delta) < 1e-6f);
+        CHECK(std::fabs(after[2*row + 1] - before[2*row + 1] + delta) < 1e-6f);
+    }
+    for (int row = 0; row < 3; ++row) {
+        const float scale = public_ids[row] == 1 ? 1.25f : 1;
+        for (int col = 0; col < 2; ++col) {
+            CHECK(served[2*row + col] == before[2*public_ids[row] + col] * scale);
+        }
     }
     ggml_opt_free(opt);
     ggml_free(graph_ctx);
@@ -326,13 +374,13 @@ static void run_label_projection() {
     ggml_backend_sched_free(sched);
     ggml_backend_free(cpu);
 }
-
 int main() {
     ggml_backend_load_all();
     run(1);
     run(2);
     run_manual();
-    run_label_projection();
+    run_label_projection(false);
+    run_label_projection(true);
     for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         run_cache_view_gradient(type);
         run_out_prod_broadcast(type, false);

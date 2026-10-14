@@ -1042,19 +1042,24 @@ void ggml_opt_prepare_alloc(
     opt_ctx->output_slices.clear();
 }
 
-int ggml_opt_prepare_alloc_head(
-        ggml_opt_context_t    opt_ctx,
+int ggml_opt_project_head(
         struct ggml_context * ctx_compute,
         struct ggml_cgraph  * gf,
-        struct ggml_tensor  * inputs,
         struct ggml_tensor  * hidden,
         struct ggml_tensor  * outputs,
-        int64_t               rows) {
-    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
-    const int64_t n = hidden->ne[1];
-    if (opt_ctx->loss_type != GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS || rows <= 0 || rows >= n ||
-            !ggml_is_contiguous(hidden) || ggml_n_dims(hidden) > 2 || outputs->ne[1] != n) {
-        return 1;
+        struct ggml_tensor * shadow_rows,
+        struct ggml_tensor * public_rows,
+        struct ggml_tensor * label_rows,
+        struct ggml_tensor * public_shadow_rows,
+        struct ggml_tensor ** slice_shadow_rows,
+        int64_t               rows,
+        struct ggml_tensor ** public_outputs,
+        struct ggml_tensor ** slices,
+        size_t                slices_capacity) {
+    const int64_t n = label_rows ? label_rows->ne[0] : hidden->ne[1];
+    if (rows <= 0 || n <= 0 || !ggml_is_contiguous(hidden) || ggml_n_dims(hidden) > 2 ||
+            outputs->ne[1] != hidden->ne[1] || slices_capacity < (size_t) ((n + rows - 1) / rows)) {
+        return 0;
     }
     // the head: the nodes between hidden and outputs, in graph order
     std::unordered_set<const ggml_tensor *> on_path = { hidden };
@@ -1069,15 +1074,27 @@ int ggml_opt_prepare_alloc_head(
             continue;
         }
         const bool replayable = node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL ||
-                                node->op == GGML_OP_ADD || node->op == GGML_OP_SCALE;
-        if (!replayable || node->view_src != nullptr) {
-            return 1; // a head this does not know how to replay per slice: the whole outputs
+                                node->op == GGML_OP_ADD || node->op == GGML_OP_SCALE ||
+                                (shadow_rows && (node->op == GGML_OP_DUP || node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_SET_ROWS));
+        if (!replayable || (node->view_src != nullptr && node->op != GGML_OP_SET_ROWS)) {
+            return 0; // unsupported head
+        }
+        if ((node->op == GGML_OP_GET_ROWS && node->src[1] != shadow_rows) ||
+                (node->op == GGML_OP_SET_ROWS && node->src[1] != shadow_rows)) {
+            return 0;
+        }
+        if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
+            for (int k = 0; k < 2; ++k) {
+                if (!on_path.count(node->src[k]) && node->src[k]->ne[1] != 1) {
+                    return 0;
+                }
+            }
         }
         on_path.insert(node);
         head.push_back(node);
     }
     if (head.empty() || head.back() != outputs) {
-        return 1;
+        return 0;
     }
     // nothing else in the graph may read the head (it is about to leave the graph)
     for (int i = 0; i < gf->n_nodes; ++i) {
@@ -1087,7 +1104,7 @@ int ggml_opt_prepare_alloc_head(
         }
         for (int k = 0; k < GGML_MAX_SRC; ++k) {
             if (node->src[k] != nullptr && node->src[k] != hidden && on_path.count(node->src[k]) > 0) {
-                return 1;
+                return 0;
             }
         }
     }
@@ -1098,15 +1115,31 @@ int ggml_opt_prepare_alloc_head(
         }
     }
     gf->n_nodes = j;
-    // the head again, one slice of rows at a time
-    for (int64_t r0 = 0; r0 < n; r0 += rows) {
-        const int64_t nr = std::min(rows, n - r0);
+    auto replay = [&](ggml_tensor * selected, ggml_tensor * local_shadow_rows, int64_t row) {
         std::unordered_map<const ggml_tensor *, ggml_tensor *> as_slice;
-        as_slice[hidden] = ggml_view_2d(ctx_compute, hidden, hidden->ne[0], nr, hidden->nb[1], r0*hidden->nb[1]);
+        as_slice[hidden] = selected;
+        if (shadow_rows) {
+            as_slice[shadow_rows] = local_shadow_rows;
+        }
         for (ggml_tensor * node : head) {
             auto src = [&](int k) { const auto it = as_slice.find(node->src[k]); return it != as_slice.end() ? it->second : node->src[k]; };
             ggml_tensor * t = nullptr;
+            if (node->op == GGML_OP_SET_ROWS && shadow_rows && !local_shadow_rows) {
+                as_slice[node] = src(2);
+                continue;
+            }
+            bool missing = false;
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                missing |= node->src[k] != nullptr && src(k) == nullptr;
+            }
+            if (missing) {
+                as_slice[node] = nullptr;
+                continue;
+            }
             switch (node->op) {
+                case GGML_OP_DUP:      t = ggml_dup(ctx_compute, src(0)); break;
+                case GGML_OP_GET_ROWS: t = ggml_get_rows(ctx_compute, src(0), src(1)); break;
+                case GGML_OP_SET_ROWS: t = ggml_set_rows(ctx_compute, src(2), src(0), src(1)); break;
                 case GGML_OP_MUL_MAT: t = ggml_mul_mat(ctx_compute, src(0), src(1)); break;
                 case GGML_OP_MUL:     t = ggml_mul    (ctx_compute, src(0), src(1)); break;
                 case GGML_OP_ADD:     t = ggml_add    (ctx_compute, src(0), src(1)); break;
@@ -1118,14 +1151,57 @@ int ggml_opt_prepare_alloc_head(
                 } break;
                 default: GGML_ABORT("not a head op");
             }
-            ggml_format_name(t, "%s-rows%lld", node->name, (long long) r0);
+            ggml_set_op_params(t, node->op_params, sizeof(node->op_params));
+            ggml_format_name(t, "%s-rows%lld", node->name, (long long) row);
             as_slice[node] = t;
         }
-        opt_ctx->output_slices.push_back(as_slice.at(outputs));
+        return as_slice.at(outputs);
+    };
+    *public_outputs = nullptr;
+    if (public_rows) {
+        *public_outputs = replay(ggml_get_rows(ctx_compute, hidden, public_rows),
+                public_shadow_rows, -1);
+        ggml_build_forward_expand(gf, *public_outputs);
     }
-    return (int) opt_ctx->output_slices.size();
+    ggml_tensor * selected = label_rows ? ggml_get_rows(ctx_compute, hidden, label_rows) : hidden;
+    size_t count = 0;
+    for (int64_t r0 = 0; r0 < n; r0 += rows) {
+        const int64_t nr = std::min(rows, n - r0);
+        slices[count] = replay(
+                ggml_view_2d(ctx_compute, selected, selected->ne[0], nr, selected->nb[1], r0 * selected->nb[1]),
+                slice_shadow_rows ? slice_shadow_rows[count] : nullptr, r0);
+        ++count;
+    }
+    ggml_graph_update_use_counts(gf);
+    return (int) count;
 }
 
+void ggml_opt_prepare_alloc_slices(
+        ggml_opt_context_t opt_ctx, ggml_context * ctx_compute, ggml_cgraph * gf,
+        ggml_tensor * inputs, ggml_tensor ** slices, size_t n_slices) {
+    GGML_ASSERT(n_slices > 0);
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, slices[0]);
+    opt_ctx->output_slices.assign(slices, slices + n_slices);
+}
+
+int ggml_opt_prepare_alloc_head(
+        ggml_opt_context_t opt_ctx, ggml_context * ctx_compute, ggml_cgraph * gf,
+        ggml_tensor * inputs, ggml_tensor * hidden, ggml_tensor * outputs, int64_t rows) {
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
+    const int64_t n = hidden->ne[1];
+    if (opt_ctx->loss_type != GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS || rows <= 0 || rows >= n) {
+        return 1;
+    }
+    std::vector<ggml_tensor *> slices((n + rows - 1) / rows);
+    ggml_tensor * public_outputs = nullptr;
+    const int count = ggml_opt_project_head(ctx_compute, gf, hidden, outputs, nullptr, nullptr, nullptr, nullptr, nullptr,
+            rows, &public_outputs, slices.data(), slices.size());
+    if (count == 0) {
+        return 1;
+    }
+    ggml_opt_prepare_alloc_slices(opt_ctx, ctx_compute, gf, inputs, slices.data(), count);
+    return count;
+}
 void ggml_opt_set_alloc_budget(ggml_opt_context_t opt_ctx, size_t bytes) {
     opt_ctx->alloc_budget = bytes;
 }

@@ -1719,6 +1719,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     if (balloc->get_n_labels() > 0) {
+        if (!model.output) {
+            LLAMA_LOG_ERROR("%s: labelled training requires a language-model output weight\n", __func__);
+            return -1;
+        }
+        if (cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+            LLAMA_LOG_ERROR("%s: labelled training requires a token-wise output head, not pooled outputs\n", __func__);
+            return -1;
+        }
         if (!opt_ctx) {
             LLAMA_LOG_ERROR("%s: labelled rows require an initialized optimizer\n", __func__);
             return -1;
@@ -2522,7 +2530,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
+        /*.n_outputs   =*/ (cparams.training || (opt_shadow && ubatch.n_labels() > 0)) ? ubatch.n_tokens : n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };

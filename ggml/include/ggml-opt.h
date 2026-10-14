@@ -208,6 +208,32 @@ extern "C" {
         struct ggml_tensor  * outputs,
         int64_t               rows);
 
+    // Project the existing row-wise head before consumers such as sampling are built.
+    // Row indices address hidden's token rows. A null public_rows requests no public logits.
+    // Returns zero without changing gf when the head cannot be replayed.
+    GGML_API int ggml_opt_project_head(
+        struct ggml_context * ctx_compute,
+        struct ggml_cgraph  * gf,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * outputs,
+        struct ggml_tensor  * shadow_rows,
+        struct ggml_tensor  * public_rows,
+        struct ggml_tensor  * label_rows,
+        struct ggml_tensor  * public_shadow_rows,
+        struct ggml_tensor ** slice_shadow_rows,
+        int64_t               rows,
+        struct ggml_tensor ** public_outputs,
+        struct ggml_tensor ** slices,
+        size_t                slices_capacity);
+
+    GGML_API void ggml_opt_prepare_alloc_slices(
+        ggml_opt_context_t    opt_ctx,
+        struct ggml_context * ctx_compute,
+        struct ggml_cgraph  * gf,
+        struct ggml_tensor  * inputs,
+        struct ggml_tensor ** slices,
+        size_t                n_slices);
+
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval
     // returns false when the graph could not be allocated (device memory): the graph is then NOT

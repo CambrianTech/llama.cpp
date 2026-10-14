@@ -398,6 +398,80 @@ static void multi_label_decode(const common_params & params, llama_model * model
     GGML_ASSERT(same_step(compare("two labelled sequences vs mean independent steps", joint, mean)));
     GGML_ASSERT(same_step(compare("two labelled sequences with reversed row order", step({1, 0}), joint)));
 }
+static void sparse_head_decode(const common_params & params, llama_model * model, const std::string & init,
+                               const std::vector<llama_token> & tokens) {
+    struct result {
+        std::vector<float> delta, logits;
+        std::vector<uint8_t> neighbour;
+    };
+    auto step = [&](int public_mode, bool reversed, bool train = true) {
+        auto cp = common_context_params_to_llama(params);
+        cp.n_ctx = 128;
+        cp.n_batch = cp.n_ubatch = 4;
+        cp.n_seq_max = 2;
+        cp.kv_unified = true;
+        cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        auto * ctx = llama_init_from_model(model, cp);
+        auto * adapter = llama_adapter_lora_init(model, init.c_str());
+        GGML_ASSERT(ctx && adapter);
+        float scale = 1.0f;
+        GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
+        llama_opt_params op{};
+        op.param_filter = llama_opt_param_filter_all;
+        op.get_opt_pars = sgd_pars;
+        op.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
+        op.adapter = adapter;
+        if (train) {
+            llama_opt_init(ctx, model, op);
+        }
+        const auto before = adapter_params(adapter);
+        llama_batch batch = llama_batch_init(3, 0, 1);
+        int neighbour_row = -1;
+        const std::vector<int> order = reversed ? std::vector<int>{2, 0, 1} : std::vector<int>{0, 1, 2};
+        for (int row : order) {
+            common_batch_add(batch, tokens[row], row == 1 ? 1 : 0, {row == 2 ? 1 : 0},
+                    public_mode == 2 || (public_mode == 1 && row == 2));
+            if (train && row == 1) {
+                batch.label[batch.n_tokens - 1] = tokens[3];
+            }
+            if (row == 2) {
+                neighbour_row = batch.n_tokens - 1;
+            }
+        }
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        printf("sparse head allocation: train=%d public=%d reversed=%d cache=%s graph_bytes=%zu\n",
+                train, public_mode, reversed, ggml_type_name(cp.type_k), llama_opt_graph_bytes(ctx));
+        result out;
+        out.delta = adapter_params(adapter);
+        for (size_t i = 0; i < before.size(); ++i) {
+            out.delta[i] -= before[i];
+        }
+        if (public_mode > 0) {
+            const float * logits = llama_get_logits_ith(ctx, neighbour_row);
+            GGML_ASSERT(logits);
+            out.logits.assign(logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(model)));
+        }
+        out.neighbour = sequence_state(ctx, 1);
+        llama_batch_free(batch);
+        llama_free(ctx);
+        llama_adapter_lora_free(adapter);
+        return out;
+    };
+    const auto dense = step(2, false);
+    const auto serving = step(1, false, false);
+    GGML_ASSERT(serving.logits == dense.logits);
+    GGML_ASSERT(serving.neighbour == dense.neighbour);
+    for (bool reversed : {false, true}) {
+        for (int public_mode : {0, 1}) {
+            const auto sparse = step(public_mode, reversed);
+            GGML_ASSERT(same_step(compare("sparse public rows vs dense objective", sparse.delta, dense.delta)));
+            GGML_ASSERT(public_mode == 0 || sparse.logits == dense.logits);
+            GGML_ASSERT(sparse.neighbour == dense.neighbour);
+        }
+    }
+    printf("sparse head: label-only rows, public logits, neighbour bytes and row reordering OK\n");
+}
+
 int main(int argc, char ** argv) {
     common_params params;
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
@@ -429,6 +503,22 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> tokens = common_tokenize(tok_ctx, text, true);
     llama_free(tok_ctx);
     GGML_ASSERT(tokens.size() > REFUSAL_WINDOW + 1);
+
+    if (getenv("WALK_HEAD_ONLY")) {
+        sparse_head_decode(params, model, init, tokens);
+        if (llama_model_get_tensor(model, "output.weight")) {
+            const auto head_init = init + ".head.gguf";
+            GGML_ASSERT(common_lora_write_fresh(model, head_init, 8, 16, { "output.weight" }, 42));
+            sparse_head_decode(params, model, head_init, tokens);
+            std::remove(head_init.c_str());
+        } else {
+            printf("output adapter: unavailable (model has no independent output.weight tensor)\n");
+        }
+        std::remove(init.c_str());
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
 
     if (getenv("WALK_MIXED_ONLY")) {
         multi_label_decode(params, model, init, tokens, false, GGML_TYPE_F32);

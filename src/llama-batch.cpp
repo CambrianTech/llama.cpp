@@ -187,10 +187,6 @@ bool llama_batch_allocr::init(
                 }
                 continue;
             }
-            if (batch.logits[i] == 0) {
-                LLAMA_LOG_ERROR("%s: position %d has a label but is not an output: a training row must be output\n", __func__, i);
-                return false;
-            }
             if (batch.n_seq_id[i] != 1) {
                 LLAMA_LOG_ERROR("%s: position %d has a label and %d sequences: a training row belongs to one sequence\n", __func__, i, batch.n_seq_id[i]);
                 return false;

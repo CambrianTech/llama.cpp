@@ -233,15 +233,14 @@ public:
     const uint32_t n_outputs;
 };
 
-// the ubatch's labelled rows, in order: where the shadow adapter applies (shadow_add)
-class llm_graph_input_label_rows : public llm_graph_input_i {
+class llm_graph_input_training_rows : public llm_graph_input_i {
 public:
-    llm_graph_input_label_rows() = default;
-    virtual ~llm_graph_input_label_rows() = default;
-
     void set_input(const llama_ubatch * ubatch) override;
-
-    ggml_tensor * rows = nullptr; // I32 [n_shadow_rows]
+    ggml_tensor * public_rows = nullptr;
+    ggml_tensor * label_rows = nullptr;
+    ggml_tensor * shadow_rows = nullptr;
+    ggml_tensor * public_shadow_rows = nullptr;
+    std::vector<ggml_tensor *> slice_shadow_rows;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -951,6 +950,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    std::vector<ggml_tensor *> t_loss_slices;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1086,7 +1086,7 @@ struct llm_graph_context {
     llm_graph_result * res;
 
     mutable ggml_tensor * inp_train_rows = nullptr; // build_inp_train_rows, once per graph
-    mutable ggml_tensor * inp_label_rows = nullptr; // shadow_add, once per graph
+    mutable llm_graph_input_training_rows * inp_training_rows = nullptr;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1452,6 +1452,8 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+    bool build_training_head() const;
+    llm_graph_input_training_rows * training_rows() const;
 
     //
     // dense (out)
