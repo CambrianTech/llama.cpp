@@ -13,6 +13,24 @@
 
 // keep this struct lightweight
 struct llama_ubatch {
+    struct row_map {
+        std::vector<int32_t> public_rows;
+        std::vector<int32_t> label_rows;
+    };
+
+    row_map rows() const {
+        row_map result;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            if (output && output[i]) {
+                result.public_rows.push_back((int32_t) i);
+            }
+            if (label && label[i] >= 0) {
+                result.label_rows.push_back((int32_t) i);
+            }
+        }
+        return result;
+    }
+
     bool equal_seqs() const {
         return b_equal_seqs != 0;
     }

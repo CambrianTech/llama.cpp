@@ -26,6 +26,7 @@ struct llama_cparams {
     // (llama_context::opt_init probes them), else the composed tiles
     bool     fa_back_native = false;
     bool     walk_exact     = false;
+    bool     walk_active    = false;
     uint32_t walk_grad_from = 0;
     bool     walk_surrogate = false;
     ggml_tensor * const * walk_acc_k = nullptr;

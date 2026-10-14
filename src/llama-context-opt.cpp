@@ -322,7 +322,7 @@ bool llama_context::opt_walk::rewind(uint32_t p_pop, const std::vector<uint8_t> 
 bool llama_context::opt_walk::train_chunk(uint32_t pos_ctx, uint32_t n_chunk) {
     llama_walk_fill(batch, tokens, pos_ctx, n_chunk);
     for (uint32_t pos_batch = 0; pos_batch < n_chunk; ++pos_batch) {
-        batch.logits[pos_batch] = labels[pos_ctx + pos_batch] >= 0;
+        batch.logits[pos_batch] = false;
         batch.label [pos_batch] = labels[pos_ctx + pos_batch];
     }
 
@@ -346,16 +346,8 @@ bool llama_context::opt_walk::train_chunk(uint32_t pos_ctx, uint32_t n_chunk) {
     return true;
 }
 
-// what one slice of the training head's logits may hold (see opt_ubatch)
-static constexpr size_t OPT_HEAD_SLICE_BYTES = 64u*1024*1024;
-
 bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch) {
-    // the loss is the mean over the logits rows: a serving row among them would dilute it
-    if (ubatch.n_labels() != n_outputs) {
-        opt_fail("a training ubatch's output rows are its labelled rows (" + std::to_string(ubatch.n_labels())
-            + " labelled, " + std::to_string(n_outputs) + " output): the loss is their mean");
-        return false;
-    }
+    const uint32_t n_labels = ubatch.n_labels();
     opt_walk * walk = opt_walk_active;
     const llama_walk_chunk * xc = walk != nullptr ? walk->xc : nullptr;
 
@@ -370,12 +362,18 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
         };
         ctx_compute_opt = ggml_init(params);
     }
-    // THE HEAD A SLICE OF ROWS AT A TIME: the logits of a chunk and their gradient were the
-    // largest tensors of its graph ([vocab x rows] F32 each: 485 MiB apiece at a 248k vocabulary
-    // and 512 rows, the 4B at window 8192, 2026-10-14), and their size does not shrink with the
-    // model. A slice holds OPT_HEAD_SLICE_BYTES of logits.
-    const int64_t head_rows = std::max<int64_t>(1, (int64_t) (OPT_HEAD_SLICE_BYTES / (sizeof(float) * (size_t) model.vocab.n_tokens())));
-    ggml_opt_prepare_alloc_head(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_embd(), res->get_logits(), head_rows);
+    std::vector<int32_t> targets;
+    targets.reserve(n_labels);
+    for (int32_t row : ubatch.rows().label_rows) {
+        targets.push_back(ubatch.label[row]);
+    }
+    if (res->t_loss_slices.empty()) {
+        ggml_free(ctx_compute_opt);
+        opt_fail("training head was not projected into bounded label slices");
+        return false;
+    }
+    ggml_opt_prepare_alloc_slices(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(),
+            res->t_loss_slices.data(), res->t_loss_slices.size());
     if (xc != nullptr) {
         ggml_opt_set_next_step(opt_ctx, xc->period_end, xc->loss_scale, res->t_walk_surrogate);
         for (const auto & io : res->t_walk) {
@@ -409,17 +407,8 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
         // the target token of each output row, in the order the ubatch emits its outputs (the
         // order the logits rows take)
         struct ggml_tensor * labels_t = ggml_opt_labels(opt_ctx);
-        GGML_ASSERT(labels_t->type == GGML_TYPE_I32 && labels_t->ne[0] == (int64_t) n_outputs);
-        std::vector<int32_t> targets;
-        targets.reserve(n_outputs);
-        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-            if (ubatch.output[i] != 0) {
-                const llama_token y = ubatch.label != nullptr ? ubatch.label[i] : -1;
-                GGML_ASSERT(y < (llama_token) model.vocab.n_tokens());
-                targets.push_back(y);
-            }
-        }
-        GGML_ASSERT(targets.size() == n_outputs);
+        GGML_ASSERT(labels_t->type == GGML_TYPE_I32 && labels_t->ne[0] == (int64_t) n_labels);
+
         ggml_backend_tensor_set(labels_t, targets.data(), 0, ggml_nbytes(labels_t));
     }
     if (xc != nullptr) {

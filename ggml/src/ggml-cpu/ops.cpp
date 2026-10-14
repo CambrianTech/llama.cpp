@@ -4371,8 +4371,8 @@ static void ggml_compute_forward_out_prod_q_f32(
     const ggml_type type = src0->type;
     ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
 
-    GGML_ASSERT(ne02 == ne12);
-    GGML_ASSERT(ne03 == ne13);
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
     GGML_ASSERT(ne2  == ne12);
     GGML_ASSERT(ne3  == ne13);
 
@@ -4387,8 +4387,8 @@ static void ggml_compute_forward_out_prod_q_f32(
 
     GGML_ASSERT(ne0 == ne00);
     GGML_ASSERT(ne1 == ne10);
-    GGML_ASSERT(ne2 == ne02);
-    GGML_ASSERT(ne3 == ne03);
+
+
 
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
@@ -4425,8 +4425,8 @@ static void ggml_compute_forward_out_prod_q_f32(
         const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
         const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
 
-        const int64_t i02 = i2;
-        const int64_t i03 = i3;
+        const int64_t i02 = i2 / (ne12 / ne02);
+        const int64_t i03 = i3 / (ne13 / ne03);
 
         //const int64_t i10 = i1;
         const int64_t i12 = i2;
@@ -4461,8 +4461,8 @@ static void ggml_compute_forward_out_prod_f16_f32(
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
-    GGML_ASSERT(ne02 == ne12);
-    GGML_ASSERT(ne03 == ne13);
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
     GGML_ASSERT(ne2  == ne12);
     GGML_ASSERT(ne3  == ne13);
 
@@ -4471,8 +4471,8 @@ static void ggml_compute_forward_out_prod_f16_f32(
 
     GGML_ASSERT(ne0 == ne00);
     GGML_ASSERT(ne1 == ne10);
-    GGML_ASSERT(ne2 == ne02);
-    GGML_ASSERT(ne3 == ne03);
+
+
 
     if (ith == 0) {
         ggml_vec_set_f32(ne0*ne1*ne2*ne3, (float *)dst->data, 0);
@@ -4491,8 +4491,8 @@ static void ggml_compute_forward_out_prod_f16_f32(
         const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
         const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
 
-        const int64_t i02 = i2;
-        const int64_t i03 = i3;
+        const int64_t i02 = i2 / (ne12 / ne02);
+        const int64_t i03 = i3 / (ne13 / ne03);
 
         const int64_t i12 = i2;
         const int64_t i13 = i3;

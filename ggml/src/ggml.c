@@ -6667,7 +6667,7 @@ static void ggml_acc_or_set(
         }
         cgraph->grads[isrc] = ggml_acc_impl(ctx, acc_into, tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
-        struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
+        struct ggml_tensor * a_zero = ggml_fill(ctx, ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne), 0.0f);
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
@@ -7181,10 +7181,10 @@ static void ggml_compute_backward(
                 size_t nb2 = tensor->nb[2];
                 size_t nb3 = tensor->nb[3];
 
-                if (cgraph->grads[isrc0] && src0->type != cgraph->grads[isrc0]->type) {
-                    // gradient is typically F32, but src0 could be other type
-                    size_t ng = ggml_element_size(cgraph->grads[isrc0]);
-                    size_t n0 = ggml_element_size(src0);
+                if (src0->type != GGML_TYPE_F32) {
+                    // The gradient is F32 even when the viewed source stores quantized blocks.
+                    size_t ng = sizeof(float) * ggml_blck_size(src0->type);
+                    size_t n0 = ggml_type_size(src0->type);
                     GGML_ASSERT(offset % n0 == 0);
                     GGML_ASSERT(nb1 % n0 == 0);
                     GGML_ASSERT(nb2 % n0 == 0);
@@ -7701,7 +7701,7 @@ void ggml_build_backward_expand(
             // A gradient is F32 whatever its tensor's type. A quantized source is admitted where
             // the backward only re-shapes the gradient or casts its tile to F32 (a training graph
             // that attends to a q8_0 cache in place, as serving does); every other op needs float.
-            const bool shapes_only = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+            const bool shapes_only = node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
                 node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_FLASH_ATTN_EXT;
             GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16 ||
                 (shapes_only && ggml_is_quantized(node->src[j]->type)));
@@ -7942,6 +7942,19 @@ void ggml_graph_reset(struct ggml_cgraph * cgraph) {
     }
 }
 
+void ggml_graph_update_use_counts(struct ggml_cgraph * cgraph) {
+    memset(cgraph->use_counts, 0, cgraph->visited_hash_set.size * sizeof(cgraph->use_counts[0]));
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            struct ggml_tensor * src = cgraph->nodes[i]->src[j];
+            if (src) {
+                const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, src);
+                GGML_ASSERT(pos != GGML_HASHSET_FULL && ggml_bitset_get(cgraph->visited_hash_set.used, pos));
+                cgraph->use_counts[pos]++;
+            }
+        }
+    }
+}
 void ggml_graph_clear(struct ggml_cgraph * cgraph) {
     cgraph->n_leafs = 0;
     cgraph->n_nodes = 0;

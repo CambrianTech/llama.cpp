@@ -674,3 +674,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         }
     }
 }
+
+const char * llama_memory_hybrid_idx::training_error(const llama_batch & batch, bool flash_attn) const {
+    if (const char * why = llama_memory_hybrid::training_error(batch, flash_attn)) {
+        return why;
+    }
+    return get_mem_idx() ? "indexed hybrid cache row gradients are not supported" : nullptr;
+}
