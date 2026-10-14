@@ -24,6 +24,8 @@
 #include <atomic>
 #include <array>
 #include <cfloat>
+#include <cerrno>
+#include <climits>
 #include <cinttypes>
 #include <cstdarg>
 #include <cstdint>
@@ -51,7 +53,7 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
-static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f, uint32_t seed = 0) {
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
     {
@@ -60,9 +62,10 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
         auto init_thread = [&](size_t start, size_t end) {
             thread_local std::default_random_engine gen(std::random_device{}());
+            std::default_random_engine seeded(seed + (uint32_t) start);
             std::uniform_real_distribution<float> distribution(min, max);
             for (size_t i = start; i < end; i++) {
-                data[i] = distribution(gen);
+                data[i] = distribution(seed ? seeded : gen);
             }
         };
 
@@ -1171,6 +1174,10 @@ struct test_case {
         return nmse(a, b, n);
     }
 
+    virtual double err(const ggml_tensor *, const float * a, const float * b, size_t n) {
+        return err(a, b, n);
+    }
+
     virtual float grad_eps() {
         return 1e-1f;
     }
@@ -1471,7 +1478,7 @@ struct test_case {
                 }
             }
 
-            double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            double err = ud->tc->err(t1, f1.data(), f2.data(), f1.size());
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -1505,7 +1512,7 @@ struct test_case {
         return test_passed ? test_status_t::OK : test_status_t::FAIL;
     }
 
-    bool eval_perf(ggml_backend_t backend, const char * op_names_filter, printer * output_printer) {
+    bool eval_perf(ggml_backend_t backend, const char * op_names_filter, printer * output_printer, int perf_runs) {
         mode = MODE_PERF;
 
         static const size_t graph_nodes = 8192;
@@ -1577,7 +1584,13 @@ struct test_case {
         // determine number of runs
         int n_runs;
         bool is_cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (op_flops(out) > 0) {
+        if (perf_runs > 0) {
+            n_runs = perf_runs;
+            if (n_runs > ggml_graph_size(gf) - ggml_graph_n_nodes(gf) + 1) {
+                fprintf(stderr, "requested performance runs exceed graph capacity\n");
+                return false;
+            }
+        } else if (op_flops(out) > 0) {
             // based on flops
             const uint64_t GFLOP = 1000 * 1000 * 1000;
             const uint64_t target_flops_cpu =   8ULL * GFLOP;
@@ -1633,7 +1646,7 @@ struct test_case {
             total_time_us += end_time - start_time;
             total_mem += mem;
             total_runs += n_runs;
-        } while (total_time_us < 1000*1000); // run for at least 1 second
+        } while (perf_runs == 0 && total_time_us < 1000*1000); // automatic mode runs for at least 1 second
 
         // Create test result
         double avg_time_us      = (double) total_time_us / total_runs;
@@ -7531,16 +7544,20 @@ struct test_flash_attn_back : public test_case {
     const int64_t dv;
     const ggml_type type_v;
     const bool strided;
-    const int mask_mode; // 0: none, 1: causal, 2: per-head with a fully masked row
+    const int mask_mode; // 0: none, 1: random blocks, 2: per-head masked row, 3: causal cache tail
+    const float derivative_scale, value_span;
 
     std::string vars() override {
-        return VARS_TO_STR6(hs, nh, nhkv, kv, nb, type_kv) + "," + VARS_TO_STR4(dv, type_v, strided, mask_mode);
+        return VARS_TO_STR6(hs, nh, nhkv, kv, nb, type_kv) + "," + VARS_TO_STR4(dv, type_v, strided, mask_mode) +
+               "," + VARS_TO_STR2(derivative_scale, value_span);
     }
 
     test_flash_attn_back(int64_t hs = 128, int64_t nh = 8, int64_t nhkv = 2, int64_t kv = 512, int64_t nb = 64, ggml_type type_kv = GGML_TYPE_F16,
-            int64_t dv = 0, ggml_type type_v = GGML_TYPE_COUNT, bool strided = false, int mask_mode = 1)
+            int64_t dv = 0, ggml_type type_v = GGML_TYPE_COUNT, bool strided = false, int mask_mode = 1,
+            float derivative_scale = 1.0f, float value_span = 0.0f)
         : hs(hs), nh(nh), nhkv(nhkv), kv(kv), nb(nb), type_kv(type_kv), dv(dv ? dv : hs),
-          type_v(type_v == GGML_TYPE_COUNT ? type_kv : type_v), strided(strided), mask_mode(mask_mode) {}
+          type_v(type_v == GGML_TYPE_COUNT ? type_kv : type_v), strided(strided), mask_mode(mask_mode),
+          derivative_scale(derivative_scale), value_span(value_span) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = strided ? ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nb, hs, nh), 1, 0, 2, 3)
@@ -7564,7 +7581,15 @@ struct test_flash_attn_back : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
-                if (mask_mode == 2) {
+                if (mask_mode == 3) {
+                    std::vector<ggml_fp16_t> row(kv);
+                    for (int64_t i = 0; i < nb; ++i) {
+                        for (int64_t j = 0; j < kv; ++j) {
+                            row[j] = ggml_fp32_to_fp16(j > kv - nb + i ? -INFINITY : 0.0f);
+                        }
+                        ggml_backend_tensor_set(t, row.data(), i*t->nb[1], row.size()*sizeof(row[0]));
+                    }
+                } else if (mask_mode == 2) {
                     std::vector<ggml_fp16_t> mask(ggml_nelements(t));
                     for (int64_t h = 0; h < nh; ++h) {
                         for (int64_t i = 0; i < nb; ++i) {
@@ -7578,9 +7603,52 @@ struct test_flash_attn_back : public test_case {
                     init_tensor_kq_mask(t);
                 }
             } else {
-                init_tensor_uniform(t);
+                const float span = strcmp(t->name, "d") == 0 ? derivative_scale : 1.0f;
+                if (strcmp(t->name, "v") == 0 && value_span > 0.0f) {
+                    init_tensor_uniform(t, 1.0f - value_span, 1.0f + value_span, 7);
+                } else {
+                    init_tensor_uniform(t, -span, span, 7);
+                }
             }
         }
+    }
+
+    uint64_t op_flops(ggml_tensor *) override {
+        // QK twice for normalization/dQ, QK again for dKV, plus dP and gradient products.
+        // Count dense arithmetic; mask skips, reductions and exponentials are excluded.
+        return uint64_t(nh)*nb*kv*(11*hs + 6*dv);
+    }
+
+    double err(const ggml_tensor * t, const float * actual, const float * reference, size_t n) override {
+        if (t->op != GGML_OP_FLASH_ATTN_BACK) { return test_case::err(actual, reference, n); }
+        const char * names[] = {"dQ", "dK", "dV", "LSE", "D"};
+        const size_t counts[] = {size_t(hs*nb*nh), size_t(hs*kv*nhkv), size_t(dv*kv*nhkv), size_t(nb*nh), size_t(nb*nh)};
+        double worst = 0.0;
+        for (int part = 0; part < 5; ++part) {
+            const size_t offset = ggml_flash_attn_back_offset(t, std::min(part, 3))/sizeof(float) + (part == 4 ? nb*nh : 0);
+            GGML_ASSERT(offset + counts[part] <= n);
+            double squared_error = 0.0, actual_energy = 0.0, reference_energy = 0.0, dot = 0.0, max_abs = 0.0;
+            for (size_t j = 0; j < counts[part]; ++j) {
+                const double a = actual[offset + j], b = reference[offset + j];
+                if (!std::isfinite(a) || !std::isfinite(b)) {
+                    if (a == b) { continue; }
+                    return INFINITY;
+                }
+                const double error = a - b;
+                squared_error += error*error;
+                actual_energy += a*a;
+                reference_energy += b*b;
+                dot += a*b;
+                max_abs = std::max(max_abs, std::abs(error));
+            }
+            const double error = reference_energy ? squared_error/reference_energy : (squared_error ? INFINITY : 0.0);
+            const double cosine = actual_energy && reference_energy ? dot/std::sqrt(actual_energy*reference_energy) : NAN;
+            const double norm_ratio = reference_energy ? std::sqrt(actual_energy/reference_energy) : NAN;
+            printf("\n    %s nmse=%.9g max_abs=%.9g cosine=%.9g norm_ratio=%.9g reference_energy=%.9g",
+                   names[part], error, max_abs, cosine, norm_ratio, reference_energy);
+            worst = std::max(worst, error);
+        }
+        return worst;
     }
 
     double max_nmse_err() override {
@@ -10520,6 +10588,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_back(256, 16, 4, 300, 37, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_back(64, 4, 2, 37, 7, GGML_TYPE_Q8_0, 96, GGML_TYPE_F16, true, 2));
     test_cases.emplace_back(new test_flash_attn_back(33, 4, 2, 41, 9, GGML_TYPE_F32, 19, GGML_TYPE_F32, true, 0));
+    test_cases.emplace_back(new test_flash_attn_back(256, 24, 4, 37, 7, GGML_TYPE_Q8_0,
+                                                   256, GGML_TYPE_Q8_0, false, 3));
+    test_cases.emplace_back(new test_flash_attn_back(64, 4, 2, 41, 9, GGML_TYPE_F32,
+                                                   64, GGML_TYPE_F32, false, 3, 1e-6f));
+    test_cases.emplace_back(new test_flash_attn_back(64, 4, 2, 41, 9, GGML_TYPE_F32,
+                                                   64, GGML_TYPE_F32, false, 3, 1.0f, 1e-4f));
     test_cases.emplace_back(new test_cross_entropy_loss_index());
     test_cases.emplace_back(new test_cross_entropy_loss_index({30000, 2, 1, 1})); // a vocabulary's width; few rows keep the finite difference above f32 rounding
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -10964,6 +11038,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t kv : {512, 8192}) {
         test_cases.emplace_back(new test_flash_attn_back(128, 8, 2, kv, 64, GGML_TYPE_Q8_0));
     }
+    for (int64_t nb : {8, 16, 2048}) {
+    test_cases.emplace_back(new test_flash_attn_back(256, 24, 4, 75520, nb, GGML_TYPE_Q8_0,
+                                                   256, GGML_TYPE_Q8_0, false, 3));
+    }
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
@@ -11264,7 +11342,7 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
 }
 
 static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
-                         printer * output_printer, const char * test_file_path, int parallel_workers) {
+                         printer * output_printer, const char * test_file_path, int parallel_workers, int perf_runs, bool test_perf_cases) {
     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
         if (params_filter == nullptr) {
             return;
@@ -11289,7 +11367,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         case MODE_TEST:
         case MODE_GRAD:
         case MODE_SUPPORT:
-            test_cases = make_test_cases_eval();
+            test_cases = test_perf_cases ? make_test_cases_perf() : make_test_cases_eval();
             break;
         case MODE_PERF:
             test_cases = make_test_cases_perf();
@@ -11425,10 +11503,11 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
     }
 
     if (mode == MODE_PERF) {
+        bool ok = true;
         for (auto & test : test_cases) {
-            test->eval_perf(backend, op_names_filter, output_printer);
+            ok = test->eval_perf(backend, op_names_filter, output_printer, perf_runs) && ok;
         }
-        return true;
+        return ok;
     }
 
     if (mode == MODE_SUPPORT) {
@@ -11561,8 +11640,10 @@ static void usage(char ** argv) {
     printf("    --output specifies output format (default: console, options: console, sql, csv)\n");
     printf("    --list-ops lists all available GGML operations\n");
     printf("    --show-coverage shows test coverage\n");
+    printf("    --test-perf-cases compares performance shapes with the CPU reference (test mode only)\n");
     printf("    --test-file reads test operators from a test file generated by test-export-graph-ops\n");
     printf("    -j <n> runs tests using <n> parallel worker threads (default: 1, test mode only)\n");
+    printf("    --perf-runs <n> executes exactly n timed runs after one warmup (perf mode only)\n");
 }
 
 int main(int argc, char ** argv) {
@@ -11573,6 +11654,8 @@ int main(int argc, char ** argv) {
     const char * params_filter = nullptr;
     const char * test_file_path = nullptr;
     int parallel_workers = 1;
+    int perf_runs = 0;
+    bool test_perf_cases = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
@@ -11627,6 +11710,17 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--test-perf-cases") == 0) {
+            test_perf_cases = true;
+        } else if (strcmp(argv[i], "--perf-runs") == 0) {
+            char * end = nullptr;
+            errno = 0;
+            const long value = i + 1 < argc ? strtol(argv[++i], &end, 10) : 0;
+            if (!end || *end || errno == ERANGE || value <= 0 || value > INT_MAX) {
+                usage(argv);
+                return 1;
+            }
+            perf_runs = (int) value;
         } else if (strcmp(argv[i], "-j") == 0) {
             if (i + 1 < argc) {
                 parallel_workers = atoi(argv[++i]);
@@ -11642,6 +11736,11 @@ int main(int argc, char ** argv) {
             usage(argv);
             return 1;
         }
+    }
+
+    if ((perf_runs && mode != MODE_PERF) || (test_perf_cases && (mode != MODE_TEST || test_file_path))) {
+        usage(argv);
+        return 1;
     }
 
     // load and enumerate backends
@@ -11690,7 +11789,7 @@ int main(int argc, char ** argv) {
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
-        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
+        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers, perf_runs, test_perf_cases);
 
         if (ok) {
             n_ok++;

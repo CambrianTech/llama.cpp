@@ -1,5 +1,9 @@
 #include "fattn-back.cuh"
 #include "dequantize.cuh"
+#include "mma.cuh"
+#if !defined(GGML_USE_HIP)
+#include <mma.h>
+#endif
 
 #include <algorithm>
 #include <climits>
@@ -37,132 +41,244 @@ static __device__ __forceinline__ float fattn_back_mask(const fattn_back_args & 
     return a.mask ? __half2float(*(const half *) (a.mask + j*a.nbm[0] + i*a.nbm[1] + (h % a.Hm)*a.nbm[2])) : 0.0f;
 }
 
+struct fattn_back_matrix {
+    const char * data;
+    size_t row_stride, col_stride;
+    int rows, cols;
+    bool transpose;
+};
+
+template <ggml_type T>
+static __device__ float fattn_back_element(const fattn_back_matrix & m, int row, int col) {
+    if (row >= m.rows || col >= m.cols) { return 0.0f; }
+    if (m.transpose) { const int tmp = row; row = col; col = tmp; }
+    if constexpr (T == GGML_TYPE_F32) {
+        return *(const float *) (m.data + row*m.row_stride + col*m.col_stride);
+    } else {
+        return fattn_back_load<T>(m.data + row*m.row_stride, col);
+    }
+}
+
+using fattn_back_fragment = ggml_cuda_mma::tile<16, 8, float>;
+
+// Split operands at the shared MMA boundary; small residuals must survive TF32 conversion.
+static __device__ void fattn_back_mma(fattn_back_fragment & result,
+        const ggml_cuda_mma::tile<16, 8, float> & a, const ggml_cuda_mma::tile<8, 8, float> & b) {
+#ifdef AMPERE_MMA_AVAILABLE
+    auto ah = a, al = a;
+    auto bh = b, bl = b;
+    for (int x = 0; x < a.ne; ++x) {
+        ah.x[x] = nvcuda::wmma::__float_to_tf32(a.x[x]);
+        al.x[x] = nvcuda::wmma::__float_to_tf32(a.x[x] - ah.x[x]);
+    }
+    for (int x = 0; x < b.ne; ++x) {
+        bh.x[x] = nvcuda::wmma::__float_to_tf32(b.x[x]);
+        bl.x[x] = nvcuda::wmma::__float_to_tf32(b.x[x] - bh.x[x]);
+    }
+    ggml_cuda_mma::mma(result, al, bl);
+    ggml_cuda_mma::mma(result, ah, bl);
+    ggml_cuda_mma::mma(result, al, bh);
+    ggml_cuda_mma::mma(result, ah, bh);
+#else
+    GGML_UNUSED_VARS(result, a, b);
+    NO_DEVICE_CODE;
+#endif
+}
+
+template <ggml_type TA, ggml_type TB>
+static __device__ fattn_back_fragment fattn_back_product(
+        const fattn_back_matrix & a, const fattn_back_matrix & b, int row_a, int row_b, int count) {
+    fattn_back_fragment result;
+    for (int base = 0; base < count; base += 8) {
+        ggml_cuda_mma::tile<16, 8, float> af;
+        ggml_cuda_mma::tile<8, 8, float> bf;
+        for (int x = 0; x < af.ne; ++x) {
+            // TF32 A registers differ from the F32 accumulator tile mapping.
+            const int row = threadIdx.x/4 + (x%2)*8;
+            const int feature = threadIdx.x%4 + (x/2)*4;
+            af.x[x] = fattn_back_element<TA>(a, row_a + row, base + feature);
+        }
+        for (int x = 0; x < bf.ne; ++x) {
+            bf.x[x] = fattn_back_element<TB>(b, row_b + bf.get_i(x), base + bf.get_j(x));
+        }
+        fattn_back_mma(result, af, bf);
+    }
+    return result;
+}
+
+static __device__ void fattn_back_store_tile(const fattn_back_fragment & value, float * dst, int col) {
+    for (int x = 0; x < value.ne; ++x) { dst[value.get_i(x)*32 + col + value.get_j(x)] = value.x[x]; }
+}
+
 template <ggml_type TK, ggml_type TV>
 static __global__ void fattn_back_q(fattn_back_args a) {
     extern __shared__ float storage[];
-    float * q = storage;
-    float * d = q + a.D;
-    float * pk = d + a.Dv;
-    float * pdk = pk + a.D;
-    const int lane = threadIdx.x;
-    const int i = blockIdx.x % a.N;
-    const int h = blockIdx.x / a.N;
-    const int hk = h / (a.H / a.Hkv);
-    for (int c = lane; c < a.D; c += WARP_SIZE) {
-        q[c] = *(const float *) (a.q + c*a.nbq[0] + i*a.nbq[1] + h*a.nbq[2]);
-        pk[c] = pdk[c] = 0.0f;
-    }
-    for (int c = lane; c < a.Dv; c += WARP_SIZE) {
-        d[c] = *(const float *) (a.d + c*a.nbd[0] + h*a.nbd[1] + i*a.nbd[2]);
-    }
-
-    float maximum = -INFINITY;
-    float sum = 0.0f;
-    for (int j = 0; j < a.M; ++j) {
-        const float mask = fattn_back_mask(a, j, i, h);
-        if (mask == -INFINITY) { continue; }
-        const char * k = a.k + j*a.nbk[1] + hk*a.nbk[2];
-        float s = 0.0f;
-        for (int c = lane; c < a.D; c += WARP_SIZE) {
-            s += q[c]*fattn_back_load<TK>(k, c);
+    float * gradient = storage;
+    float * scores = gradient + 16*a.D;
+    float * products = scores + 16*32;
+    double * maxima = (double *) (products + 16*32);
+    double * sums = maxima + 16;
+    double * deltas = sums + 16;
+    const int thread = threadIdx.y*WARP_SIZE + threadIdx.x;
+    const int blocks = (a.N + 15)/16;
+    const int row = (blockIdx.x%blocks)*16;
+    const int h = blockIdx.x/blocks;
+    const int hk = h/(a.H/a.Hkv);
+    const int col = threadIdx.y*8;
+    const fattn_back_matrix q {a.q + h*a.nbq[2], a.nbq[1], a.nbq[0], a.N, a.D, false};
+    const fattn_back_matrix d {a.d + h*a.nbd[1], a.nbd[2], a.nbd[0], a.N, a.Dv, false};
+    const fattn_back_matrix k {a.k + hk*a.nbk[2], a.nbk[1], a.nbk[0], a.M, a.D, false};
+    const fattn_back_matrix v {a.v + hk*a.nbv[2], a.nbv[1], a.nbv[0], a.M, a.Dv, false};
+    for (int x = thread; x < 16*a.D; x += 4*WARP_SIZE) { gradient[x] = 0.0f; }
+    if (thread < 16) { maxima[thread] = -INFINITY; sums[thread] = deltas[thread] = 0.0; }
+    __syncthreads();
+    // Normalize, compute D, then accumulate dS*K directly rather than subtract large moments.
+    for (int phase = 0; phase < 3; ++phase) {
+        for (int base = 0; base < a.M; base += 32) {
+            fattn_back_store_tile(fattn_back_product<GGML_TYPE_F32, TK>(q, k, row, base + col, a.D), scores, col);
+            if (phase) {
+                fattn_back_store_tile(fattn_back_product<GGML_TYPE_F32, TV>(d, v, row, base + col, a.Dv), products, col);
+            }
+            __syncthreads();
+            if (thread < 16 && row + thread < a.N) {
+                const int i = row + thread;
+                const size_t index = (size_t) h*a.N + i;
+                for (int t = 0; t < 32; ++t) {
+                    const int j = base + t;
+                    const float mask = j < a.M ? fattn_back_mask(a, j, i, h) : -INFINITY;
+                    const float s = mask == -INFINITY ? -INFINITY : scores[thread*32 + t]*a.scale + mask;
+                    if (phase == 0) {
+                        if (s == -INFINITY) { continue; }
+                        const double next = fmax(maxima[thread], (double) s);
+                        sums[thread] = sums[thread]*exp(maxima[thread] - next) + exp((double) s - next);
+                        maxima[thread] = next;
+                    } else {
+                        const float lse = a.lse[index];
+                        const float p = s == -INFINITY || lse == -INFINITY ? 0.0f : expf(s - lse);
+                        if (phase == 1) {
+                            if (p) { deltas[thread] += (double) p*products[thread*32 + t]; }
+                        } else {
+                            scores[thread*32 + t] = p ? p*(products[thread*32 + t] - a.delta[index])*a.scale : 0.0f;
+                        }
+                    }
+                }
+            } else if (thread < 16 && phase == 2) {
+                for (int t = 0; t < 32; ++t) { scores[thread*32 + t] = 0.0f; }
+            }
+            __syncthreads();
+            if (phase == 2) {
+                const fattn_back_matrix ds {(const char *) scores, 32*sizeof(float), sizeof(float), 16, 32, false};
+                const fattn_back_matrix kt {k.data + base*k.row_stride, k.row_stride, k.col_stride, a.D, min(32, a.M - base), true};
+                for (int feature = col; feature < a.D; feature += 32) {
+                    const auto g = fattn_back_product<GGML_TYPE_F32, TK>(ds, kt, 0, feature, 32);
+                    for (int x = 0; x < g.ne; ++x) {
+                        const int c = feature + g.get_j(x);
+                        if (c < a.D) { gradient[g.get_i(x)*a.D + c] += g.x[x]; }
+                    }
+                }
+            }
+            __syncthreads();
         }
-        s = warp_reduce_sum(s)*a.scale + mask;
-        if (s == -INFINITY) { continue; }
-        const float next = fmaxf(maximum, s);
-        sum = sum*expf(maximum - next) + expf(s - next);
-        maximum = next;
-    }
-    const float lse = maximum == -INFINITY ? -INFINITY : maximum + logf(sum);
-    float delta = 0.0f;
-    if (lse != -INFINITY) {
-        for (int j = 0; j < a.M; ++j) {
-            const float mask = fattn_back_mask(a, j, i, h);
-            if (mask == -INFINITY) { continue; }
-            const char * k = a.k + j*a.nbk[1] + hk*a.nbk[2];
-            float s = 0.0f;
-            for (int c = lane; c < a.D; c += WARP_SIZE) {
-                s += q[c]*fattn_back_load<TK>(k, c);
-            }
-            const float p = expf(warp_reduce_sum(s)*a.scale + mask - lse);
-            if (p == 0.0f) { continue; }
-            const char * v = a.v + j*a.nbv[1] + hk*a.nbv[2];
-            float dp = 0.0f;
-            for (int c = lane; c < a.Dv; c += WARP_SIZE) {
-                dp += d[c]*fattn_back_load<TV>(v, c);
-            }
-            dp = warp_reduce_sum(dp);
-            delta += p*dp;
-            for (int c = lane; c < a.D; c += WARP_SIZE) {
-                const float kc = fattn_back_load<TK>(k, c);
-                pk[c] += p*kc;
-                pdk[c] += p*dp*kc;
-            }
+        if (thread < 16 && row + thread < a.N) {
+            const size_t index = (size_t) h*a.N + row + thread;
+            if (phase == 0) { a.lse[index] = maxima[thread] == -INFINITY ? -INFINITY : (float) (maxima[thread] + log(sums[thread])); }
+            if (phase == 1) { a.delta[index] = (float) deltas[thread]; }
         }
+        __syncthreads();
     }
-    for (int c = lane; c < a.D; c += WARP_SIZE) {
-        a.dq[(size_t) blockIdx.x*a.D + c] = a.scale*(pdk[c] - delta*pk[c]);
-    }
-    if (lane == 0) {
-        a.lse[blockIdx.x] = lse;
-        a.delta[blockIdx.x] = delta;
+    for (int x = thread; x < 16*a.D; x += 4*WARP_SIZE) {
+        const int i = row + x/a.D;
+        if (i < a.N) { a.dq[((size_t) h*a.N + i)*a.D + x%a.D] = gradient[x]; }
     }
 }
 
 template <ggml_type TK, ggml_type TV>
 static __global__ void fattn_back_kv(fattn_back_args a) {
     extern __shared__ float storage[];
-    float * k = storage;
-    float * v = k + a.D;
-    float * dk = v + a.Dv;
-    float * dv = dk + a.D;
-    const int lane = threadIdx.x;
-    const int j = blockIdx.x % a.M;
-    const int hk = blockIdx.x / a.M;
-    const int group = a.H / a.Hkv;
-    for (int c = lane; c < a.D; c += WARP_SIZE) {
-        k[c] = fattn_back_load<TK>(a.k + j*a.nbk[1] + hk*a.nbk[2], c);
-        dk[c] = 0.0f;
-    }
-    for (int c = lane; c < a.Dv; c += WARP_SIZE) {
-        v[c] = fattn_back_load<TV>(a.v + j*a.nbv[1] + hk*a.nbv[2], c);
-        dv[c] = 0.0f;
-    }
+    float * dk = storage;
+    float * dv = dk + 16*a.D;
+    float * scores = dv + 16*a.Dv;
+    float * products = scores + 16*32;
+    const int thread = threadIdx.y*WARP_SIZE + threadIdx.x;
+    const int blocks = (a.M + 15)/16;
+    const int row = (blockIdx.x%blocks)*16;
+    const int hk = blockIdx.x/blocks;
+    const int col = threadIdx.y*8;
+    const int group = a.H/a.Hkv;
+    const fattn_back_matrix k {a.k + hk*a.nbk[2], a.nbk[1], a.nbk[0], a.M, a.D, false};
+    const fattn_back_matrix v {a.v + hk*a.nbv[2], a.nbv[1], a.nbv[0], a.M, a.Dv, false};
+    for (int x = thread; x < 16*(a.D + a.Dv); x += 4*WARP_SIZE) { storage[x] = 0.0f; }
+    __syncthreads();
     for (int h = hk*group; h < (hk + 1)*group; ++h) {
-        for (int i = 0; i < a.N; ++i) {
-            const float lse = a.lse[(size_t) h*a.N + i];
-            const float mask = fattn_back_mask(a, j, i, h);
-            if (lse == -INFINITY || mask == -INFINITY) { continue; }
-            const char * q = a.q + i*a.nbq[1] + h*a.nbq[2];
-            const char * d = a.d + h*a.nbd[1] + i*a.nbd[2];
-            float s = 0.0f;
-            for (int c = lane; c < a.D; c += WARP_SIZE) {
-                s += *(const float *) (q + c*a.nbq[0])*k[c];
+        const fattn_back_matrix q {a.q + h*a.nbq[2], a.nbq[1], a.nbq[0], a.N, a.D, false};
+        const fattn_back_matrix d {a.d + h*a.nbd[1], a.nbd[2], a.nbd[0], a.N, a.Dv, false};
+        for (int base = 0; base < a.N; base += 32) {
+            fattn_back_store_tile(fattn_back_product<TK, GGML_TYPE_F32>(k, q, row, base + col, a.D), scores, col);
+            fattn_back_store_tile(fattn_back_product<TV, GGML_TYPE_F32>(v, d, row, base + col, a.Dv), products, col);
+            __syncthreads();
+            for (int x = thread; x < 16*32; x += 4*WARP_SIZE) {
+                const int j = row + x/32, i = base + x%32;
+                float p = 0.0f, ds = 0.0f;
+                if (j < a.M && i < a.N) {
+                    const float lse = a.lse[(size_t) h*a.N + i];
+                    const float mask = fattn_back_mask(a, j, i, h);
+                    if (lse != -INFINITY && mask != -INFINITY) { p = expf(scores[x]*a.scale + mask - lse); }
+                    if (p) { ds = p*(products[x] - a.delta[(size_t) h*a.N + i])*a.scale; }
+                }
+                scores[x] = ds;
+                products[x] = p;
             }
-            const float p = expf(warp_reduce_sum(s)*a.scale + mask - lse);
-            if (p == 0.0f) { continue; }
-            float dp = 0.0f;
-            for (int c = lane; c < a.Dv; c += WARP_SIZE) {
-                dp += *(const float *) (d + c*a.nbd[0])*v[c];
+            __syncthreads();
+            const fattn_back_matrix ds {(const char *) scores, 32*sizeof(float), sizeof(float), 16, 32, false};
+            const fattn_back_matrix p {(const char *) products, 32*sizeof(float), sizeof(float), 16, 32, false};
+            const fattn_back_matrix qt {q.data + base*q.row_stride, q.row_stride, q.col_stride, a.D, min(32, a.N - base), true};
+            const fattn_back_matrix dt {d.data + base*d.row_stride, d.row_stride, d.col_stride, a.Dv, min(32, a.N - base), true};
+            for (int feature = col; feature < a.D; feature += 32) {
+                const auto g = fattn_back_product<GGML_TYPE_F32, GGML_TYPE_F32>(ds, qt, 0, feature, 32);
+                for (int x = 0; x < g.ne; ++x) {
+                    const int c = feature + g.get_j(x);
+                    if (c < a.D) { dk[g.get_i(x)*a.D + c] += g.x[x]; }
+                }
             }
-            const float ds = p*(warp_reduce_sum(dp) - a.delta[(size_t) h*a.N + i])*a.scale;
-            for (int c = lane; c < a.D; c += WARP_SIZE) {
-                dk[c] += ds * *(const float *) (q + c*a.nbq[0]);
+            for (int feature = col; feature < a.Dv; feature += 32) {
+                const auto g = fattn_back_product<GGML_TYPE_F32, GGML_TYPE_F32>(p, dt, 0, feature, 32);
+                for (int x = 0; x < g.ne; ++x) {
+                    const int c = feature + g.get_j(x);
+                    if (c < a.Dv) { dv[g.get_i(x)*a.Dv + c] += g.x[x]; }
+                }
             }
-            for (int c = lane; c < a.Dv; c += WARP_SIZE) {
-                dv[c] += p * *(const float *) (d + c*a.nbd[0]);
-            }
+            __syncthreads();
         }
     }
-    for (int c = lane; c < a.D; c += WARP_SIZE) {
-        a.dk[(size_t) blockIdx.x*a.D + c] = dk[c];
+    for (int x = thread; x < 16*a.D; x += 4*WARP_SIZE) {
+        const int j = row + x/a.D;
+        if (j < a.M) { a.dk[((size_t) hk*a.M + j)*a.D + x%a.D] = dk[x]; }
     }
-    for (int c = lane; c < a.Dv; c += WARP_SIZE) {
-        a.dv[(size_t) blockIdx.x*a.Dv + c] = dv[c];
+    for (int x = thread; x < 16*a.Dv; x += 4*WARP_SIZE) {
+        const int j = row + x/a.Dv;
+        if (j < a.M) { a.dv[((size_t) hk*a.M + j)*a.Dv + x%a.Dv] = dv[x]; }
     }
 }
 
 static bool fattn_back_type(ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_Q8_0;
+}
+
+struct fattn_back_config {
+    int rows = 0;
+    size_t shared_q = 0;
+    size_t shared_kv = 0;
+};
+
+static fattn_back_config fattn_back_configuration(int device, size_t d, size_t dv) {
+    const auto & info = ggml_cuda_info().devices[device];
+    const size_t q = (16*d + 2*16*32)*sizeof(float) + 3*16*sizeof(double);
+    const size_t kv = (16*(d + dv) + 2*16*32)*sizeof(float);
+#if !defined(GGML_USE_HIP)
+    if (info.cc >= GGML_CUDA_CC_AMPERE && info.max_threads_per_block >= 4*WARP_SIZE &&
+        std::max(q, kv) <= info.smpb) { return {16, q, kv}; }
+#endif
+    return {};
 }
 
 bool ggml_cuda_flash_attn_back_supported(int device, const ggml_tensor * dst) {
@@ -179,17 +295,21 @@ bool ggml_cuda_flash_attn_back_supported(int device, const ggml_tensor * dst) {
         }
     }
     const auto & info = ggml_cuda_info().devices[device];
-    const size_t shared = std::max(3*(size_t) q->ne[0] + v->ne[0], 2*(size_t) q->ne[0] + 2*(size_t) v->ne[0])*sizeof(float);
-    return info.warp_size == WARP_SIZE && info.max_threads_per_block >= WARP_SIZE && shared <= info.smpb &&
+    const auto config = fattn_back_configuration(device, q->ne[0], v->ne[0]);
+    return info.warp_size == WARP_SIZE && config.rows > 0 &&
         q->ne[1] <= info.max_grid_dim_x/q->ne[2] && k->ne[1] <= info.max_grid_dim_x/k->ne[2] &&
         (!mask || (mask->ne[2] == 1 || mask->ne[2] == q->ne[2]));
 }
 
 template <ggml_type TK, ggml_type TV>
 static void fattn_back_launch(ggml_backend_cuda_context & ctx, const fattn_back_args & a) {
-    fattn_back_q<TK, TV><<<a.N*a.H, WARP_SIZE, (3*(size_t) a.D + a.Dv)*sizeof(float), ctx.stream()>>>(a);
+    const auto config = fattn_back_configuration(ctx.device, a.D, a.Dv);
+    const dim3 threads(WARP_SIZE, 4, 1);
+    const size_t nq = ((size_t) a.N + config.rows - 1)/config.rows;
+    const size_t nk = ((size_t) a.M + config.rows - 1)/config.rows;
+    fattn_back_q<TK, TV><<<nq*a.H, threads, config.shared_q, ctx.stream()>>>(a);
     CUDA_CHECK(cudaGetLastError());
-    fattn_back_kv<TK, TV><<<a.M*a.Hkv, WARP_SIZE, (2*(size_t) a.D + 2*(size_t) a.Dv)*sizeof(float), ctx.stream()>>>(a);
+    fattn_back_kv<TK, TV><<<nk*a.Hkv, threads, config.shared_kv, ctx.stream()>>>(a);
     CUDA_CHECK(cudaGetLastError());
 }
 
