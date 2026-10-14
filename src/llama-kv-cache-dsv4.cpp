@@ -2252,3 +2252,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
 
     return reserve_plan_lid;
 }
+
+const char * llama_kv_cache_dsv4::training_error(const llama_batch &, bool) const {
+    return "DSV4 cache row gradients are not supported";
+}

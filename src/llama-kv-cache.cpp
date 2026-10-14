@@ -1411,25 +1411,25 @@ static void set_cache_index(ggml_tensor * dst, size_t i, int64_t value) {
         ((int64_t *) dst->data)[i] = value;
     }
 }
-ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch, bool row_gradients) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
-    ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, cache_index_type((uint64_t) get_size()*n_stream), n_tokens);
+    ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, row_gradients ? cache_index_type((uint64_t) get_size()*n_stream) : GGML_TYPE_I64, n_tokens);
 
     ggml_set_input(k_idxs);
 
     return k_idxs;
 }
 
-ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch, bool row_gradients) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 
     ggml_tensor * v_idxs;
 
     if (!v_trans) {
-        v_idxs = ggml_new_tensor_1d(ctx, cache_index_type((uint64_t) get_size()*n_stream), n_tokens);
+        v_idxs = ggml_new_tensor_1d(ctx, row_gradients ? cache_index_type((uint64_t) get_size()*n_stream) : GGML_TYPE_I64, n_tokens);
     } else {
-        v_idxs = ggml_new_tensor_1d(ctx, cache_index_type((uint64_t) get_size()*n_stream*hparams.n_embd_v_gqa_max()), n_tokens*hparams.n_embd_v_gqa_max());
+        v_idxs = ggml_new_tensor_1d(ctx, row_gradients ? cache_index_type((uint64_t) get_size()*n_stream*hparams.n_embd_v_gqa_max()) : GGML_TYPE_I64, n_tokens*hparams.n_embd_v_gqa_max());
     }
 
     ggml_set_input(v_idxs);
@@ -2629,12 +2629,12 @@ ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
-    return kv->build_input_k_idxs(ctx, ubatch);
+ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch, bool row_gradients) const {
+    return kv->build_input_k_idxs(ctx, ubatch, row_gradients);
 }
 
-ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
-    return kv->build_input_v_idxs(ctx, ubatch);
+ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch, bool row_gradients) const {
+    return kv->build_input_v_idxs(ctx, ubatch, row_gradients);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {
@@ -2671,4 +2671,14 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+const char * llama_kv_cache::training_error(const llama_batch &, bool flash_attn) const {
+    if (!supports_row_gradients()) {
+        return "cache row indices exceed the backward gather's index range";
+    }
+    if (flash_attn && get_n_stream() != 1) {
+        return "flash attention backward requires a unified cache stream";
+    }
+    return nullptr;
 }

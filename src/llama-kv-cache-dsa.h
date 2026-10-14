@@ -36,6 +36,8 @@ public:
     // llama_memory_i
     //
 
+    const char * training_error(const llama_batch & batch, bool flash_attn) const override;
+
     llama_memory_context_ptr init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,

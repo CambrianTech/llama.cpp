@@ -1723,29 +1723,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             LLAMA_LOG_ERROR("%s: labelled rows require an initialized optimizer\n", __func__);
             return -1;
         }
-        auto * recurrent = dynamic_cast<llama_memory_recurrent *>(memory.get());
-        auto * attention = dynamic_cast<llama_kv_cache *>(memory.get());
-        if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
-            recurrent = hybrid->get_mem_recr();
-            attention = hybrid->get_mem_attn();
-        }
-        if (attention && !attention->supports_row_gradients()) {
-            LLAMA_LOG_ERROR("%s: cache row indices exceed the backward gather's index range\n", __func__);
+        if (const char * why = memory->training_error(balloc->get_batch(), cparams.flash_attn)) {
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, why);
             return -1;
-        }
-        if (attention && cparams.flash_attn && attention->get_n_stream() != 1) {
-            LLAMA_LOG_ERROR("%s: flash attention backward requires a unified cache stream\n", __func__);
-            return -1;
-        }
-        const auto & batch = balloc->get_batch();
-        for (int32_t i = 0; recurrent && i < batch.n_tokens; ++i) {
-            if (batch.label[i] >= 0 && recurrent->rollback_pending(batch.seq_id[i][0])) {
-                LLAMA_LOG_ERROR("%s: sequence %d has pending rollback before training\n", __func__, batch.seq_id[i][0]);
-                return -1;
-            }
         }
     }
-
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 

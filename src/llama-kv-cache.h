@@ -122,6 +122,8 @@ public:
     // llama_memory_i
     //
 
+    const char * training_error(const llama_batch & batch, bool flash_attn) const override;
+
     llama_memory_context_ptr init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
@@ -206,8 +208,8 @@ public:
     // input API
     //
 
-    ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
-    ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch, bool row_gradients = false) const;
+    ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch, bool row_gradients = false) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
@@ -389,8 +391,8 @@ public:
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
     //   helps understand the implementation logic of cpy_k and cpy_v
-    ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
-    ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch, bool row_gradients = false) const;
+    ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch, bool row_gradients = false) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
