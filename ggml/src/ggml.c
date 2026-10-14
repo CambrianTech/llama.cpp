@@ -5542,6 +5542,16 @@ void ggml_flash_attn_ext_add_sinks(
 
 // ggml_flash_attn_back
 
+float ggml_flash_attn_back_scale(float max_abs_do) {
+    if (!(max_abs_do > 0.0f)) {
+        return 1.0f;
+    }
+    int e;
+    frexpf(max_abs_do, &e);   // max_abs_do in [2^(e-1), 2^e)
+    const int k = 3 - e;      // scaled into [2^2, 2^3)
+    return ldexpf(1.0f, k < -24 ? -24 : (k > 40 ? 40 : k));
+}
+
 size_t ggml_flash_attn_back_offset(const struct ggml_tensor * back, int part) {
     const struct ggml_tensor * q = back->src[0];
     const struct ggml_tensor * k = back->src[1];
@@ -5577,7 +5587,7 @@ struct ggml_tensor * ggml_flash_attn_back(
     const size_t rows  = (size_t) q->ne[1]*q->ne[2];
     struct ggml_tensor tmp = { 0 };
     tmp.src[0] = q; tmp.src[1] = k; tmp.src[2] = v;
-    const size_t bytes = ggml_flash_attn_back_offset(&tmp, 3) + 2*rows*sizeof(float);
+    const size_t bytes = ggml_flash_attn_back_offset(&tmp, 3) + (2*rows + 1)*sizeof(float); // lse, D, the dO scale
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) (bytes/sizeof(float)));
     ggml_set_op_params_f32(result, 0, scale);

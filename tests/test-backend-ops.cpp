@@ -7561,6 +7561,13 @@ struct test_flash_attn_back : public test_case {
     double max_nmse_err() override {
         return 1e-5; // the kernel and the reference sum in different orders over the window
     }
+
+    // the five products of the ideal backward (S, dP, dV, dQ, dK), so perf reports TFLOPS against
+    // the forward's two
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2ull*nb*kv*nh*(3*hs + 2*hs);
+    }
 };
 
 // GGML_OP_CROSS_ENTROPY_LOSS
@@ -10682,6 +10689,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // the attention backward beside its forward at one training shape (head 256, 16 heads over 4 KV
+    // heads, 256 rows over a 2048 window, f16 cache): small enough to time on every kernel edit; a
+    // backward costs about 2.5 forwards of matmul work
+    test_cases.emplace_back(new test_flash_attn_back(256, 16, 4, 2048, 256, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 2048, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     // OUT_PROD at the shapes a LoRA backward emits (dx = out_prod(W, dy^T), trans_b): a 1.5B
     // (n_embd 1536, ffn 8960) and a 27B (n_embd 5120, ffn 17408) at 1024 tokens, plus the

@@ -4278,8 +4278,8 @@ int ggml_metal_op_flash_attn_back(ggml_metal_op_t ctx, int idx) {
         /*.offs_lse =*/ ggml_flash_attn_back_offset(op, 3),
     };
 
-    for (int pass = 0; pass < 2; ++pass) {
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_back(lib, op, pass == 1);
+    auto run = [&](const char * pass, int ngx, int ngy, int nth, size_t shmem) {
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_back(lib, op, pass);
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q), 1);
@@ -4288,9 +4288,25 @@ int ggml_metal_op_flash_attn_back(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, mask ? ggml_metal_get_buffer_id(mask) : ggml_metal_get_buffer_id(q), 4);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(d), 5);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 6);
-        const int ngroups = pass == 0 ? args.N*args.H : args.M*args.Hkv;
-        ggml_metal_encoder_dispatch_threadgroups(enc, ngroups, 1, 1, 32, 1, 1);
+        if (shmem > 0) {
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, shmem, 0);
+        }
+        ggml_metal_encoder_dispatch_threadgroups(enc, ngx, ngy, 1, nth, 1, 1);
         ggml_metal_op_concurrency_reset(ctx);
+    };
+    // the dO scale (one threadgroup; every path records it so backends agree)
+    run("scale", 1, 1, 1024, 32*sizeof(float));
+    if (args.D == args.Dv && args.D % 32 == 0) {
+        // tiled (fa.metal FAB_*): query blocks of 8 rows, KV blocks of 16, four simdgroups
+        const int br = 8, bc = 16, nsg = 4;
+        const size_t shmem = (size_t) (2*br + 2*bc)*args.D*sizeof(uint16_t) + (2*br*bc + 2*br)*sizeof(float) + 2*br*bc*sizeof(uint16_t);
+        run("stats", (args.N + br - 1)/br, args.H,   32*nsg, shmem);
+        run("dkv",   (args.M + bc - 1)/bc, args.Hkv, 32*nsg, shmem);
+        run("dq",    (args.N + br - 1)/br, args.H,   32*nsg, shmem);
+    } else {
+        // one simdgroup per row
+        run("q",  args.N*args.H,   1, 32, 0);
+        run("kv", args.M*args.Hkv, 1, 32, 0);
     }
 
     return 1;

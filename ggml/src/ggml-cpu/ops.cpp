@@ -9303,6 +9303,20 @@ static void ggml_compute_forward_flash_attn_back_f32(
         return (float) r;
     };
 
+    // the dO scale a reduced-precision kernel uses (recorded so every backend's result agrees; the
+    // CPU works in F32 and does not apply it)
+    if (ith == 0) {
+        float mx = 0.0f;
+        for (int64_t i = 0; i < N; ++i) {
+            for (int64_t h = 0; h < H; ++h) {
+                for (int64_t c = 0; c < Dv; ++c) {
+                    mx = std::max(mx, fabsf(*(const float *) ((const char *) d->data + c*d->nb[0] + h*d->nb[1] + i*d->nb[2])));
+                }
+            }
+        }
+        dvec[N*H] = ggml_flash_attn_back_scale(mx);
+    }
+
     // pass 1: the query rows
     for (int64_t r = ith; r < N*H; r += nth) {
         const int64_t i  = r % N;

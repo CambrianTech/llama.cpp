@@ -2485,7 +2485,8 @@ extern "C" {
     // scores per block instead of keeping them: memory is the gradients alone. The result is F32:
     // dQ ([D, N, H]), dK (k's shape), dV (v's shape), each contiguous at
     // ggml_flash_attn_back_offset, then each query row's log-sum-exp and D = sum_j p_ij dp_ij,
-    // which the kernels pass between their passes.
+    // which the kernels pass between their passes, and the power of two dO is scaled by in a
+    // kernel's reduced-precision tiles (ggml_flash_attn_back_scale).
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
            struct ggml_tensor  * q,
@@ -2496,6 +2497,10 @@ extern "C" {
            float                 scale);
 
     // byte offset in a ggml_flash_attn_back result of: 0 dQ, 1 dK, 2 dV, 3 the per-row scratch
+    // the power of two that brings the largest |dO| to [4, 8): training gradients sit far below half
+    // precision's normal range (6.1e-5) and lose their precision in half tiles; 1 when dO is zero
+    // (the Metal kernel computes the same rule, kernel_flash_attn_back_scale)
+    GGML_API float ggml_flash_attn_back_scale(float max_abs_do);
     GGML_API size_t ggml_flash_attn_back_offset(const struct ggml_tensor * back, int part);
 
     // the backward of FLASH_ATTN_EXT as the one op above (ggml_flash_attn_ext_set_back_tile)

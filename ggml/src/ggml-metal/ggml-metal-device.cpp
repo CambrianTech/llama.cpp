@@ -353,11 +353,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_lo
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_back(ggml_metal_library_t lib, const ggml_tensor * op, bool kv_pass) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_back(ggml_metal_library_t lib, const ggml_tensor * op, const char * pass) {
     assert(op->op == GGML_OP_FLASH_ATTN_BACK);
 
     char name[256];
-    snprintf(name, 256, "kernel_flash_attn_back_%s_%s", kv_pass ? "kv" : "q", ggml_type_name(op->src[1]->type));
+    if (strcmp(pass, "scale") == 0) {
+        snprintf(name, 256, "kernel_flash_attn_back_scale");
+    } else {
+        snprintf(name, 256, "kernel_flash_attn_back_%s_%s", pass, ggml_type_name(op->src[1]->type));
+    }
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
