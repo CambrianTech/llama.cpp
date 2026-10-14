@@ -6667,7 +6667,11 @@ static void ggml_acc_or_set(
         }
         cgraph->grads[isrc] = ggml_acc_impl(ctx, acc_into, tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
-        struct ggml_tensor * a_zero = ggml_fill(ctx, ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, src->ne), 0.0f);
+        // zeros by fill (0 * inf would be NaN), built from a one-element leaf repeated to src's
+        // shape: a full-size leaf stays allocated for the whole graph (+813 MiB on the 4B at
+        // window 8192, 2026-10-14), a node is freed after its use
+        struct ggml_tensor * a_zero = ggml_repeat_4d(ctx, ggml_fill(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 0.0f),
+                src->ne[0], src->ne[1], src->ne[2], src->ne[3]);
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
     }
     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
