@@ -244,6 +244,12 @@ private:
     // the step that failed, for the log
     void opt_fail(std::string why, const std::string & what = "");
 
+    // THE EXTRAS A LABELLED UBATCH SWITCHES ON (llama-context-opt.cpp). process_ubatch runs a
+    // ubatch whose rows carry labels through ggml_opt instead of graph_compute: the same graph,
+    // plus the loss over the labelled rows, the backward and, at a period's end, the optimizer
+    // step. A walk driving the decode adds its taps to that graph.
+    bool opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch);
+
     //
     // output
     //
@@ -387,6 +393,13 @@ private:
     bool     opt_walk_exact   = false; // llama_opt_params::walk_exact
     uint32_t opt_walk_horizon_req = 0; // llama_opt_params::walk_horizon, as requested
     uint32_t opt_walk_horizon = 0;     // this window's: starts at the request, shrinks to fit the device
+
+    // set by a walk for the decode it drives: whose taps join the graph, where the loss lands,
+    // whether a ubatch without labels still trains (an exact walk's context chunk), and that the
+    // logits rows are the loss's alone (no host copy)
+    opt_walk *        opt_walk_active      = nullptr;
+    ggml_opt_result_t opt_result_active    = nullptr;
+    bool              opt_train_unlabelled = false;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

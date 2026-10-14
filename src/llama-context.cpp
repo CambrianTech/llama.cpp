@@ -1334,11 +1334,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
+    // a ubatch with labelled rows is a training step on this context's trainable adapter
+    // (llama_opt_init): the same graph with the extras on (opt_ubatch). It is built fresh, and
+    // cparams.training is part of the reuse key, so a serving graph never reuses it.
+    bool train = false;
+    if (opt_ctx != nullptr) {
+        train = opt_train_unlabelled;
+        for (uint32_t i = 0; !train && ubatch.label != nullptr && i < ubatch.n_tokens; ++i) {
+            train = ubatch.label[i] >= 0;
+        }
+        cparams.training = train;
+    }
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!train && !graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1365,6 +1377,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (train) {
+            if (!opt_ubatch(res, gf, ubatch)) {
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            ret = GGML_STATUS_SUCCESS;
+            return res;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -1862,7 +1883,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && opt_walk_active == nullptr && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);

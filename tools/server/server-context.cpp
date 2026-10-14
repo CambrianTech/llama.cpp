@@ -205,6 +205,7 @@ struct server_batch {
             batch.n_seq_id + off,
             batch.seq_id   + off,
             batch.logits   + off,
+            batch.label ? batch.label + off : nullptr,
         };
 
         return view;

@@ -674,6 +674,7 @@ static bool decode_helper(llama_context * ctx, llama_batch & batch, std::vector<
             batch.n_seq_id + i,
             batch.seq_id   + i,
             batch.logits   + i,
+            batch.label ? batch.label + i : nullptr,
         };
 
         const int ret = llama_decode(ctx, batch_view);

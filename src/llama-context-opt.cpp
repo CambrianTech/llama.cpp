@@ -227,168 +227,124 @@ bool llama_context::opt_walk::decode_span(uint32_t p0, uint32_t p1) {
 
 // one training chunk [pos_ctx, pos_ctx + n_chunk): forward and backward over it alone, attending
 // to the cached context before it
+// One chunk of a walk is one llama_decode with labels: the batch loop is decode's, and the
+// extras switch on in process_ubatch (llama_context::opt_ubatch). This function only fills the
+// chunk's tokens and labels and says whose walk it is.
 bool llama_context::opt_walk::train_chunk(uint32_t pos_ctx, uint32_t n_chunk) {
-    const llama_model & model   = lctx.model;
-    llama_cparams     & cparams = lctx.cparams;
-    ggml_opt_context_t  opt_ctx = lctx.opt_ctx;
-
     llama_walk_fill(batch, tokens, pos_ctx, n_chunk);
     for (uint32_t pos_batch = 0; pos_batch < n_chunk; ++pos_batch) {
         // an exact walk's context chunk has no label but still trains (its K/V carry later
         // chunks' gradient): one output row, weighted zero, so the graph has its loss
         batch.logits[pos_batch] = labels[pos_ctx + pos_batch] >= 0
             || (xc != nullptr && xc->n_labels == 0 && pos_batch + 1 == n_chunk);
+        batch.label[pos_batch] = labels[pos_ctx + pos_batch];
     }
 
-    // output_all = false: the batch's own logits flags decide which rows exist
-    if (!lctx.balloc->init(batch, model.vocab, nullptr, model.hparams.n_embd_inp(), cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, false)) {
-        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+    lctx.opt_walk_active      = this;
+    lctx.opt_result_active    = xc != nullptr && xc->n_labels == 0 ? nullptr : result;
+    lctx.opt_train_unlabelled = xc != nullptr && xc->n_labels == 0;
+    const int ret = lctx.decode(batch);
+    lctx.opt_walk_active      = nullptr;
+    lctx.opt_result_active    = nullptr;
+    lctx.opt_train_unlabelled = false;
+    std::fill(batch.label, batch.label + n_chunk, -1);
+
+    if (ret != 0) {
+        // a refusal has already stopped the epoch by name (opt_fail); anything else is decode's
+        if (!lctx.opt_alloc_failed.load()) {
+            lctx.opt_fail("the training chunk failed to decode (llama_decode returned " + std::to_string(ret) + ")");
+        }
         return false;
     }
-
-    lctx.n_queued_tokens += lctx.balloc->get_n_tokens();
-
-    lctx.embd_seq.clear();
-
-    const uint32_t n_outputs_all = lctx.balloc->get_n_outputs();
-    // Unreachable: the walk trains only chunks of a labelled run. It RETURNS from the whole
-    // window, since a later chunk would need this one in the cache.
-    if (n_outputs_all == 0) {
-        LLAMA_LOG_ERROR("%s: a training batch with no labelled position (every label masked): nothing to learn from it\n", __func__);
-        return false;
+    if (callback && !(xc != nullptr && xc->n_labels == 0)) {
+        callback(train, lctx.opt_ctx, dataset, result, idata_in_loop + pos_ctx/n_batch + 1, ndata_in_loop, t_loop_start);
     }
+    return true;
+}
 
-    auto mctx = lctx.memory->init_batch(*lctx.balloc, cparams.n_ubatch, true);
-    if (!mctx || mctx->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
-        LLAMA_LOG_ERROR("%s: could not initialize batch\n", __func__);
-        return false;
+bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch) {
+    opt_walk * walk = opt_walk_active;
+    const llama_walk_chunk * xc = walk != nullptr ? walk->xc : nullptr;
+
+    struct ggml_context * ctx_compute_opt;
+    {
+        const size_t size_gf = ggml_graph_size(gf);
+        const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ size_meta,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_compute_opt = ggml_init(params);
     }
-
-    // reserve output buffer
-    if (lctx.output_reserve(n_outputs_all) < n_outputs_all) {
-        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
-        GGML_ABORT("TODO: handle this error");
-    };
-
-    uint32_t pos_batch = 0;
-    do {
-        const auto & ubatch = mctx->get_ubatch();
-
-        // the labelled rows of this ubatch, as decode counts its outputs
-        {
-            uint32_t n_outputs_ubatch = 0;
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                n_outputs_ubatch += (uint32_t) (ubatch.output[i] != 0);
-            }
-            lctx.n_outputs = n_outputs_ubatch;
-        }
-
-        if (!mctx->apply()) {
-            LLAMA_LOG_ERROR("%s: failed to update the memory context\n", __func__);
-            return false;
-        }
-
-        auto * res = lctx.gf_res_prev.get();
-
-        const auto gparams = lctx.graph_params(res, ubatch, mctx.get(), lctx.graph_type());
-
-        res->reset();
-
-        auto * gf = model.build_graph(gparams);
-
-        struct ggml_context * ctx_compute_opt;
-        {
-            const size_t size_gf = ggml_graph_size(gf);
-            const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
-            struct ggml_init_params params = {
-                /*.mem_size   =*/ size_meta,
-                /*.mem_buffer =*/ nullptr,
-                /*.no_alloc   =*/ true,
-            };
-            ctx_compute_opt = ggml_init(params);
-        }
-        ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
-        if (xc != nullptr) {
-            ggml_opt_set_next_step(opt_ctx, xc->period_end, xc->loss_scale, res->t_walk_surrogate);
-            for (const auto & io : res->t_walk) {
-                if (io.tk) {
-                    ggml_opt_accumulate_grad(opt_ctx, io.tk, io.ak);
-                    ggml_opt_accumulate_grad(opt_ctx, io.tv, io.av);
-                }
-            }
-            for (const auto & ws : res->t_walk_state) {
-                // a state read without its write reporting the exit (build_walk_state_exit) would drop
-                // the gradient later chunks put on it: a wrong step, silently. Refused by name.
-                if (ws.tap && ws.gs == nullptr && lctx.cparams.walk_state_surrogate) {
-                    ggml_free(ctx_compute_opt);
-                    lctx.opt_fail(std::string("this model's recurrent state write (") + ws.cache->name
-                        + ") does not report its exit to the walk (llm_graph_context::build_walk_state_exit): its gradient across chunks would be dropped");
-                    return false;
-                }
-                if (ws.tap) {
-                    ggml_opt_accumulate_grad(opt_ctx, ws.tap, acc.state.at(ws.cache));
-                }
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+    if (xc != nullptr) {
+        ggml_opt_set_next_step(opt_ctx, xc->period_end, xc->loss_scale, res->t_walk_surrogate);
+        for (const auto & io : res->t_walk) {
+            if (io.tk) {
+                ggml_opt_accumulate_grad(opt_ctx, io.tk, io.ak);
+                ggml_opt_accumulate_grad(opt_ctx, io.tv, io.av);
             }
         }
-        if (!ggml_opt_alloc(opt_ctx, train)) {
-            ggml_free(ctx_compute_opt);
-            lctx.opt_fail(ggml_opt_refusal(opt_ctx),
-                std::string("the ") + (train ? "training" : "evaluation") + " graph was refused (window " + std::to_string(n_ctx) + ")");
-            return false;
-        }
-
-        res->set_inputs(&ubatch);
-        {
-            // one-hot rows for the labelled positions only, in the order the ubatch emits its
-            // outputs (the same order the logits rows take)
-            struct ggml_tensor * labels_t = ggml_opt_labels(opt_ctx);
-            GGML_ASSERT(labels_t->ne[1] == (int64_t) lctx.n_outputs);
-            ggml_set_zero(labels_t);
-            const float onef = 1.0f;
-            uint32_t row = 0;
-            for (uint32_t pos_ubatch = 0; pos_ubatch < ubatch.n_tokens; ++pos_ubatch) {
-                if (ubatch.output[pos_ubatch] == 0) {
-                    continue;
-                }
-                const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                // an exact walk's context chunk: its one row has no label (weighted zero)
-                GGML_ASSERT((xc != nullptr && labels[ilabel] < 0) || (labels[ilabel] >= 0 && labels[ilabel] < labels_t->ne[0]));
-                if (labels[ilabel] >= 0) {
-                    ggml_backend_tensor_set(labels_t, &onef, (row*labels_t->ne[0] + labels[ilabel])*sizeof(float), sizeof(float));
-                }
-                ++row;
-            }
-            GGML_ASSERT(row == lctx.n_outputs);
-        }
-        if (xc != nullptr) {
-            // the later chunk's dL/d(entry state) is this chunk's exit gradient; then the
-            // accumulator takes this chunk's own
-            for (const auto & ws : res->t_walk_state) {
-                ggml_tensor * a = acc.state.at(ws.cache);
-                if (ws.gs) {
-                    GGML_ASSERT(ggml_nbytes(a) == ggml_nbytes(ws.gs));
-                    ggml_backend_tensor_set(ws.gs, a->data, 0, ggml_nbytes(ws.gs));
-                }
-                memset(a->data, 0, ggml_nbytes(a));
+        for (const auto & ws : res->t_walk_state) {
+            if (ws.tap) {
+                ggml_opt_accumulate_grad(opt_ctx, ws.tap, walk->acc.state.at(ws.cache));
             }
         }
-        ggml_opt_eval(opt_ctx, xc != nullptr && xc->n_labels == 0 ? nullptr : result);
-        if (const char * why = ggml_opt_refusal(opt_ctx); why[0] != '\0') {
-            // the backend failed the graph (ggml_opt_eval): the run fails, as a refused graph does
-            ggml_free(ctx_compute_opt);
-            lctx.opt_fail(why);
-            return false;
-        }
-        if (xc != nullptr && !res->t_walk_state.empty()) {
-            acc.state_ready = true;
-        }
-        if (callback && !(xc != nullptr && xc->n_labels == 0)) {
-            callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_batch + 1, ndata_in_loop, t_loop_start);
-        }
+    }
+    const bool train = walk == nullptr || walk->train;
+    if (!ggml_opt_alloc(opt_ctx, train)) {
         ggml_free(ctx_compute_opt);
+        opt_fail(ggml_opt_refusal(opt_ctx),
+            std::string("the ") + (train ? "training" : "evaluation") + " graph was refused (window " + std::to_string(walk != nullptr ? walk->n_ctx : ubatch.n_tokens) + ")");
+        return false;
+    }
 
-        pos_batch += ubatch.n_tokens;
-    } while (mctx->next());
+    res->set_inputs(&ubatch);
+    {
+        // one-hot rows for the labelled positions, in the order the ubatch emits its outputs
+        // (the order the logits rows take); an unlabelled output row stays zero, so it adds no
+        // LOCAL loss (its sequence's context still carries gradient to later labelled rows)
+        struct ggml_tensor * labels_t = ggml_opt_labels(opt_ctx);
+        GGML_ASSERT(labels_t->ne[1] == (int64_t) n_outputs);
+        ggml_set_zero(labels_t);
+        const float onef = 1.0f;
+        uint32_t row = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.output[i] == 0) {
+                continue;
+            }
+            const llama_token y = ubatch.label != nullptr ? ubatch.label[i] : -1;
+            GGML_ASSERT(y < labels_t->ne[0]);
+            if (y >= 0) {
+                ggml_backend_tensor_set(labels_t, &onef, (row*labels_t->ne[0] + y)*sizeof(float), sizeof(float));
+            }
+            ++row;
+        }
+        GGML_ASSERT(row == n_outputs);
+    }
+    if (xc != nullptr) {
+        // the later chunk's dL/d(entry state) is this chunk's exit gradient; then the
+        // accumulator takes this chunk's own
+        for (const auto & ws : res->t_walk_state) {
+            ggml_tensor * a = walk->acc.state.at(ws.cache);
+            if (ws.gs) {
+                GGML_ASSERT(ggml_nbytes(a) == ggml_nbytes(ws.gs));
+                ggml_backend_tensor_set(ws.gs, a->data, 0, ggml_nbytes(ws.gs));
+            }
+            memset(a->data, 0, ggml_nbytes(a));
+        }
+    }
+    ggml_opt_eval(opt_ctx, opt_result_active);
+    ggml_free(ctx_compute_opt);
+    if (const char * why = ggml_opt_refusal(opt_ctx); why[0] != '\0') {
+        // the backend failed the graph (ggml_opt_eval): the run fails, as a refused graph does
+        opt_fail(why);
+        return false;
+    }
+    if (xc != nullptr && !res->t_walk_state.empty()) {
+        walk->acc.state_ready = true;
+    }
     return true;
 }
 

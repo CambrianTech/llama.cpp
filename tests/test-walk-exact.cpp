@@ -496,8 +496,12 @@ int main(int argc, char ** argv) {
         step_delta(params, model, init, tokens, all, WINDOW / 4, true);
         const size_t graph_bytes = g_last_graph_bytes;
         printf("  device graph: %.1f MiB per chunk\n", graph_bytes / 1048576.0);
-        if (graph_bytes == 0) {
-            printf("  device refusal: skipped (no device graph measured: a CPU-only run)\n");
+        // the budget caps GPU memory only (ggml_opt_alloc), so a CPU-only run cannot refuse; it
+        // still measures a graph (in host buffers), which is why the graph size alone was the
+        // wrong test for "a CPU-only run"
+        const bool cpu_only = !params.devices.empty() && params.devices[0] == nullptr;
+        if (graph_bytes == 0 || cpu_only) {
+            printf("  device refusal: skipped (a CPU-only run: the device budget caps GPU memory only)\n");
         } else {
             llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
             const std::vector<float> before = adapter_params(adapter);
