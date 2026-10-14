@@ -50,9 +50,11 @@ struct llama_walk_plan {
 
     static llama_walk_plan of(const std::vector<llama_token> & labels, uint32_t n_ctx, uint32_t n_batch);
 
-    // positions [begin, end) of a run
+    // positions [begin, end) of a run, and the longest run's length (what the exact walk's K/V
+    // gradient holds: a run's, never the window's)
     uint32_t begin(const llama_walk_run & r) const { return chunks[r.j0].c0; }
     uint32_t end  (const llama_walk_run & r) const { return chunks[r.j1 - 1].c0 + chunks[r.j1 - 1].n; }
+    uint32_t longest_run() const;
 
     // which chunks the exact walk trains (the labelled ones: the context before a run is her
     // stable set's and carries no gradient), how far back each gradient reaches (never before
@@ -72,11 +74,11 @@ struct llama_walk_plan {
 };
 
 // THE EXACT WALK's gradients, in host memory, each added into in place by the backward: per
-// attention layer dL/d(cached K) and dL/d(cached V) of the window, [n_embd_*_gqa, position]
-// F32 (null for a recurrent layer), which the graph reads through cparams while bound (never
-// past the accumulator's life); per recurrent state tensor (a layer's conv state r_l and its
-// recurrent state s_l) dL/d(the state entering the chunk trained last), which is what the
-// chunk before it puts on the state it leaves (state_ready once one is in)
+// attention layer dL/d(cached K) and dL/d(cached V) of the run being trained, [n_embd_*_gqa,
+// position - its start] F32 (null for a recurrent layer), which the graph reads through cparams
+// while bound (never past the accumulator's life); per recurrent state tensor (a layer's conv
+// state r_l and its recurrent state s_l) dL/d(the state entering the chunk trained last), which
+// is what the chunk before it puts on the state it leaves (state_ready once one is in)
 struct llama_walk_acc {
     std::vector<ggml_tensor *> k, v;
     std::unordered_map<const ggml_tensor *, ggml_tensor *> state;
@@ -90,6 +92,8 @@ struct llama_walk_acc {
     // zeroed accumulators for n_pos positions, bound into cparams; false: the host memory
     // could not be allocated
     bool init(const llama_hparams & hparams, const llama_memory_recurrent * recr, uint32_t n_pos, llama_cparams & cparams);
+    // zeroed again for the run starting at position base (row 0)
+    void start_run(uint32_t base);
 
     // what init allocates for the K/V of n_pos positions, and one sequence's recurrent state
     static size_t kv_bytes(const llama_hparams & hparams, uint32_t n_pos);

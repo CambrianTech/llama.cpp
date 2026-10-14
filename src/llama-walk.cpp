@@ -63,6 +63,14 @@ void llama_walk_plan::mark_exact(uint32_t horizon) {
     chunks[first].period_end = true;
 }
 
+uint32_t llama_walk_plan::longest_run() const {
+    uint32_t n = 0;
+    for (const llama_walk_run & r : runs) {
+        n = std::max(n, end(r) - begin(r));
+    }
+    return n;
+}
+
 size_t llama_walk_plan::host_bytes(size_t stride, size_t kv_bytes, size_t state_bytes) const {
     size_t n_checkpoints = 0;
     for (const llama_walk_run & r : runs) {
@@ -133,13 +141,22 @@ bool llama_walk_acc::init(const llama_hparams & hparams, const llama_memory_recu
     bound = &cparams;
     cparams.walk_acc_k = k.data();
     cparams.walk_acc_v = v.data();
+    cparams.walk_acc_base = 0;
     return true;
+}
+
+void llama_walk_acc::start_run(uint32_t base) {
+    GGML_ASSERT(bound != nullptr);
+    ggml_backend_buffer_clear(buf.get(), 0);
+    state_ready = false;
+    bound->walk_acc_base = base;
 }
 
 llama_walk_acc::~llama_walk_acc() {
     if (bound != nullptr) {
         bound->walk_acc_k = nullptr;
         bound->walk_acc_v = nullptr;
+        bound->walk_acc_base = 0;
     }
 }
 

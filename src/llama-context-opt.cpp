@@ -329,8 +329,14 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
         ggml_opt_set_next_step(opt_ctx, xc->period_end, xc->loss_scale, res->t_walk_surrogate);
         for (const auto & io : res->t_walk) {
             if (io.tk) {
-                ggml_opt_accumulate_grad(opt_ctx, io.tk, io.ak);
-                ggml_opt_accumulate_grad(opt_ctx, io.tv, io.av);
+                // the explicit path taps the span itself; the in-place path taps the window's cells
+                if (ggml_are_same_shape(io.tk, io.ak)) {
+                    ggml_opt_accumulate_grad(opt_ctx, io.tk, io.ak);
+                    ggml_opt_accumulate_grad(opt_ctx, io.tv, io.av);
+                } else {
+                    ggml_opt_accumulate_grad_rows(opt_ctx, io.tk, io.g0, io.ak);
+                    ggml_opt_accumulate_grad_rows(opt_ctx, io.tv, io.g0, io.av);
+                }
             }
         }
         for (const auto & ws : res->t_walk_state) {
@@ -429,7 +435,7 @@ void llama_context::opt_walk::run_exact() {
     }
     plan.mark_exact(lctx.opt_walk_horizon);
     const std::vector<llama_walk_chunk> & chunks = plan.chunks;
-    const uint32_t n_pos = (uint32_t) plan.last_label + 1;
+    const uint32_t n_pos = plan.longest_run();
 
     // THE HOST BUDGET (llama_walk_plan::stride_for): the K/V accumulators and the recurrent state
     // checkpoints are both known before anything runs
@@ -442,8 +448,8 @@ void llama_context::opt_walk::run_exact() {
     if (budget > 0 && bytes > budget) {
         char why[512];
         snprintf(why, sizeof(why),
-            "the exact walk needs %.1f MiB of host memory for this window (%u positions, the K/V gradient alone), over its budget of %.1f MiB: "
-            "the K/V gradient grows with the window; neither the horizon nor the chunk size changes it",
+            "the exact walk needs %.1f MiB of host memory for this window (its longest reply, %u positions, the K/V gradient alone), over its budget of %.1f MiB: "
+            "the K/V gradient grows with the reply; neither the horizon nor the chunk size changes it",
             bytes/1048576.0, n_pos, budget/1048576.0);
         lctx.opt_fail(why);
         return;
@@ -475,7 +481,7 @@ void llama_context::opt_walk::run_exact() {
             }
         }
         // the reverse pass: back to the chunk's checkpoint, forward to its start, train it
-        acc.state_ready = false;
+        acc.start_run(r0);
         for (size_t j = run.j1; j-- > run.j0; ) {
             const llama_walk_chunk & c = chunks[j];
             if (!yield_point()) {

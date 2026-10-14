@@ -2908,19 +2908,23 @@ ggml_tensor * llm_graph_context::build_attn(
     if (cparams.training && uses_flash_attn(kq_b, sinks, v_mla)) {
         // THE TRAINING GRAPH IS THE SERVING GRAPH. This chunk writes its K/V into the cache
         // exactly as serving does (SET_ROWS, the cache's own type) and attention reads the
-        // cache in place: no copy of the context, at any window. The walk decoded the window
+        // cache in place: no copy of the context, at any window. The walk decoded the run
         // into the cache under the same adapter, so the write is idempotent; the backward
         // gathers this chunk's gradient from the rows it wrote (SET_ROWS backward). In the
-        // exact walk the write is TAPPED (cparams.walk_acc_k / _v): the backward adds
-        // dL/d(cached K/V) of the whole window into the host accumulator, and reads its own
-        // rows back from it, so what later chunks put on them reaches the adapter through
-        // this chunk with no surrogate term. A quantized or f16 cache trains on the values
-        // serving reads; its gradient passes straight through the cast.
+        // exact walk the write is TAPPED: the backward adds dL/d(cached K/V) of the run's
+        // positions before this chunk ([walk_grad_from, n_past)) into the run's host
+        // accumulator (cparams.walk_acc_k / _v, row 0 at walk_acc_base), and what later chunks
+        // put on this chunk's own rows reaches it through the surrogate. A quantized or f16
+        // cache trains on the values serving reads; its gradient passes straight through the
+        // cast.
         const int64_t n_tokens = k_cur->ne[2];
         const int64_t n_past   = ubatch.pos[0];
         const int64_t n_win    = n_past + n_tokens;
         ggml_tensor * rows = build_inp_train_rows();
-        llm_graph_result::walk_layer io = { il, (uint32_t) n_past };
+        // the run's positions before this chunk carry a gradient: [g0, n_past), rows from base
+        const int64_t base = cparams.walk_acc_base;
+        const int64_t g0   = std::max<int64_t>(cparams.walk_grad_from, base);
+        llm_graph_result::walk_layer io = { il, (uint32_t) n_past, (uint32_t) g0 };
         // the window's cells [0, n_win) of one layer's cache with this chunk's rows written
         auto write = [&](ggml_tensor * all, ggml_tensor * cur, ggml_tensor * acc, ggml_tensor *& tap, ggml_tensor *& tap_acc) {
             const int64_t n_embd = cur->ne[0]*cur->ne[1];
@@ -2928,9 +2932,9 @@ ggml_tensor * llm_graph_context::build_attn(
             GGML_ASSERT(ggml_row_size(cur->type, cur->ne[0]) == cur->nb[1]);
             ggml_tensor * win = ggml_view_2d(ctx0, all, n_embd, n_win, all->nb[2], 0);
             ggml_tensor * w   = ggml_set_rows(ctx0, win, ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[2], 0), rows);
-            if (acc != nullptr) {
+            if (acc != nullptr && n_past > g0) {
                 tap     = w;
-                tap_acc = ggml_view_2d(ctx0, acc, n_embd, n_win, acc->nb[1], 0);
+                tap_acc = ggml_view_2d(ctx0, acc, n_embd, n_past - g0, acc->nb[1], (g0 - base)*acc->nb[1]);
             }
             return ggml_reshape_3d(ctx0, w, cur->ne[0], cur->ne[1], n_win);
         };
@@ -2940,6 +2944,9 @@ ggml_tensor * llm_graph_context::build_attn(
         k = write(mctx_cur->get_k(ctx0, il), k_cur, tapped ? cparams.walk_acc_k[il] : nullptr, io.tk, io.ak);
         v = write(v_all,                     v_cur, tapped ? cparams.walk_acc_v[il] : nullptr, io.tv, io.av);
         if (tapped) {
+            if (cparams.walk_surrogate) {
+                build_walk_surrogate(il, k_cur, v_cur, n_past - base);
+            }
             res->t_walk.push_back(io);
         }
         if (kq_mask->ne[0] > n_win) {
@@ -2994,15 +3001,9 @@ ggml_tensor * llm_graph_context::build_attn(
             // (test-walk-exact, q8_0 and f16 caches): cosine 0.998 against one graph, the same as
             // at an F32 cache, so training reads the numbers serving runs on (Joel: align the bit
             // depth to inference).
-            const int64_t g0 = std::min<int64_t>(cparams.walk_grad_from, n_past);
-            llm_graph_result::walk_layer io = { il, (uint32_t) n_past };
-            ggml_tensor * acc_k = cparams.walk_acc_k[il];
-            ggml_tensor * acc_v = cparams.walk_acc_v[il];
-            // rows [p0, p0 + n) of a layer's accumulator, shaped like that span's K / V
-            auto acc_rows = [&](ggml_tensor * acc, const ggml_tensor * like, int64_t p0) {
-                return ggml_view_3d(ctx0, acc, like->ne[0], like->ne[1], like->ne[2],
-                        like->ne[0]*sizeof(float), acc->nb[1], p0*acc->nb[1]);
-            };
+            const int64_t base = cparams.walk_acc_base;
+            const int64_t g0   = std::min<int64_t>(std::max<int64_t>(cparams.walk_grad_from, base), n_past);
+            llm_graph_result::walk_layer io = { il, (uint32_t) n_past, (uint32_t) g0 };
             // [const prefix][gradient prefix][this chunk]: the order the cells hold them in
             std::vector<ggml_tensor *> k_parts, v_parts;
             if (g0 > 0) {
@@ -3015,8 +3016,8 @@ ggml_tensor * llm_graph_context::build_attn(
                 io.tv = v_span(g0, n_past);
                 ggml_format_name(io.tk, "walk_tk-%d", il);
                 ggml_format_name(io.tv, "walk_tv-%d", il);
-                io.ak = acc_rows(acc_k, io.tk, g0);
-                io.av = acc_rows(acc_v, io.tv, g0);
+                io.ak = walk_acc_rows(cparams.walk_acc_k[il], io.tk, g0 - base);
+                io.av = walk_acc_rows(cparams.walk_acc_v[il], io.tv, g0 - base);
                 k_parts.push_back(io.tk);
                 v_parts.push_back(io.tv);
             }
@@ -3029,14 +3030,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 v = ggml_concat(ctx0, v, v_parts[i], 2);
             }
             if (cparams.walk_surrogate) {
-                ggml_tensor * gk = acc_rows(acc_k, k_cur, n_past);
-                ggml_tensor * gv = acc_rows(acc_v, v_cur, n_past);
-                ggml_tensor * k32 = k_cur->type == GGML_TYPE_F32 ? k_cur : ggml_cast(ctx0, k_cur, GGML_TYPE_F32);
-                ggml_tensor * v32 = v_cur->type == GGML_TYPE_F32 ? v_cur : ggml_cast(ctx0, v_cur, GGML_TYPE_F32);
-                ggml_tensor * term = ggml_add(ctx0,
-                        ggml_sum(ctx0, ggml_mul(ctx0, k32, gk)),
-                        ggml_sum(ctx0, ggml_mul(ctx0, v32, gv)));
-                res->t_walk_surrogate = res->t_walk_surrogate ? ggml_add(ctx0, res->t_walk_surrogate, term) : term;
+                build_walk_surrogate(il, k_cur, v_cur, n_past - base);
             }
             res->t_walk.push_back(io);
         } else if (n_past > 0) {
@@ -3730,6 +3724,22 @@ ggml_tensor * llm_graph_context::build_rs(
 int64_t llm_graph_context::rs_keep() const {
     const bool training = cparams.training && cparams.walk_exact;
     return cparams.n_rs_seq > 0 && !training ? (int64_t) cparams.n_rs_seq + 1 : 1;
+}
+
+ggml_tensor * llm_graph_context::walk_acc_rows(ggml_tensor * acc, const ggml_tensor * like, int64_t row) const {
+    return ggml_view_3d(ctx0, acc, like->ne[0], like->ne[1], like->ne[2],
+            like->ne[0]*sizeof(float), acc->nb[1], row*acc->nb[1]);
+}
+
+void llm_graph_context::build_walk_surrogate(int il, ggml_tensor * k_cur, ggml_tensor * v_cur, int64_t row) const {
+    ggml_tensor * gk  = walk_acc_rows(cparams.walk_acc_k[il], k_cur, row);
+    ggml_tensor * gv  = walk_acc_rows(cparams.walk_acc_v[il], v_cur, row);
+    ggml_tensor * k32 = k_cur->type == GGML_TYPE_F32 ? k_cur : ggml_cast(ctx0, k_cur, GGML_TYPE_F32);
+    ggml_tensor * v32 = v_cur->type == GGML_TYPE_F32 ? v_cur : ggml_cast(ctx0, v_cur, GGML_TYPE_F32);
+    ggml_tensor * term = ggml_add(ctx0,
+            ggml_sum(ctx0, ggml_mul(ctx0, k32, gk)),
+            ggml_sum(ctx0, ggml_mul(ctx0, v32, gv)));
+    res->t_walk_surrogate = res->t_walk_surrogate ? ggml_add(ctx0, res->t_walk_surrogate, term) : term;
 }
 
 void llm_graph_context::build_walk_state_exit(ggml_tensor * cache, ggml_tensor * exit) const {

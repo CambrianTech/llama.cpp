@@ -962,6 +962,7 @@ public:
     struct walk_layer {
         int           il;
         uint32_t      n_past;
+        uint32_t      g0;           // the first position whose K/V gradient is kept
         ggml_tensor * tk = nullptr; // the cached K/V of [grad_from, n_past) as F32, tapped: their
         ggml_tensor * tv = nullptr; //   gradient adds into ak / av (ggml_opt_accumulate_grad)
         ggml_tensor * ak = nullptr; // the accumulator's rows [grad_from, n_past), shaped like tk / tv
@@ -1411,6 +1412,11 @@ struct llm_graph_context {
     // THE EXACT WALK: the state a chunk leaves (`exit`, what is written back to `cache`) meets the
     // gradient later chunks put on it, through the surrogate <exit, gs>. A no-op outside the walk.
     void build_walk_state_exit(ggml_tensor * cache, ggml_tensor * exit) const;
+    // rows [row, row + n) of a layer's walk accumulator, shaped like `like`'s K / V span
+    ggml_tensor * walk_acc_rows(ggml_tensor * acc, const ggml_tensor * like, int64_t row) const;
+    // <k_cur, G_k> + <v_cur, G_v>: what later chunks of the run put on this chunk's own K/V
+    // (accumulator rows from `row`), carried into it through the loss
+    void build_walk_surrogate(int il, ggml_tensor * k_cur, ggml_tensor * v_cur, int64_t row) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
