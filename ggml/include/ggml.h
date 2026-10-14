@@ -2779,7 +2779,12 @@ extern "C" {
             int                   n_tasks,
             void                * userdata);
 
-    // loss function
+    // loss function: the mean over rows of -sum(labels * log softmax(logits)). The labels are
+    // either a distribution per row (F32, the logits' shape) or one target index per row (I32,
+    // one per row of the logits, -1 for a row that carries no loss): a target index never builds
+    // a vocabulary-wide one-hot tensor beside the logits.
+
+    GGML_API bool ggml_cross_entropy_labels_ok(const struct ggml_tensor * logits, const struct ggml_tensor * labels);
 
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss(
             struct ggml_context * ctx,

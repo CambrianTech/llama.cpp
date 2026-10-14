@@ -340,7 +340,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_lo
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_cross_entropy_loss%s_f32", op->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK ? "_back" : "");
+    const bool back = op->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK;
+    const ggml_tensor * labels = back ? op->src[2] : op->src[1];
+    snprintf(base, 256, "kernel_cross_entropy_loss%s_%s", back ? "_back" : "", labels->type == GGML_TYPE_I32 ? "i32" : "f32");
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

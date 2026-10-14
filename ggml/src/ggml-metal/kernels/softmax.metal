@@ -350,6 +350,85 @@ kernel void kernel_cross_entropy_loss_back_f32(
 }
 
 
+// the same with one target index per row (I32 labels, -1: the row carries no loss), so no
+// vocabulary-wide one-hot tensor exists beside the logits
+kernel void kernel_cross_entropy_loss_i32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const  char * src0,
+        device const  char * src1,
+        device        char * dst,
+        threadgroup  float * buf [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint3  tptg[[threads_per_threadgroup]]) {
+    const int32_t row = tgpig.x;
+    const int32_t t   = ((device const int32_t *) src1)[row];
+
+    device const float * s0 = (device const float *) (src0 + row*args.nb01);
+
+    float lmax = -INFINITY;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lmax = MAX(lmax, s0[i]);
+    }
+    const float max_val = ce_reduce_max<float>(lmax, buf, sgitg, tiisg, tptg);
+
+    float lsum = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lsum += exp(s0[i] - max_val);
+    }
+    const float lse = log(ce_reduce_sum(lsum, buf, sgitg, tiisg, tptg));
+
+    if (tpitg.x == 0) {
+        ((device float *) dst)[row] = t >= 0 ? -(s0[t] - max_val - lse)/(float) args.nr : 0.0f;
+    }
+}
+
+kernel void kernel_cross_entropy_loss_back_i32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const  char * src0,   // grad: one float
+        device const  char * src1,   // logits
+        device const  char * src2,   // labels: one target per row
+        device        char * dst,
+        threadgroup  float * buf [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint3  tptg[[threads_per_threadgroup]]) {
+    const int32_t row = tgpig.x;
+    const int32_t t   = ((device const int32_t *) src2)[row];
+
+    device const float * s0 = (device const float *) (src1 + row*args.nb01);
+    device       float * d  = (device       float *) (dst  + row*args.nb1);
+
+    if (t < 0) {
+        for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+            d[i] = 0.0f;
+        }
+        return;
+    }
+
+    const float d_by_nr = ((device const float *) src0)[0]/(float) args.nr;
+
+    float lmax = -INFINITY;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lmax = MAX(lmax, s0[i]);
+    }
+    const float max_val = ce_reduce_max<float>(lmax, buf, sgitg, tiisg, tptg);
+
+    float lsum = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lsum += exp(s0[i] - max_val);
+    }
+    const float inv_sum = 1.0f/ce_reduce_sum(lsum, buf, sgitg, tiisg, tptg);
+
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        d[i] = (exp(s0[i] - max_val)*inv_sum - (i == t ? 1.0f : 0.0f))*d_by_nr;
+    }
+}
+
 // RMS_NORM_BACK: dx = (dz - x * sum(x*dz)/(sum(x*x) + eps*n)) / sqrt(sum(x*x)/n + eps)
 // (the CPU reference, ggml-cpu ops.cpp rms_norm_back_f32). src0 = dz, src1 = x.
 kernel void kernel_rms_norm_back_f32(

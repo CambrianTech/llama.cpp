@@ -76,7 +76,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
                     max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     }
 
-    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+    // one target token per row: no one-hot tensor as wide as the vocabulary beside the logits
+    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS);
     opt_params.opt_period      = n_batch / n_ubatch;
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     // per-layer recompute: the layer outputs are the checkpoints (llm_graph names them l_out-N)
@@ -355,26 +356,21 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
 
     res->set_inputs(&ubatch);
     {
-        // one-hot rows for the labelled positions, in the order the ubatch emits its outputs
-        // (the order the logits rows take); an unlabelled output row stays zero, so it adds no
-        // LOCAL loss (its sequence's context still carries gradient to later labelled rows)
+        // the target token of each output row, in the order the ubatch emits its outputs (the
+        // order the logits rows take)
         struct ggml_tensor * labels_t = ggml_opt_labels(opt_ctx);
-        GGML_ASSERT(labels_t->ne[1] == (int64_t) n_outputs);
-        ggml_set_zero(labels_t);
-        const float onef = 1.0f;
-        uint32_t row = 0;
+        GGML_ASSERT(labels_t->type == GGML_TYPE_I32 && labels_t->ne[0] == (int64_t) n_outputs);
+        std::vector<int32_t> targets;
+        targets.reserve(n_outputs);
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-            if (ubatch.output[i] == 0) {
-                continue;
+            if (ubatch.output[i] != 0) {
+                const llama_token y = ubatch.label != nullptr ? ubatch.label[i] : -1;
+                GGML_ASSERT(y < (llama_token) model.vocab.n_tokens());
+                targets.push_back(y);
             }
-            const llama_token y = ubatch.label != nullptr ? ubatch.label[i] : -1;
-            GGML_ASSERT(y < labels_t->ne[0]);
-            if (y >= 0) {
-                ggml_backend_tensor_set(labels_t, &onef, (row*labels_t->ne[0] + y)*sizeof(float), sizeof(float));
-            }
-            ++row;
         }
-        GGML_ASSERT(row == n_outputs);
+        GGML_ASSERT(targets.size() == n_outputs);
+        ggml_backend_tensor_set(labels_t, targets.data(), 0, ggml_nbytes(labels_t));
     }
     if (xc != nullptr) {
         // the later chunk's dL/d(entry state) is this chunk's exit gradient; then the

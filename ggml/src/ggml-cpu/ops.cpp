@@ -11746,11 +11746,12 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
     const ggml_tensor * src1 = dst->src[1];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_I32);
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
-    GGML_ASSERT(ggml_are_same_shape(src0, src1));
+    GGML_ASSERT(ggml_cross_entropy_labels_ok(src0, src1));
     GGML_ASSERT(ggml_is_scalar(dst));
+    const bool index = src1->type == GGML_TYPE_I32;
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     // TODO: handle transposed/permuted matrices
@@ -11775,18 +11776,21 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
 
     for (int64_t i1 = ir0; i1 < ir1; ++i1) {
         const float * s0 = (const float *)((const char *) src0->data + i1*src0->nb[1]);
-        const float * s1 = (const float *)((const char *) src1->data + i1*src1->nb[1]);
-
-#ifndef NDEBUG
-        for (int64_t i = 0; i < nc; ++i) {
-            //printf("p[%d] = %f\n", i, p[i]);
-            assert(!isnan(s0[i]));
-            assert(!isnan(s1[i]));
-        }
-#endif // NDEBUG
 
         float max = -INFINITY;
         ggml_vec_max_f32(nc, &max, s0);
+        if (index) {
+            // one target: its log softmax, -(max + log sum exp(x - max)) + x[t]
+            const int32_t t = ((const int32_t *) src1->data)[i1];
+            if (t >= 0) {
+                GGML_ASSERT(t < nc);
+                const ggml_float lse = ggml_vec_log_soft_max_f32(nc, st, s0, max);
+                sum_thread += st[t] - lse;
+            }
+            continue;
+        }
+        const float * s1 = (const float *)((const char *) src1->data + i1*src1->nb[1]);
+
         const ggml_float sum_softmax = ggml_vec_log_soft_max_f32(nc, st, s0, max);
         assert(sum_softmax >= 0.0);
 
@@ -11846,7 +11850,8 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
     GGML_ASSERT(ggml_is_contiguous(src0f));
     GGML_ASSERT(ggml_is_contiguous(src1f));
     GGML_ASSERT(ggml_is_contiguous(grad));
-    GGML_ASSERT(ggml_are_same_shape(src0f, src1f) && ggml_are_same_shape(src0f, dst));
+    GGML_ASSERT(ggml_cross_entropy_labels_ok(src0f, src1f) && ggml_are_same_shape(src0f, dst));
+    const bool index = src1f->type == GGML_TYPE_I32;
 
     const int64_t ith = params->ith;
     const int64_t nth = params->nth;
@@ -11867,15 +11872,24 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
     for (int64_t i1 = ir0; i1 < ir1; i1++) {
         float       * ds0 = (float       *)((char       *) dst->data   + i1*dst->nb[1]);
         const float * s0  = (const float *)((const char *) src0f->data + i1*src0f->nb[1]);
-        const float * s1  = (const float *)((const char *) src1f->data + i1*src1f->nb[1]);
 
-#ifndef NDEBUG
-        for (int64_t i = 0; i < nc; ++i) {
-            //printf("p[%d] = %f\n", i, p[i]);
-            assert(!isnan(s0[i]));
-            assert(!isnan(s1[i]));
+        if (index) {
+            // one target t: (softmax(x) - onehot(t)) * d / nr; a row without one is zero
+            const int32_t t = ((const int32_t *) src1f->data)[i1];
+            if (t < 0) {
+                memset(ds0, 0, nc*sizeof(float));
+                continue;
+            }
+            GGML_ASSERT(t < nc);
+            float max = -INFINITY;
+            ggml_vec_max_f32(nc, &max, s0);
+            const ggml_float sum = ggml_vec_soft_max_f32(nc, ds0, s0, max);
+            ggml_vec_scale_f32(nc, ds0, 1.0/sum);
+            ds0[t] -= 1.0f;
+            ggml_vec_scale_f32(nc, ds0, d_by_nr);
+            continue;
         }
-#endif // NDEBUG
+        const float * s1  = (const float *)((const char *) src1f->data + i1*src1f->nb[1]);
 
         // soft_max
         float max = -INFINITY;

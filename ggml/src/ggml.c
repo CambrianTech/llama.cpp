@@ -6198,11 +6198,18 @@ struct ggml_tensor * ggml_custom_inplace(
 }
 // ggml_cross_entropy_loss
 
+bool ggml_cross_entropy_labels_ok(const struct ggml_tensor * logits, const struct ggml_tensor * labels) {
+    if (labels->type == GGML_TYPE_I32) {
+        return ggml_is_contiguous(labels) && ggml_nelements(labels) == ggml_nrows(logits);
+    }
+    return ggml_are_same_shape(logits, labels);
+}
+
 struct ggml_tensor * ggml_cross_entropy_loss(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
-    GGML_ASSERT(ggml_are_same_shape(a, b));
+    GGML_ASSERT(ggml_cross_entropy_labels_ok(a, b));
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, a->type, 1);
 
@@ -6221,7 +6228,7 @@ struct ggml_tensor * ggml_cross_entropy_loss_back(
         struct ggml_tensor  * b,
         struct ggml_tensor  * c) {
     GGML_ASSERT(ggml_is_scalar(a));
-    GGML_ASSERT(ggml_are_same_shape(b, c));
+    GGML_ASSERT(ggml_cross_entropy_labels_ok(b, c));
 
     struct ggml_tensor * result = ggml_dup_tensor(ctx, b);
 

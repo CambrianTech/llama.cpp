@@ -585,8 +585,11 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->loss_per_datapoint = false;
             break;
         }
-        case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY: {
-            opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
+        case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY:
+        case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS: {
+            opt_ctx->labels = opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS
+                ? ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, ggml_nrows(opt_ctx->outputs))
+                : ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);
             ggml_set_name(opt_ctx->labels, "labels");
             opt_ctx->loss = ggml_cross_entropy_loss(ctx_results, opt_ctx->outputs, opt_ctx->labels);
@@ -620,7 +623,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_output(opt_ctx->loss);
     if (opt_ctx->next_manual) {
         GGML_ASSERT(!opt_ctx->static_graphs && "a caller-driven period needs graphs built per step");
-        GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+        GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS);
         // the loss the backward differentiates: the caller's weight of this graph's loss, plus
         // its extra term; opt_ctx->loss stays the unweighted loss the result reports
         struct ggml_tensor * total = ggml_scale(ctx_results, opt_ctx->loss, opt_ctx->next_loss_scale);
@@ -637,13 +640,15 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
     }
 
-    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY) {
+    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS) {
         opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
         ggml_set_name(opt_ctx->pred, "pred");
         ggml_set_output(opt_ctx->pred);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->pred);
 
-        opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, ggml_argmax(ctx_results, opt_ctx->labels));
+        ggml_tensor * truth = opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS
+            ? opt_ctx->labels : ggml_argmax(ctx_results, opt_ctx->labels);
+        opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, truth);
         ggml_set_name(opt_ctx->ncorrect, "ncorrect");
         ggml_set_output(opt_ctx->ncorrect);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->ncorrect);
@@ -1171,6 +1176,24 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         }
     }
     opt_ctx->allocated_graph = graph;
+
+    // GGML_OPT_TOP=N: the graph's N largest tensors (views excluded), where its memory goes
+    if (const char * top = getenv("GGML_OPT_TOP")) {
+        ggml_cgraph * g = opt_ctx->allocated_graph_copy;
+        std::vector<std::pair<size_t, const ggml_tensor *>> rows;
+        for (int i = 0; i < g->n_nodes; ++i) {
+            if (g->nodes[i]->view_src == nullptr) {
+                rows.emplace_back(ggml_nbytes(g->nodes[i]), g->nodes[i]);
+            }
+        }
+        std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
+        const size_t n = std::min<size_t>(rows.size(), (size_t) atoi(top));
+        for (size_t i = 0; i < n; ++i) {
+            const ggml_tensor * t = rows[i].second;
+            GGML_LOG_INFO("%s: top %2zu: %8.1f MiB %-12s %-6s [%lld,%lld,%lld,%lld] %s\n", __func__, i, rows[i].first/1048576.0,
+                ggml_op_desc(t), ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->name);
+        }
+    }
 
     opt_ctx->eval_ready = true;
     return true;

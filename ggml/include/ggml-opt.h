@@ -32,6 +32,10 @@ extern "C" {
         GGML_OPT_LOSS_TYPE_SUM,
         GGML_OPT_LOSS_TYPE_CROSS_ENTROPY,
         GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR,
+        // GGML_OPT_LOSS_TYPE_CROSS_ENTROPY with one I32 target per output row (-1: no loss) in place of a one-hot
+        // row as wide as the outputs: what a language model's training step needs (its outputs are
+        // vocabulary-wide logits)
+        GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS,
     };
 
     // ====== Dataset ======
