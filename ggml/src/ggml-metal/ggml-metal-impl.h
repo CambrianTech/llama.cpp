@@ -482,6 +482,22 @@ typedef struct {
 } ggml_metal_kargs_mul_mm;
 
 typedef struct {
+    int32_t  ne00; // m: dst rows
+    int32_t  ne01; // k: the contraction, rows of both sources
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne10; // n: dst columns
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne2;
+    int32_t  dps2; // dst per src0 along dim 2 (grouped heads)
+    int32_t  dps3;
+} ggml_metal_kargs_out_prod;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;
