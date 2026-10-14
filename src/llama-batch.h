@@ -50,6 +50,7 @@ struct llama_ubatch {
     llama_seq_id *  seq_id_unq; // [n_seqs_unq]       | s   | seq_id
     int32_t      *  seq_idx;    // [LLAMA_MAX_SEQ]    | -   | seq_idx
     int8_t       *  output;     // [n_tokens]         | i   | -
+    llama_token  *  label;      // [n_tokens]         | i   | training target, -1 for none (nullptr: inference)
 
     struct data_t {
         std::vector<llama_token>    token;
@@ -60,6 +61,7 @@ struct llama_ubatch {
         std::vector<llama_seq_id>   seq_id_unq;
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
+        std::vector<llama_token>    label;
 
         std::vector<llama_seq_id> seq_id_data;
     };
@@ -87,6 +89,9 @@ public:
 
     uint32_t get_n_tokens()  const;
     uint32_t get_n_outputs() const;
+
+    // labelled positions (training rows) in the batch; 0 for an inference batch
+    uint32_t get_n_labels() const;
     uint32_t get_n_used()    const;
 
     // the array of output indices in the order they were encountered during the ubatch splitting
@@ -136,6 +141,7 @@ private:
     uint32_t n_embd;
     uint32_t n_seq_max;
     uint32_t n_outputs;
+    uint32_t n_labels = 0;
 
     std::array<llama_seq_id, 1> seq_id_0 = {{ 0 }}; // default sequence id
 

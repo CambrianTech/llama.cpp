@@ -252,6 +252,11 @@ extern "C" {
     //               - if embeddings: all tokens are output
     //               - if not:        only the last token is output
     //            )
+    // - label  : the token the model should have predicted at this position, which makes the
+    //            position a training row: llama_decode then also runs the loss, the backward and
+    //            the optimizer write of the context's trainable adapter (llama_opt_init), in the
+    //            same graph as the batch's other rows. -1 marks a position with no label.
+    //            (if set to NULL, the batch is inference only, unchanged)
     //
     typedef struct llama_batch {
         int32_t n_tokens;
@@ -262,6 +267,7 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+        llama_token  *  label;
     } llama_batch;
 
     enum llama_model_kv_override_type {
