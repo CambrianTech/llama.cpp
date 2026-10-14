@@ -7528,21 +7528,34 @@ struct test_flash_attn_ext_grad : public test_case {
 struct test_flash_attn_back : public test_case {
     const int64_t   hs, nh, nhkv, kv, nb;
     const ggml_type type_kv;
+    const int64_t dv;
+    const ggml_type type_v;
+    const bool strided;
+    const int mask_mode; // 0: none, 1: causal, 2: per-head with a fully masked row
 
     std::string vars() override {
-        return VARS_TO_STR6(hs, nh, nhkv, kv, nb, type_kv);
+        return VARS_TO_STR6(hs, nh, nhkv, kv, nb, type_kv) + "," + VARS_TO_STR4(dv, type_v, strided, mask_mode);
     }
 
-    test_flash_attn_back(int64_t hs = 128, int64_t nh = 8, int64_t nhkv = 2, int64_t kv = 512, int64_t nb = 64, ggml_type type_kv = GGML_TYPE_F16)
-        : hs(hs), nh(nh), nhkv(nhkv), kv(kv), nb(nb), type_kv(type_kv) {}
+    test_flash_attn_back(int64_t hs = 128, int64_t nh = 8, int64_t nhkv = 2, int64_t kv = 512, int64_t nb = 64, ggml_type type_kv = GGML_TYPE_F16,
+            int64_t dv = 0, ggml_type type_v = GGML_TYPE_COUNT, bool strided = false, int mask_mode = 1)
+        : hs(hs), nh(nh), nhkv(nhkv), kv(kv), nb(nb), type_kv(type_kv), dv(dv ? dv : hs),
+          type_v(type_v == GGML_TYPE_COUNT ? type_kv : type_v), strided(strided), mask_mode(mask_mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nb, nh);
-        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_kv, hs, kv, nhkv);
-        ggml_tensor * v = ggml_new_tensor_3d(ctx, type_kv, hs, kv, nhkv);
-        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, nb);
-        ggml_tensor * d = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh, nb);
-        ggml_set_name(q, "q"); ggml_set_name(k, "k"); ggml_set_name(v, "v"); ggml_set_name(m, "m"); ggml_set_name(d, "d");
+        ggml_tensor * q = strided ? ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nb, hs, nh), 1, 0, 2, 3)
+                                 : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nb, nh);
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_kv, hs, kv + strided, nhkv);
+        ggml_tensor * v = ggml_new_tensor_3d(ctx, type_v, dv, kv + strided, nhkv);
+        if (strided) {
+            k = ggml_view_3d(ctx, k, hs, kv, nhkv, k->nb[1], k->nb[2], 0);
+            v = ggml_view_3d(ctx, v, dv, kv, nhkv, v->nb[1], v->nb[2], 0);
+        }
+        ggml_tensor * m = mask_mode ? ggml_new_tensor_3d(ctx, GGML_TYPE_F16, kv, nb, mask_mode == 2 ? nh : 1) : nullptr;
+        ggml_tensor * d = strided ? ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nh, dv, nb), 1, 0, 2, 3)
+                                 : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dv, nh, nb);
+        ggml_set_name(q, "q"); ggml_set_name(k, "k"); ggml_set_name(v, "v"); ggml_set_name(d, "d");
+        if (m) { ggml_set_name(m, "m"); }
         ggml_tensor * out = ggml_flash_attn_back(ctx, q, k, v, m, d, 1.0f/sqrtf((float) hs));
         ggml_set_name(out, "out");
         return out;
@@ -7551,7 +7564,19 @@ struct test_flash_attn_back : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (mask_mode == 2) {
+                    std::vector<ggml_fp16_t> mask(ggml_nelements(t));
+                    for (int64_t h = 0; h < nh; ++h) {
+                        for (int64_t i = 0; i < nb; ++i) {
+                            for (int64_t j = 0; j < kv; ++j) {
+                                mask[(h*nb + i)*kv + j] = ggml_fp32_to_fp16(i == 0 || j > i + h ? -INFINITY : 0.0f);
+                            }
+                        }
+                    }
+                    ggml_backend_tensor_set(t, mask.data(), 0, ggml_nbytes(t));
+                } else {
+                    init_tensor_kq_mask(t);
+                }
             } else {
                 init_tensor_uniform(t);
             }
@@ -10493,6 +10518,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_back(128, 8, 2, 512, 64, t));
     }
     test_cases.emplace_back(new test_flash_attn_back(256, 16, 4, 300, 37, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_back(64, 4, 2, 37, 7, GGML_TYPE_Q8_0, 96, GGML_TYPE_F16, true, 2));
+    test_cases.emplace_back(new test_flash_attn_back(33, 4, 2, 41, 9, GGML_TYPE_F32, 19, GGML_TYPE_F32, true, 0));
     test_cases.emplace_back(new test_cross_entropy_loss_index());
     test_cases.emplace_back(new test_cross_entropy_loss_index({30000, 2, 1, 1})); // a vocabulary's width; few rows keep the finite difference above f32 rounding
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -10934,6 +10961,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    for (int64_t kv : {512, 8192}) {
+        test_cases.emplace_back(new test_flash_attn_back(128, 8, 2, kv, 64, GGML_TYPE_Q8_0));
+    }
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
