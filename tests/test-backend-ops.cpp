@@ -9774,6 +9774,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                       type_a == GGML_TYPE_F32 ? 1024 : 256, 1024, 8, {1, 1}, {1, 1}, trans_b, true));
         }
     }
+    // the batched, broadcast shape a delta-net backward hands OUT_PROD on the 4B (16 value heads
+    // over 4 key heads, head width 256 and 128), both gradient layouts
+    for (bool trans_b : {false, true}) {
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 256, 128, 256, {4, 1}, {4, 1}, trans_b));
+    }
+    // a LoRA parameter gradient: the rank is the OUTPUT width (dA, dB = out_prod(x, grad) with
+    // m = rank), not the contraction; ranks below and between multiples of 16, at the 4B walk's
+    // shapes (8192 tokens, 128 and 1024 wide), both layouts
+    for (int64_t rank : {4, 8, 24}) {
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, rank, 128, 8192, {1, 1}, {1, 1}, true));
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, rank, 8192, 128, {1, 1}, {1, 1}, false));
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, rank, 1024, 128, {1, 1}, {1, 1}, false));
+    }
     // the q8_0 three-block case in both gradient layouts: the training graph hands
     // out_prod a TRANSPOSED gradient (out_prod(W, ggml_transpose(grad)))
     for (bool trans_b : {false, true}) {
