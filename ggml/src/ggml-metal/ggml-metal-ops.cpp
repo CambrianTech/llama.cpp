@@ -312,6 +312,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_cross_entropy_loss_back(ctx, idx);
             } break;
+        case GGML_OP_FLASH_ATTN_BACK:
+            {
+                n_fuse = ggml_metal_op_flash_attn_back(ctx, idx);
+            } break;
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_SOFT_MAX_BACK:
             {
@@ -4231,6 +4235,63 @@ int ggml_metal_op_cross_entropy_loss(ggml_metal_op_t ctx, int idx) {
     sum.src[0] = &rows;
     sum.src[1] = nullptr;
     ggml_metal_op_sum_impl(ctx, &sum);
+
+    return 1;
+}
+
+// FLASH_ATTN_BACK: the Q pass (dq, and each row's lse and D into the scratch after dv), then the
+// KV pass, which reads them
+int ggml_metal_op_flash_attn_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q    = op->src[0];
+    const ggml_tensor * k    = op->src[1];
+    const ggml_tensor * v    = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+    const ggml_tensor * d    = op->src[4];
+
+    ggml_metal_kargs_flash_attn_back args = {
+        /*.D        =*/ (int32_t) q->ne[0],
+        /*.Dv       =*/ (int32_t) v->ne[0],
+        /*.N        =*/ (int32_t) q->ne[1],
+        /*.H        =*/ (int32_t) q->ne[2],
+        /*.M        =*/ (int32_t) k->ne[1],
+        /*.Hkv      =*/ (int32_t) k->ne[2],
+        /*.nbq1     =*/ q->nb[1],
+        /*.nbq2     =*/ q->nb[2],
+        /*.nbk1     =*/ k->nb[1],
+        /*.nbk2     =*/ k->nb[2],
+        /*.nbv1     =*/ v->nb[1],
+        /*.nbv2     =*/ v->nb[2],
+        /*.nbd1     =*/ d->nb[1],
+        /*.nbd2     =*/ d->nb[2],
+        /*.nbm1     =*/ mask ? mask->nb[1] : 0,
+        /*.nbm2     =*/ mask ? mask->nb[2] : 0,
+        /*.nem2     =*/ mask ? (int32_t) mask->ne[2] : 1,
+        /*.has_mask =*/ mask ? 1 : 0,
+        /*.scale    =*/ ggml_get_op_params_f32(op, 0),
+        /*.offs_dk  =*/ ggml_flash_attn_back_offset(op, 1),
+        /*.offs_dv  =*/ ggml_flash_attn_back_offset(op, 2),
+        /*.offs_lse =*/ ggml_flash_attn_back_offset(op, 3),
+    };
+
+    for (int pass = 0; pass < 2; ++pass) {
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_back(lib, op, pass == 1);
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(k), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(v), 3);
+        ggml_metal_encoder_set_buffer  (enc, mask ? ggml_metal_get_buffer_id(mask) : ggml_metal_get_buffer_id(q), 4);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(d), 5);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 6);
+        const int ngroups = pass == 0 ? args.N*args.H : args.M*args.Hkv;
+        ggml_metal_encoder_dispatch_threadgroups(enc, ngroups, 1, 1, 32, 1, 1);
+        ggml_metal_op_concurrency_reset(ctx);
+    }
 
     return 1;
 }

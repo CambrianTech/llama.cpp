@@ -2254,3 +2254,193 @@ template [[host_name("kernel_lightning_indexer_q4_1")]] kernel kernel_lightning_
 template [[host_name("kernel_lightning_indexer_q5_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_lightning_indexer_q5_1")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_lightning_indexer_q8_0")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<block_q8_0, 2, dequantize_q8_0>;
+
+// FLASH_ATTN_BACK: the gradients of FLASH_ATTN_EXT, recomputing the scores instead of keeping
+// them, so the memory is the gradients alone (the CPU reference: ggml-cpu ops.cpp
+// ggml_compute_forward_flash_attn_back_f32). One simdgroup per row; each lane holds every 32nd
+// element of a row. Pass Q, per query row and head: the row's log-sum-exp over the window, then
+// in one more sweep D = sum_j p_j dp_j, A = sum_j p_j dp_j k_j and B = sum_j p_j k_j, so
+// dq = scale (A - D B). Pass KV, per KV position and KV head: dk and dv summed over the query
+// rows of every head in its group, from the lse and D the Q pass wrote.
+
+#define FA_BACK_MAX_D 512
+
+template <typename T>
+static inline float fa_back_elem(device const char * row, int c);
+
+template <> inline float fa_back_elem<float>(device const char * row, int c) { return ((device const float *) row)[c]; }
+template <> inline float fa_back_elem<half> (device const char * row, int c) { return (float) ((device const half *) row)[c]; }
+template <> inline float fa_back_elem<block_q8_0>(device const char * row, int c) {
+    device const block_q8_0 * b = (device const block_q8_0 *) row + c/QK8_0;
+    return (float) b->d * (float) b->qs[c%QK8_0];
+}
+
+static inline float fa_back_mask(constant ggml_metal_kargs_flash_attn_back & args, device const char * mask, int j, int i, int h) {
+    if (!args.has_mask) {
+        return 0.0f;
+    }
+    return (float) ((device const half *) (mask + i*args.nbm1 + (h % args.nem2)*args.nbm2))[j];
+}
+
+template <typename T>
+kernel void kernel_flash_attn_back_q(
+        constant ggml_metal_kargs_flash_attn_back & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * d,
+        device       char * dst,
+        uint  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int i  = tgpig % args.N;
+    const int h  = tgpig / args.N;
+    const int hk = h / (args.H / args.Hkv);
+
+    const int nq = args.D  / 32;
+    const int nv = args.Dv / 32;
+    float qr[FA_BACK_MAX_D/32], dr[FA_BACK_MAX_D/32], a[FA_BACK_MAX_D/32], b[FA_BACK_MAX_D/32];
+    for (int c = 0; c < nq; ++c) {
+        qr[c] = *(device const float *) (q + (tiisg + 32*c)*sizeof(float) + i*args.nbq1 + h*args.nbq2);
+        a[c] = 0.0f;
+        b[c] = 0.0f;
+    }
+    for (int c = 0; c < nv; ++c) {
+        dr[c] = *(device const float *) (d + (tiisg + 32*c)*sizeof(float) + h*args.nbd1 + i*args.nbd2);
+    }
+
+    // the log-sum-exp, online
+    float m = -INFINITY;
+    float l = 0.0f;
+    for (int j = 0; j < args.M; ++j) {
+        const float mj = fa_back_mask(args, mask, j, i, h);
+        if (mj == -INFINITY) {
+            continue;
+        }
+        device const char * kr = k + j*args.nbk1 + hk*args.nbk2;
+        float s = 0.0f;
+        for (int c = 0; c < nq; ++c) {
+            s += qr[c]*fa_back_elem<T>(kr, tiisg + 32*c);
+        }
+        s = simd_sum(s)*args.scale + mj;
+        const float mn = max(m, s);
+        l = l*exp(m - mn) + exp(s - mn);
+        m = mn;
+    }
+    const float lse = m == -INFINITY ? -INFINITY : m + log(l);
+
+    // D, A and B in one sweep
+    float dd = 0.0f;
+    if (lse != -INFINITY) {
+        for (int j = 0; j < args.M; ++j) {
+            const float mj = fa_back_mask(args, mask, j, i, h);
+            if (mj == -INFINITY) {
+                continue;
+            }
+            device const char * kr = k + j*args.nbk1 + hk*args.nbk2;
+            device const char * vr = v + j*args.nbv1 + hk*args.nbv2;
+            float s = 0.0f;
+            for (int c = 0; c < nq; ++c) {
+                s += qr[c]*fa_back_elem<T>(kr, tiisg + 32*c);
+            }
+            float dp = 0.0f;
+            for (int c = 0; c < nv; ++c) {
+                dp += dr[c]*fa_back_elem<T>(vr, tiisg + 32*c);
+            }
+            const float p = exp(simd_sum(s)*args.scale + mj - lse);
+            dp = simd_sum(dp);
+            dd += p*dp;
+            for (int c = 0; c < nq; ++c) {
+                const float kc = fa_back_elem<T>(kr, tiisg + 32*c);
+                a[c] += p*dp*kc;
+                b[c] += p*kc;
+            }
+        }
+    }
+
+    device float * dq = (device float *) dst + (h*args.N + i)*args.D;
+    for (int c = 0; c < nq; ++c) {
+        dq[tiisg + 32*c] = args.scale*(a[c] - dd*b[c]);
+    }
+    if (tiisg == 0) {
+        device float * lsev = (device float *) (dst + args.offs_lse);
+        lsev[h*args.N + i] = lse;
+        lsev[args.N*args.H + h*args.N + i] = dd;
+    }
+}
+
+template <typename T>
+kernel void kernel_flash_attn_back_kv(
+        constant ggml_metal_kargs_flash_attn_back & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * d,
+        device       char * dst,
+        uint  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int j  = tgpig % args.M;
+    const int hk = tgpig / args.M;
+    const int G  = args.H / args.Hkv;
+
+    const int nq = args.D  / 32;
+    const int nv = args.Dv / 32;
+    float kr[FA_BACK_MAX_D/32], vr[FA_BACK_MAX_D/32], gk[FA_BACK_MAX_D/32], gv[FA_BACK_MAX_D/32];
+    device const char * kp = k + j*args.nbk1 + hk*args.nbk2;
+    device const char * vp = v + j*args.nbv1 + hk*args.nbv2;
+    for (int c = 0; c < nq; ++c) {
+        kr[c] = fa_back_elem<T>(kp, tiisg + 32*c);
+        gk[c] = 0.0f;
+    }
+    for (int c = 0; c < nv; ++c) {
+        vr[c] = fa_back_elem<T>(vp, tiisg + 32*c);
+        gv[c] = 0.0f;
+    }
+    device const float * lsev = (device const float *) (dst + args.offs_lse);
+    for (int h = hk*G; h < (hk + 1)*G; ++h) {
+        for (int i = 0; i < args.N; ++i) {
+            const float lse = lsev[h*args.N + i];
+            const float mj  = fa_back_mask(args, mask, j, i, h);
+            if (lse == -INFINITY || mj == -INFINITY) {
+                continue;
+            }
+            device const char * qp = q + i*args.nbq1 + h*args.nbq2;
+            device const char * dp = d + h*args.nbd1 + i*args.nbd2;
+            float s = 0.0f;
+            float t = 0.0f;
+            for (int c = 0; c < nq; ++c) {
+                s += ((device const float *) qp)[tiisg + 32*c]*kr[c];
+            }
+            for (int c = 0; c < nv; ++c) {
+                t += ((device const float *) dp)[tiisg + 32*c]*vr[c];
+            }
+            const float p  = exp(simd_sum(s)*args.scale + mj - lse);
+            const float ds = p*(simd_sum(t) - lsev[args.N*args.H + h*args.N + i])*args.scale;
+            for (int c = 0; c < nq; ++c) {
+                gk[c] += ds*((device const float *) qp)[tiisg + 32*c];
+            }
+            for (int c = 0; c < nv; ++c) {
+                gv[c] += p*((device const float *) dp)[tiisg + 32*c];
+            }
+        }
+    }
+    device float * dk = (device float *) (dst + args.offs_dk) + (hk*args.M + j)*args.D;
+    device float * dv = (device float *) (dst + args.offs_dv) + (hk*args.M + j)*args.Dv;
+    for (int c = 0; c < nq; ++c) {
+        dk[tiisg + 32*c] = gk[c];
+    }
+    for (int c = 0; c < nv; ++c) {
+        dv[tiisg + 32*c] = gv[c];
+    }
+}
+
+typedef decltype(kernel_flash_attn_back_q<float>)  kernel_flash_attn_back_q_t;
+typedef decltype(kernel_flash_attn_back_kv<float>) kernel_flash_attn_back_kv_t;
+
+template [[host_name("kernel_flash_attn_back_q_f32")]]   kernel kernel_flash_attn_back_q_t  kernel_flash_attn_back_q<float>;
+template [[host_name("kernel_flash_attn_back_q_f16")]]   kernel kernel_flash_attn_back_q_t  kernel_flash_attn_back_q<half>;
+template [[host_name("kernel_flash_attn_back_q_q8_0")]]  kernel kernel_flash_attn_back_q_t  kernel_flash_attn_back_q<block_q8_0>;
+template [[host_name("kernel_flash_attn_back_kv_f32")]]  kernel kernel_flash_attn_back_kv_t kernel_flash_attn_back_kv<float>;
+template [[host_name("kernel_flash_attn_back_kv_f16")]]  kernel kernel_flash_attn_back_kv_t kernel_flash_attn_back_kv<half>;
+template [[host_name("kernel_flash_attn_back_kv_q8_0")]] kernel kernel_flash_attn_back_kv_t kernel_flash_attn_back_kv<block_q8_0>;

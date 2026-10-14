@@ -2480,14 +2480,26 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // TODO: needs to be adapted to ggml_flash_attn_ext
+    // The gradients of ggml_flash_attn_ext(q, k, v, mask, scale) (no ALiBi, softcap or sinks), given
+    // d, the gradient of its output in the output's layout [Dv, H, N]. One op, recomputing the
+    // scores per block instead of keeping them: memory is the gradients alone. The result is F32:
+    // dQ ([D, N, H]), dK (k's shape), dV (v's shape), each contiguous at
+    // ggml_flash_attn_back_offset, then each query row's log-sum-exp and D = sum_j p_ij dp_ij,
+    // which the kernels pass between their passes.
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
            struct ggml_tensor  * q,
            struct ggml_tensor  * k,
            struct ggml_tensor  * v,
+           struct ggml_tensor  * mask,
            struct ggml_tensor  * d,
-           bool                  masked);
+           float                 scale);
+
+    // byte offset in a ggml_flash_attn_back result of: 0 dQ, 1 dK, 2 dV, 3 the per-row scratch
+    GGML_API size_t ggml_flash_attn_back_offset(const struct ggml_tensor * back, int part);
+
+    // the backward of FLASH_ATTN_EXT as the one op above (ggml_flash_attn_ext_set_back_tile)
+    #define GGML_FA_BACK_NATIVE (-1)
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,

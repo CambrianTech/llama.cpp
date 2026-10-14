@@ -5542,71 +5542,52 @@ void ggml_flash_attn_ext_add_sinks(
 
 // ggml_flash_attn_back
 
+size_t ggml_flash_attn_back_offset(const struct ggml_tensor * back, int part) {
+    const struct ggml_tensor * q = back->src[0];
+    const struct ggml_tensor * k = back->src[1];
+    const struct ggml_tensor * v = back->src[2];
+    const size_t sizes[3] = {
+        GGML_PAD((size_t) q->ne[0]*q->ne[1]*q->ne[2]*sizeof(float), GGML_MEM_ALIGN),
+        GGML_PAD((size_t) ggml_nelements(k)*sizeof(float),       GGML_MEM_ALIGN),
+        GGML_PAD((size_t) ggml_nelements(v)*sizeof(float),       GGML_MEM_ALIGN),
+    };
+    size_t offs = 0;
+    for (int i = 0; i < part; ++i) {
+        offs += sizes[i];
+    }
+    return offs;
+}
+
 struct ggml_tensor * ggml_flash_attn_back(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
         struct ggml_tensor  * d,
-        bool                  masked) {
-    GGML_ABORT("TODO: adapt to ggml_flash_attn_ext() changes");
+        float                 scale) {
+    // q [D, N, H, 1], k [D, M, Hkv, 1], v [Dv, M, Hkv, 1], d [Dv, H, N, 1], mask [M', N', 1|H, 1]
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && d->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 && "one sequence stream");
+    GGML_ASSERT(k->ne[0] == q->ne[0] && v->ne[1] == k->ne[1] && v->ne[2] == k->ne[2]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(d->ne[0] == v->ne[0] && d->ne[1] == q->ne[2] && d->ne[2] == q->ne[1]);
+    GGML_ASSERT(!mask || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= k->ne[1] && mask->ne[1] >= q->ne[1]));
 
-    GGML_ASSERT(ggml_can_mul_mat(k, q));
-    // TODO: check if vT can be multiplied by (k*qT)
+    const size_t rows  = (size_t) q->ne[1]*q->ne[2];
+    struct ggml_tensor tmp = { 0 };
+    tmp.src[0] = q; tmp.src[1] = k; tmp.src[2] = v;
+    const size_t bytes = ggml_flash_attn_back_offset(&tmp, 3) + 2*rows*sizeof(float);
 
-    // d shape [D,N,ne2,ne3]
-    // q shape [D,N,ne2,ne3]
-    // k shape [D,M,kvne2,ne3]
-    // v shape [M,D,kvne2,ne3]
-
-    const int64_t     D = q->ne[0];
-    const int64_t     N = q->ne[1];
-    const int64_t     M = k->ne[1];
-    const int64_t   ne2 = q->ne[2];
-    const int64_t   ne3 = q->ne[3];
-    const int64_t kvne2 = k->ne[2];
-
-    GGML_ASSERT(k->ne[0] == D);
-    GGML_ASSERT(v->ne[0] == M);
-    GGML_ASSERT(v->ne[1] == D);
-    GGML_ASSERT(d->ne[0] == D);
-    GGML_ASSERT(d->ne[1] == N);
-    GGML_ASSERT(k->ne[2] == kvne2);
-    GGML_ASSERT(k->ne[3] == ne3);
-    GGML_ASSERT(v->ne[2] == kvne2);
-    GGML_ASSERT(v->ne[3] == ne3);
-    GGML_ASSERT(d->ne[2] == ne2);
-    GGML_ASSERT(d->ne[3] == ne3);
-
-    GGML_ASSERT(ne2 % kvne2 == 0);
-
-    // store gradients of q, k and v as continuous tensors concatenated in result.
-    // note: v and gradv are actually transposed, i.e. v->ne[0] != D.
-    const int64_t elem_q = ggml_nelements(q);
-    const int64_t elem_k = ggml_nelements(k);
-    const int64_t elem_v = ggml_nelements(v);
-
-    enum ggml_type result_type = GGML_TYPE_F32;
-    GGML_ASSERT(ggml_blck_size(result_type) == 1);
-    const size_t tsize = ggml_type_size(result_type);
-
-    const size_t offs_q = 0;
-    const size_t offs_k = offs_q + GGML_PAD(elem_q * tsize, GGML_MEM_ALIGN);
-    const size_t offs_v = offs_k + GGML_PAD(elem_k * tsize, GGML_MEM_ALIGN);
-    const size_t end    = offs_v + GGML_PAD(elem_v * tsize, GGML_MEM_ALIGN);
-
-    const size_t nelements = (end + tsize - 1)/tsize;
-
-    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nelements);
-
-    int32_t masked_i = masked ? 1 : 0;
-    ggml_set_op_params(result, &masked_i, sizeof(masked_i));
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) (bytes/sizeof(float)));
+    ggml_set_op_params_f32(result, 0, scale);
 
     result->op     = GGML_OP_FLASH_ATTN_BACK;
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;
-    result->src[3] = d;
+    result->src[3] = mask;
+    result->src[4] = d;
 
     return result;
 }
@@ -6826,6 +6807,26 @@ static void ggml_flash_attn_ext_backward(
     GGML_ASSERT(q->ne[3] == 1 && "flash_attn_ext backward: one sequence stream");
 
     int32_t tile = ggml_get_op_params_i32(tensor, 4);
+    if (tile == GGML_FA_BACK_NATIVE) {
+        struct ggml_tensor * b = ggml_flash_attn_back(ctx, q, k, v, mask, grad, scale);
+        // views of the packed result, each a contiguous tensor shaped like its source
+        struct ggml_tensor * dq = ggml_view_3d(ctx, b, q->ne[0], q->ne[1], q->ne[2], q->ne[0]*sizeof(float), q->ne[0]*q->ne[1]*sizeof(float),
+                ggml_flash_attn_back_offset(b, 0));
+        struct ggml_tensor * dk = ggml_view_4d(ctx, b, k->ne[0], k->ne[1], k->ne[2], k->ne[3], k->ne[0]*sizeof(float),
+                k->ne[0]*k->ne[1]*sizeof(float), k->ne[0]*k->ne[1]*k->ne[2]*sizeof(float), ggml_flash_attn_back_offset(b, 1));
+        struct ggml_tensor * dv = ggml_view_4d(ctx, b, v->ne[0], v->ne[1], v->ne[2], v->ne[3], v->ne[0]*sizeof(float),
+                v->ne[0]*v->ne[1]*sizeof(float), v->ne[0]*v->ne[1]*v->ne[2]*sizeof(float), ggml_flash_attn_back_offset(b, 2));
+        if (dq_needed) {
+            ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape_4d(ctx, ggml_cont(ctx, dq), q->ne[0], q->ne[1], q->ne[2], q->ne[3]));
+        }
+        if (dk_needed) {
+            ggml_add_or_set(ctx, cgraph, isrc1, dk);
+        }
+        if (dv_needed) {
+            ggml_add_or_set(ctx, cgraph, isrc2, dv);
+        }
+        return;
+    }
     if (tile <= 0) {
         tile = GGML_FA_BACK_TILE_DEFAULT;
     }

@@ -2666,7 +2666,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
         if (cparams.training) {
-            ggml_flash_attn_ext_set_back_tile(cur, 0); // the backward's default tile
+            ggml_flash_attn_ext_set_back_tile(cur, cparams.fa_back_native ? GGML_FA_BACK_NATIVE : 0);
         }
 
         if (v_mla) {

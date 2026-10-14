@@ -40,6 +40,44 @@ static bool llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
     return true;
 }
 
+// whether every GPU this context computes on has a kernel for ggml_flash_attn_back, at this
+// model's attention shape and this context's cache types (the CPU has one)
+bool llama_context::opt_fa_back_native() const {
+    const llama_hparams & hp = model.hparams;
+    uint32_t il = 0;
+    while (il < hp.n_layer() && hp.is_recr(il)) {
+        ++il;
+    }
+    if (il == hp.n_layer()) {
+        return false; // no attention layer
+    }
+    // the cache the step's attention reads in place
+    const llama_kv_cache * kv = dynamic_cast<const llama_kv_cache *>(memory.get());
+    if (const auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(memory.get())) {
+        kv = hybrid->get_mem_attn();
+    }
+    if (kv == nullptr) {
+        return false;
+    }
+    ggml_init_params ip = { 8*ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+    ggml_context_ptr ctx(ggml_init(ip));
+    const int64_t H = hp.n_head(il), Hkv = hp.n_head_kv(il), D = hp.n_embd_head_k(il), Dv = hp.n_embd_head_v(il);
+    ggml_tensor * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, D,  8,  H);
+    ggml_tensor * k = ggml_new_tensor_3d(ctx.get(), kv->type_k(), D, 64, Hkv);
+    ggml_tensor * v = ggml_new_tensor_3d(ctx.get(), kv->type_v(), Dv, 64, Hkv);
+    ggml_tensor * m = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, 64, 8);
+    ggml_tensor * d = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, Dv, H, 8);
+    ggml_tensor * op = ggml_flash_attn_back(ctx.get(), q, k, v, m, d, 1.0f);
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        const auto type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+        if ((type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) && !ggml_backend_dev_supports_op(dev, op)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
     // The training window lives on this context, not the shared model (a serving context may
@@ -75,6 +113,10 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                     max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     }
+
+    cparams.fa_back_native = opt_fa_back_native();
+    LLAMA_LOG_INFO("%s: the attention backward is %s\n", __func__,
+            cparams.fa_back_native ? "one op (ggml_flash_attn_back): no score is kept" : "composed from tiles (a device has no ggml_flash_attn_back kernel)");
 
     // one target token per row: no one-hot tensor as wide as the vocabulary beside the logits
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS);

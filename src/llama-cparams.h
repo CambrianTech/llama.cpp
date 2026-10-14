@@ -22,6 +22,9 @@ struct llama_cparams {
     // the run's positions] F32 in host memory (null for a recurrent layer), row 0 at position
     // walk_acc_base; a chunk's backward adds its prefix's share into rows [walk_grad_from, n_past)
     // and its surrogate reads its own rows.
+    // the attention backward is one op (ggml_flash_attn_back) on every device that would run it
+    // (llama_context::opt_init probes them), else the composed tiles
+    bool     fa_back_native = false;
     bool     walk_exact     = false;
     uint32_t walk_grad_from = 0;
     bool     walk_surrogate = false;

@@ -249,6 +249,7 @@ private:
     // plus the loss over the labelled rows, the backward and, at a period's end, the optimizer
     // step. A walk driving the decode adds its taps to that graph.
     bool opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch);
+    bool opt_fa_back_native() const;
 
     //
     // output

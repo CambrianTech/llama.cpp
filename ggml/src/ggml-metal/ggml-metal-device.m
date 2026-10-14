@@ -1477,6 +1477,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    (op->op != GGML_OP_SOFT_MAX_BACK || ggml_get_op_params_f32(op, 1) == 0.0f);
         case GGML_OP_REPEAT_BACK:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+        case GGML_OP_FLASH_ATTN_BACK:
+            // one simdgroup per row: head sizes a multiple of 32, at most 512 (FA_BACK_MAX_D)
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[4]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == op->src[2]->type &&
+                   (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_Q8_0) &&
+                   op->src[0]->ne[0] % 32 == 0 && op->src[2]->ne[0] % 32 == 0 &&
+                   op->src[0]->ne[0] <= 512 && op->src[2]->ne[0] <= 512 &&
+                   op->src[0]->nb[0] == sizeof(float) && op->src[4]->nb[0] == sizeof(float) &&
+                   (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_F16);
         case GGML_OP_CROSS_ENTROPY_LOSS:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_I32) &&

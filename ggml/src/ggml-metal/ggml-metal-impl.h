@@ -888,6 +888,33 @@ typedef struct {
     uint64_t nb1;
 } ggml_metal_kargs_cross_entropy_loss;
 
+// FLASH_ATTN_BACK (ggml_flash_attn_back): q [D, N, H], k [D, M, Hkv], v [Dv, M, Hkv], d [Dv, H, N],
+// mask [M', N', ne32] F16; the result's parts at byte offsets offs_dk / offs_dv / offs_lse
+typedef struct {
+    int32_t  D;
+    int32_t  Dv;
+    int32_t  N;
+    int32_t  H;
+    int32_t  M;
+    int32_t  Hkv;
+    uint64_t nbq1;
+    uint64_t nbq2;
+    uint64_t nbk1;
+    uint64_t nbk2;
+    uint64_t nbv1;
+    uint64_t nbv2;
+    uint64_t nbd1;
+    uint64_t nbd2;
+    uint64_t nbm1;
+    uint64_t nbm2;
+    int32_t  nem2;
+    int32_t  has_mask;
+    float    scale;
+    uint64_t offs_dk;
+    uint64_t offs_dv;
+    uint64_t offs_lse;
+} ggml_metal_kargs_flash_attn_back;
+
 // a per-row backward with one scalar parameter (eps for RMS_NORM_BACK, scale for SOFT_MAX_BACK)
 typedef struct {
     int32_t  ne00;
