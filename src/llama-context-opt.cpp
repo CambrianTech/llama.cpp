@@ -304,6 +304,9 @@ bool llama_context::opt_walk::train_chunk(uint32_t pos_ctx, uint32_t n_chunk) {
     return true;
 }
 
+// what one slice of the training head's logits may hold (see opt_ubatch)
+static constexpr size_t OPT_HEAD_SLICE_BYTES = 64u*1024*1024;
+
 bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch) {
     // the loss is the mean over the logits rows: a serving row among them would dilute it
     if (ubatch.n_labels() != n_outputs) {
@@ -325,7 +328,12 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
         };
         ctx_compute_opt = ggml_init(params);
     }
-    ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
+    // THE HEAD A SLICE OF ROWS AT A TIME: the logits of a chunk and their gradient were the
+    // largest tensors of its graph ([vocab x rows] F32 each: 485 MiB apiece at a 248k vocabulary
+    // and 512 rows, the 4B at window 8192, 2026-10-14), and their size does not shrink with the
+    // model. A slice holds OPT_HEAD_SLICE_BYTES of logits.
+    const int64_t head_rows = std::max<int64_t>(1, (int64_t) (OPT_HEAD_SLICE_BYTES / (sizeof(float) * (size_t) model.vocab.n_tokens())));
+    ggml_opt_prepare_alloc_head(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_embd(), res->get_logits(), head_rows);
     if (xc != nullptr) {
         ggml_opt_set_next_step(opt_ctx, xc->period_end, xc->loss_scale, res->t_walk_surrogate);
         for (const auto & io : res->t_walk) {

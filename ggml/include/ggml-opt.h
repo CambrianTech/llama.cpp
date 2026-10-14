@@ -192,6 +192,22 @@ extern "C" {
         struct ggml_tensor  * inputs,
         struct ggml_tensor  * outputs);
 
+    // The same, for an `outputs` that is a row-wise function of `hidden` (a language model's
+    // head: logits = W x, with its adapters and scales; MUL_MAT, MUL, ADD and SCALE nodes): that
+    // head is taken out of gf and computed for `rows` rows of hidden at a time, and the loss is
+    // the mean over every row (GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS only). Under recompute
+    // (checkpoint_prefix) only one slice's outputs and their gradient exist at a time, never the
+    // [n_outputs x rows] tensor and its gradient. A head with any other node is not sliced.
+    // Returns the number of slices (1: not sliced; accuracy is reported only then).
+    GGML_API int ggml_opt_prepare_alloc_head(
+        ggml_opt_context_t    opt_ctx,
+        struct ggml_context * ctx_compute,
+        struct ggml_cgraph  * gf,
+        struct ggml_tensor  * inputs,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * outputs,
+        int64_t               rows);
+
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval
     // returns false when the graph could not be allocated (device memory): the graph is then NOT

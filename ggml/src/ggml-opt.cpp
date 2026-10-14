@@ -93,6 +93,8 @@ struct ggml_opt_context {
     // into a caller's tensor, for the graph prepared last
     std::unordered_map<const struct ggml_tensor *, std::pair<int64_t, struct ggml_tensor *>> next_grad_rows;
     std::vector<struct ggml_tensor *> grad_accs;
+    // ggml_opt_prepare_alloc_head: the outputs' row slices, in row order (empty: one outputs)
+    std::vector<struct ggml_tensor *> output_slices;
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
@@ -505,6 +507,18 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     return dst;
 }
 
+// the outputs' rows: every slice's when sliced
+static int64_t ggml_opt_output_rows(ggml_opt_context_t opt_ctx) {
+    if (opt_ctx->output_slices.empty()) {
+        return opt_ctx->outputs->ne[1];
+    }
+    int64_t n = 0;
+    for (const ggml_tensor * out : opt_ctx->output_slices) {
+        n += out->ne[1];
+    }
+    return n;
+}
+
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
@@ -518,7 +532,9 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
 
     ggml_set_input(opt_ctx->inputs);
-    ggml_set_output(opt_ctx->outputs);
+    if (opt_ctx->output_slices.empty()) {
+        ggml_set_output(opt_ctx->outputs);
+    }
 
     int n_param = 0;
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
@@ -588,11 +604,26 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY:
         case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS: {
             opt_ctx->labels = opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS
-                ? ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, ggml_nrows(opt_ctx->outputs))
+                ? ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, ggml_opt_output_rows(opt_ctx))
                 : ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);
             ggml_set_name(opt_ctx->labels, "labels");
-            opt_ctx->loss = ggml_cross_entropy_loss(ctx_results, opt_ctx->outputs, opt_ctx->labels);
+            if (opt_ctx->output_slices.empty()) {
+                opt_ctx->loss = ggml_cross_entropy_loss(ctx_results, opt_ctx->outputs, opt_ctx->labels);
+            } else {
+                // the mean over every row: each slice's mean weighted by its share of the rows
+                const int64_t n = opt_ctx->labels->ne[0];
+                int64_t r0 = 0;
+                ggml_tensor * sum = nullptr;
+                for (ggml_tensor * out : opt_ctx->output_slices) {
+                    const int64_t nr = out->ne[1];
+                    ggml_tensor * lab = ggml_view_1d(ctx_results, opt_ctx->labels, nr, r0*sizeof(int32_t));
+                    ggml_tensor * l   = ggml_scale(ctx_results, ggml_cross_entropy_loss(ctx_results, out, lab), (float) nr / (float) n);
+                    sum = sum ? ggml_add(ctx_results, sum, l) : l;
+                    r0 += nr;
+                }
+                opt_ctx->loss = sum;
+            }
             ggml_set_name(opt_ctx->loss, "loss_cross_entropy");
             if (opt_ctx->next_manual) {
                 // weighted by the caller below, beside its extra term
@@ -640,7 +671,11 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
     }
 
-    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS) {
+    // per-step graphs rebuild these: one left from the previous graph would be read after it is freed
+    opt_ctx->pred     = nullptr;
+    opt_ctx->ncorrect = nullptr;
+    if ((opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS)
+            && opt_ctx->output_slices.empty()) {
         opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
         ggml_set_name(opt_ctx->pred, "pred");
         ggml_set_output(opt_ctx->pred);
@@ -1003,6 +1038,91 @@ void ggml_opt_prepare_alloc(
     opt_ctx->outputs     = outputs;
     opt_ctx->next_grad_accs.clear(); // registrations belong to the graph prepared last
     opt_ctx->next_grad_rows.clear();
+    opt_ctx->output_slices.clear();
+}
+
+int ggml_opt_prepare_alloc_head(
+        ggml_opt_context_t    opt_ctx,
+        struct ggml_context * ctx_compute,
+        struct ggml_cgraph  * gf,
+        struct ggml_tensor  * inputs,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * outputs,
+        int64_t               rows) {
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
+    const int64_t n = hidden->ne[1];
+    if (opt_ctx->loss_type != GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS || rows <= 0 || rows >= n ||
+            !ggml_is_contiguous(hidden) || ggml_n_dims(hidden) > 2 || outputs->ne[1] != n) {
+        return 1;
+    }
+    // the head: the nodes between hidden and outputs, in graph order
+    std::unordered_set<const ggml_tensor *> on_path = { hidden };
+    std::vector<ggml_tensor *> head;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * node = gf->nodes[i];
+        bool reads_path = false;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            reads_path |= node->src[k] != nullptr && on_path.count(node->src[k]) > 0;
+        }
+        if (!reads_path) {
+            continue;
+        }
+        const bool replayable = node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL ||
+                                node->op == GGML_OP_ADD || node->op == GGML_OP_SCALE;
+        if (!replayable || node->view_src != nullptr) {
+            return 1; // a head this does not know how to replay per slice: the whole outputs
+        }
+        on_path.insert(node);
+        head.push_back(node);
+    }
+    if (head.empty() || head.back() != outputs) {
+        return 1;
+    }
+    // nothing else in the graph may read the head (it is about to leave the graph)
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * node = gf->nodes[i];
+        if (on_path.count(node) > 0) {
+            continue;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (node->src[k] != nullptr && node->src[k] != hidden && on_path.count(node->src[k]) > 0) {
+                return 1;
+            }
+        }
+    }
+    int j = 0;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        if (gf->nodes[i] == hidden || on_path.count(gf->nodes[i]) == 0) {
+            gf->nodes[j++] = gf->nodes[i];
+        }
+    }
+    gf->n_nodes = j;
+    // the head again, one slice of rows at a time
+    for (int64_t r0 = 0; r0 < n; r0 += rows) {
+        const int64_t nr = std::min(rows, n - r0);
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> as_slice;
+        as_slice[hidden] = ggml_view_2d(ctx_compute, hidden, hidden->ne[0], nr, hidden->nb[1], r0*hidden->nb[1]);
+        for (ggml_tensor * node : head) {
+            auto src = [&](int k) { const auto it = as_slice.find(node->src[k]); return it != as_slice.end() ? it->second : node->src[k]; };
+            ggml_tensor * t = nullptr;
+            switch (node->op) {
+                case GGML_OP_MUL_MAT: t = ggml_mul_mat(ctx_compute, src(0), src(1)); break;
+                case GGML_OP_MUL:     t = ggml_mul    (ctx_compute, src(0), src(1)); break;
+                case GGML_OP_ADD:     t = ggml_add    (ctx_compute, src(0), src(1)); break;
+                case GGML_OP_SCALE: {
+                    float s, b;
+                    memcpy(&s, (const float *) node->op_params + 0, sizeof(float));
+                    memcpy(&b, (const float *) node->op_params + 1, sizeof(float));
+                    t = ggml_scale_bias(ctx_compute, src(0), s, b);
+                } break;
+                default: GGML_ABORT("not a head op");
+            }
+            ggml_format_name(t, "%s-rows%lld", node->name, (long long) r0);
+            as_slice[node] = t;
+        }
+        opt_ctx->output_slices.push_back(as_slice.at(outputs));
+    }
+    return (int) opt_ctx->output_slices.size();
 }
 
 void ggml_opt_set_alloc_budget(ggml_opt_context_t opt_ctx, size_t bytes) {
@@ -1283,7 +1403,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         GGML_ASSERT(result->opt_period         == opt_ctx->opt_period);
     }
 
-    const int64_t ndata = opt_ctx->outputs->ne[1];
+    const int64_t ndata = ggml_opt_output_rows(opt_ctx);
     result->ndata += ndata;
     result->ndata_batch.push_back(ndata);
 
