@@ -1334,11 +1334,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
+    // a ubatch with labelled rows is a training step on this context's trainable adapter
+    // (llama_opt_init): the same graph with the extras on, the shadow's masked term
+    // (graph_params) and the loss and backward (opt_ubatch). It is built fresh, and
+    // cparams.training is part of the reuse key, so a serving graph never reuses it.
+    bool train = false;
+    if (opt_ctx != nullptr) {
+        train = !opt_forward_only && ubatch.n_labels() > 0;
+        cparams.training = train;
+        cparams.walk_active = opt_walk_active != nullptr;
+    }
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!train && !graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1365,6 +1376,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (train) {
+            if (!opt_ubatch(res, gf, ubatch)) {
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            ret = GGML_STATUS_SUCCESS;
+            return res;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -1698,6 +1718,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    if (balloc->get_n_labels() > 0) {
+        if (!model.output) {
+            LLAMA_LOG_ERROR("%s: labelled training requires a language-model output weight\n", __func__);
+            return -1;
+        }
+        if (cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+            LLAMA_LOG_ERROR("%s: labelled training requires a token-wise output head, not pooled outputs\n", __func__);
+            return -1;
+        }
+        if (!opt_ctx) {
+            LLAMA_LOG_ERROR("%s: labelled rows require an initialized optimizer\n", __func__);
+            return -1;
+        }
+        if (const char * why = memory->training_error(balloc->get_batch(), cparams.flash_attn)) {
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, why);
+            return -1;
+        }
+    }
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
@@ -1780,8 +1818,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
-    // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    // reserve output buffer (none for outputs that only feed a training loss)
+    const bool host_outputs = !opt_outputs_internal && opt_walk_active == nullptr;
+    if (output_reserve(host_outputs ? n_outputs_all : 0) < (host_outputs ? n_outputs_all : 0)) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
@@ -1862,7 +1901,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && host_outputs && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -1877,7 +1916,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs > 0) {
+        if (embd.data && t_embd && n_outputs > 0 && host_outputs) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -1945,7 +1984,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (embd_nextn.data && t_h_nextn && n_rows > 0 && host_outputs && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -1972,7 +2011,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
-    n_outputs = n_outputs_all;
+    n_outputs = host_outputs ? n_outputs_all : 0;
 
     // set output mappings
     if (n_outputs > 0) {
@@ -2487,10 +2526,12 @@ llm_graph_params llama_context::graph_params(
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
+        /*.shadow      =*/ opt_shadow,
+        /*.n_shadow_rows =*/ opt_shadow != nullptr ? ubatch.n_labels() : 0,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
+        /*.n_outputs   =*/ (cparams.training || (opt_shadow && ubatch.n_labels() > 0)) ? ubatch.n_tokens : n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };

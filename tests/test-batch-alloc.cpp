@@ -21,6 +21,8 @@ struct mock_memory : public llama_memory_i {
     llama_memory_context_ptr init_full() override {  GGML_ASSERT(false && "not implemented"); }
     llama_memory_context_ptr init_update(llama_context *, bool) override { GGML_ASSERT(false && "not implemented"); }
 
+    const char * training_error(const llama_batch &, bool) const override { return nullptr; }
+
     bool get_can_shift() const override { GGML_ASSERT(false && "not implemented"); }
 
     void clear(bool) override { GGML_ASSERT(false && "not implemented"); }
@@ -95,6 +97,33 @@ struct batch_builder {
 
 static void test_init(testing & t) {
     llama_vocab vocab;
+
+    t.test("rejects_invalid_labels_before_memory_mutation", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, true);
+        mock_memory mem;
+        llama_batch batch = bb.make();
+        llama_token label = -2;
+        batch.label = &label;
+        llama_batch_allocr ba(1);
+        t.assert_true("only -1 denotes no label", !ba.init(batch, vocab, &mem, bb.n_embd, 1, false));
+        label = 0;
+        t.assert_true("target must belong to vocabulary", !ba.init(batch, vocab, &mem, bb.n_embd, 1, false));
+        label = -1;
+        t.assert_true("unlabelled inference remains valid", ba.init(batch, vocab, &mem, bb.n_embd, 1, false));
+    });
+
+    t.test("rejects_missing_or_empty_sequence_lists", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, true);
+        llama_batch batch = bb.make();
+        llama_batch_allocr ba(1);
+        batch.n_seq_id = nullptr;
+        t.assert_true("missing counts", !ba.init(batch, vocab, nullptr, bb.n_embd, 1, false));
+        batch = bb.make();
+        batch.n_seq_id[0] = 0;
+        t.assert_true("empty sequence list", !ba.init(batch, vocab, nullptr, bb.n_embd, 1, false));
+    });
 
     t.test("rejects_n_seq_max_too_large", [&](testing & t) {
         batch_builder bb;

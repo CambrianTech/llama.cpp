@@ -33,6 +33,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/fa.metal
     kernels/mul_mv.metal
     kernels/mul_mm.metal
+    kernels/out_prod.metal
     kernels/quantize.metal
     kernels/softmax.metal
     kernels/norm.metal

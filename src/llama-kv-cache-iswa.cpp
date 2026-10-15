@@ -361,3 +361,10 @@ const llama_kv_cache_context * llama_kv_cache_iswa_context::get_swa()  const {
 
     return static_cast<const llama_kv_cache_context *>(ctx_swa.get());
 }
+
+const char * llama_kv_cache_iswa::training_error(const llama_batch & batch, bool flash_attn) const {
+    if (const char * why = kv_base->training_error(batch, flash_attn)) {
+        return why;
+    }
+    return kv_swa->training_error(batch, flash_attn);
+}

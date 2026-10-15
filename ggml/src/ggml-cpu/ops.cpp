@@ -4356,7 +4356,7 @@ static void ggml_compute_forward_out_prod_f32(
     }
 }
 
-static void ggml_compute_forward_out_prod_q_f32(
+static void ggml_compute_forward_out_prod_converted_f32(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
 
@@ -4371,8 +4371,8 @@ static void ggml_compute_forward_out_prod_q_f32(
     const ggml_type type = src0->type;
     ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
 
-    GGML_ASSERT(ne02 == ne12);
-    GGML_ASSERT(ne03 == ne13);
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
     GGML_ASSERT(ne2  == ne12);
     GGML_ASSERT(ne3  == ne13);
 
@@ -4387,124 +4387,62 @@ static void ggml_compute_forward_out_prod_q_f32(
 
     GGML_ASSERT(ne0 == ne00);
     GGML_ASSERT(ne1 == ne10);
-    GGML_ASSERT(ne2 == ne02);
-    GGML_ASSERT(ne3 == ne03);
+
+
 
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
+    //
+    // dst[i0,i1] = sum_i01 src0[i0,i01] * src1[i1,i01]: a GEMM dst[ne1 x ne0] = S1[ne1 x ne01] *
+    // W[ne01 x ne0]. Each task owns a block of BN dst rows of one (i2,i3) plane, dequantizes src0 in
+    // tiles of KT rows ONCE per block (the row loop dequantized every src0 row again for every dst
+    // row), gathers the matching src1 values, and accumulates on simd_gemm.
+    const int64_t BN = GGML_OUT_PROD_BN;
+    const int64_t KT = GGML_OUT_PROD_KT;
 
     if (ith == 0) {
         ggml_vec_set_f32(ne0*ne1*ne2*ne3, (float *)dst->data, 0);
     }
     ggml_barrier(params->threadpool);
 
-    // parallelize by last three dimensions
+    float * wt = (float *) params->wdata + ith*ggml_out_prod_cpu_wsize(ne0); // [KT][ne0]
+    float * at = wt + KT*ne0;                                               // [BN][KT]
 
-    // total rows in dst
-    const int64_t nr = ne1*ne2*ne3;
+    const int64_t nblk   = (ne1 + BN - 1)/BN;
+    const int64_t ntasks = nblk*ne2*ne3;
+    const bool    dense  = nb1 == (size_t) ne0*sizeof(float); // simd_gemm's C rows are contiguous
 
-    // rows per thread
-    const int64_t dr = (nr + nth - 1)/nth;
+    for (int64_t t = ith; t < ntasks; t += nth) {
+        const int64_t i3  = t/(ne2*nblk);
+        const int64_t i2  = (t - i3*ne2*nblk)/nblk;
+        const int64_t b0  = (t - i3*ne2*nblk - i2*nblk)*BN;
+        const int64_t nb_ = std::min(BN, ne1 - b0);
 
-    // row range for this thread
-    const int64_t ir0 = dr*ith;
-    const int64_t ir1 = MIN(ir0 + dr, nr);
+        const int64_t i02 = i2 / (ne12 / ne02);
+        const int64_t i03 = i3 / (ne13 / ne03);
 
-    // dst[:,:,:,:] = 0
-    // for i2,i3:
-    //   for i1:
-    //     for i01:
-    //       for i0:
-    //         dst[i0,i1,i2,i3] += src0[i0,i01,i2,i3] * src1[i1,i01,i2,i3]
+        float * d0 = (float *) ((char *) dst->data + (b0*nb1 + i2*nb2 + i3*nb3));
 
-    float * wdata = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
-
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
-        // dst indices
-        const int64_t i3 = ir/(ne2*ne1);
-        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
-        const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
-
-        const int64_t i02 = i2;
-        const int64_t i03 = i3;
-
-        //const int64_t i10 = i1;
-        const int64_t i12 = i2;
-        const int64_t i13 = i3;
-
-        for (int64_t i01 = 0; i01 < ne01; ++i01) {
-            const int64_t i11 = i01;
-
-            float * s0 = (float *) ((char *) src0->data + (          i01*nb01 + i02*nb02 + i03*nb03));
-            float * s1 = (float *) ((char *) src1->data + (i1*nb10 + i11*nb11 + i12*nb12 + i13*nb13));
-            float * d  = (float *) ((char *)  dst->data + (          i1*nb1 + i2*nb2 + i3*nb3));
-
-            dequantize_row_q(s0, wdata, ne0);
-            ggml_vec_mad_f32(ne0, d, wdata, *s1);
-        }
-    }
-}
-
-static void ggml_compute_forward_out_prod_f16_f32(
-        const ggml_compute_params * params,
-              ggml_tensor * dst) {
-
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    GGML_TENSOR_BINARY_OP_LOCALS;
-
-    const int ith = params->ith;
-    const int nth = params->nth;
-
-    GGML_ASSERT(src0->type == GGML_TYPE_F16);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-
-    GGML_ASSERT(ne02 == ne12);
-    GGML_ASSERT(ne03 == ne13);
-    GGML_ASSERT(ne2  == ne12);
-    GGML_ASSERT(ne3  == ne13);
-
-    GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
-    GGML_ASSERT(nb0  == sizeof(float));
-
-    GGML_ASSERT(ne0 == ne00);
-    GGML_ASSERT(ne1 == ne10);
-    GGML_ASSERT(ne2 == ne02);
-    GGML_ASSERT(ne3 == ne03);
-
-    if (ith == 0) {
-        ggml_vec_set_f32(ne0*ne1*ne2*ne3, (float *)dst->data, 0);
-    }
-    ggml_barrier(params->threadpool);
-
-    const int64_t nr = ne1*ne2*ne3;
-    const int64_t dr = (nr + nth - 1)/nth;
-    const int64_t ir0 = dr*ith;
-    const int64_t ir1 = MIN(ir0 + dr, nr);
-
-    float * wdata = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
-
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
-        const int64_t i3 = ir/(ne2*ne1);
-        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
-        const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
-
-        const int64_t i02 = i2;
-        const int64_t i03 = i3;
-
-        const int64_t i12 = i2;
-        const int64_t i13 = i3;
-
-        float * d = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2 + i3*nb3));
-
-        for (int64_t i01 = 0; i01 < ne01; ++i01) {
-            const int64_t i11 = i01;
-            ggml_fp16_t * s0 = (ggml_fp16_t *) ((char *) src0->data + (i01*nb01 + i02*nb02 + i03*nb03));
-            float * s1 = (float *) ((char *) src1->data + (i1*nb10 + i11*nb11 + i12*nb12 + i13*nb13));
-            ggml_fp16_to_fp32_row(s0, wdata, ne0);
-            ggml_vec_mad_f32(ne0, d, wdata, *s1);
+        for (int64_t k0 = 0; k0 < ne01; k0 += KT) {
+            const int64_t kt = std::min(KT, ne01 - k0);
+            for (int64_t r = 0; r < kt; ++r) {
+                dequantize_row_q((const char *) src0->data + ((k0 + r)*nb01 + i02*nb02 + i03*nb03), wt + r*ne0, ne0);
+            }
+            for (int64_t b = 0; b < nb_; ++b) {
+                for (int64_t r = 0; r < kt; ++r) {
+                    at[b*kt + r] = *(const float *) ((const char *) src1->data + ((b0 + b)*nb10 + (k0 + r)*nb11 + i2*nb12 + i3*nb13));
+                }
+            }
+            if (dense) {
+                simd_gemm(d0, at, wt, (int) nb_, (int) kt, (int) ne0);
+            } else {
+                for (int64_t b = 0; b < nb_; ++b) {
+                    float * d = (float *) ((char *) d0 + b*nb1);
+                    for (int64_t r = 0; r < kt; ++r) {
+                        ggml_vec_mad_f32(ne0, d, wt + r*ne0, at[b*kt + r]);
+                    }
+                }
+            }
         }
     }
 }
@@ -4542,11 +4480,12 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
             {
-                ggml_compute_forward_out_prod_q_f32(params, dst);
+                ggml_compute_forward_out_prod_converted_f32(params, dst);
             } break;
         case GGML_TYPE_F16:
             {
-                ggml_compute_forward_out_prod_f16_f32(params, dst);
+                // f16 converts through its to_float trait exactly as a quantized row dequantizes
+                ggml_compute_forward_out_prod_converted_f32(params, dst);
             } break;
         case GGML_TYPE_F32:
             {
@@ -9224,316 +9163,227 @@ void ggml_compute_forward_flash_attn_ext(
 }
 
 // ggml_compute_forward_flash_attn_back
+//
+// The gradients of FLASH_ATTN_EXT (ggml_flash_attn_back), the reference every backend's kernel is
+// checked against. Pass 1, over query rows (i, h): the row's log-sum-exp, D_i = sum_j p_ij dp_ij
+// (from the same recomputed p and dp the gradients use, never from the forward's output) and
+// dq_i = scale sum_j ds_ij k_j, with ds_ij = p_ij (dp_ij - D_i). Pass 2, over KV positions
+// (j, kv head): dk_j and dv_j summed over the query rows and the KV head's group of query heads.
+// Nothing window x rows is kept: a row's scores live in one per-thread buffer.
+
+static inline float ggml_fa_back_mask(const ggml_tensor * mask, int64_t j, int64_t i, int64_t h) {
+    if (mask == nullptr) {
+        return 0.0f;
+    }
+    const char * m = (const char *) mask->data + i*mask->nb[1] + (h % mask->ne[2])*mask->nb[2];
+    return GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) m)[j]);
+}
 
 static void ggml_compute_forward_flash_attn_back_f32(
         const ggml_compute_params * params,
-        const bool masked,
-              ggml_tensor * dst) {
+        ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * d    = dst->src[4];
 
-    const ggml_tensor * q = dst->src[0];
-    const ggml_tensor * k = dst->src[1];
-    const ggml_tensor * v = dst->src[2];
-    const ggml_tensor * d = dst->src[3];
+    const float   scale = ggml_get_op_params_f32(dst, 0);
+    const int64_t kv0   = ggml_get_op_params_i32(dst, 1); // dK/dV cover the key rows [kv0, M)
 
-    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
-    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
-    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
-    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
-    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
-    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
-    GGML_TENSOR_LOCALS(int64_t, ned, d,   ne)
-    GGML_TENSOR_LOCALS(size_t,  nbd, d,   nb)
-    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
-    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+    const int64_t D   = q->ne[0];
+    const int64_t N   = q->ne[1];
+    const int64_t H   = q->ne[2];
+    const int64_t M   = k->ne[1];
+    const int64_t L   = M - kv0;
+    const int64_t Hkv = k->ne[2];
+    const int64_t Dv  = v->ne[0];
+    const int64_t G   = H / Hkv; // query head h reads KV head h / G
+
+    float * dq   = (float *) ((char *) dst->data + ggml_flash_attn_back_offset(dst, 0));
+    float * dk   = (float *) ((char *) dst->data + ggml_flash_attn_back_offset(dst, 1));
+    float * dv   = (float *) ((char *) dst->data + ggml_flash_attn_back_offset(dst, 2));
+    float * lse  = (float *) ((char *) dst->data + ggml_flash_attn_back_offset(dst, 3));
+    float * dvec = lse + N*H;
 
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const int64_t D = neq0;
-    const int64_t N = neq1;
-    const int64_t P = nek1 - N;
-    const int64_t M = P + N;
+    // Rows are worked in blocks so each K and V row is converted to F32 once per block, not once per
+    // query row, and the dot products run on ggml's SIMD vec_dot (pass 1: BR query rows of one head;
+    // pass 2: BC KV positions of one KV head). Per thread: BR rows of scores, the block's query and
+    // output-gradient rows, one K and one V row; pass 2 reuses the same space for its K and V block.
+    const int64_t BR = GGML_FA_BACK_BR;
+    const int64_t BC = GGML_FA_BACK_BC;
+    float * wbase = (float *) params->wdata + ith*ggml_flash_attn_back_cpu_wsize(D, Dv, M);
 
-    const int Mup  = ggml_up(M, GGML_SOFT_MAX_UNROLL);
-    const int mxDM = MAX(D, Mup);
+    const ggml_to_float_t k_to_float = ggml_get_type_traits(k->type)->to_float;
+    const ggml_to_float_t v_to_float = ggml_get_type_traits(v->type)->to_float;
+    auto k_row = [&](int64_t j, int64_t hk, float * out) {
+        const char * r = (const char *) k->data + j*k->nb[1] + hk*k->nb[2];
+        if (k->type == GGML_TYPE_F32) { memcpy(out, r, D*sizeof(float)); } else { k_to_float(r, out, D); }
+    };
+    auto v_row = [&](int64_t j, int64_t hk, float * out) {
+        const char * r = (const char *) v->data + j*v->nb[1] + hk*v->nb[2];
+        if (v->type == GGML_TYPE_F32) { memcpy(out, r, Dv*sizeof(float)); } else { v_to_float(r, out, Dv); }
+    };
+    auto q_row = [&](int64_t i, int64_t h, float * out) {
+        for (int64_t c = 0; c < D; ++c) {
+            out[c] = *(const float *) ((const char *) q->data + c*q->nb[0] + i*q->nb[1] + h*q->nb[2]);
+        }
+    };
+    auto d_row = [&](int64_t i, int64_t h, float * out) {
+        for (int64_t c = 0; c < Dv; ++c) {
+            out[c] = *(const float *) ((const char *) d->data + c*d->nb[0] + h*d->nb[1] + i*d->nb[2]);
+        }
+    };
+    auto dot = [](const float * a, const float * b, int64_t n) {
+        float r;
+        ggml_vec_dot_f32((int) n, &r, 0, a, 0, b, 0, 1);
+        return r;
+    };
 
-    // GGML_ASSERT(ne0 == D);
-    // GGML_ASSERT(ne1 == N);
-    GGML_ASSERT(P >= 0);
-
-    GGML_ASSERT(nbq0 == sizeof(float));
-    GGML_ASSERT(nbk0 == sizeof(float));
-    GGML_ASSERT(nbv0 == sizeof(float));
-
-    GGML_ASSERT(neq0 == D);
-    GGML_ASSERT(nek0 == D);
-    GGML_ASSERT(nev1 == D);
-    GGML_ASSERT(ned0 == D);
-
-    GGML_ASSERT(neq1 == N);
-    GGML_ASSERT(nek1 == N + P);
-    GGML_ASSERT(nev1 == D);
-    GGML_ASSERT(ned1 == N);
-
-    // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
-    GGML_ASSERT(nb0 <= nb1);
-    GGML_ASSERT(nb1 <= nb2);
-    GGML_ASSERT(nb2 <= nb3);
-
+    // the dO scale a reduced-precision kernel uses (recorded so every backend's result agrees; the
+    // CPU works in F32 and does not apply it)
     if (ith == 0) {
-        memset(dst->data, 0, nb0*ne0*ne1*ne2*ne3);
+        float mx = 0.0f;
+        for (int64_t i = 0; i < N; ++i) {
+            for (int64_t h = 0; h < H; ++h) {
+                for (int64_t c = 0; c < Dv; ++c) {
+                    mx = std::max(mx, fabsf(*(const float *) ((const char *) d->data + c*d->nb[0] + h*d->nb[1] + i*d->nb[2])));
+                }
+            }
+        }
+        dvec[N*H] = ggml_flash_attn_back_scale(mx);
     }
+
+    // pass 1: blocks of BR query rows of one head
+    {
+        float * s   = wbase;          // [BR][M] scores, then p
+        float * qb  = s  + BR*M;      // [BR][D]
+        float * db  = qb + BR*D;      // [BR][Dv]
+        float * kr  = db + BR*Dv;     // [D]
+        float * vr  = kr + D;         // [Dv]
+        float     l[GGML_FA_BACK_BR];
+        ggml_float dd[GGML_FA_BACK_BR];
+
+        const int64_t nblk = (N + BR - 1)/BR;
+        for (int64_t t = ith; t < nblk*H; t += nth) {
+            const int64_t i0 = (t % nblk)*BR;
+            const int64_t h  = t / nblk;
+            const int64_t hk = h / G;
+            const int64_t nb = std::min(BR, N - i0);
+            for (int64_t b = 0; b < nb; ++b) {
+                q_row(i0 + b, h, qb + b*D);
+                d_row(i0 + b, h, db + b*Dv);
+            }
+            for (int64_t j = 0; j < M; ++j) {
+                k_row(j, hk, kr);
+                for (int64_t b = 0; b < nb; ++b) {
+                    s[b*M + j] = dot(qb + b*D, kr, D)*scale + ggml_fa_back_mask(mask, j, i0 + b, h);
+                }
+            }
+            for (int64_t b = 0; b < nb; ++b) {
+                float * sb = s + b*M;
+                float smax = -INFINITY;
+                for (int64_t j = 0; j < M; ++j) {
+                    smax = std::max(smax, sb[j]);
+                }
+                l[b] = -INFINITY;
+                if (smax != -INFINITY) {
+                    ggml_float sum = 0.0;
+                    for (int64_t j = 0; j < M; ++j) {
+                        sum += expf(sb[j] - smax);
+                    }
+                    l[b] = smax + (float) log(sum);
+                }
+                for (int64_t j = 0; j < M; ++j) {
+                    sb[j] = l[b] == -INFINITY ? 0.0f : expf(sb[j] - l[b]);
+                }
+                dd[b] = 0.0;
+            }
+            // D from the recomputed p and dp
+            for (int64_t j = 0; j < M; ++j) {
+                bool any = false;
+                for (int64_t b = 0; b < nb; ++b) { any = any || s[b*M + j] != 0.0f; }
+                if (!any) { continue; }
+                v_row(j, hk, vr);
+                for (int64_t b = 0; b < nb; ++b) {
+                    const float p = s[b*M + j];
+                    if (p != 0.0f) {
+                        dd[b] += (ggml_float) p*dot(db + b*Dv, vr, Dv);
+                    }
+                }
+            }
+            for (int64_t b = 0; b < nb; ++b) {
+                lse [h*N + i0 + b] = l[b];
+                dvec[h*N + i0 + b] = (float) dd[b];
+                memset(dq + (h*N + i0 + b)*D, 0, D*sizeof(float));
+            }
+            for (int64_t j = 0; j < M; ++j) {
+                bool any = false;
+                for (int64_t b = 0; b < nb; ++b) { any = any || s[b*M + j] != 0.0f; }
+                if (!any) { continue; }
+                k_row(j, hk, kr);
+                v_row(j, hk, vr);
+                for (int64_t b = 0; b < nb; ++b) {
+                    const float p = s[b*M + j];
+                    if (p == 0.0f) {
+                        continue;
+                    }
+                    const float ds = p*(dot(db + b*Dv, vr, Dv) - (float) dd[b])*scale;
+                    ggml_vec_mad_f32((int) D, dq + (h*N + i0 + b)*D, kr, ds);
+                }
+            }
+        }
+    }
+
     ggml_barrier(params->threadpool);
 
-    const int64_t elem_q = ggml_nelements(q);
-    const int64_t elem_k = ggml_nelements(k);
+    // pass 2: blocks of BC KV positions of one KV head, each summed over its group's query heads and
+    // every query row
+    {
+        float * kb = wbase;          // [BC][D]
+        float * vb = kb + BC*D;      // [BC][Dv]
+        float * qr = vb + BC*Dv;     // [D]
+        float * dr = qr + D;         // [Dv]
 
-    ggml_type result_type = dst->type;
-    GGML_ASSERT(ggml_blck_size(result_type) == 1);
-    const size_t tsize = ggml_type_size(result_type);
-
-    const size_t offs_q = 0;
-    const size_t offs_k = offs_q + GGML_PAD(elem_q * tsize, GGML_MEM_ALIGN);
-    const size_t offs_v = offs_k + GGML_PAD(elem_k * tsize, GGML_MEM_ALIGN);
-
-    void * grad_q = (char *) dst->data;
-    void * grad_k = (char *) dst->data + offs_k;
-    void * grad_v = (char *) dst->data + offs_v;
-
-    const size_t nbgq1 = nb0*neq0;
-    const size_t nbgq2 = nb0*neq0*neq1;
-    const size_t nbgq3 = nb0*neq0*neq1*neq2;
-
-    const size_t nbgk1 = nb0*nek0;
-    const size_t nbgk2 = nb0*nek0*nek1;
-    const size_t nbgk3 = nb0*nek0*nek1*neq2;
-
-    const size_t nbgv1 = nb0*nev0;
-    const size_t nbgv2 = nb0*nev0*nev1;
-    const size_t nbgv3 = nb0*nev0*nev1*neq2;
-
-    // parallelize by k rows using ggml_vec_dot_f32
-
-    // total rows in k
-    const int nr = nek2*nek3;
-
-    // rows per thread
-    const int dr = (nr + nth - 1)/nth;
-
-    // row range for this thread
-    const int ir0 = dr*ith;
-    const int ir1 = MIN(ir0 + dr, nr);
-
-    const float scale = 1.0f/sqrtf(D);
-
-    //printf("P=%d N=%d D=%d ir0=%d ir1=%d scale = %f\n", P, N, D, ir0, ir1, scale);
-
-    // how often k2 (and v2) is repeated in q2
-    int nrep = neq2/nek2;
-
-    for (int ir = ir0; ir < ir1; ++ir) {
-        // q indices
-        const int ik3 = ir/(nek2);
-        const int ik2 = ir - ik3*nek2;
-
-        const int iq3 = ik3;
-        const int id3 = ik3;
-        const int iv3 = ik3;
-        const int iv2 = ik2;
-
-        for (int irep = 0; irep < nrep; ++irep) {
-            const int iq2 = ik2 + irep*nek2;
-            const int id2 = iq2;
-
-            // (ik2 + irep*nek2) % nek2 == ik2
-            for (int iq1 = 0; iq1 < neq1; ++iq1) {
-                const int id1 = iq1;
-
-                // not sure about CACHE_LINE_SIZE_F32..
-                // - maybe it must not be multiplied by 2 and excluded from .. in SM 1*(..) offset?
-                float * S  = (float *) params->wdata + ith*2*(mxDM + CACHE_LINE_SIZE_F32) + 0*(mxDM+CACHE_LINE_SIZE_F32);
-                float * SM = (float *) params->wdata + ith*2*(mxDM + CACHE_LINE_SIZE_F32) + 1*(mxDM+CACHE_LINE_SIZE_F32);
-
-                for (int i = M; i < Mup; ++i) {
-                    S[i] = -INFINITY;
-                }
-
-                const int64_t masked_begin = masked ? (P + iq1 + 1) : M;
-                for (int64_t ic = 0; ic < masked_begin; ++ic) {
-                    // k indices
-                    const int ik1 = ic;
-
-                    // S indices
-                    const int i1 = ik1;
-
-                    ggml_vec_dot_f32(neq0,
-                            S + i1, 0,
-                            (float *) ((char *) k->data + (ik1*nbk1 + ik2*nbk2 + ik3*nbk3)), 0,
-                            (float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3)), 0, 1);
-                }
-
-                // scale
-                ggml_vec_scale_f32(masked_begin, S, scale);
-
-                for (int64_t i = masked_begin; i < M; i++) {
-                    S[i] = -INFINITY;
-                }
-
-                // softmax
-                // exclude known -INF S[..] values from max and loop
-                // dont forget to set their SM values to zero
-                {
-                    float max = -INFINITY;
-                    ggml_vec_max_f32(masked_begin, &max, S);
-
-                    ggml_float sum = 0.0;
-                    {
-#ifdef GGML_SOFT_MAX_ACCELERATE
-                        max = -max;
-                        vDSP_vsadd(SM, 1, &max, SM, 1, Mup);
-                        vvexpf(SM, SM, &Mup);
-                        ggml_vec_sum_f32(Mup, &sum, SM);
-#else
-                        sum = ggml_vec_soft_max_f32(Mup, SM, S, max);
-#endif
+        const int64_t nblk = (L + BC - 1)/BC;
+        for (int64_t t = ith; t < nblk*Hkv; t += nth) {
+            const int64_t j0 = kv0 + (t % nblk)*BC;
+            const int64_t hk = t / nblk;
+            const int64_t nb = std::min(BC, M - j0);
+            for (int64_t b = 0; b < nb; ++b) {
+                k_row(j0 + b, hk, kb + b*D);
+                v_row(j0 + b, hk, vb + b*Dv);
+                memset(dk + (hk*L + j0 - kv0 + b)*D,  0, D*sizeof(float));
+                memset(dv + (hk*L + j0 - kv0 + b)*Dv, 0, Dv*sizeof(float));
+            }
+            for (int64_t h = hk*G; h < (hk + 1)*G; ++h) {
+                for (int64_t i = 0; i < N; ++i) {
+                    const float l = lse[h*N + i];
+                    if (l == -INFINITY) {
+                        continue;
                     }
-
-                    assert(sum > 0.0);
-
-                    sum = 1.0/sum;
-                    ggml_vec_scale_f32(masked_begin, SM, sum);
-
-                }
-
-                // step-by-step explanation
-                {
-                    // forward-process                    shape      grads from backward process
-                    // parallel_for ik2,ik3:
-                    //  for irep:
-                    //   iq2 = ik2 + irep*nek2
-                    //   k[:D,:M,:,:]                     [D,M,:,:]  grad[k][:D,:M,ik2,ik3]  += grad[kcur]
-                    //   q[:D,:N,:,:]                     [D,N,:,:]  grad[q][:D,iq1,iq2,iq3] += grad[qcur]
-                    //   v[:M,:D,:,:]                     [M,D,:,:]  grad[v][:M,:D,iv2,iv3]  += grad[vcur]
-                    //   for iq1:
-                    //    kcur   = k[:D,:M,ik2,ik3]       [D,M,1,1]  grad[kcur] = grad[S1].T @ qcur
-                    //    qcur   = q[:D,iq1,iq2,iq3]      [D,1,1,1]  grad[qcur] = grad[S1]   @ kcur
-                    //    vcur   = v[:M,:D,iv2,iv3]       [M,D,1,1]  grad[vcur] = grad[S5].T @ S4
-                    //    S0     = -Inf                   [D,1,1,1]
-                    //   ~S1[i]  = dot(kcur[:D,i], qcur)
-                    //    S1     = qcur @ kcur.T          [M,1,1,1]  grad[S1]   = grad[S2] * scale
-                    //    S2     = S1 * scale             [M,1,1,1]  grad[S2]   = diag_mask_zero(grad[S3], P)
-                    //    S3     = diag_mask_inf(S2, P)   [M,1,1,1]  grad[S3]   = S4 * (grad[S4] - dot(S4, grad[S4]))
-                    //    S4     = softmax(S3)            [M,1,1,1]  grad[S4]   = grad[S5] @ vcur
-                    //   ~S5[i]  = dot(vcur[:,i], S4)
-                    //    S5     = S4 @ vcur.T            [D,1,1,1]  grad[S5]   = d[:D,id1,id2,id3]
-                    //   ~dst[i,iq1,iq2,iq3]  = S5[i]              ^
-                    //    dst[:D,iq1,iq2,iq3] = S5                 | grad[dst[:D,iq1,iq2,iq3]] = d[:D,id1,id2,id3]
-                    // dst                               backward-/ grad[dst]                 = d
-                    //
-                    // output gradients with their dependencies:
-                    //
-                    // grad[kcur] = grad[S1].T @ qcur
-                    // grad[S1]   = diag_mask_zero(grad[S3], P) * scale
-                    // grad[S3]   = S4 * (grad[S4] - dot(S4, grad[S4]))
-                    // grad[S4]   = grad[S5] @ vcur
-                    // grad[S4]   = d[:D,id1,id2,id3] @ vcur
-                    // grad[qcur] = grad[S1]   @ kcur
-                    // grad[vcur] = grad[S5].T @ S4
-                    // grad[vcur] = d[:D,id1,id2,id3].T @ S4
-                    //
-                    // in post-order:
-                    //
-                    // S1         = qcur @ kcur.T
-                    // S2         = S1 * scale
-                    // S3         = diag_mask_inf(S2, P)
-                    // S4         = softmax(S3)
-                    // grad[S4]   = d[:D,id1,id2,id3] @ vcur
-                    // grad[S3]   = S4 * (grad[S4] - dot(S4, grad[S4]))
-                    // grad[S1]   = diag_mask_zero(grad[S3], P) * scale
-                    // grad[qcur] = grad[S1]   @ kcur
-                    // grad[kcur] = grad[S1].T @ qcur
-                    // grad[vcur] = d[:D,id1,id2,id3].T @ S4
-                    //
-                    // using less variables (SM=S4):
-                    //
-                    // S             = diag_mask_inf(qcur @ kcur.T * scale, P)
-                    // SM            = softmax(S)
-                    // S             = d[:D,iq1,iq2,iq3] @ vcur
-                    // dot_SM_gradSM = dot(SM, S)
-                    // S             = SM * (S - dot(SM, S))
-                    // S             = diag_mask_zero(S, P) * scale
-                    //
-                    // grad[q][:D,iq1,iq2,iq3] += S   @ kcur
-                    // grad[k][:D,:M,ik2,ik3]  += S.T @ qcur
-                    // grad[v][:M,:D,iv2,iv3]  += d[:D,id1,id2,id3].T @ SM
-                }
-
-                // S = gradSM = d[:D,id1,id2,id3] @ vcur[:,:,iv2,iv3]
-                // S = d[:D,id1,id2,id3] @ vcur[:,:,iv2,iv3]
-                // for ic:
-                //   S[:M] += vcur[:M,ic,iv2,iv3] * d[ic,id1,id2,id3]
-                // exclude known future zero S[..] values from operation
-                ggml_vec_set_f32(masked_begin, S, 0);
-                for (int64_t ic = 0; ic < D; ++ic) {
-                    ggml_vec_mad_f32(masked_begin,
-                            S,
-                             (float *) ((char *) v->data + (          ic*nbv1  + iv2*nbv2 + iv3*nbv3)),
-                            *(float *) ((char *) d->data + (ic*nbd0 + id1*nbd1 + id2*nbd2 + id3*nbd3)));
-                }
-
-                // S = SM * (S - dot(SM, S))
-                float dot_SM_gradSM = 0;
-                ggml_vec_dot_f32 (masked_begin, &dot_SM_gradSM, 0, SM, 0, S, 0, 1);
-                ggml_vec_acc1_f32(M, S, -dot_SM_gradSM);
-                ggml_vec_mul_f32 (masked_begin, S, S, SM);
-
-                // S = diag_mask_zero(S, P) * scale
-                // already done by above ggml_vec_set_f32
-
-                // exclude known zero S[..] values from operation
-                ggml_vec_scale_f32(masked_begin, S, scale);
-
-                // S    shape [M,1]
-                // SM   shape [M,1]
-                // kcur shape [D,M]
-                // qcur shape [D,1]
-                // vcur shape [M,D]
-
-                // grad[q][:D,iq1,iq2,iq3] += S @ kcur
-                // grad[q][:D,iq1,iq2,iq3] += shape[M,1] @ shape[D,M]
-                // for ic:
-                //  grad[q][:D,iq1,iq2,iq3] += S[ic] * kcur[:D,ic,ik2,ik3]
-                // exclude known zero S[..] values from loop
-                for (int64_t ic = 0; ic < masked_begin; ++ic) {
-                    ggml_vec_mad_f32(D,
-                            (float *) ((char *) grad_q  + (iq1*nbgq1 + iq2*nbgq2  + iq3*nbgq3)),
-                            (float *) ((char *) k->data + (ic*nbk1   + ik2*nbk2   + ik3*nbk3)),
-                            S[ic]);
-                }
-
-                // grad[k][:D,:M,iq2,iq3] += S.T @ qcur
-                // for ic:
-                //  grad[k][:D,ic,iq2,iq3] += S.T[0,ic] * qcur[:D,0]
-                //  grad[k][:D,ic,iq2,iq3] += S[ic]     * qcur[:D,0]
-                // exclude known zero S[..] values from loop
-                for (int64_t ic = 0; ic < masked_begin; ++ic) {
-                    ggml_vec_mad_f32(D,
-                            (float *) ((char *) grad_k  + (ic*nbgk1  + ik2*nbgk2  + ik3*nbgk3)),
-                            (float *) ((char *) q->data + (iq1*nbq1  + iq2*nbq2   + iq3*nbq3)),
-                            S[ic]);
-                }
-
-                // grad[v][:M,:D,iv2,iv3] += d[:D,id1,id2,id3].T       @ SM
-                // for ic:
-                //  grad[v][:M,ic,iv2,iv3] += d[:D,id1,id2,id3].T[0,ic] * SM[:M]
-                //  grad[v][:M,ic,iv2,iv3] += d[ic,id1,id2,id3]         * SM[:M]
-                // exclude known zero SM[..] values from mad
-                for (int64_t ic = 0; ic < D; ++ic) {
-                    ggml_vec_mad_f32(masked_begin,
-                            (float *) ((char *) grad_v   + (          ic*nbgv1 + iv2*nbgv2 + iv3*nbgv3)),
-                            SM,
-                            *(float *) ((char *) d->data + (ic*nbd0 + id1*nbd1 + id2*nbd2  + id3*nbd3)));
+                    bool loaded = false;
+                    for (int64_t b = 0; b < nb; ++b) {
+                        const float m = ggml_fa_back_mask(mask, j0 + b, i, h);
+                        if (m == -INFINITY) {
+                            continue;
+                        }
+                        if (!loaded) {
+                            q_row(i, h, qr);
+                            d_row(i, h, dr);
+                            loaded = true;
+                        }
+                        const float p = expf(dot(qr, kb + b*D, D)*scale + m - l);
+                        if (p == 0.0f) {
+                            continue;
+                        }
+                        const float ds = p*(dot(dr, vb + b*Dv, Dv) - dvec[h*N + i])*scale;
+                        ggml_vec_mad_f32((int) D,  dk + (hk*L + j0 - kv0 + b)*D,  qr, ds);
+                        ggml_vec_mad_f32((int) Dv, dv + (hk*L + j0 - kv0 + b)*Dv, dr, p);
+                    }
                 }
             }
         }
@@ -9542,21 +9392,9 @@ static void ggml_compute_forward_flash_attn_back_f32(
 
 void ggml_compute_forward_flash_attn_back(
         const ggml_compute_params * params,
-        const bool masked,
         ggml_tensor * dst) {
-
-    const ggml_tensor * q = dst->src[0];
-
-    switch (q->type) {
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_flash_attn_back_f32(params, masked, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("fatal error");
-            }
-    }
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    ggml_compute_forward_flash_attn_back_f32(params, dst);
 }
 
 // ggml_compute_forward_ssm_conv
@@ -11746,11 +11584,12 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
     const ggml_tensor * src1 = dst->src[1];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_I32);
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
-    GGML_ASSERT(ggml_are_same_shape(src0, src1));
+    GGML_ASSERT(ggml_cross_entropy_labels_ok(src0, src1));
     GGML_ASSERT(ggml_is_scalar(dst));
+    const bool index = src1->type == GGML_TYPE_I32;
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     // TODO: handle transposed/permuted matrices
@@ -11775,18 +11614,22 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
 
     for (int64_t i1 = ir0; i1 < ir1; ++i1) {
         const float * s0 = (const float *)((const char *) src0->data + i1*src0->nb[1]);
-        const float * s1 = (const float *)((const char *) src1->data + i1*src1->nb[1]);
-
-#ifndef NDEBUG
-        for (int64_t i = 0; i < nc; ++i) {
-            //printf("p[%d] = %f\n", i, p[i]);
-            assert(!isnan(s0[i]));
-            assert(!isnan(s1[i]));
-        }
-#endif // NDEBUG
 
         float max = -INFINITY;
         ggml_vec_max_f32(nc, &max, s0);
+        if (index) {
+            // one target: its log softmax, -(max + log sum exp(x - max)) + x[t], times the row's weight
+            const int32_t t = ((const int32_t *) src1->data)[i1];
+            const float   w = dst->src[2] ? ((const float *) dst->src[2]->data)[i1] : 1.0f;
+            if (t >= 0 && w != 0.0f) {
+                GGML_ASSERT(t < nc);
+                const ggml_float lse = ggml_vec_log_soft_max_f32(nc, st, s0, max);
+                sum_thread += w*(st[t] - lse);
+            }
+            continue;
+        }
+        const float * s1 = (const float *)((const char *) src1->data + i1*src1->nb[1]);
+
         const ggml_float sum_softmax = ggml_vec_log_soft_max_f32(nc, st, s0, max);
         assert(sum_softmax >= 0.0);
 
@@ -11846,7 +11689,8 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
     GGML_ASSERT(ggml_is_contiguous(src0f));
     GGML_ASSERT(ggml_is_contiguous(src1f));
     GGML_ASSERT(ggml_is_contiguous(grad));
-    GGML_ASSERT(ggml_are_same_shape(src0f, src1f) && ggml_are_same_shape(src0f, dst));
+    GGML_ASSERT(ggml_cross_entropy_labels_ok(src0f, src1f) && ggml_are_same_shape(src0f, dst));
+    const bool index = src1f->type == GGML_TYPE_I32;
 
     const int64_t ith = params->ith;
     const int64_t nth = params->nth;
@@ -11867,15 +11711,25 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
     for (int64_t i1 = ir0; i1 < ir1; i1++) {
         float       * ds0 = (float       *)((char       *) dst->data   + i1*dst->nb[1]);
         const float * s0  = (const float *)((const char *) src0f->data + i1*src0f->nb[1]);
-        const float * s1  = (const float *)((const char *) src1f->data + i1*src1f->nb[1]);
 
-#ifndef NDEBUG
-        for (int64_t i = 0; i < nc; ++i) {
-            //printf("p[%d] = %f\n", i, p[i]);
-            assert(!isnan(s0[i]));
-            assert(!isnan(s1[i]));
+        if (index) {
+            // one target t: (softmax(x) - onehot(t)) * d / nr; a row without one is zero
+            const int32_t t = ((const int32_t *) src1f->data)[i1];
+            const float   w = dst->src[3] ? ((const float *) dst->src[3]->data)[i1] : 1.0f;
+            if (t < 0 || w == 0.0f) {
+                memset(ds0, 0, nc*sizeof(float));
+                continue;
+            }
+            GGML_ASSERT(t < nc);
+            float max = -INFINITY;
+            ggml_vec_max_f32(nc, &max, s0);
+            const ggml_float sum = ggml_vec_soft_max_f32(nc, ds0, s0, max);
+            ggml_vec_scale_f32(nc, ds0, 1.0/sum);
+            ds0[t] -= 1.0f;
+            ggml_vec_scale_f32(nc, ds0, d_by_nr*w);
+            continue;
         }
-#endif // NDEBUG
+        const float * s1  = (const float *)((const char *) src1f->data + i1*src1f->nb[1]);
 
         // soft_max
         float max = -INFINITY;

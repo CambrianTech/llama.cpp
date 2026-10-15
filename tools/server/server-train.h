@@ -61,6 +61,12 @@ struct llama_context;
 // for every path the server writes or reads there: /train's "out" and /lora-adapters/load.
 std::string confine_out(const std::string & dir, const std::string & name);
 
+// Why this server must not train on its served weights, or "" when it may: a quantized weight kept
+// on the CPU sits in a repacked buffer (CPU_REPACK) whose layout only the CPU kernels read, and the
+// backward needs the standard one. One check for every training path (/train, /learn, a learn on a
+// completion), so they refuse alike instead of failing differently (continuum card 5b497852).
+std::string train_repack_refusal(const llama_model * model, const common_params & params);
+
 class server_trainer {
 public:
     // serving: read between training windows; the trainer yields while serving is busy, so a
@@ -103,6 +109,7 @@ public:
         std::vector<int64_t> skipped_at;
     };
     ~server_trainer();
+
 
     // Starts a run on a worker thread; refuses (ok=false) while one is running or on bad input.
     common_json start(const common_json & body_in);

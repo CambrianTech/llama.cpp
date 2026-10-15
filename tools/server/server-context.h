@@ -167,6 +167,7 @@ struct server_routes {
     server_http_context::handler_t post_lora_adapters;
     server_http_context::handler_t post_lora_adapters_load;
     server_http_context::handler_t post_lora_adapters_unload;
+    server_http_context::handler_t post_learn;
     server_http_context::handler_t get_train;
     server_http_context::handler_t post_train;
     server_http_context::handler_t post_train_cancel;

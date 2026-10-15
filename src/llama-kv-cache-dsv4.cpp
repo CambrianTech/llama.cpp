@@ -164,6 +164,8 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
         /*.seq_id_unq   =*/ data->seq_id_unq.data(),
         /*.seq_idx      =*/ data->seq_idx.data(),
         /*.output       =*/ data->output.data(),
+        /*.label        =*/ nullptr,
+        /*.label_weight =*/ nullptr,
         /*.data         =*/ data,
     };
 
@@ -2250,4 +2252,8 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
             lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream(), lid_state->get_n_rs_seq());
 
     return reserve_plan_lid;
+}
+
+const char * llama_kv_cache_dsv4::training_error(const llama_batch &, bool) const {
+    return "DSV4 cache row gradients are not supported";
 }

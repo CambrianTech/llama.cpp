@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <array>
 #include <vector>
 #include <memory>
 #include <set>
@@ -231,6 +232,16 @@ public:
     const llama_cparams cparams;
 
     const uint32_t n_outputs;
+};
+
+class llm_graph_input_training_rows : public llm_graph_input_i {
+public:
+    void set_input(const llama_ubatch * ubatch) override;
+    ggml_tensor * public_rows = nullptr;
+    ggml_tensor * label_rows = nullptr;
+    ggml_tensor * shadow_rows = nullptr;
+    ggml_tensor * public_shadow_rows = nullptr;
+    std::vector<ggml_tensor *> slice_shadow_rows;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -783,6 +794,11 @@ struct llm_graph_params {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    // THE SHADOW: the attached adapter being trained (llama_opt_init), the layer that switches on
+    // and off. It applies only to the ubatch's labelled rows (n_shadow_rows of them); a ubatch
+    // with no label never applies it, so serving is the stable set's graph
+    const llama_adapter_lora     * shadow;
+    uint32_t                       n_shadow_rows;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -875,10 +891,13 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.training                == other.cparams.training                &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
+            shadow == other.shadow &&
+            n_shadow_rows == other.n_shadow_rows &&
             cross == other.cross;
     }
 };
@@ -932,6 +951,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    std::vector<ggml_tensor *> t_loss_slices;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -943,6 +963,7 @@ public:
     struct walk_layer {
         int           il;
         uint32_t      n_past;
+        uint32_t      g0;           // the first position whose K/V gradient is kept
         ggml_tensor * tk = nullptr; // the cached K/V of [grad_from, n_past) as F32, tapped: their
         ggml_tensor * tv = nullptr; //   gradient adds into ak / av (ggml_opt_accumulate_grad)
         ggml_tensor * ak = nullptr; // the accumulator's rows [grad_from, n_past), shaped like tk / tv
@@ -1054,6 +1075,8 @@ struct llm_graph_context {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const llama_adapter_lora     * shadow;
+    const uint32_t                 n_shadow_rows;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -1064,6 +1087,7 @@ struct llm_graph_context {
     llm_graph_result * res;
 
     mutable ggml_tensor * inp_train_rows = nullptr; // build_inp_train_rows, once per graph
+    mutable llm_graph_input_training_rows * inp_training_rows = nullptr;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1186,6 +1210,16 @@ struct llm_graph_context {
     // A training chunk's cache rows: I32 [n_tokens], its positions (in the walk a position
     // is its cell). One per graph, shared by every attention layer.
     ggml_tensor * build_inp_train_rows() const;
+
+    // whether an attached adapter's term is in this graph: every one but the shadow always, the
+    // shadow only when the ubatch has labelled rows
+    bool lora_on(const llama_adapter_lora * adapter) const;
+    // base plus the shadow's term, on the labelled rows only (Cormac, 2026-10-14): those rows of
+    // base and of the term are gathered and added, and written back into a copy of base; every
+    // other row is base, byte for byte. A multiplied 0/1 mask was not: an untrained layer's inf or
+    // NaN times zero is NaN, and x + 0 turns a -0 into +0, on a serving row co-batched with
+    // training.
+    ggml_tensor * shadow_add(ggml_tensor * base, ggml_tensor * term) const;
 
     // Whether this layer's attention runs through FLASH_ATTN_EXT: the one decision
     // build_attn_mha makes and a training graph reads to attend to the cache in place.
@@ -1367,9 +1401,26 @@ struct llm_graph_context {
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
+    // THE ONE RULE for how many recurrent states a graph keeps per sequence, read by every family's
+    // state write (delta-net, mamba, lfm2, bailing) and by the ops that produce snapshots. Serving with
+    // rollback slots keeps K = n_rs_seq + 1 (group g = the state g tokens back, so a draft can be undone);
+    // a context without them, and a TRAINING graph, keep one: the live state, group 0, which is the same
+    // bytes in both layouts. So training reads and writes the state serving reads, in the serving
+    // context; the undo groups it leaves stale are rewritten by the next serving decode, and the walk
+    // refuses a sequence with an undo pending (llama_memory_recurrent::rollback_pending).
+    int64_t rs_keep() const;
+
     // THE EXACT WALK: the state a chunk leaves (`exit`, what is written back to `cache`) meets the
     // gradient later chunks put on it, through the surrogate <exit, gs>. A no-op outside the walk.
     void build_walk_state_exit(ggml_tensor * cache, ggml_tensor * exit) const;
+    // rows [row, row + n) of a layer's walk accumulator, shaped like `like`'s K / V span
+    ggml_tensor * walk_acc_rows(ggml_tensor * acc, const ggml_tensor * like, int64_t row) const;
+    // the in-place training attention's K/V grad sinks (tap k, chunk k, tap v, chunk v), set by
+    // build_attn before build_attn_mha and taken by the FLASH_ATTN_EXT it builds
+    mutable std::array<ggml_tensor *, 4> walk_grad_sinks = {};
+    // <k_cur, G_k> + <v_cur, G_v>: what later chunks of the run put on this chunk's own K/V
+    // (accumulator rows from `row`), carried into it through the loss
+    void build_walk_surrogate(int il, ggml_tensor * k_cur, ggml_tensor * v_cur, int64_t row) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
@@ -1405,6 +1456,8 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+    bool build_training_head() const;
+    llm_graph_input_training_rows * training_rows() const;
 
     //
     // dense (out)
