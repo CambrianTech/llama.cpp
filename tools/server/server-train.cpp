@@ -397,6 +397,32 @@ json server_trainer::measure(const json & body) const {
     return json::object({{"ok", true}, {"window", window}, {"examples", rows}});
 }
 
+// REPACKED WEIGHTS CANNOT BE TRAINED THROUGH (Cormac on the /train plan; card 5b497852): the
+// backward reads quantized blocks in the standard layout, and a weight in an extra buffer type
+// (CPU_REPACK) is not in it, and its buffer cannot even be read back (get_tensor/cpy_tensor NULL,
+// ggml-cpu/repack.cpp). Measured 2026-10-15: on x86 a learn fails ("no backend can run" an
+// OUT_PROD on blk.23.ffn_down.weight); on a Metal host at -ngl 0 the scheduler copies the weight to
+// Metal and crashes in ggml_backend_tensor_copy. With --no-repack the same learn succeeds. Extra
+// buffer types only apply to weights kept on the CPU, so training is allowed when they are
+// disabled, or when every layer is offloaded and no tensor override pins a weight elsewhere.
+std::string train_repack_refusal(const llama_model * model, const common_params & params) {
+    const int32_t n_layer = llama_model_n_layer(model);
+    const int32_t ngl     = params.n_gpu_layers;
+    const bool    all_gpu = ngl <= -2 || ngl > n_layer;
+    // the list carries a {nullptr, nullptr} terminator when parsed from args: count real entries
+    bool override = false;
+    for (const auto & o : params.tensor_buft_overrides) {
+        override = override || o.pattern != nullptr;
+    }
+    if (params.no_extra_bufts || (all_gpu && !override)) {
+        return "";
+    }
+    return "this server may hold base weights in a repacked CPU buffer (n_gpu_layers " + std::to_string(ngl) +
+           " of " + std::to_string(n_layer) + " layers" + (override ? ", tensor overrides set" : "") +
+           "), and training's backward needs the standard layout. "
+           "Serve with every layer offloaded (-ngl all) or with --no-repack.";
+}
+
 json server_trainer::start(const json & body_in) {
     json body = body_in;
     examples_data prepared;
@@ -466,27 +492,8 @@ json server_trainer::start(const json & body_in) {
     if (confine_out(params_base.train_dir, body.at("out").get<std::string>()).empty()) {
         return json::object({{"ok", false}, {"error", "\"out\" must be a bare file name ending in .gguf (no directories, no \"..\"); it is written inside the server's --train-dir"}});
     }
-    // REPACKED WEIGHTS GIVE WRONG GRADIENTS, SILENTLY (Cormac on the /train plan): the backward
-    // reads quantized blocks in the standard layout, and a weight in an extra buffer type
-    // (CPU_REPACK) is not in it — no crash, garbage gradients. Extra buffer types only apply to
-    // weights kept on the CPU, so training is allowed when they are disabled, or when every layer
-    // is offloaded and no tensor override pins a weight elsewhere; otherwise refuse and say so.
-    {
-        const int32_t n_layer  = llama_model_n_layer(model);
-        const int32_t ngl      = params_base.n_gpu_layers;
-        const bool    all_gpu  = ngl <= -2 || ngl > n_layer;
-        // the list carries a {nullptr, nullptr} terminator when parsed from args: count real entries
-        bool override = false;
-        for (const auto & o : params_base.tensor_buft_overrides) {
-            override = override || o.pattern != nullptr;
-        }
-        if (!params_base.no_extra_bufts && (!all_gpu || override)) {
-            return json::object({{"ok", false}, {"error",
-                "refusing to train: this server may hold base weights in a repacked CPU buffer (n_gpu_layers " +
-                std::to_string(ngl) + " of " + std::to_string(n_layer) + " layers" + (override ? ", tensor overrides set" : "") +
-                "), and the backward reads the standard layout, so gradients would be silently wrong. "
-                "Serve with every layer offloaded (-ngl all) or with --no-repack."}});
-        }
+    if (const std::string why = train_repack_refusal(model, params_base); !why.empty()) {
+        return json::object({{"ok", false}, {"error", "refusing to train: " + why}});
     }
     if (body.contains("parse_special") && !body.at("parse_special").is_boolean()) {
         return json::object({{"ok", false}, {"error", "\"parse_special\" must be true or false"}});

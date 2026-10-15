@@ -2072,6 +2072,11 @@ private:
             SRV_WRN("learn refused: %s\n", why.c_str());
             return out;
         };
+        // the same refusal /train gives: repacked CPU weights fail the backward (x86) or crash
+        // the copy to Metal (an M5 at -ngl 0), card 5b497852
+        if (const std::string why = train_repack_refusal(model_tgt, params_base); !why.empty()) {
+            return refused(why);
+        }
         auto & loras = params_base.lora_adapters;
         if (L.lora_id < 0 || (size_t) L.lora_id >= loras.size() || loras[L.lora_id].ptr == nullptr) {
             return refused("no loaded adapter " + std::to_string(L.lora_id) + " to train (POST /lora-adapters/load it first)");
