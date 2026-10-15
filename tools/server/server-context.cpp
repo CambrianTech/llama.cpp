@@ -3572,6 +3572,11 @@ private:
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
 
                             slot.print_timings();
+                            if (slot.task->params.learn) {
+                                // a learn that could not run is said, not omitted (Cormac's review)
+                                slot.learned = learn_outcome{};
+                                slot.learned->failure = "the request had no prompt to learn the reply after";
+                            }
                             send_final_response(slot);
                             slot.release();
 
