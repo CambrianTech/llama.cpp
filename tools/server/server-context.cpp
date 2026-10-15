@@ -897,6 +897,12 @@ private:
     // given (one per server run for now), and the learning rate its next step reads
     int32_t learn_lora_id = -1;
     float   learn_lr      = 1e-4f;
+    // LEARNING BARELY TOUCHES THE FLOW: while any other slot is working, learning may take at most
+    // LEARN_DUTY of the loop's time (the step after a learn of t ms waits t*(1/LEARN_DUTY - 1) ms);
+    // with every other slot idle it runs at once. Back to back, learns took the 4B's other slot from
+    // p50 218 / p95 450 ms per token to 686 / 2,567 (M5, 2026-10-15).
+    static constexpr double LEARN_DUTY = 0.10;
+    int64_t learn_next_us = 0;
     static ggml_opt_optimizer_params learn_opt_pars(void * ud) {
         ggml_opt_optimizer_params p = ggml_opt_get_default_optimizer_params(nullptr);
         p.adamw.alpha = *(const float *) ud;
@@ -2888,6 +2894,16 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    {
+                        bool others_busy = false;
+                        for (const auto & other : slots) {
+                            others_busy = others_busy || (other.id != slot->id && other.is_processing());
+                        }
+                        if (others_busy && ggml_time_us() < learn_next_us) {
+                            queue_tasks.defer(std::move(task)); // within the duty cycle's rest
+                            break;
+                        }
+                    }
                     auto & loras = params_base.lora_adapters;
                     if (L.lora_id < 0 || (size_t) L.lora_id >= loras.size() || loras[L.lora_id].ptr == nullptr) {
                         refuse("no loaded adapter " + std::to_string(L.lora_id) + " to train (POST /lora-adapters/load it first)");
@@ -2998,6 +3014,7 @@ private:
                     res->loss     = loss;
                     res->n_labels = (int32_t) toks.size() - 1;
                     res->t_ms     = (ggml_time_us() - t0) / 1000.0;
+                    learn_next_us = ggml_time_us() + (int64_t) ((ggml_time_us() - t0) * (1.0/LEARN_DUTY - 1.0));
                     SRV_INF("learned on slot %d: %d labels from position %d, loss %.4f, %.1f ms%s\n", slot->id, res->n_labels, n0, loss,
                             res->t_ms, ok ? "" : (" (failed: " + res->failure + ")").c_str());
                     queue_results.send(std::move(res));
@@ -5769,6 +5786,7 @@ void server_routes::init_routes() {
         const json body = json::parse(req.body);
         server_task task(SERVER_TASK_TYPE_LEARN);
         task.learn.id_slot  = json_value(body, "id_slot",  -1);
+        task.id_slot        = task.learn.id_slot; // a deferred learn comes back when her slot frees
         task.learn.n_prefix = json_value(body, "n_prefix", 0);
         task.learn.lora_id  = json_value(body, "lora_id",  -1);
         task.learn.lr       = json_value(body, "lr",       1e-4f);
