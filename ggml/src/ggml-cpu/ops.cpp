@@ -9268,39 +9268,38 @@ static void ggml_compute_forward_flash_attn_back_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // per thread: a row's scores, then one K row, one V row and one query row as F32
-    float * s   = (float *) params->wdata + ith*(M + D + Dv + D + Dv);
-    float * kr  = s  + M;
-    float * vr  = kr + D;
-    float * qr  = vr + Dv;
-    float * dor = qr + D;
+    // Rows are worked in blocks so each K and V row is converted to F32 once per block, not once per
+    // query row, and the dot products run on ggml's SIMD vec_dot (pass 1: BR query rows of one head;
+    // pass 2: BC KV positions of one KV head). Per thread: BR rows of scores, the block's query and
+    // output-gradient rows, one K and one V row; pass 2 reuses the same space for its K and V block.
+    const int64_t BR = GGML_FA_BACK_BR;
+    const int64_t BC = GGML_FA_BACK_BC;
+    float * wbase = (float *) params->wdata + ith*ggml_flash_attn_back_cpu_wsize(D, Dv, M);
 
     const ggml_to_float_t k_to_float = ggml_get_type_traits(k->type)->to_float;
     const ggml_to_float_t v_to_float = ggml_get_type_traits(v->type)->to_float;
-    auto k_row = [&](int64_t j, int64_t hk) {
+    auto k_row = [&](int64_t j, int64_t hk, float * out) {
         const char * r = (const char *) k->data + j*k->nb[1] + hk*k->nb[2];
-        if (k->type == GGML_TYPE_F32) { memcpy(kr, r, D*sizeof(float)); } else { k_to_float(r, kr, D); }
+        if (k->type == GGML_TYPE_F32) { memcpy(out, r, D*sizeof(float)); } else { k_to_float(r, out, D); }
     };
-    auto v_row = [&](int64_t j, int64_t hk) {
+    auto v_row = [&](int64_t j, int64_t hk, float * out) {
         const char * r = (const char *) v->data + j*v->nb[1] + hk*v->nb[2];
-        if (v->type == GGML_TYPE_F32) { memcpy(vr, r, Dv*sizeof(float)); } else { v_to_float(r, vr, Dv); }
+        if (v->type == GGML_TYPE_F32) { memcpy(out, r, Dv*sizeof(float)); } else { v_to_float(r, out, Dv); }
     };
-    auto q_row = [&](int64_t i, int64_t h) {
+    auto q_row = [&](int64_t i, int64_t h, float * out) {
         for (int64_t c = 0; c < D; ++c) {
-            qr[c] = *(const float *) ((const char *) q->data + c*q->nb[0] + i*q->nb[1] + h*q->nb[2]);
+            out[c] = *(const float *) ((const char *) q->data + c*q->nb[0] + i*q->nb[1] + h*q->nb[2]);
         }
     };
-    auto d_row = [&](int64_t i, int64_t h) {
+    auto d_row = [&](int64_t i, int64_t h, float * out) {
         for (int64_t c = 0; c < Dv; ++c) {
-            dor[c] = *(const float *) ((const char *) d->data + c*d->nb[0] + h*d->nb[1] + i*d->nb[2]);
+            out[c] = *(const float *) ((const char *) d->data + c*d->nb[0] + h*d->nb[1] + i*d->nb[2]);
         }
     };
     auto dot = [](const float * a, const float * b, int64_t n) {
-        ggml_float r = 0.0;
-        for (int64_t c = 0; c < n; ++c) {
-            r += (ggml_float) a[c]*b[c];
-        }
-        return (float) r;
+        float r;
+        ggml_vec_dot_f32((int) n, &r, 0, a, 0, b, 0, 1);
+        return r;
     };
 
     // the dO scale a reduced-precision kernel uses (recorded so every backend's result agrees; the
@@ -9317,87 +9316,133 @@ static void ggml_compute_forward_flash_attn_back_f32(
         dvec[N*H] = ggml_flash_attn_back_scale(mx);
     }
 
-    // pass 1: the query rows
-    for (int64_t r = ith; r < N*H; r += nth) {
-        const int64_t i  = r % N;
-        const int64_t h  = r / N;
-        const int64_t hk = h / G;
-        q_row(i, h);
-        d_row(i, h);
-        float smax = -INFINITY;
-        for (int64_t j = 0; j < M; ++j) {
-            k_row(j, hk);
-            s[j] = dot(qr, kr, D)*scale + ggml_fa_back_mask(mask, j, i, h);
-            smax = std::max(smax, s[j]);
-        }
-        float l = -INFINITY;
-        if (smax != -INFINITY) {
-            ggml_float sum = 0.0;
+    // pass 1: blocks of BR query rows of one head
+    {
+        float * s   = wbase;          // [BR][M] scores, then p
+        float * qb  = s  + BR*M;      // [BR][D]
+        float * db  = qb + BR*D;      // [BR][Dv]
+        float * kr  = db + BR*Dv;     // [D]
+        float * vr  = kr + D;         // [Dv]
+        float     l[GGML_FA_BACK_BR];
+        ggml_float dd[GGML_FA_BACK_BR];
+
+        const int64_t nblk = (N + BR - 1)/BR;
+        for (int64_t t = ith; t < nblk*H; t += nth) {
+            const int64_t i0 = (t % nblk)*BR;
+            const int64_t h  = t / nblk;
+            const int64_t hk = h / G;
+            const int64_t nb = std::min(BR, N - i0);
+            for (int64_t b = 0; b < nb; ++b) {
+                q_row(i0 + b, h, qb + b*D);
+                d_row(i0 + b, h, db + b*Dv);
+            }
             for (int64_t j = 0; j < M; ++j) {
-                sum += expf(s[j] - smax);
+                k_row(j, hk, kr);
+                for (int64_t b = 0; b < nb; ++b) {
+                    s[b*M + j] = dot(qb + b*D, kr, D)*scale + ggml_fa_back_mask(mask, j, i0 + b, h);
+                }
             }
-            l = smax + (float) log(sum);
-        }
-        // s becomes p; D from the recomputed p and dp
-        ggml_float dd = 0.0;
-        for (int64_t j = 0; j < M; ++j) {
-            s[j] = l == -INFINITY ? 0.0f : expf(s[j] - l);
-            if (s[j] != 0.0f) {
-                v_row(j, hk);
-                dd += (ggml_float) s[j]*dot(dor, vr, Dv);
+            for (int64_t b = 0; b < nb; ++b) {
+                float * sb = s + b*M;
+                float smax = -INFINITY;
+                for (int64_t j = 0; j < M; ++j) {
+                    smax = std::max(smax, sb[j]);
+                }
+                l[b] = -INFINITY;
+                if (smax != -INFINITY) {
+                    ggml_float sum = 0.0;
+                    for (int64_t j = 0; j < M; ++j) {
+                        sum += expf(sb[j] - smax);
+                    }
+                    l[b] = smax + (float) log(sum);
+                }
+                for (int64_t j = 0; j < M; ++j) {
+                    sb[j] = l[b] == -INFINITY ? 0.0f : expf(sb[j] - l[b]);
+                }
+                dd[b] = 0.0;
             }
-        }
-        lse [h*N + i] = l;
-        dvec[h*N + i] = (float) dd;
-        float * g = dq + (h*N + i)*D;
-        memset(g, 0, D*sizeof(float));
-        for (int64_t j = 0; j < M; ++j) {
-            if (s[j] == 0.0f) {
-                continue;
+            // D from the recomputed p and dp
+            for (int64_t j = 0; j < M; ++j) {
+                bool any = false;
+                for (int64_t b = 0; b < nb; ++b) { any = any || s[b*M + j] != 0.0f; }
+                if (!any) { continue; }
+                v_row(j, hk, vr);
+                for (int64_t b = 0; b < nb; ++b) {
+                    const float p = s[b*M + j];
+                    if (p != 0.0f) {
+                        dd[b] += (ggml_float) p*dot(db + b*Dv, vr, Dv);
+                    }
+                }
             }
-            v_row(j, hk);
-            k_row(j, hk);
-            const float ds = s[j]*(dot(dor, vr, Dv) - (float) dd)*scale;
-            for (int64_t c = 0; c < D; ++c) {
-                g[c] += ds*kr[c];
+            for (int64_t b = 0; b < nb; ++b) {
+                lse [h*N + i0 + b] = l[b];
+                dvec[h*N + i0 + b] = (float) dd[b];
+                memset(dq + (h*N + i0 + b)*D, 0, D*sizeof(float));
+            }
+            for (int64_t j = 0; j < M; ++j) {
+                bool any = false;
+                for (int64_t b = 0; b < nb; ++b) { any = any || s[b*M + j] != 0.0f; }
+                if (!any) { continue; }
+                k_row(j, hk, kr);
+                v_row(j, hk, vr);
+                for (int64_t b = 0; b < nb; ++b) {
+                    const float p = s[b*M + j];
+                    if (p == 0.0f) {
+                        continue;
+                    }
+                    const float ds = p*(dot(db + b*Dv, vr, Dv) - (float) dd[b])*scale;
+                    ggml_vec_mad_f32((int) D, dq + (h*N + i0 + b)*D, kr, ds);
+                }
             }
         }
     }
 
     ggml_barrier(params->threadpool);
 
-    // pass 2: the KV positions, each summed over its group's query heads and every query row
-    for (int64_t r = ith; r < M*Hkv; r += nth) {
-        const int64_t j  = r % M;
-        const int64_t hk = r / M;
-        float * gk = dk + (hk*M + j)*D;
-        float * gv = dv + (hk*M + j)*Dv;
-        memset(gk, 0, D*sizeof(float));
-        memset(gv, 0, Dv*sizeof(float));
-        k_row(j, hk);
-        v_row(j, hk);
-        for (int64_t h = hk*G; h < (hk + 1)*G; ++h) {
-            for (int64_t i = 0; i < N; ++i) {
-                const float l = lse[h*N + i];
-                if (l == -INFINITY) {
-                    continue;
-                }
-                const float m = ggml_fa_back_mask(mask, j, i, h);
-                if (m == -INFINITY) {
-                    continue;
-                }
-                q_row(i, h);
-                const float p = expf(dot(qr, kr, D)*scale + m - l);
-                if (p == 0.0f) {
-                    continue;
-                }
-                d_row(i, h);
-                const float ds = p*(dot(dor, vr, Dv) - dvec[h*N + i])*scale;
-                for (int64_t c = 0; c < D; ++c) {
-                    gk[c] += ds*qr[c];
-                }
-                for (int64_t c = 0; c < Dv; ++c) {
-                    gv[c] += p*dor[c];
+    // pass 2: blocks of BC KV positions of one KV head, each summed over its group's query heads and
+    // every query row
+    {
+        float * kb = wbase;          // [BC][D]
+        float * vb = kb + BC*D;      // [BC][Dv]
+        float * qr = vb + BC*Dv;     // [D]
+        float * dr = qr + D;         // [Dv]
+
+        const int64_t nblk = (M + BC - 1)/BC;
+        for (int64_t t = ith; t < nblk*Hkv; t += nth) {
+            const int64_t j0 = (t % nblk)*BC;
+            const int64_t hk = t / nblk;
+            const int64_t nb = std::min(BC, M - j0);
+            for (int64_t b = 0; b < nb; ++b) {
+                k_row(j0 + b, hk, kb + b*D);
+                v_row(j0 + b, hk, vb + b*Dv);
+                memset(dk + (hk*M + j0 + b)*D,  0, D*sizeof(float));
+                memset(dv + (hk*M + j0 + b)*Dv, 0, Dv*sizeof(float));
+            }
+            for (int64_t h = hk*G; h < (hk + 1)*G; ++h) {
+                for (int64_t i = 0; i < N; ++i) {
+                    const float l = lse[h*N + i];
+                    if (l == -INFINITY) {
+                        continue;
+                    }
+                    bool loaded = false;
+                    for (int64_t b = 0; b < nb; ++b) {
+                        const float m = ggml_fa_back_mask(mask, j0 + b, i, h);
+                        if (m == -INFINITY) {
+                            continue;
+                        }
+                        if (!loaded) {
+                            q_row(i, h, qr);
+                            d_row(i, h, dr);
+                            loaded = true;
+                        }
+                        const float p = expf(dot(qr, kb + b*D, D)*scale + m - l);
+                        if (p == 0.0f) {
+                            continue;
+                        }
+                        const float ds = p*(dot(dr, vb + b*Dv, Dv) - dvec[h*N + i])*scale;
+                        ggml_vec_mad_f32((int) D,  dk + (hk*M + j0 + b)*D,  qr, ds);
+                        ggml_vec_mad_f32((int) Dv, dv + (hk*M + j0 + b)*Dv, dr, p);
+                    }
                 }
             }
         }
