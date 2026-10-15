@@ -329,6 +329,13 @@ static ggml_tensor * ggml_opt_recompute_node(
     if (node->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT)) {
         return node;
     }
+    // an in-place write into a buffer the forward did not compute (a cache, a state) is a side
+    // effect: a clone would apply it a second time to the live buffer (Cormac's review of #5057)
+    const bool view_op = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                         node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
+    if (node->view_src != nullptr && !view_op && !forward.count(ggml_opt_view_root(node))) {
+        return node;
+    }
     switch (node->op) {
         case GGML_OP_NONE:
         case GGML_OP_SET_ROWS:
