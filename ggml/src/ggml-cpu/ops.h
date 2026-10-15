@@ -89,6 +89,13 @@ void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct 
 void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_flash_attn_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_flash_attn_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+// OUT_PROD with a quantized src0: BN dst rows per task share one dequantization of each KT-row tile
+// of src0. Its per-thread scratch, in floats, for a row of ne0; the work planner reserves this.
+#define GGML_OUT_PROD_BN 32
+#define GGML_OUT_PROD_KT 32
+static inline int64_t ggml_out_prod_cpu_wsize(int64_t ne0) {
+    return GGML_OUT_PROD_KT*ne0 + GGML_OUT_PROD_BN*GGML_OUT_PROD_KT;
+}
 // FLASH_ATTN_BACK's blocks: BR query rows (pass 1) and BC KV positions (pass 2) share one conversion of
 // each K and V row. Its per-thread scratch, in floats; the work-size planner reserves this per task.
 #define GGML_FA_BACK_BR 8

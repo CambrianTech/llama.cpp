@@ -4392,55 +4392,57 @@ static void ggml_compute_forward_out_prod_q_f32(
 
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
+    //
+    // dst[i0,i1] = sum_i01 src0[i0,i01] * src1[i1,i01]: a GEMM dst[ne1 x ne0] = S1[ne1 x ne01] *
+    // W[ne01 x ne0]. Each task owns a block of BN dst rows of one (i2,i3) plane, dequantizes src0 in
+    // tiles of KT rows ONCE per block (the row loop dequantized every src0 row again for every dst
+    // row), gathers the matching src1 values, and accumulates on simd_gemm.
+    const int64_t BN = GGML_OUT_PROD_BN;
+    const int64_t KT = GGML_OUT_PROD_KT;
 
     if (ith == 0) {
         ggml_vec_set_f32(ne0*ne1*ne2*ne3, (float *)dst->data, 0);
     }
     ggml_barrier(params->threadpool);
 
-    // parallelize by last three dimensions
+    float * wt = (float *) params->wdata + ith*ggml_out_prod_cpu_wsize(ne0); // [KT][ne0]
+    float * at = wt + KT*ne0;                                               // [BN][KT]
 
-    // total rows in dst
-    const int64_t nr = ne1*ne2*ne3;
+    const int64_t nblk   = (ne1 + BN - 1)/BN;
+    const int64_t ntasks = nblk*ne2*ne3;
+    const bool    dense  = nb1 == (size_t) ne0*sizeof(float); // simd_gemm's C rows are contiguous
 
-    // rows per thread
-    const int64_t dr = (nr + nth - 1)/nth;
-
-    // row range for this thread
-    const int64_t ir0 = dr*ith;
-    const int64_t ir1 = MIN(ir0 + dr, nr);
-
-    // dst[:,:,:,:] = 0
-    // for i2,i3:
-    //   for i1:
-    //     for i01:
-    //       for i0:
-    //         dst[i0,i1,i2,i3] += src0[i0,i01,i2,i3] * src1[i1,i01,i2,i3]
-
-    float * wdata = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32) * ith;
-
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
-        // dst indices
-        const int64_t i3 = ir/(ne2*ne1);
-        const int64_t i2 = (ir - i3*ne2*ne1)/ne1;
-        const int64_t i1 = (ir - i3*ne2*ne1 - i2*ne1);
+    for (int64_t t = ith; t < ntasks; t += nth) {
+        const int64_t i3  = t/(ne2*nblk);
+        const int64_t i2  = (t - i3*ne2*nblk)/nblk;
+        const int64_t b0  = (t - i3*ne2*nblk - i2*nblk)*BN;
+        const int64_t nb_ = std::min(BN, ne1 - b0);
 
         const int64_t i02 = i2 / (ne12 / ne02);
         const int64_t i03 = i3 / (ne13 / ne03);
 
-        //const int64_t i10 = i1;
-        const int64_t i12 = i2;
-        const int64_t i13 = i3;
+        float * d0 = (float *) ((char *) dst->data + (b0*nb1 + i2*nb2 + i3*nb3));
 
-        for (int64_t i01 = 0; i01 < ne01; ++i01) {
-            const int64_t i11 = i01;
-
-            float * s0 = (float *) ((char *) src0->data + (          i01*nb01 + i02*nb02 + i03*nb03));
-            float * s1 = (float *) ((char *) src1->data + (i1*nb10 + i11*nb11 + i12*nb12 + i13*nb13));
-            float * d  = (float *) ((char *)  dst->data + (          i1*nb1 + i2*nb2 + i3*nb3));
-
-            dequantize_row_q(s0, wdata, ne0);
-            ggml_vec_mad_f32(ne0, d, wdata, *s1);
+        for (int64_t k0 = 0; k0 < ne01; k0 += KT) {
+            const int64_t kt = std::min(KT, ne01 - k0);
+            for (int64_t r = 0; r < kt; ++r) {
+                dequantize_row_q((const char *) src0->data + ((k0 + r)*nb01 + i02*nb02 + i03*nb03), wt + r*ne0, ne0);
+            }
+            for (int64_t b = 0; b < nb_; ++b) {
+                for (int64_t r = 0; r < kt; ++r) {
+                    at[b*kt + r] = *(const float *) ((const char *) src1->data + ((b0 + b)*nb10 + (k0 + r)*nb11 + i2*nb12 + i3*nb13));
+                }
+            }
+            if (dense) {
+                simd_gemm(d0, at, wt, (int) nb_, (int) kt, (int) ne0);
+            } else {
+                for (int64_t b = 0; b < nb_; ++b) {
+                    float * d = (float *) ((char *) d0 + b*nb1);
+                    for (int64_t r = 0; r < kt; ++r) {
+                        ggml_vec_mad_f32(ne0, d, wt + r*ne0, at[b*kt + r]);
+                    }
+                }
+            }
         }
     }
 }
