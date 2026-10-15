@@ -359,6 +359,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
+    if (learned) {
+        res["learn"] = learned->to_json();
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -403,6 +406,9 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     // extra fields for debugging purposes
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
+    }
+    if (learned) {
+        res["learn"] = learned->to_json();
     }
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
@@ -451,6 +457,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     // extra fields for debugging purposes
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
+    }
+    if (learned) {
+        res["learn"] = learned->to_json();
     }
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
@@ -1693,7 +1702,7 @@ json server_task_result_lora_change::to_json() {
     return res;
 }
 
-json server_task_result_learn::to_json() {
+json learn_outcome::to_json() const {
     json res = { { "success", ok }, { "loss", loss }, { "n_labels", n_labels }, { "t_ms", t_ms } };
     if (!ok) {
         res["failure"] = failure;

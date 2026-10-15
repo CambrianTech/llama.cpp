@@ -206,6 +206,7 @@ struct server_batch {
             batch.seq_id   + off,
             batch.logits   + off,
             batch.label ? batch.label + off : nullptr,
+            batch.label && batch.label_weight ? batch.label_weight + off : nullptr,
         };
 
         return view;
@@ -347,6 +348,7 @@ struct server_slot {
     int32_t n_gen_last = 0;
 
     void reset() {
+        learned.reset();
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
@@ -520,6 +522,9 @@ struct server_slot {
         prompt.tokens.push_back(sampled);
         prompt.tokens.insert(spec_draft);
     }
+
+    // the outcome of the finishing task's learn (task_params::learn), for its final response
+    std::optional<learn_outcome> learned;
 
     void release() {
         if (is_processing()) {
@@ -2057,11 +2062,160 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // One reply learned on `slot`, which holds the served prompt (POST /learn between its turns, or a
+    // completion's own learn before its slot is released): the slot's stable set plus the shadow on
+    // the reply's labelled rows, then the slot back to its whole served prompt.
+    learn_outcome learn_on_slot(server_slot & slot, const learn_request & L, int64_t t0) {
+        auto refused = [&](const std::string & why) {
+            learn_outcome out;
+            out.failure = why;
+            SRV_WRN("learn refused: %s\n", why.c_str());
+            return out;
+        };
+        auto & loras = params_base.lora_adapters;
+        if (L.lora_id < 0 || (size_t) L.lora_id >= loras.size() || loras[L.lora_id].ptr == nullptr) {
+            return refused("no loaded adapter " + std::to_string(L.lora_id) + " to train (POST /lora-adapters/load it first)");
+        }
+        if (learn_lora_id >= 0 && learn_lora_id != L.lora_id) {
+            return refused("this server trains adapter " + std::to_string(learn_lora_id) + "; one shadow per server run");
+        }
+        const int32_t n0 = L.n_prefix - 1; // the last prompt token is re-decoded with the reply's first token as its label
+        if (n0 < 0 || L.n_prefix > slot.prompt.n_tokens() || L.reply.empty()) {
+            return refused("slot " + std::to_string(slot.id) + " holds " + std::to_string(slot.prompt.n_tokens())
+                + " prompt tokens; the served prefix is " + std::to_string(L.n_prefix) + " and the reply must not be empty");
+        }
+        // the served prompt, when the request carries it: her slot must still hold exactly it (a
+        // slot that has served other turns since, or compacted, would teach the wrong context)
+        if (!L.prompt.empty()) {
+            int32_t i = 0;
+            while (i < L.n_prefix && slot.prompt.tokens[i] == L.prompt[i]) {
+                ++i;
+            }
+            if (i < L.n_prefix) {
+                return refused("slot " + std::to_string(slot.id) + " no longer holds this turn's prompt (it differs at token "
+                    + std::to_string(i) + " of " + std::to_string(L.n_prefix) + "): serve the prompt again, then learn");
+            }
+        }
+        // the recurrent part cannot be cut back: her state one token before the prompt's end
+        const common_prompt_checkpoint * cp = nullptr;
+        const bool needs_cp = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+        if (needs_cp) {
+            for (const auto & c : slot.prompt.checkpoints) {
+                if (c.n_tokens == n0) {
+                    cp = &c;
+                }
+            }
+            if (cp == nullptr) {
+                return refused("slot " + std::to_string(slot.id) + " has no checkpoint one token before its prompt's end ("
+                    + std::to_string(n0) + "): the lane learns only with --train-dir, which keeps one");
+            }
+        }
+        // the tokens from the last prompt token on, each labelled with the next
+        std::vector<llama_token> toks;
+        toks.push_back(slot.prompt.tokens[n0]);
+        toks.insert(toks.end(), L.reply.begin(), L.reply.end());
+        std::vector<llama_token> labels(toks.size(), -1);
+        for (size_t i = 0; i + 1 < toks.size(); ++i) {
+            labels[i] = toks[i + 1];
+        }
+        // her stable set plus the shadow: the shadow applies to labelled rows only
+        std::vector<common_adapter_lora_info> set = slot.lora.empty() ? construct_lora_list({}) : slot.lora;
+        if ((size_t) L.lora_id >= set.size()) {
+            set = construct_lora_list({});
+        }
+        set[L.lora_id].scale = 1.0f;
+        common_set_adapter_lora(ctx_tgt, set);
+        learn_lr = L.lr;
+        if (learn_lora_id < 0) {
+            llama_opt_params lopt{};
+            lopt.param_filter    = llama_opt_param_filter_all;
+            lopt.get_opt_pars    = learn_opt_pars;
+            lopt.get_opt_pars_ud = &learn_lr;
+            lopt.optimizer_type  = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+            lopt.adapter         = loras[L.lora_id].ptr;
+            llama_opt_init(ctx_tgt, model_tgt, lopt);
+            learn_lora_id = L.lora_id;
+        }
+        // drop what follows n0 (attention) and put her recurrent state back at n0
+        if (cp != nullptr) {
+            cp->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        ggml_opt_result_t result = ggml_opt_result_init();
+        const bool ok = llama_opt_learn(ctx_tgt, slot.id, n0, toks.data(), labels.data(), (int32_t) toks.size(), result);
+        double loss = 0.0, unc = 0.0;
+        if (ok) {
+            ggml_opt_result_loss(result, &loss, &unc);
+        }
+        ggml_opt_result_free(result);
+        // her own adapter set again before anything else is decoded for her (the shadow is
+        // already off for a batch without labels: llama-graph.cpp lora_on, n_shadow_rows =
+        // the ubatch's label count; this does not rely on it)
+        common_set_adapter_lora(ctx_tgt, slot.lora);
+        // her slot goes back to her whole served prompt (attention cells, recurrent state,
+        // tokens and checkpoints agree; her next turn reuses all of it): back to n0 from the
+        // checkpoint, then the last prompt token decoded again under her stable set. A draft
+        // model's cache is cut to n0 with its own checkpoint, and the slot's tokens with it.
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, n0, -1);
+        if (cp != nullptr) {
+            cp->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        int32_t n_keep = n0;
+        if (ctx_dft != nullptr) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, n0, -1);
+            if (cp != nullptr) {
+                cp->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+        } else {
+            llama_batch one = llama_batch_get_one(&toks[0], 1);
+            llama_pos pos = n0;
+            one.pos = &pos;
+            llama_seq_id sid = slot.id;
+            int32_t nsid = 1;
+            llama_seq_id * sids = &sid;
+            one.n_seq_id = &nsid;
+            one.seq_id = &sids;
+            if (llama_decode(ctx_tgt, one) == 0) {
+                n_keep = L.n_prefix;
+            } else {
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, n0, -1);
+                if (cp != nullptr) {
+                    cp->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
+            }
+        }
+        slot.prompt.tokens.keep_first(n_keep);
+        slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & c) { return c.n_tokens > n_keep; });
+        learn_outcome out;
+        out.ok       = ok;
+        out.failure  = ok ? "" : llama_opt_failure(ctx_tgt);
+        out.loss     = loss;
+        out.n_labels = (int32_t) toks.size() - 1;
+        out.t_ms     = (ggml_time_us() - t0) / 1000.0;
+        SRV_INF("learned on slot %d: %d labels from position %d, loss %.4f, %.1f ms%s\n", slot.id, out.n_labels, n0, loss,
+                out.t_ms, ok ? "" : (" (failed: " + out.failure + ")").c_str());
+        return out;
+    }
+
+    // A completion that carries a learn learns its reply on its own slot as it finishes, before the
+    // slot is released: no other request can take the slot between the turn and its learning (on
+    // a one-slot lane that is busy almost always, a separate POST /learn lost that race 12 times in
+    // 12 on the M5's 27B, 2026-10-15).
+    void learn_if_asked(server_slot & slot) {
+        if (!slot.task->params.learn) {
+            return;
+        }
+        learn_request L = *slot.task->params.learn;
+        L.id_slot  = slot.id;
+        L.n_prefix = slot.task->n_tokens();
+        slot.learned = learn_on_slot(slot, L, ggml_time_us());
+    }
+
     void send_final_response(server_slot & slot) {
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
         res->id_slot = slot.id;
+        res->learned = slot.learned;
 
         res->index = slot.task->index;
 
@@ -2880,8 +3034,8 @@ private:
                     const int64_t t0 = ggml_time_us();
                     server_slot * slot = get_slot_by_id(L.id_slot);
                     auto refuse = [&](const std::string & why) {
-                        res->ok = false;
-                        res->failure = why;
+                        res->outcome.ok      = false;
+                        res->outcome.failure = why;
                         SRV_WRN("learn refused: %s\n", why.c_str());
                         queue_results.send(std::move(res));
                     };
@@ -2904,132 +3058,8 @@ private:
                             break;
                         }
                     }
-                    auto & loras = params_base.lora_adapters;
-                    if (L.lora_id < 0 || (size_t) L.lora_id >= loras.size() || loras[L.lora_id].ptr == nullptr) {
-                        refuse("no loaded adapter " + std::to_string(L.lora_id) + " to train (POST /lora-adapters/load it first)");
-                        break;
-                    }
-                    if (learn_lora_id >= 0 && learn_lora_id != L.lora_id) {
-                        refuse("this server trains adapter " + std::to_string(learn_lora_id) + "; one shadow per server run");
-                        break;
-                    }
-                    const int32_t n0 = L.n_prefix - 1; // the last prompt token is re-decoded with the reply's first token as its label
-                    if (n0 < 0 || L.n_prefix > slot->prompt.n_tokens() || L.reply.empty()) {
-                        refuse("slot " + std::to_string(slot->id) + " holds " + std::to_string(slot->prompt.n_tokens())
-                            + " prompt tokens; the served prefix is " + std::to_string(L.n_prefix) + " and the reply must not be empty");
-                        break;
-                    }
-                    // the served prompt, when the request carries it: her slot must still hold exactly it (a
-                    // slot that has served other turns since, or compacted, would teach the wrong context)
-                    if (!L.prompt.empty()) {
-                        int32_t i = 0;
-                        while (i < L.n_prefix && slot->prompt.tokens[i] == L.prompt[i]) {
-                            ++i;
-                        }
-                        if (i < L.n_prefix) {
-                            refuse("slot " + std::to_string(slot->id) + " no longer holds this turn's prompt (it differs at token "
-                                + std::to_string(i) + " of " + std::to_string(L.n_prefix) + "): serve the prompt again, then learn");
-                            break;
-                        }
-                    }
-                    // the recurrent part cannot be cut back: her state one token before the prompt's end
-                    const common_prompt_checkpoint * cp = nullptr;
-                    const bool needs_cp = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
-                    if (needs_cp) {
-                        for (const auto & c : slot->prompt.checkpoints) {
-                            if (c.n_tokens == n0) {
-                                cp = &c;
-                            }
-                        }
-                        if (cp == nullptr) {
-                            refuse("slot " + std::to_string(slot->id) + " has no checkpoint one token before its prompt's end ("
-                                + std::to_string(n0) + "): the lane learns only with --train-dir, which keeps one");
-                            break;
-                        }
-                    }
-                    // the tokens from the last prompt token on, each labelled with the next
-                    std::vector<llama_token> toks;
-                    toks.push_back(slot->prompt.tokens[n0]);
-                    toks.insert(toks.end(), L.reply.begin(), L.reply.end());
-                    std::vector<llama_token> labels(toks.size(), -1);
-                    for (size_t i = 0; i + 1 < toks.size(); ++i) {
-                        labels[i] = toks[i + 1];
-                    }
-                    // her stable set plus the shadow: the shadow applies to labelled rows only
-                    std::vector<common_adapter_lora_info> set = slot->lora.empty() ? construct_lora_list({}) : slot->lora;
-                    if ((size_t) L.lora_id >= set.size()) {
-                        set = construct_lora_list({});
-                    }
-                    set[L.lora_id].scale = 1.0f;
-                    common_set_adapter_lora(ctx_tgt, set);
-                    learn_lr = L.lr;
-                    if (learn_lora_id < 0) {
-                        llama_opt_params lopt{};
-                        lopt.param_filter    = llama_opt_param_filter_all;
-                        lopt.get_opt_pars    = learn_opt_pars;
-                        lopt.get_opt_pars_ud = &learn_lr;
-                        lopt.optimizer_type  = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
-                        lopt.adapter         = loras[L.lora_id].ptr;
-                        llama_opt_init(ctx_tgt, model_tgt, lopt);
-                        learn_lora_id = L.lora_id;
-                    }
-                    // drop what follows n0 (attention) and put her recurrent state back at n0
-                    if (cp != nullptr) {
-                        cp->load_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    }
-                    ggml_opt_result_t result = ggml_opt_result_init();
-                    const bool ok = llama_opt_learn(ctx_tgt, slot->id, n0, toks.data(), labels.data(), (int32_t) toks.size(), result);
-                    double loss = 0.0, unc = 0.0;
-                    if (ok) {
-                        ggml_opt_result_loss(result, &loss, &unc);
-                    }
-                    ggml_opt_result_free(result);
-                    // her own adapter set again before anything else is decoded for her (the shadow is
-                    // already off for a batch without labels: llama-graph.cpp lora_on, n_shadow_rows =
-                    // the ubatch's label count; this does not rely on it)
-                    common_set_adapter_lora(ctx_tgt, slot->lora);
-                    // her slot goes back to her whole served prompt (attention cells, recurrent state,
-                    // tokens and checkpoints agree; her next turn reuses all of it): back to n0 from the
-                    // checkpoint, then the last prompt token decoded again under her stable set. A draft
-                    // model's cache is cut to n0 with its own checkpoint, and the slot's tokens with it.
-                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot->id, n0, -1);
-                    if (cp != nullptr) {
-                        cp->load_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                    }
-                    int32_t n_keep = n0;
-                    if (ctx_dft != nullptr) {
-                        llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, n0, -1);
-                        if (cp != nullptr) {
-                            cp->load_dft(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                        }
-                    } else {
-                        llama_batch one = llama_batch_get_one(&toks[0], 1);
-                        llama_pos pos = n0;
-                        one.pos = &pos;
-                        llama_seq_id sid = slot->id;
-                        int32_t nsid = 1;
-                        llama_seq_id * sids = &sid;
-                        one.n_seq_id = &nsid;
-                        one.seq_id = &sids;
-                        if (llama_decode(ctx_tgt, one) == 0) {
-                            n_keep = L.n_prefix;
-                        } else {
-                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot->id, n0, -1);
-                            if (cp != nullptr) {
-                                cp->load_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                            }
-                        }
-                    }
-                    slot->prompt.tokens.keep_first(n_keep);
-                    slot->prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & c) { return c.n_tokens > n_keep; });
-                    res->ok       = ok;
-                    res->failure  = ok ? "" : llama_opt_failure(ctx_tgt);
-                    res->loss     = loss;
-                    res->n_labels = (int32_t) toks.size() - 1;
-                    res->t_ms     = (ggml_time_us() - t0) / 1000.0;
+                    res->outcome = learn_on_slot(*slot, L, t0);
                     learn_next_us = ggml_time_us() + (int64_t) ((ggml_time_us() - t0) * (1.0/LEARN_DUTY - 1.0));
-                    SRV_INF("learned on slot %d: %d labels from position %d, loss %.4f, %.1f ms%s\n", slot->id, res->n_labels, n0, loss,
-                            res->t_ms, ok ? "" : (" (failed: " + res->failure + ")").c_str());
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_UNLOAD_LORA:
@@ -4291,6 +4321,7 @@ private:
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
                 slot.print_timings();
+                learn_if_asked(slot);
                 send_final_response(slot);
                 slot.release();
 
@@ -4412,6 +4443,7 @@ private:
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
+                    learn_if_asked(slot);
                     send_final_response(slot);
                     slot.release();
 
