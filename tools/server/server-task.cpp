@@ -1693,6 +1693,14 @@ json server_task_result_lora_change::to_json() {
     return res;
 }
 
+json server_task_result_learn::to_json() {
+    json res = { { "success", ok }, { "loss", loss }, { "n_labels", n_labels }, { "t_ms", t_ms } };
+    if (!ok) {
+        res["failure"] = failure;
+    }
+    return res;
+}
+
 //
 // server_prompt_cache
 //

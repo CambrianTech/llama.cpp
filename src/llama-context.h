@@ -408,6 +408,13 @@ private:
     opt_walk *        opt_walk_active   = nullptr;
     ggml_opt_result_t opt_result_active = nullptr;
     bool              opt_forward_only  = false;
+    // the batch's outputs feed only the in-graph loss (llama_opt_learn; a walk): no host logits are
+    // reserved, copied or mapped for them (a 512-row chunk at a 248k vocabulary is 485 MiB of host RAM)
+    bool              opt_outputs_internal = false;
+    // llama_opt_learn's one step: its labelled rows in all, and those trained so far (the ubatch that
+    // completes them takes the step, each weighted by its share)
+    int64_t           opt_learn_labels      = 0;
+    int64_t           opt_learn_labels_done = 0;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

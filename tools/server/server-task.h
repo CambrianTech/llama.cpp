@@ -29,6 +29,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,
     SERVER_TASK_TYPE_UNLOAD_LORA,
+    SERVER_TASK_TYPE_LEARN,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -184,6 +185,16 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_UNLOAD_LORA: the adapter id to retire
     int32_t unload_lora = -1;
+
+    // used by SERVER_TASK_TYPE_LEARN: one reply learned on the slot that served its prompt, in this
+    // serving context (llama_opt_learn): no second context, her prompt never decoded again
+    struct {
+        int32_t                  id_slot  = -1;
+        int32_t                  n_prefix = 0;      // the served prompt's tokens, before the reply
+        std::vector<llama_token> reply;             // what she should have said (her reply, or the reviewed correction)
+        int32_t                  lora_id  = -1;     // the trainable adapter (the shadow), loaded dormant
+        float                    lr       = 1e-4f;
+    } learn;
 
     server_task() = default;
 
@@ -579,6 +590,15 @@ struct server_task_result_lora_change : server_task_result {
     int32_t     lora_id = -1;
     std::string path;
     bool        loaded  = true;
+    virtual json to_json() override;
+};
+
+struct server_task_result_learn : server_task_result {
+    bool        ok       = false;
+    std::string failure;
+    double      loss     = 0.0;
+    int32_t     n_labels = 0;
+    double      t_ms     = 0.0;
     virtual json to_json() override;
 };
 

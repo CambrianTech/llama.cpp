@@ -105,9 +105,12 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     // (no backward pass) and before any adapter attached since (its nodes uncounted).
     // Size both again for the training graph, from the same number, plus the nodes each
     // attention layer's tiled backward adds for this window (one count, owned by ggml).
+    // the attention backward: one op where every GPU has the kernel, else composed tiles whose node
+    // count grows with the window (decided first: it sizes the graph)
+    cparams.fa_back_native = opt_fa_back_native();
     {
         size_t max_nodes = graph_max_nodes(n_ubatch);
-        if (cparams.flash_attn) {
+        if (cparams.flash_attn && !cparams.fa_back_native) {
             max_nodes += (size_t) model->hparams.n_layer() * ggml_flash_attn_ext_back_n_nodes(opt_n_ctx_train, 0);
         }
         gf_res_prev.reset(new llm_graph_result(max_nodes));
@@ -115,7 +118,6 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
                     max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     }
 
-    cparams.fa_back_native = opt_fa_back_native();
     LLAMA_LOG_INFO("%s: the attention backward is %s\n", __func__,
             cparams.fa_back_native ? "one op (ggml_flash_attn_back): no score is kept" : "composed from tiles (a device has no ggml_flash_attn_back kernel)");
 
@@ -375,6 +377,12 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
     }
     ggml_opt_prepare_alloc_slices(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(),
             res->t_loss_slices.data(), res->t_loss_slices.size());
+    if (xc == nullptr && opt_learn_labels > 0) {
+        // llama_opt_learn: one step per call, at the ubatch that completes its labelled rows
+        const int64_t nl = ubatch.n_labels();
+        opt_learn_labels_done += nl;
+        ggml_opt_set_next_step(opt_ctx, opt_learn_labels_done >= opt_learn_labels, (float) nl / (float) opt_learn_labels, nullptr);
+    }
     if (xc != nullptr) {
         ggml_opt_set_next_step(opt_ctx, xc->period_end, xc->loss_scale, res->t_walk_surrogate);
         for (const auto & io : res->t_walk) {
@@ -857,17 +865,33 @@ bool llama_context::opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_
             batch.logits[m - 1] = true;
         }
     };
+    // train up to the last labelled row: rows after it cannot change the loss, and in one batch an
+    // unlabelled row after the run is refused (a run ends its sequence's rows); the restore below
+    // still decodes all n
+    int32_t n_train = n;
+    while (n_train > 0 && labels[n_train - 1] < 0) {
+        --n_train;
+    }
     bool ok = true;
-    opt_result_active = result;
-    for (int32_t c0 = 0; c0 < n && ok; c0 += (int32_t) nb) {
-        const int32_t m = std::min<int32_t>((int32_t) nb, n - c0);
+    opt_result_active     = result;
+    opt_outputs_internal  = true;
+    opt_learn_labels      = 0;
+    opt_learn_labels_done = 0;
+    for (int32_t i = 0; i < n_train; ++i) {
+        opt_learn_labels += labels[i] >= 0;
+    }
+    for (int32_t c0 = 0; c0 < n_train && ok; c0 += (int32_t) nb) {
+        const int32_t m = std::min<int32_t>((int32_t) nb, n_train - c0);
         fill(c0, m, true);
         ok = decode(batch) == 0;
         if (!ok && !opt_alloc_failed.load()) {
             opt_fail("llama_opt_learn: the reply's training batch at " + std::to_string(n_cached + c0) + " failed to decode");
         }
     }
-    opt_result_active = nullptr;
+    opt_result_active     = nullptr;
+    opt_outputs_internal  = false;
+    opt_learn_labels      = 0;
+    opt_learn_labels_done = 0;
     // RESTORE: the reply's cells and the recurrent state decoded again under her stable set
     bool restored = attn == nullptr || attn->seq_rm(seq, n_cached, -1);
     if (recr != nullptr) {

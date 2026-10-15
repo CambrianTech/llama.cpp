@@ -665,12 +665,20 @@ int main(int argc, char ** argv) {
             reply[i] = 1;
         }
         const llama_pos r0 = WINDOW / 2 + 36; // the first labelled position
-        const auto want = step_delta(params, model, init, tokens, reply, WINDOW, true);
+        const auto want_f32 = step_delta(params, model, init, tokens, reply, WINDOW, true);
+        g_cache_type = GGML_TYPE_F16;
+        const auto want_f16 = step_delta(params, model, init, tokens, reply, WINDOW, true);
+        g_cache_type = GGML_TYPE_F32;
 
+      for (const bool streams : { false, true }) {
+        // unified F32 cache with explicit attention, then a stream per slot with an f16 cache and
+        // flash attention: how a serving lane runs (each slot attends over its own stream)
+        printf("  live sequence, %s:\n", streams ? "a stream per slot, f16 cache, flash attention" : "one unified F32 cache, explicit attention");
         auto two_seq_ctx = [&]() {
             auto cp = common_context_params_to_llama(params);
-            cp.n_ctx = 2*WINDOW; cp.n_batch = WINDOW; cp.n_ubatch = WINDOW; cp.n_seq_max = 2; cp.kv_unified = true;
-            cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED; cp.type_k = GGML_TYPE_F32; cp.type_v = GGML_TYPE_F32;
+            cp.n_ctx = 2*WINDOW; cp.n_batch = WINDOW; cp.n_ubatch = WINDOW; cp.n_seq_max = 2; cp.kv_unified = !streams;
+            cp.flash_attn_type = streams ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            cp.type_k = streams ? GGML_TYPE_F16 : GGML_TYPE_F32; cp.type_v = cp.type_k;
             return llama_init_from_model(model, cp);
         };
         auto decode_span = [&](llama_context * c, llama_seq_id sq, const llama_token * t, llama_pos p0, int32_t n) {
@@ -741,7 +749,7 @@ int main(int argc, char ** argv) {
             got[i] = after[i] - before[i];
         }
         printf("  live sequence: learned=%d \"%s\"\n", (int) learned, learned ? "" : "see the log");
-        if (!learned || !same_step(compare("live sequence: her reply learned in place vs the walk's exact step", got, want))) {
+        if (!learned || !same_step(compare("live sequence: her reply learned in place vs the walk's exact step", got, streams ? want_f16 : want_f32))) {
             fprintf(stderr, "FAILED: learning on a live sequence is not the walk's step\n");
             ++failures;
         }
@@ -753,6 +761,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "FAILED: learning on a live sequence disturbed the cache\n");
             ++failures;
         }
+      }
     }
 
     {

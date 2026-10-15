@@ -2673,12 +2673,24 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
 }
 
-const char * llama_kv_cache::training_error(const llama_batch &, bool flash_attn) const {
+const char * llama_kv_cache::training_error(const llama_batch & batch, bool flash_attn) const {
     if (!supports_row_gradients()) {
         return "cache row indices exceed the backward gather's index range";
     }
+    // the flash-attention backward reads one stream: a training batch may touch only one (a serving
+    // context with a stream per slot learns on one slot's stream at a time)
     if (flash_attn && get_n_stream() != 1) {
-        return "flash attention backward requires a unified cache stream";
+        int64_t stream = -1;
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            for (int32_t k = 0; k < (batch.n_seq_id ? batch.n_seq_id[i] : 1); ++k) {
+                const llama_seq_id sq = batch.seq_id ? batch.seq_id[i][k] : 0;
+                const int64_t st = seq_to_stream[sq];
+                if (stream >= 0 && st != stream) {
+                    return "a training batch with flash attention may touch one cache stream: this one spans several";
+                }
+                stream = st;
+            }
+        }
     }
     return nullptr;
 }

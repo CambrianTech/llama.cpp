@@ -1397,6 +1397,9 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->eval_ready);
+    // a caller-driven step's loss is not scaled by 1/opt_period (ggml_opt_build): recorded as if it
+    // were, so the result's reader (which multiplies a per-datapoint loss by opt_period) reports it right
+    const bool manual = opt_ctx->next_manual;
     if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
 
@@ -1487,7 +1490,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->loss->type == GGML_TYPE_F32);
     float loss;
     ggml_backend_tensor_get(opt_ctx->loss, &loss, 0, ggml_nbytes(opt_ctx->loss));
-    result->loss.push_back(loss);
+    result->loss.push_back(manual && opt_ctx->loss_per_datapoint ? loss / opt_ctx->opt_period : loss);
 
     if (opt_ctx->pred) {
         GGML_ASSERT(opt_ctx->pred->type == GGML_TYPE_I32);

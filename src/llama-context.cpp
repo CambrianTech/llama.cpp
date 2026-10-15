@@ -1818,8 +1818,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
-    // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    // reserve output buffer (none for outputs that only feed a training loss)
+    const bool host_outputs = !opt_outputs_internal && opt_walk_active == nullptr;
+    if (output_reserve(host_outputs ? n_outputs_all : 0) < (host_outputs ? n_outputs_all : 0)) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
@@ -1900,7 +1901,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && opt_walk_active == nullptr && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && host_outputs && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -1915,7 +1916,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs > 0) {
+        if (embd.data && t_embd && n_outputs > 0 && host_outputs) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -1983,7 +1984,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (embd_nextn.data && t_h_nextn && n_rows > 0 && host_outputs && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -2010,7 +2011,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
-    n_outputs = n_outputs_all;
+    n_outputs = host_outputs ? n_outputs_all : 0;
 
     // set output mappings
     if (n_outputs > 0) {
