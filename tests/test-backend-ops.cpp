@@ -44,6 +44,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
@@ -1770,6 +1771,28 @@ struct test_case {
         ggml_set_loss(out);
 
         ggml_build_forward_expand(gf, out);
+        // A param-reachable node whose op has no backward is not supported, not an abort: the
+        // full grad suite must reach its summary (ggml_node_has_backward is the one list).
+        {
+            std::unordered_set<const ggml_tensor *> reach;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                bool reached = false;
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    const ggml_tensor * s = node->src[k];
+                    reached = reached || (s != nullptr && ((s->flags & GGML_TENSOR_FLAG_PARAM) || reach.count(s)));
+                }
+                if (!reached) {
+                    continue;
+                }
+                reach.insert(node);
+                if (!ggml_node_has_backward(node)) {
+                    output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
+                        test_status_t::NOT_SUPPORTED, std::string("no backward for ") + ggml_op_desc(node)));
+                    return true;
+                }
+            }
+        }
         ggml_graph_cpy(gf, gb);
         ggml_build_backward_expand(ctx.get(), gb, nullptr);
         if (expect.size() != 1 || expect[0] != 0.0f) {
@@ -1992,7 +2015,6 @@ struct test_example : public test_case {
 
 
 // GGML_OP_UNARY
-static float EXPM1_GRAD_RANGE = 5.0f;
 struct test_unary : public test_case {
     const ggml_unary_op op;
     const ggml_type type;
@@ -2053,12 +2075,11 @@ struct test_unary : public test_case {
             min = -10.f;
             max =  10.f;
         }
-        // EXPM1's gradient is checked: exp past ~88.7 overflows f32, and over a wide range the
-        // summed loss is too coarse in f32 for the finite difference to see the small gradients
-        // (exp(-10) against a sum of exp(10)s reads 0). A range where both sides are measurable.
+        // EXPM1's gradient is checked against a finite difference: exp past ~88.7 overflows f32,
+        // and the summed loss must stay small enough in f32 for a small step to register.
         if (op == GGML_UNARY_OP_EXPM1) {
-            min = -EXPM1_GRAD_RANGE;
-            max =  EXPM1_GRAD_RANGE;
+            min = -2.f;
+            max =  2.f;
         }
 
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
@@ -2068,7 +2089,18 @@ struct test_unary : public test_case {
     }
 
     float grad_eps() override {
-        return 15.0f;
+        // 15 suits the piecewise-linear ops over [-150, 150]; exp's slope changes by e^15 over such
+        // a step, so EXPM1 takes the smooth ops' convention (test_sin): a small step, the 4-point
+        // difference, and an f32-sum tolerance (its range is narrowed above)
+        return op == GGML_UNARY_OP_EXPM1 ? 0.2f : 15.0f;
+    }
+
+    bool grad_precise() override {
+        return op == GGML_UNARY_OP_EXPM1;
+    }
+
+    double max_maa_err() override {
+        return op == GGML_UNARY_OP_EXPM1 ? 1e-3 : test_case::max_maa_err();
     }
 
     std::vector<float> grad_expect() override {
@@ -2150,33 +2182,30 @@ struct test_glu_split : public test_case {
         : op(op), type(type), ne_a(ne_a), v(v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        // only SWIGLU has a backward (ggml_compute_backward); marking another glu's inputs as
-        // params aborts the whole grad suite there and leaves every later case unchecked
-        const bool grad_supported = op == GGML_GLU_OP_SWIGLU;
         ggml_tensor * a;
         ggml_tensor * b;
         if (v & 1) {
             auto ne = ne_a; ne[0] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
-            if (grad_supported) { ggml_set_param(a); }
+            ggml_set_param(a);
             ggml_set_name(a, "a");
 
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
 
             b = ggml_new_tensor(ctx, type, 4, ne.data());
-            if (grad_supported) { ggml_set_param(b); }
+            ggml_set_param(b);
             ggml_set_name(b, "b");
 
             b = ggml_view_4d(ctx, b, ne_a[0], ne_a[1], ne_a[2], ne_a[3], b->nb[1], b->nb[2], b->nb[3], 0);
             ggml_set_name(a, "view_of_b");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
-            if (grad_supported) { ggml_set_param(a); }
+            ggml_set_param(a);
             ggml_set_name(a, "a");
 
             b = ggml_new_tensor(ctx, type, 4, ne_a.data());
-            if (grad_supported) { ggml_set_param(b); }
+            ggml_set_param(b);
             ggml_set_name(b, "b");
         }
 
@@ -2212,29 +2241,31 @@ struct test_swiglu_oai : public test_case {
                     float limit = 7.0f)
         : type(type), ne_a(ne_a), v(v), alpha(alpha), limit(limit) {}
 
-    // no params: SWIGLU_OAI has no backward (ggml_compute_backward), and a param would abort the
-    // whole grad suite here, leaving every later case unchecked
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
         ggml_tensor * b;
         if (v & 1) {
             auto ne = ne_a; ne[0] *= 3;
             a = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(a);
             ggml_set_name(a, "a");
 
             a = ggml_view_4d(ctx, a, ne_a[0], ne_a[1], ne_a[2], ne_a[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
 
             b = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(b);
             ggml_set_name(b, "b");
 
             b = ggml_view_4d(ctx, b, ne_a[0], ne_a[1], ne_a[2], ne_a[3], b->nb[1], b->nb[2], b->nb[3], 0);
             ggml_set_name(a, "view_of_b");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_param(a);
             ggml_set_name(a, "a");
 
             b = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_param(b);
             ggml_set_name(b, "b");
         }
 
@@ -5807,7 +5838,7 @@ struct test_pool1d : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * input = ggml_new_tensor(ctx, type_input, 4, ne_input.data());
-        // no param: POOL_1D has no backward (ggml_compute_backward aborts the grad suite on it)
+        ggml_set_param(input);
         ggml_set_name(input, "input");
 
         ggml_tensor * out = ggml_pool_1d(ctx, input, pool_type, k0, s0, p0);

@@ -7019,6 +7019,85 @@ static void ggml_flash_attn_ext_backward(
     }
 }
 
+// Whether a backward can be built through this node: its op (and unary or glu op) has a case in
+// ggml_compute_backward, and it is not an in-place write other than the re-shaping views. The ONE
+// answer a caller asks before building a backward graph, instead of meeting an abort there; both
+// ggml_build_backward_expand and ggml_compute_backward assert it, so they cannot disagree silently.
+bool ggml_node_has_backward(const struct ggml_tensor * tensor) {
+    if (tensor->view_src != NULL && tensor->op != GGML_OP_CPY && tensor->op != GGML_OP_VIEW &&
+            tensor->op != GGML_OP_RESHAPE && tensor->op != GGML_OP_PERMUTE && tensor->op != GGML_OP_TRANSPOSE &&
+            tensor->op != GGML_OP_SET_ROWS) {
+        return false; // in-place operations are not supported
+    }
+    switch (tensor->op) {
+        case GGML_OP_DUP:
+        case GGML_OP_ADD:
+        case GGML_OP_ADD1:
+        case GGML_OP_ACC:
+        case GGML_OP_SUB:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SQR:
+        case GGML_OP_SQRT:
+        case GGML_OP_LOG:
+        case GGML_OP_SIN:
+        case GGML_OP_COS:
+        case GGML_OP_SUM:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_MEAN:
+        case GGML_OP_REPEAT:
+        case GGML_OP_REPEAT_BACK:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_SCALE:
+        case GGML_OP_SET:
+        case GGML_OP_CPY:
+        case GGML_OP_CONT:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_DIAG_MASK_INF:
+        case GGML_OP_DIAG_MASK_ZERO:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_ROPE:
+        case GGML_OP_IM2COL:
+        case GGML_OP_POOL_2D:
+        case GGML_OP_WIN_PART:
+        case GGML_OP_WIN_UNPART:
+        case GGML_OP_CONCAT:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_NONE:
+            return true;
+        case GGML_OP_UNARY:
+            switch (ggml_get_unary_op(tensor)) {
+                case GGML_UNARY_OP_ABS:
+                case GGML_UNARY_OP_SGN:
+                case GGML_UNARY_OP_NEG:
+                case GGML_UNARY_OP_STEP:
+                case GGML_UNARY_OP_RELU:
+                case GGML_UNARY_OP_SILU:
+                case GGML_UNARY_OP_EXP:
+                case GGML_UNARY_OP_SIGMOID:
+                case GGML_UNARY_OP_EXPM1:
+                case GGML_UNARY_OP_SOFTPLUS:
+                    return true;
+                default:
+                    return false;
+            }
+        case GGML_OP_GLU:
+            return ggml_get_glu_op(tensor) == GGML_GLU_OP_SWIGLU;
+        default:
+            return false;
+    }
+}
+
 static void ggml_compute_backward(
         struct ggml_context * ctx, struct ggml_cgraph * cgraph, int i, const bool * grads_needed) {
     struct ggml_tensor * tensor = cgraph->nodes[i];
@@ -7039,6 +7118,9 @@ static void ggml_compute_backward(
     const bool src1_needs_grads = src1 && isrc1 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc1) && grads_needed[isrc1];
     const bool src2_needs_grads = src2 && isrc2 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc2) && grads_needed[isrc2];
 
+    if (!ggml_node_has_backward(tensor)) {
+        GGML_ABORT("%s: no backward implemented for op %s (%s)", __func__, ggml_op_name(tensor->op), ggml_op_desc(tensor));
+    }
     switch (tensor->op) {
         case GGML_OP_DUP: {
             if (src0_needs_grads) {
@@ -7827,10 +7909,10 @@ void ggml_build_backward_expand(
             continue;
         }
 
-        // inplace operations are currently not supported
-        GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
-            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE ||
-            node->op == GGML_OP_SET_ROWS);
+        if (!ggml_node_has_backward(node)) {
+            GGML_ABORT("%s: no backward through %s (%s): its op has none, or it is an in-place write", __func__,
+                ggml_op_name(node->op), ggml_op_desc(node));
+        }
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
         GGML_ASSERT(ihash != GGML_HASHSET_FULL);
