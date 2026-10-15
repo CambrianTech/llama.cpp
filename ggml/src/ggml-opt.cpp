@@ -367,7 +367,8 @@ static ggml_tensor * ggml_opt_recompute_node(
 static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, const char * prefix) {
     std::unordered_set<ggml_tensor *> forward;
     std::unordered_set<ggml_tensor *> keep;
-    std::unordered_set<ggml_tensor *> mutated; // roots of the buffers the forward pass writes in place
+    // roots of the buffers the forward pass writes in place, each with its last write's position
+    std::unordered_map<ggml_tensor *, int> mutated;
     const size_t plen = strlen(prefix);
     for (int i = 0; i < n_fwd; ++i) {
         ggml_tensor * node = g->nodes[i];
@@ -380,18 +381,27 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
         const bool view_op = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
                              node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
         if ((node->op == GGML_OP_CPY && !ggml_opt_is_cast(node)) || node->op == GGML_OP_SET_ROWS || (node->view_src != nullptr && !view_op)) {
-            mutated.insert(ggml_opt_view_root(node));
+            mutated[ggml_opt_view_root(node)] = i;
         }
     }
+    // A clone runs after the whole forward pass, so it sees a mutated buffer as the forward left
+    // it: the same value the original read unless the buffer is written AFTER the original. A read
+    // of a buffer whose writes all precede it (a layer's cache read after its own chunk's write) is
+    // recomputed like any other node; keeping it held a window-sized cast of the cache per layer
+    // from the forward to the backward (the M5, qwen3.5-4b, q8_0 cache, window 32768: 16 x 64 MiB).
+    auto written_after = [&](ggml_tensor * t, int i) {
+        const auto it = mutated.find(ggml_opt_view_root(t));
+        return it != mutated.end() && it->second > i;
+    };
     for (int i = 0; i < n_fwd; ++i) {
         ggml_tensor * node = g->nodes[i];
         bool reads_mutated = false;
         for (int k = 0; k < GGML_MAX_SRC && !reads_mutated; ++k) {
-            reads_mutated = node->src[k] != nullptr && mutated.count(ggml_opt_view_root(node->src[k]));
+            reads_mutated = node->src[k] != nullptr && written_after(node->src[k], i);
         }
         if (strncmp(ggml_get_name(node), prefix, plen) == 0 || (node->flags & GGML_TENSOR_FLAG_LOSS) ||
                 (node->flags & GGML_TENSOR_FLAG_OUTPUT) || reads_mutated ||
-                (node->view_src != nullptr && mutated.count(ggml_opt_view_root(node)))) {
+                (node->view_src != nullptr && written_after(node, i))) {
             keep.insert(node);
         }
     }
@@ -1351,7 +1361,8 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
     opt_ctx->allocated_graph = graph;
 
-    // GGML_OPT_TOP=N: the graph's N largest tensors (views excluded), where its memory goes
+    // GGML_OPT_TOP=N: the graph's N largest tensors, nodes and the leaves it allocates (inputs, not
+    // views or weights), where its memory goes
     if (const char * top = getenv("GGML_OPT_TOP")) {
         ggml_cgraph * g = opt_ctx->allocated_graph_copy;
         std::vector<std::pair<size_t, const ggml_tensor *>> rows;
@@ -1360,12 +1371,29 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
                 rows.emplace_back(ggml_nbytes(g->nodes[i]), g->nodes[i]);
             }
         }
+        for (int i = 0; i < g->n_leafs; ++i) {
+            const ggml_tensor * l = g->leafs[i];
+            if (l->view_src == nullptr && (l->flags & GGML_TENSOR_FLAG_INPUT)) {
+                rows.emplace_back(ggml_nbytes(l), l);
+            }
+        }
         std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
+        size_t sum = 0;
+        for (const auto & r : rows) {
+            sum += r.first;
+        }
+        GGML_LOG_INFO("%s: graph of %d nodes, %d leafs: its tensors sum to %.1f MiB, the peak so far %.1f MiB\n", __func__,
+            g->n_nodes, g->n_leafs, sum/1048576.0, opt_ctx->peak_graph_bytes/1048576.0);
         const size_t n = std::min<size_t>(rows.size(), (size_t) atoi(top));
         for (size_t i = 0; i < n; ++i) {
             const ggml_tensor * t = rows[i].second;
-            GGML_LOG_INFO("%s: top %2zu: %8.1f MiB %-12s %-6s [%lld,%lld,%lld,%lld] %s\n", __func__, i, rows[i].first/1048576.0,
-                ggml_op_desc(t), ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->name);
+            GGML_LOG_INFO("%s: top %2zu: %8.1f MiB %-12s %-6s [%lld,%lld,%lld,%lld] %s <- %s %s [%lld,%lld] | %s %s [%lld,%lld]\n", __func__, i,
+                rows[i].first/1048576.0, ggml_op_desc(t), ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1],
+                (long long) t->ne[2], (long long) t->ne[3], t->name,
+                t->src[0] ? ggml_op_desc(t->src[0]) : "-", t->src[0] ? t->src[0]->name : "", t->src[0] ? (long long) t->src[0]->ne[0] : 0LL,
+                t->src[0] ? (long long) t->src[0]->ne[1] : 0LL,
+                t->src[1] ? ggml_op_desc(t->src[1]) : "-", t->src[1] ? t->src[1]->name : "", t->src[1] ? (long long) t->src[1]->ne[0] : 0LL,
+                t->src[1] ? (long long) t->src[1]->ne[1] : 0LL);
         }
     }
 

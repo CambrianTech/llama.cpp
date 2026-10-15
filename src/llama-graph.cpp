@@ -2742,6 +2742,19 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
+        // A training graph reads a quantized cache as F16 through a node of its own, as the kernel
+        // would dequantize it anyway: inside the attention the F16 copy lives as long as the
+        // attention's output, which a training graph keeps for the backward, one window-sized copy
+        // per layer; the backward reads the cast's quantized source (ggml_flash_attn_ext_backward),
+        // so this copy dies with the forward (the M5, qwen3.5-4b, q8_0, window 32768: 1,888 MiB
+        // against 853 at an f16 cache)
+        if (cparams.training && cparams.walk_active && ggml_is_quantized(k->type)) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+        if (cparams.training && cparams.walk_active && ggml_is_quantized(v->type)) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});

@@ -2961,16 +2961,8 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/27390
 // dequantize the quantized KV cache to F16 before running the F16 flash attention kernels
-static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
-
-    // depending on compute/bandwidth ratio, dequant to f16 kv is not always beneficial
-    // ref: https://github.com/ggml-org/llama.cpp/pull/27390#issuecomment-5355152767
-    // TODO: tune per device
-    if (op->src[0]->ne[1] < 32) {
-        return false;
-    }
-
+// whether the kernel may dequantize this K to F16 at some batch size (a quantized K)
+static bool ggml_metal_op_flash_attn_ext_kv_dequantizable(const ggml_tensor * op) {
     switch (op->src[1]->type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
@@ -2981,6 +2973,19 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
         default:
             return false;
     }
+}
+
+static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    // depending on compute/bandwidth ratio, dequant to f16 kv is not always beneficial
+    // ref: https://github.com/ggml-org/llama.cpp/pull/27390#issuecomment-5355152767
+    // TODO: tune per device
+    if (op->src[0]->ne[1] < 32) {
+        return false;
+    }
+
+    return ggml_metal_op_flash_attn_ext_kv_dequantizable(op);
 }
 
 // in some models (e.g. MLA-based), V is a view of K (the first ne20 elements of each K row);
@@ -3133,10 +3138,13 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    // note: always reserve the temp buffer to avoid graph reallocations
-    //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
-    //    return 0;
-    //}
+    // reserved at every batch size for a quantized K (its use depends on the batch, and a graph
+    // must not reallocate between decode and prefill); a K the kernel never dequantizes needs none:
+    // the reservation lives as long as the attention's output, and a training graph keeps one per
+    // layer for the backward (the M5, qwen3.5-4b, window 32768: 128 MiB a layer, never read)
+    if (!ggml_metal_op_flash_attn_ext_kv_dequantizable(op)) {
+        return 0;
+    }
 
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
 

@@ -553,7 +553,7 @@ int main(int argc, char ** argv) {
         const uint32_t chunk = getenv("WALK_MEASURE_CHUNK") ? (uint32_t) atoi(getenv("WALK_MEASURE_CHUNK")) : 256;
         g_recompute = getenv("WALK_MEASURE_RECOMPUTE") != nullptr; // per-layer recompute, as the served runs train
         g_walk_horizon = getenv("WALK_MEASURE_HORIZON") ? (uint32_t) atoi(getenv("WALK_MEASURE_HORIZON")) : 0; // 0 = the whole window
-        printf("  window  chunk  explicit MiB  flash MiB  ratio\n");
+        printf("  window  chunk  explicit MiB  flash MiB  flash q8_0 MiB  ratio\n");
         for (const char * p = env; *p; ) {
             char * end = nullptr;
             const uint32_t w = (uint32_t) strtoul(p, &end, 10);
@@ -562,15 +562,16 @@ int main(int argc, char ** argv) {
             g_window = w;
             std::vector<uint8_t> reply(w + 1, 0);
             for (uint32_t i = w - 511; i <= w; ++i) reply[i] = 1;
-            double mib[2] = { 0, 0 };
-            const ggml_type types[2] = { GGML_TYPE_F32, GGML_TYPE_F16 };
-            for (int a = 0; a < 2; ++a) {
+            double mib[3] = { 0, 0, 0 };
+            // explicit attention at an F32 cache; flash at an f16 cache; flash at q8_0 (her lane's cache)
+            const ggml_type types[3] = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 };
+            for (int a = 0; a < 3; ++a) {
                 g_cache_type = types[a];
                 step_delta(params, model, init, long_tokens, reply, chunk, true);
                 mib[a] = g_last_graph_bytes / 1048576.0;
             }
             g_cache_type = GGML_TYPE_F32;
-            printf("  %6u  %5u  %12.1f  %9.1f  %5.2fx\n", w, chunk, mib[0], mib[1], mib[1] > 0 ? mib[0] / mib[1] : 0.0);
+            printf("  %6u  %5u  %12.1f  %9.1f  %14.1f  %5.2fx\n", w, chunk, mib[0], mib[1], mib[2], mib[1] > 0 ? mib[0] / mib[1] : 0.0);
             fflush(stdout);
         }
         std::remove(init.c_str());

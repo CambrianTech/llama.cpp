@@ -6884,6 +6884,17 @@ static void ggml_flash_attn_ext_backward(
     struct ggml_tensor * v    = tensor->src[2]; // [Dv, M, Hkv, 1]
     struct ggml_tensor * mask = tensor->src[3]; // [M', N', 1|H, 1] F16, or NULL
 
+    // the native backward reads a quantized K/V itself: one the forward read through an F16 cast of
+    // a quantized cache is read at the cast's source, so the window-sized cast is not kept alive
+    // for the backward
+    const bool native = ggml_get_op_params_i32(tensor, 4) == GGML_FA_BACK_NATIVE;
+    if (native && k->op == GGML_OP_CPY && ggml_is_quantized(k->src[0]->type) && ggml_are_same_shape(k, k->src[0])) {
+        k = k->src[0];
+    }
+    if (native && v->op == GGML_OP_CPY && ggml_is_quantized(v->src[0]->type) && ggml_are_same_shape(v, v->src[0])) {
+        v = v->src[0];
+    }
+
     float scale, max_bias, softcap;
     memcpy(&scale,    (const float *) tensor->op_params + 0, sizeof(float));
     memcpy(&max_bias, (const float *) tensor->op_params + 1, sizeof(float));
