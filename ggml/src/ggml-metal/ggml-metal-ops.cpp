@@ -3103,6 +3103,20 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/27390
 // dequantize the quantized KV cache to F16 before running the F16 flash attention kernels
+// whether K is a type the kernel may dequantize to F16 (at some batch size)
+static bool ggml_metal_op_flash_attn_ext_kv_dequantizable(const ggml_tensor * op) {
+    switch (op->src[1]->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -3115,16 +3129,7 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
         return false;
     }
 
-    switch (op->src[1]->type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q8_0:
-            return true;
-        default:
-            return false;
-    }
+    return ggml_metal_op_flash_attn_ext_kv_dequantizable(op);
 }
 
 static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool has_tensor) {
@@ -3379,10 +3384,11 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    // note: always reserve the temp buffer to avoid graph reallocations
-    //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
-    //    return 0;
-    //}
+    // note: reserved at every batch size for a K the kernel may dequantize, to avoid graph
+    // reallocations; a K it never dequantizes (F16, BF16, F32) needs none at any batch size
+    if (!ggml_metal_op_flash_attn_ext_kv_dequantizable(op)) {
+        return 0;
+    }
 
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
 
