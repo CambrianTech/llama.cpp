@@ -789,8 +789,17 @@ bool llama_context::opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_
         opt_fail("llama_opt_learn needs llama_opt_init on this context first");
         return false;
     }
-    if (n <= 0 || n_cached < 0) {
-        opt_fail("llama_opt_learn: an empty reply or a negative served prefix");
+    // each call answers for itself: a refusal before it does not refuse this one
+    opt_alloc_failed.store(false);
+    opt_stop_requested.store(false);
+    opt_failure.clear();
+    if (n <= 0 || n_cached < 0 || tokens == nullptr || labels == nullptr) {
+        opt_fail("llama_opt_learn: an empty reply, a negative served prefix, or no tokens / labels");
+        return false;
+    }
+    if ((int64_t) n_cached + n > (int64_t) cparams.n_ctx_seq) {
+        opt_fail("llama_opt_learn: the reply ends at " + std::to_string((int64_t) n_cached + n) + ", past the sequence's context of "
+            + std::to_string(cparams.n_ctx_seq) + " positions");
         return false;
     }
     // the parts of the memory: a recurrent state cannot be cut back, attention cells can

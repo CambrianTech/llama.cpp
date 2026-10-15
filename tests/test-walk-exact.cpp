@@ -715,6 +715,21 @@ int main(int argc, char ** argv) {
         for (int32_t i = 0; i < (int32_t) WINDOW - r0; ++i) {
             labels[i] = tokens[r0 + i + 1];
         }
+        // refusals come before any change: her sequence byte-identical after each
+        {
+            const std::vector<uint8_t> her_before = seq_state(ctx, 0);
+            const bool r_null = llama_opt_learn(ctx, 0, r0, tokens.data() + r0, nullptr, WINDOW - r0, nullptr);
+            const bool r_long = llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), 2*WINDOW, nullptr);
+            const bool r_more = llama_opt_learn(ctx, 0, r0 + 5, tokens.data() + r0, labels.data(), 10, nullptr);
+            const bool same   = seq_state(ctx, 0) == her_before;
+            printf("  live sequence refusals: null labels %s, past the context %s, prefix not held %s; her sequence %s\n",
+                    r_null ? "ACCEPTED" : "refused", r_long ? "ACCEPTED" : "refused", r_more ? "ACCEPTED" : "refused",
+                    same ? "byte-identical" : "CHANGED");
+            if (r_null || r_long || r_more || !same) {
+                fprintf(stderr, "FAILED: a refused live learn was accepted or changed her sequence\n");
+                ++failures;
+            }
+        }
         const bool learned = llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr);
         const std::vector<uint8_t> her_after = seq_state(ctx, 0);
         const std::vector<uint8_t> neighbour_after = seq_state(ctx, 1);
