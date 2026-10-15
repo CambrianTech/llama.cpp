@@ -10500,6 +10500,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_back(128, 8, 2, 512, 64, t));
     }
     test_cases.emplace_back(new test_flash_attn_back(256, 16, 4, 300, 37, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_back(512, 4, 2, 128, 9, GGML_TYPE_F16)); // the tiled path's tiles exceed 32 KiB: the per-row path
     test_cases.emplace_back(new test_cross_entropy_loss_index());
     test_cases.emplace_back(new test_cross_entropy_loss_index({30000, 2, 1, 1})); // a vocabulary's width; few rows keep the finite difference above f32 rounding
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));

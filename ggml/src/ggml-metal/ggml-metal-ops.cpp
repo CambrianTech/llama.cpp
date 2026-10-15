@@ -4296,10 +4296,13 @@ int ggml_metal_op_flash_attn_back(ggml_metal_op_t ctx, int idx) {
     };
     // the dO scale (one threadgroup; every path records it so backends agree)
     run("scale", 1, 1, 1024, 32*sizeof(float));
-    if (args.D == args.Dv && args.D % 32 == 0) {
-        // tiled (fa.metal FAB_*): query blocks of 8 rows, KV blocks of 16, four simdgroups
-        const int br = 8, bc = 16, nsg = 4;
-        const size_t shmem = (size_t) (2*br + 2*bc)*args.D*sizeof(uint16_t) + (2*br*bc + 2*br)*sizeof(float) + 2*br*bc*sizeof(uint16_t);
+    // tiled (fa.metal FAB_*): query blocks of 8 rows, KV blocks of 16, four simdgroups; its tiles
+    // must fit the device's threadgroup memory (head 256: 26,176 bytes; head 512 would need 50,752,
+    // over Apple's 32 KiB: Cormac's review of 8ec4f9d84)
+    const int br = 8, bc = 16, nsg = 4;
+    const size_t shmem = (size_t) (2*br + 2*bc)*args.D*sizeof(uint16_t) + (2*br*bc + 2*br)*sizeof(float) + 2*br*bc*sizeof(uint16_t);
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    if (args.D == args.Dv && args.D % 32 == 0 && shmem <= props_dev->max_theadgroup_memory_size) {
         run("stats", (args.N + br - 1)/br, args.H,   32*nsg, shmem);
         run("dkv",   (args.M + bc - 1)/bc, args.Hkv, 32*nsg, shmem);
         run("dq",    (args.N + br - 1)/br, args.H,   32*nsg, shmem);
