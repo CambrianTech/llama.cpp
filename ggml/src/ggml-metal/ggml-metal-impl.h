@@ -482,6 +482,22 @@ typedef struct {
 } ggml_metal_kargs_mul_mm;
 
 typedef struct {
+    int32_t  ne00; // m: dst rows
+    int32_t  ne01; // k: the contraction, rows of both sources
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne10; // n: dst columns
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne2;
+    int32_t  dps2; // dst per src0 along dim 2 (grouped heads)
+    int32_t  dps3;
+} ggml_metal_kargs_out_prod;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;
@@ -916,13 +932,24 @@ typedef struct {
 } ggml_metal_kargs_flash_attn_back;
 
 // a per-row backward with one scalar parameter (eps for RMS_NORM_BACK, scale for SOFT_MAX_BACK)
+// rows are addressed through each source's own strides, so a strided view (a per-head norm)
+// is read in place
 typedef struct {
     int32_t  ne00;
-    uint64_t nb01;
-    uint64_t nb11;
-    uint64_t nb1;
+    uint64_t nb01, nb02, nb03;
+    uint64_t nb11, nb12, nb13;
+    uint64_t nb1,  nb2,  nb3;
     float    param;
 } ggml_metal_kargs_row_back;
+
+// GET_ROWS_BACK: dst = 0, then dst[:, ids[i]] += src0[:, i] for each i (the gradient of a row
+// gather; in a training graph, the selection of the output rows)
+typedef struct {
+    int32_t  ne00; // row width
+    int32_t  nr;   // number of ids
+    uint64_t nb01;
+    uint64_t nb1;
+} ggml_metal_kargs_get_rows_back;
 
 typedef struct {
     int64_t  ne00;
@@ -1155,6 +1182,10 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  lp0; // left padding per dim: dst[i] = src[i - lp]
+    int32_t  lp1;
+    int32_t  lp2;
+    int32_t  lp3;
 } ggml_metal_kargs_pad;
 
 typedef struct {

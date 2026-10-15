@@ -3526,22 +3526,28 @@ struct test_rms_norm_back : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     const float eps;
+    const bool strided; // a and b are row views into tensors twice as wide (a per-head norm)
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne, eps);
+        return VARS_TO_STR4(type, ne, eps, strided);
     }
 
     test_rms_norm_back(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {64, 5, 4, 3},
-            float eps = 1e-6f)
-        : type(type), ne(ne), eps(eps) {}
+            float eps = 1e-6f, bool strided = false)
+        : type(type), ne(ne), eps(eps), strided(strided) {}
+
+    ggml_tensor * input(ggml_context * ctx, const char * name) {
+        std::array<int64_t, 4> ne_full = ne;
+        ne_full[0] *= strided ? 2 : 1;
+        ggml_tensor * t = ggml_new_tensor(ctx, type, 4, ne_full.data());
+        ggml_set_name(t, name);
+        return strided ? ggml_view_4d(ctx, t, ne[0], ne[1], ne[2], ne[3], t->nb[1], t->nb[2], t->nb[3], 0) : t;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_name(a, "a");
-
-        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_name(b, "b");
+        ggml_tensor * a = input(ctx, "a");
+        ggml_tensor * b = input(ctx, "b");
 
         ggml_tensor * out = ggml_rms_norm_back(ctx, a, b, eps);
         ggml_set_name(out, "out");
@@ -9495,6 +9501,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
             test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, false, eps, true));
             test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
+            test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, true));
@@ -9939,6 +9946,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                       type_a == GGML_TYPE_F32 ? 1024 : 256, 1024, 8, {1, 1}, {1, 1}, trans_b, true));
         }
     }
+    // the batched, broadcast shape a delta-net backward hands OUT_PROD on the 4B (16 value heads
+    // over 4 key heads, head width 256 and 128), both gradient layouts
+    for (bool trans_b : {false, true}) {
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, 256, 128, 256, {4, 1}, {4, 1}, trans_b));
+    }
+    // a LoRA parameter gradient: the rank is the OUTPUT width (dA, dB = out_prod(x, grad) with
+    // m = rank), not the contraction; ranks below and between multiples of 16, at the 4B walk's
+    // shapes (8192 tokens, 128 and 1024 wide), both layouts
+    for (int64_t rank : {4, 8, 24}) {
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, rank, 128, 8192, {1, 1}, {1, 1}, true));
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, rank, 8192, 128, {1, 1}, {1, 1}, false));
+        test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32, GGML_TYPE_F32, rank, 1024, 128, {1, 1}, {1, 1}, false));
+    }
     // the q8_0 three-block case in both gradient layouts: the training graph hands
     // out_prod a TRANSPOSED gradient (out_prod(W, ggml_transpose(grad)))
     for (bool trans_b : {false, true}) {
@@ -10289,6 +10309,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad());
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {33, 17, 2, 1}, 4, 3, true)); // circular
     test_cases.emplace_back(new test_pad_ext());
+    // left padding on one dim at a time, and on views (a training graph pads a strided view):
+    // Metal refused every left pad until it read src[i - lp]
+    for (int tfrm : {0, 1, 2}) {
+        test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {128, 64, 3, 2}, 3, 0, 0, 0, 0, 0, 0, 0, tfrm));
+        test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {128, 64, 3, 2}, 0, 0, 5, 2, 0, 0, 0, 0, tfrm));
+        test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {128, 64, 3, 2}, 0, 0, 0, 0, 2, 0, 1, 1, tfrm));
+    }
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {1024, 1, 1, 1}, 1, 0, false));
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {1024, 2, 1, 1}, 1, 0, false));
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {1024, 16, 1, 1}, 0, 1, false));

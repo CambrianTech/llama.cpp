@@ -109,6 +109,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(FA,              fa)             \
     X(MUL_MV,          mul_mv)         \
     X(MUL_MM,          mul_mm)         \
+    X(OUT_PROD,        out_prod)       \
     X(QUANTIZE,        quantize)       \
     X(SOFTMAX,         softmax)        \
     X(NORM,            norm)           \
@@ -1470,10 +1471,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
         case GGML_OP_RMS_NORM_BACK:
         case GGML_OP_SOFT_MAX_BACK:
-            // src0 the incoming gradient, src1 the forward input/output; rows contiguous.
-            // SOFT_MAX_BACK carries no max_bias (the CPU reference asserts the same).
+            // src0 the incoming gradient, src1 the forward input/output; each row contiguous, the
+            // rows themselves at any stride. SOFT_MAX_BACK carries no max_bias (the CPU reference
+            // asserts the same).
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op) &&
+                   ggml_are_same_shape(op->src[0], op->src[1]) &&
+                   ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) && ggml_is_contiguous_rows(op) &&
                    (op->op != GGML_OP_SOFT_MAX_BACK || ggml_get_op_params_f32(op, 1) == 0.0f);
         case GGML_OP_REPEAT_BACK:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
@@ -1486,6 +1489,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->src[0]->ne[0] <= 512 && op->src[2]->ne[0] <= 512 &&
                    op->src[0]->nb[0] == sizeof(float) && op->src[4]->nb[0] == sizeof(float) &&
                    (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_F16);
+        case GGML_OP_GET_ROWS_BACK:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_I32) &&
@@ -1620,8 +1626,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return false;
             }
 
-            return (ggml_get_op_params_i32(op, 0) == 0) && (ggml_get_op_params_i32(op, 2) == 0) &&
-                   (ggml_get_op_params_i32(op, 4) == 0) && (ggml_get_op_params_i32(op, 6) == 0);
+            return true; // left and right zero padding on every dim
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_TIMESTEP_EMBEDDING:
             return op->src[0]->type == GGML_TYPE_F32;
