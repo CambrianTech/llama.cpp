@@ -4698,6 +4698,21 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+// The tokens a parsed request is served as: a chat request with a projector loaded goes through
+// mtmd (its media markers and files), everything else through tokenize_input_prompts. One place, so
+// what /learn checks a slot against is what serving put there by construction.
+static std::vector<server_tokens> serving_prompt_tokens(const llama_vocab * vocab, mtmd_context * mctx, const json & prompt,
+                                                        const std::vector<raw_buffer> & files, bool chat) {
+    if (chat && mctx != nullptr) {
+        // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
+        std::vector<server_tokens> out;
+        out.push_back(process_mtmd_prompt(mctx, prompt.get<std::string>(), files));
+        return out;
+    }
+    // Everything else, including multimodal completions.
+    return tokenize_input_prompts(vocab, mctx, prompt, true, true);
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -4733,15 +4748,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
 
         // process prompt
-        std::vector<server_tokens> inputs;
-
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
-            // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
-        } else {
-            // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
-        }
+        std::vector<server_tokens> inputs = serving_prompt_tokens(ctx_server.vocab, ctx_server.mctx, prompt, files,
+                                                                  res_type != TASK_RESPONSE_TYPE_NONE);
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
@@ -5816,6 +5824,23 @@ void server_routes::init_routes() {
                                                  ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
+            // the reply is learned as its text then the end of the turn; a reply whose substance is
+            // elsewhere (tool calls, reasoning) would teach her to end the turn instead (Cormac's
+            // review of #5061), so it is refused until those render through the template
+            const json & last = messages.back();
+            const json no_value;
+            const json & calls     = last.contains("tool_calls")        ? last.at("tool_calls")        : no_value;
+            const json & reasoning = last.contains("reasoning_content") ? last.at("reasoning_content") : no_value;
+            const bool has_calls     = calls.is_array() && !calls.empty();
+            const bool has_reasoning = reasoning.is_string() && !reasoning.get<std::string>().empty();
+            const bool has_text      = last.contains("content") && last.at("content").is_string() && !last.at("content").get<std::string>().empty();
+            if (has_calls || has_reasoning || !has_text) {
+                res->error(format_error_response(has_calls ? "a reply with tool_calls cannot be learned yet (only its text would be: it would teach ending the turn)"
+                                                 : has_reasoning ? "a reply with reasoning_content cannot be learned yet (its reasoning would be dropped)"
+                                                                 : "the reply to learn has no text content",
+                                                 ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
             json served = body;
             served["messages"] = json::array();
             for (size_t i = 0; i + 1 < messages.size(); ++i) {
@@ -5823,9 +5848,13 @@ void server_routes::init_routes() {
             }
             std::vector<raw_buffer> files;
             const json parsed = oaicompat_chat_params_parse(served, meta->chat_params, files);
-            task.learn.prompt   = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, parsed.at("prompt"), true, true)[0].get_text_tokens();
+            if (!files.empty()) {
+                res->error(format_error_response("a conversation with media cannot be learned yet: only text prompts", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            task.learn.prompt   = serving_prompt_tokens(ctx_server.vocab, ctx_server.mctx, parsed.at("prompt"), files, true)[0].get_text_tokens();
             task.learn.n_prefix = (int32_t) task.learn.prompt.size();
-            task.learn.reply    = common_tokenize(ctx_server.vocab, messages.back().value("content", std::string()), false, true);
+            task.learn.reply    = common_tokenize(ctx_server.vocab, last.at("content").get<std::string>(), false, true);
             const llama_token eot = llama_vocab_eot(ctx_server.vocab) != LLAMA_TOKEN_NULL ? llama_vocab_eot(ctx_server.vocab) : llama_vocab_eos(ctx_server.vocab);
             task.learn.reply.push_back(eot);
         } else if (body.contains("reply_tokens")) {
