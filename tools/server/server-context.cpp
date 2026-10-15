@@ -2955,6 +2955,10 @@ private:
                         ggml_opt_result_loss(result, &loss, &unc);
                     }
                     ggml_opt_result_free(result);
+                    // her own adapter set again before anything else is decoded for her (the shadow is
+                    // already off for a batch without labels: llama-graph.cpp lora_on, n_shadow_rows =
+                    // the ubatch's label count; this does not rely on it)
+                    common_set_adapter_lora(ctx_tgt, slot->lora);
                     // her slot goes back to her whole served prompt (attention cells, recurrent state,
                     // tokens and checkpoints agree; her next turn reuses all of it): back to n0 from the
                     // checkpoint, then the last prompt token decoded again under her stable set. A draft
