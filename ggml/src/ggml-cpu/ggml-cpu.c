@@ -2884,9 +2884,9 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
-                        if (ggml_is_quantized(node->src[0]->type) ||
-                            node->src[0]->type == GGML_TYPE_F16) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                        if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F16) {
+                            // the blocked kernel's tile and gathered values (ops.h)
+                            cur = ggml_type_size(GGML_TYPE_F32) * ggml_out_prod_cpu_wsize(node->src[0]->ne[0]) * n_tasks;
                         }
                     } break;
                 case GGML_OP_SET_ROWS:
