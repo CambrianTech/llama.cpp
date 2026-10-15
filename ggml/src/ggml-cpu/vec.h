@@ -1514,30 +1514,6 @@ inline static void ggml_vec_cumsum_f32(const int n, float * y, const float * x) 
     }
 }
 
-inline static void ggml_vec_sum_f32_ggf(const int n, ggml_float * s, const float * x) {
-    ggml_float sum = 0.0;
-    for (int i = 0; i < n; ++i) {
-        sum += (ggml_float)x[i];
-    }
-    *s = sum;
-}
-
-inline static void ggml_vec_sum_f16_ggf(const int n, float * s, const ggml_fp16_t * x) {
-    float sum = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        sum += GGML_CPU_FP16_TO_FP32(x[i]);
-    }
-    *s = sum;
-}
-
-inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16_t * x) {
-    float sum = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        sum += GGML_BF16_TO_FP32(x[i]);
-    }
-    *s = sum;
-}
-
 inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
 #ifndef GGML_USE_ACCELERATE
     float max = -INFINITY;
