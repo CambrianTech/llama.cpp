@@ -2972,11 +2972,11 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
-                        // per thread: a row's scores, then a K, V, query and output-gradient row
+                        // per thread: the blocked kernel's scratch (ops.h)
                         const int64_t D  = node->src[0]->ne[0];
                         const int64_t M  = node->src[1]->ne[1];
                         const int64_t Dv = node->src[2]->ne[0];
-                        cur = sizeof(float)*(M + 2*D + 2*Dv)*n_tasks;
+                        cur = sizeof(float)*ggml_flash_attn_back_cpu_wsize(D, Dv, M)*n_tasks;
                     } break;
 
                 case GGML_OP_CROSS_ENTROPY_LOSS:

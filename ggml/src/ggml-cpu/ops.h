@@ -89,6 +89,15 @@ void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct 
 void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_flash_attn_ext(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_flash_attn_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+// FLASH_ATTN_BACK's blocks: BR query rows (pass 1) and BC KV positions (pass 2) share one conversion of
+// each K and V row. Its per-thread scratch, in floats; the work-size planner reserves this per task.
+#define GGML_FA_BACK_BR 8
+#define GGML_FA_BACK_BC 16
+static inline int64_t ggml_flash_attn_back_cpu_wsize(int64_t D, int64_t Dv, int64_t M) {
+    const int64_t pass1 = GGML_FA_BACK_BR*(M + D + Dv) + D + Dv;
+    const int64_t pass2 = GGML_FA_BACK_BC*(D + Dv) + D + Dv;
+    return pass1 > pass2 ? pass1 : pass2;
+}
 void ggml_compute_forward_ssm_conv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_ssm_scan(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_win_part(const struct ggml_compute_params * params, struct ggml_tensor * dst);
