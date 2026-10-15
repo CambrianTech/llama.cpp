@@ -7606,10 +7606,12 @@ struct test_cross_entropy_loss_index : public test_case {
     const std::array<int64_t, 4> ne;
 
     std::string vars() override {
-        return VARS_TO_STR1(ne);
+        return VARS_TO_STR2(ne, weighted);
     }
 
-    test_cross_entropy_loss_index(std::array<int64_t, 4> ne = {10, 5, 4, 3}) : ne(ne) {}
+    const bool weighted; // a weight per row: how much each row counts, not only whether
+
+    test_cross_entropy_loss_index(std::array<int64_t, 4> ne = {10, 5, 4, 3}, bool weighted = false) : ne(ne), weighted(weighted) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -7619,7 +7621,14 @@ struct test_cross_entropy_loss_index : public test_case {
         ggml_tensor * targets = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne[1]*ne[2]*ne[3]);
         ggml_set_name(targets, "targets");
 
-        ggml_tensor * out = ggml_cross_entropy_loss(ctx, logits, targets);
+        ggml_tensor * out;
+        if (weighted) {
+            ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[1]*ne[2]*ne[3]);
+            ggml_set_name(weights, "weights");
+            out = ggml_cross_entropy_loss_weighted(ctx, logits, targets, weights);
+        } else {
+            out = ggml_cross_entropy_loss(ctx, logits, targets);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -7628,7 +7637,14 @@ struct test_cross_entropy_loss_index : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         std::default_random_engine rng(7);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_I32) {
+            if (strcmp(t->name, "weights") == 0) {
+                // a spread of relevance, zero included (a row the mind did not care about)
+                std::vector<float> w(ggml_nelements(t));
+                for (size_t i = 0; i < w.size(); ++i) {
+                    w[i] = i % 4 == 1 ? 0.0f : 0.25f + 0.5f*(float) (i % 5);
+                }
+                ggml_backend_tensor_set(t, w.data(), 0, ggml_nbytes(t));
+            } else if (t->type == GGML_TYPE_I32) {
                 // every third row masked (-1), the rest a random target
                 std::uniform_int_distribution<int32_t> pick(0, (int32_t) ne[0] - 1);
                 std::vector<int32_t> v(ggml_nelements(t));
@@ -10530,6 +10546,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_back(512, 4, 2, 128, 9, GGML_TYPE_F16)); // the tiled path's tiles exceed 32 KiB: the per-row path
     test_cases.emplace_back(new test_cross_entropy_loss_index());
     test_cases.emplace_back(new test_cross_entropy_loss_index({30000, 2, 1, 1})); // a vocabulary's width; few rows keep the finite difference above f32 rounding
+    test_cases.emplace_back(new test_cross_entropy_loss_index({10, 5, 4, 3}, true));
+    test_cases.emplace_back(new test_cross_entropy_loss_index({30000, 2, 1, 1}, true));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));

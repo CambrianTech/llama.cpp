@@ -357,6 +357,7 @@ kernel void kernel_cross_entropy_loss_i32(
         device const  char * src0,
         device const  char * src1,
         device        char * dst,
+        device const float * weights,
         threadgroup  float * buf [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
@@ -381,7 +382,8 @@ kernel void kernel_cross_entropy_loss_i32(
     const float lse = log(ce_reduce_sum(lsum, buf, sgitg, tiisg, tptg));
 
     if (tpitg.x == 0) {
-        ((device float *) dst)[row] = t >= 0 ? -(s0[t] - max_val - lse)/(float) args.nr : 0.0f;
+        const float w = args.has_weights ? weights[row] : 1.0f;
+        ((device float *) dst)[row] = t >= 0 && w != 0.0f ? -w*(s0[t] - max_val - lse)/(float) args.nr : 0.0f;
     }
 }
 
@@ -391,6 +393,7 @@ kernel void kernel_cross_entropy_loss_back_i32(
         device const  char * src1,   // logits
         device const  char * src2,   // labels: one target per row
         device        char * dst,
+        device const float * weights,
         threadgroup  float * buf [[threadgroup(0)]],
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
@@ -403,14 +406,15 @@ kernel void kernel_cross_entropy_loss_back_i32(
     device const float * s0 = (device const float *) (src1 + row*args.nb01);
     device       float * d  = (device       float *) (dst  + row*args.nb1);
 
-    if (t < 0) {
+    const float w = args.has_weights ? weights[row] : 1.0f;
+    if (t < 0 || w == 0.0f) {
         for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
             d[i] = 0.0f;
         }
         return;
     }
 
-    const float d_by_nr = ((device const float *) src0)[0]/(float) args.nr;
+    const float d_by_nr = w*((device const float *) src0)[0]/(float) args.nr;
 
     float lmax = -INFINITY;
     for (int i = tpitg.x; i < args.ne00; i += tptg.x) {

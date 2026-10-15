@@ -2803,6 +2803,15 @@ extern "C" {
 
     GGML_API bool ggml_cross_entropy_labels_ok(const struct ggml_tensor * logits, const struct ggml_tensor * labels);
 
+    // The same with one target index per row (I32) and a weight per row (F32, one per row): row i
+    // contributes w_i * -log softmax(logits_i)[t_i] / rows, and its gradient scales by w_i. How much a
+    // row counts is the caller's to say (a mind's relevance on what it perceived), not only whether.
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_weighted(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * targets,
+            struct ggml_tensor  * weights);
+
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // logits

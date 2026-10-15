@@ -1495,11 +1495,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_CROSS_ENTROPY_LOSS:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
                    (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_I32) &&
-                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                   (op->src[2] == NULL || (op->src[2]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32));
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                    (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_I32) &&
-                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op);
+                   ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]) && ggml_is_contiguous(op) &&
+                   (op->src[3] == NULL || (op->src[3]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32));
         case GGML_OP_OUT_PROD:
             // The backward through a frozen weight: out_prod(W, grad^T). Composed on this
             // backend from a dequantizing copy, two transposing copies and the F32 simdgroup

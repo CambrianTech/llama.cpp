@@ -11677,12 +11677,13 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
         float max = -INFINITY;
         ggml_vec_max_f32(nc, &max, s0);
         if (index) {
-            // one target: its log softmax, -(max + log sum exp(x - max)) + x[t]
+            // one target: its log softmax, -(max + log sum exp(x - max)) + x[t], times the row's weight
             const int32_t t = ((const int32_t *) src1->data)[i1];
-            if (t >= 0) {
+            const float   w = dst->src[2] ? ((const float *) dst->src[2]->data)[i1] : 1.0f;
+            if (t >= 0 && w != 0.0f) {
                 GGML_ASSERT(t < nc);
                 const ggml_float lse = ggml_vec_log_soft_max_f32(nc, st, s0, max);
-                sum_thread += st[t] - lse;
+                sum_thread += w*(st[t] - lse);
             }
             continue;
         }
@@ -11773,7 +11774,8 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
         if (index) {
             // one target t: (softmax(x) - onehot(t)) * d / nr; a row without one is zero
             const int32_t t = ((const int32_t *) src1f->data)[i1];
-            if (t < 0) {
+            const float   w = dst->src[3] ? ((const float *) dst->src[3]->data)[i1] : 1.0f;
+            if (t < 0 || w == 0.0f) {
                 memset(ds0, 0, nc*sizeof(float));
                 continue;
             }
@@ -11783,7 +11785,7 @@ static void ggml_compute_forward_cross_entropy_loss_back_f32(
             const ggml_float sum = ggml_vec_soft_max_f32(nc, ds0, s0, max);
             ggml_vec_scale_f32(nc, ds0, 1.0/sum);
             ds0[t] -= 1.0f;
-            ggml_vec_scale_f32(nc, ds0, d_by_nr);
+            ggml_vec_scale_f32(nc, ds0, d_by_nr*w);
             continue;
         }
         const float * s1  = (const float *)((const char *) src1f->data + i1*src1f->nb[1]);

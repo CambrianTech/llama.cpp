@@ -4064,12 +4064,14 @@ static int ggml_metal_op_cross_entropy_loss_rows(ggml_metal_op_t ctx, const ggml
     const int32_t ne00 = logits->ne[0];
     const int32_t nr   = ggml_nrows(logits);
 
+    const ggml_tensor * weights = back ? op->src[3] : op->src[2];
     ggml_metal_kargs_cross_entropy_loss args = {
-        /*.ne00 =*/ ne00,
-        /*.nr   =*/ nr,
-        /*.nb01 =*/ logits->nb[1],
-        /*.nb11 =*/ labels->nb[1],
-        /*.nb1  =*/ nb1,
+        /*.ne00        =*/ ne00,
+        /*.nr          =*/ nr,
+        /*.nb01        =*/ logits->nb[1],
+        /*.nb11        =*/ labels->nb[1],
+        /*.nb1         =*/ nb1,
+        /*.has_weights =*/ weights != nullptr,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_cross_entropy_loss(lib, op);
@@ -4082,15 +4084,19 @@ static int ggml_metal_op_cross_entropy_loss_rows(ggml_metal_op_t ctx, const ggml
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    // the weights ride in the last slot (the labels' buffer stands in when there are none: never read)
+    const ggml_metal_buffer_id bid_w = ggml_metal_get_buffer_id(weights ? weights : labels);
     if (back) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(logits),     2);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(labels),     3);
         ggml_metal_encoder_set_buffer(enc, bid_dst,                              4);
+        ggml_metal_encoder_set_buffer(enc, bid_w,                                5);
     } else {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(logits),     1);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(labels),     2);
         ggml_metal_encoder_set_buffer(enc, bid_dst,                              3);
+        ggml_metal_encoder_set_buffer(enc, bid_w,                                4);
     }
     ggml_metal_encoder_set_threadgroup_memory_size(enc, 32*sizeof(float), 0);
     ggml_metal_encoder_dispatch_threadgroups(enc, nr, 1, 1, nth, 1, 1);

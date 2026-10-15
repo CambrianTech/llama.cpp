@@ -902,6 +902,7 @@ typedef struct {
     uint64_t nb01;
     uint64_t nb11;
     uint64_t nb1;
+    int32_t  has_weights; // a per-row F32 weight follows the labels (I32 targets only)
 } ggml_metal_kargs_cross_entropy_loss;
 
 // FLASH_ATTN_BACK (ggml_flash_attn_back): q [D, N, H], k [D, M, Hkv], v [Dv, M, Hkv], d [Dv, H, N],

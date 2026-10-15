@@ -6211,6 +6211,18 @@ struct ggml_tensor * ggml_cross_entropy_loss(
     return result;
 }
 
+struct ggml_tensor * ggml_cross_entropy_loss_weighted(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * targets,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(targets->type == GGML_TYPE_I32 && ggml_cross_entropy_labels_ok(logits, targets));
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) && ggml_nelements(weights) == ggml_nrows(logits));
+    struct ggml_tensor * result = ggml_cross_entropy_loss(ctx, logits, targets);
+    result->src[2] = weights;
+    return result;
+}
+
 // ggml_cross_entropy_loss_back
 
 struct ggml_tensor * ggml_cross_entropy_loss_back(
@@ -7501,7 +7513,9 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_CROSS_ENTROPY_LOSS: {
             if (src0_needs_grads) {
-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cross_entropy_loss_back(ctx, grad, src0, src1));
+                struct ggml_tensor * back = ggml_cross_entropy_loss_back(ctx, grad, src0, src1);
+                back->src[3] = src2; // the per-row weights, when the loss has them
+                ggml_add_or_set(ctx, cgraph, isrc0, back);
             }
             GGML_ASSERT(!src1_needs_grads && "backward pass for labels not implemented");
         } break;
