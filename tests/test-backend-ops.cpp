@@ -1176,6 +1176,11 @@ struct test_case {
         return 1e-1f;
     }
 
+    // For an op whose loss is linear in each param element (a copy, a scale, a matmul) a
+    // central difference has no truncation error at any eps; its only error is the f32 loss
+    // rounding divided by 2*eps, which at 1e-1 reached 1e-4..7e-4 on summed losses.
+    static constexpr float grad_eps_linear = 1.0f;
+
     // If false, estimate gradient with 2 points, neglects 3rd order derivative and higher.
     // If true,  estimate gradient with 4 points, neglects 5th order derivative and higher.
     virtual bool grad_precise() {
@@ -3010,6 +3015,10 @@ struct test_cpy : public test_case {
         return VARS_TO_STR6(type_src, type_dst, ne_src, permute_src, permute_dst, _src_transpose);
     }
 
+    float grad_eps() override {
+        return grad_eps_linear;
+    }
+
     int64_t total_elements() const {
         return ne_src[0] * ne_src[1] * ne_src[2] * ne_src[3];
     }
@@ -3328,6 +3337,10 @@ struct test_scale : public test_case {
 
     std::string vars() override {
         return VARS_TO_STR5(type, ne, scale, bias, inplace);
+    }
+
+    float grad_eps() override {
+        return grad_eps_linear;
     }
 
     test_scale(ggml_type type = GGML_TYPE_F32,
@@ -4755,12 +4768,9 @@ struct test_mul_mat : public test_case {
         return 20000;
     }
 
-    // The loss is linear in each param element, so a central difference has no
-    // truncation error at any eps; its only error is the forward's rounding over 2*eps.
-    // A non-f32 src0 casts b to its vec_dot type, so eps 1e-1 left f16/bf16 cases at
-    // MAA 3e-4..5e-4 against 1e-4 (68 CPU misses); eps 1 passes them all.
+    // A non-f32 src0 also rounds b to its vec_dot type, which the difference divides by 2*eps.
     float grad_eps() override {
-        return 1.0f;
+        return grad_eps_linear;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -4875,6 +4885,11 @@ struct test_mul_mat_hadamard : public test_mul_mat {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->op == GGML_OP_MUL_MAT) {
                 ggml_mul_mat_set_hint(t, GGML_HINT_SRC0_IS_HADAMARD);
+            }
+            // Under the hint the kernel never reads a's values, so a is a constant here: a finite
+            // difference on it is identically 0 against the analytic g*b^T (MAA exactly 1).
+            if (strcmp(t->name, "a") == 0) {
+                t->flags &= ~GGML_TENSOR_FLAG_PARAM;
             }
         }
         return out;
