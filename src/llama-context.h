@@ -215,6 +215,9 @@ struct llama_context {
     // the largest training graph the allocation preflight measured on a GPU device (bytes)
     size_t opt_graph_bytes() const;
 
+    bool opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens, const llama_token * labels, int32_t n,
+            ggml_opt_result_t result);
+
     void opt_epoch(
             ggml_opt_dataset_t      dataset,
             ggml_opt_result_t       result_train,

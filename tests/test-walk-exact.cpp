@@ -653,6 +653,94 @@ int main(int argc, char ** argv) {
     }
 
     {
+        // 9. LEARNING ON A LIVE SEQUENCE (llama_opt_learn, P2). What this catches: training that
+        // needs its own context, re-decodes her context, disturbs another slot, or leaves the shadow
+        // in her cache. A serving-shaped context holds two sequences; sequence 0 is her context as
+        // served, sequence 1 a neighbour. Her reply trains on sequence 0 from the served prefix:
+        // the step must be the walk's exact step for the same window (one chunk per run), her
+        // sequence must end as a stable decode of the reply would leave it, and the neighbour's
+        // state must not change by a byte.
+        std::vector<uint8_t> reply(WINDOW + 1, 0);
+        for (uint32_t i = WINDOW / 2 + 37; i <= WINDOW; ++i) {
+            reply[i] = 1;
+        }
+        const llama_pos r0 = WINDOW / 2 + 36; // the first labelled position
+        const auto want = step_delta(params, model, init, tokens, reply, WINDOW, true);
+
+        auto two_seq_ctx = [&]() {
+            auto cp = common_context_params_to_llama(params);
+            cp.n_ctx = 2*WINDOW; cp.n_batch = WINDOW; cp.n_ubatch = WINDOW; cp.n_seq_max = 2; cp.kv_unified = true;
+            cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED; cp.type_k = GGML_TYPE_F32; cp.type_v = GGML_TYPE_F32;
+            return llama_init_from_model(model, cp);
+        };
+        auto decode_span = [&](llama_context * c, llama_seq_id sq, const llama_token * t, llama_pos p0, int32_t n) {
+            llama_batch b = llama_batch_init(WINDOW, 0, 1);
+            common_batch_clear(b);
+            for (int32_t i = 0; i < n; ++i) {
+                common_batch_add(b, t[i], p0 + i, { sq }, i + 1 == n);
+            }
+            GGML_ASSERT(llama_decode(c, b) == 0);
+            llama_batch_free(b);
+        };
+        auto seq_state = [&](llama_context * c, llama_seq_id sq) {
+            std::vector<uint8_t> st(llama_state_seq_get_size(c, sq));
+            GGML_ASSERT(llama_state_seq_get_data(c, st.data(), st.size(), sq) == st.size());
+            return st;
+        };
+        const llama_token * neighbour = tokens.data() + WINDOW + 1; // other text, beyond her window
+
+        // the control: her context, then her reply, decoded plainly beside the same neighbour
+        llama_context * ctl = two_seq_ctx();
+        decode_span(ctl, 1, neighbour, 0, 200);
+        decode_span(ctl, 0, tokens.data(), 0, r0);
+        decode_span(ctl, 0, tokens.data() + r0, r0, WINDOW - r0);
+        const std::vector<uint8_t> want_her = seq_state(ctl, 0);
+        llama_free(ctl);
+
+        llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
+        const std::vector<float> before = adapter_params(adapter);
+        llama_context * ctx = two_seq_ctx();
+        float scale = 1.0f;
+        GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
+        decode_span(ctx, 1, neighbour, 0, 200);
+        decode_span(ctx, 0, tokens.data(), 0, r0); // her context, as served
+        const std::vector<uint8_t> neighbour_before = seq_state(ctx, 1);
+        llama_opt_params lopt{};
+        lopt.param_filter   = llama_opt_param_filter_all;
+        lopt.get_opt_pars   = sgd_pars;
+        lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
+        lopt.adapter        = adapter;
+        llama_opt_init(ctx, model, lopt);
+        std::vector<llama_token> labels(WINDOW - r0);
+        for (int32_t i = 0; i < (int32_t) WINDOW - r0; ++i) {
+            labels[i] = tokens[r0 + i + 1];
+        }
+        const bool learned = llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr);
+        const std::vector<uint8_t> her_after = seq_state(ctx, 0);
+        const std::vector<uint8_t> neighbour_after = seq_state(ctx, 1);
+        llama_free(ctx);
+        const std::vector<float> after = adapter_params(adapter);
+        llama_adapter_lora_free(adapter);
+        std::vector<float> got(before.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            got[i] = after[i] - before[i];
+        }
+        printf("  live sequence: learned=%d \"%s\"\n", (int) learned, learned ? "" : "see the log");
+        if (!learned || !same_step(compare("live sequence: her reply learned in place vs the walk's exact step", got, want))) {
+            fprintf(stderr, "FAILED: learning on a live sequence is not the walk's step\n");
+            ++failures;
+        }
+        const bool her_ok = her_after == want_her;
+        const bool nb_ok  = neighbour_after == neighbour_before;
+        printf("  live sequence: her cache %s a stable decode of the reply; the neighbour %s\n",
+                her_ok ? "byte-identical to" : "DIFFERS from", nb_ok ? "byte-identical" : "CHANGED");
+        if (!her_ok || !nb_ok) {
+            fprintf(stderr, "FAILED: learning on a live sequence disturbed the cache\n");
+            ++failures;
+        }
+    }
+
+    {
         // 8. what this catches: a walk that leaves the shadow in her cache. The reply's cells
         // are written under the shadow while it trains, then restored, so after either walk the
         // sequence (every attention cell, the recurrent state) is byte-identical to her stable

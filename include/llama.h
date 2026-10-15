@@ -1781,6 +1781,26 @@ extern "C" {
     // window): the requested one, or smaller where a chunk's graph did not fit the device.
     LLAMA_API uint32_t llama_opt_walk_horizon(struct llama_context * lctx);
 
+    // LEARN ON A LIVE SEQUENCE (P2): train one reply on `seq` of a serving context, given the
+    // context before it exactly as served. The sequence must hold positions [0, n_cached) as served
+    // and nothing after them for a recurrent part (restore the served-prefix checkpoint first:
+    // a recurrent state cannot be cut back); attention cells past n_cached are dropped. The reply
+    // tokens[0..n) decode at positions n_cached.. with labels[i] the target after tokens[i] (-1:
+    // none): the trainable adapter applies to labelled rows only, the context is never decoded
+    // again, and afterwards the reply is restored under her stable set, so the sequence (every
+    // cell, the recurrent state) is what serving left and every other sequence is untouched.
+    // A reply within one batch is one exact step; a longer one steps per batch, its gradient
+    // stopped at each batch boundary. false: refused or failed by name (llama_opt_failure),
+    // with the sequence restored.
+    LLAMA_API bool llama_opt_learn(
+            struct llama_context * lctx,
+            llama_seq_id           seq,
+            llama_pos              n_cached,
+            const llama_token    * tokens,
+            const llama_token    * labels,
+            int32_t                n,
+            ggml_opt_result_t      result);
+
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,
