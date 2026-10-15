@@ -366,10 +366,16 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
         ctx_compute_opt = ggml_init(params);
     }
     std::vector<int32_t> targets;
+    std::vector<float>   weights; // a labelled row's weight in the loss, when the batch carries them
     targets.reserve(n_labels);
     for (int32_t row : ubatch.rows().label_rows) {
         targets.push_back(ubatch.label[row]);
+        if (ubatch.label_weight != nullptr) {
+            weights.push_back(ubatch.label_weight[row]);
+        }
     }
+    // an unweighted batch keeps the unweighted loss (every backend has its kernels)
+    ggml_opt_set_next_label_weights(opt_ctx, ubatch.label_weight != nullptr);
     if (res->t_loss_slices.empty()) {
         ggml_free(ctx_compute_opt);
         opt_fail("training head was not projected into bounded label slices");
@@ -414,6 +420,10 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
         GGML_ASSERT(labels_t->type == GGML_TYPE_I32 && labels_t->ne[0] == (int64_t) n_labels);
 
         ggml_backend_tensor_set(labels_t, targets.data(), 0, ggml_nbytes(labels_t));
+        if (struct ggml_tensor * weights_t = ggml_opt_label_weights(opt_ctx)) {
+            GGML_ASSERT(weights.size() == (size_t) n_labels);
+            ggml_backend_tensor_set(weights_t, weights.data(), 0, ggml_nbytes(weights_t));
+        }
     }
     if (xc != nullptr) {
         // the later chunk's dL/d(entry state) is this chunk's exit gradient; then the

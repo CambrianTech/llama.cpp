@@ -97,6 +97,7 @@ struct decode_embd_batch {
             /*seq_id         =*/ seq_ids.data(),
             /*logits         =*/ logits.data(),
             /*label          =*/ nullptr,
+            /*label_weight   =*/ nullptr,
         };
     }
 
@@ -181,6 +182,7 @@ struct decode_embd_batch {
             /*seq_id         =*/ batch.seq_id   + offset,
             /*logits         =*/ batch.logits   + offset,
             /*label          =*/ batch.label ? batch.label + offset : nullptr,
+            /*label_weight   =*/ batch.label && batch.label_weight ? batch.label_weight + offset : nullptr,
         };
     }
 };

@@ -354,7 +354,8 @@ static void mixed_decode(const common_params & params, llama_model * model, cons
 
 static void multi_label_decode(const common_params & params, llama_model * model, const std::string & init,
                                const std::vector<llama_token> & tokens, bool flash, ggml_type cache_type) {
-    auto step = [&](const std::vector<int> & sequences) {
+    // weights empty: an unweighted batch (label_weight NULL)
+    auto step = [&](const std::vector<int> & sequences, const std::vector<float> & weights = {}) {
         auto cp = common_context_params_to_llama(params);
         cp.n_ctx = 128;
         cp.n_batch = cp.n_ubatch = 2;
@@ -375,11 +376,20 @@ static void multi_label_decode(const common_params & params, llama_model * model
         llama_opt_init(ctx, model, op);
         const auto before = adapter_params(adapter);
         llama_batch batch = llama_batch_init(2, 0, 1);
-        for (int seq : sequences) {
+        for (size_t k = 0; k < sequences.size(); ++k) {
+            const int seq = sequences[k];
             common_batch_add(batch, tokens[seq], 0, {seq}, true);
             batch.label[batch.n_tokens - 1] = tokens[seq + 2];
+            if (!weights.empty()) {
+                batch.label_weight[batch.n_tokens - 1] = weights[k];
+            }
+        }
+        float * kept_weights = batch.label_weight;
+        if (weights.empty()) {
+            batch.label_weight = nullptr; // unweighted: the loss every backend has
         }
         GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        batch.label_weight = kept_weights;
         auto delta = adapter_params(adapter);
         for (size_t i = 0; i < delta.size(); ++i) {
             delta[i] -= before[i];
@@ -397,6 +407,12 @@ static void multi_label_decode(const common_params & params, llama_model * model
     const auto joint = step({0, 1});
     GGML_ASSERT(same_step(compare("two labelled sequences vs mean independent steps", joint, mean)));
     GGML_ASSERT(same_step(compare("two labelled sequences with reversed row order", step({1, 0}), joint)));
+    // what this catches: the per-row weight not reaching the loss, or reaching it wrong (each row
+    // counts w_i * its loss / rows, its gradient scaled by w_i; a mind's relevance per token)
+    auto scaled = [](std::vector<float> v, float s) { for (float & x : v) { x *= s; } return v; };
+    GGML_ASSERT(same_step(compare("weights 1,1 vs an unweighted batch", step({0, 1}, {1.0f, 1.0f}), joint)));
+    GGML_ASSERT(same_step(compare("weights 2,2 vs twice the unweighted step", step({0, 1}, {2.0f, 2.0f}), scaled(joint, 2.0f))));
+    GGML_ASSERT(same_step(compare("weights 1,0 vs half of row 0's own step (a mean over 2 rows)", step({0, 1}, {1.0f, 0.0f}), scaled(step({0}), 0.5f))));
 }
 static void sparse_head_decode(const common_params & params, llama_model * model, const std::string & init,
                                const std::vector<llama_token> & tokens) {

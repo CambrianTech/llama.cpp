@@ -158,7 +158,13 @@ extern "C" {
     // if not using static graphs these pointers become invalid with the next call to ggml_opt_alloc
     GGML_API struct ggml_tensor * ggml_opt_inputs(  ggml_opt_context_t opt_ctx); // forward graph input tensor
     GGML_API struct ggml_tensor * ggml_opt_outputs( ggml_opt_context_t opt_ctx); // forward graph output tensor
-    GGML_API struct ggml_tensor * ggml_opt_labels(  ggml_opt_context_t opt_ctx); // labels to compare outputs against
+    GGML_API struct ggml_tensor * ggml_opt_labels(  ggml_opt_context_t opt_ctx);
+    // the per-row weights of a weighted cross-entropy step (F32, one per label), or NULL when the
+    // graph prepared last is unweighted (ggml_opt_set_next_label_weights)
+    GGML_API struct ggml_tensor * ggml_opt_label_weights(ggml_opt_context_t opt_ctx);
+    // whether the next graph's cross-entropy weighs each row (by ggml_opt_label_weights); an
+    // unweighted step keeps the unweighted loss, whose kernels every backend has
+    GGML_API void ggml_opt_set_next_label_weights(ggml_opt_context_t opt_ctx, bool weighted); // labels to compare outputs against
     GGML_API struct ggml_tensor * ggml_opt_loss(    ggml_opt_context_t opt_ctx); // scalar tensor that contains the loss
     GGML_API struct ggml_tensor * ggml_opt_pred(    ggml_opt_context_t opt_ctx); // predictions made by outputs
     GGML_API struct ggml_tensor * ggml_opt_ncorrect(ggml_opt_context_t opt_ctx); // number of matching predictions between outputs and labels

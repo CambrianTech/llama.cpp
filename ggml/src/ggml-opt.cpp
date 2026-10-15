@@ -90,6 +90,9 @@ struct ggml_opt_context {
     // graph prepared last (ggml_opt_prepare_alloc clears them)
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> next_grad_accs;
     std::vector<struct ggml_tensor *> grad_accs;
+    // a weighted cross-entropy for the next graph, and that graph's weights (one per label row)
+    bool                 next_label_weights = false;
+    struct ggml_tensor * label_weights      = nullptr;
     // ggml_opt_prepare_alloc_head: the outputs' row slices, in row order (empty: one outputs)
     std::vector<struct ggml_tensor *> output_slices;
 
@@ -623,8 +626,22 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 : ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);
             ggml_set_name(opt_ctx->labels, "labels");
+            opt_ctx->label_weights = nullptr;
+            if (opt_ctx->next_label_weights) {
+                GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS && "a weight per row needs one target index per row");
+                opt_ctx->label_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, opt_ctx->labels->ne[0]);
+                ggml_set_input(opt_ctx->label_weights);
+                ggml_set_name(opt_ctx->label_weights, "label_weights");
+            }
+            auto row_loss = [&](ggml_tensor * out, ggml_tensor * lab, int64_t r0) {
+                if (opt_ctx->label_weights == nullptr) {
+                    return ggml_cross_entropy_loss(ctx_results, out, lab);
+                }
+                ggml_tensor * w = ggml_view_1d(ctx_results, opt_ctx->label_weights, out->ne[1], r0*sizeof(float));
+                return ggml_cross_entropy_loss_weighted(ctx_results, out, lab, w);
+            };
             if (opt_ctx->output_slices.empty()) {
-                opt_ctx->loss = ggml_cross_entropy_loss(ctx_results, opt_ctx->outputs, opt_ctx->labels);
+                opt_ctx->loss = row_loss(opt_ctx->outputs, opt_ctx->labels, 0);
             } else {
                 // the mean over every row: each slice's mean weighted by its share of the rows
                 const int64_t n = opt_ctx->labels->ne[0];
@@ -633,7 +650,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
                 for (ggml_tensor * out : opt_ctx->output_slices) {
                     const int64_t nr = out->ne[1];
                     ggml_tensor * lab = ggml_view_1d(ctx_results, opt_ctx->labels, nr, r0*sizeof(int32_t));
-                    ggml_tensor * l   = ggml_scale(ctx_results, ggml_cross_entropy_loss(ctx_results, out, lab), (float) nr / (float) n);
+                    ggml_tensor * l   = ggml_scale(ctx_results, row_loss(out, lab, r0), (float) nr / (float) n);
                     sum = sum ? ggml_add(ctx_results, sum, l) : l;
                     r0 += nr;
                 }
@@ -922,6 +939,15 @@ struct ggml_tensor * ggml_opt_outputs(ggml_opt_context_t opt_ctx) {
 
 struct ggml_tensor * ggml_opt_labels(ggml_opt_context_t opt_ctx) {
     return opt_ctx->labels;
+}
+
+struct ggml_tensor * ggml_opt_label_weights(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->label_weights;
+}
+
+void ggml_opt_set_next_label_weights(ggml_opt_context_t opt_ctx, bool weighted) {
+    GGML_ASSERT(!opt_ctx->eval_ready && "set before ggml_opt_alloc");
+    opt_ctx->next_label_weights = weighted;
 }
 
 struct ggml_tensor * ggml_opt_loss(ggml_opt_context_t opt_ctx) {

@@ -257,6 +257,9 @@ extern "C" {
     //            the optimizer write of the context's trainable adapter (llama_opt_init), in the
     //            same graph as the batch's other rows. -1 marks a position with no label.
     //            (if set to NULL, the batch is inference only, unchanged)
+    // - label_weight : how much a labelled position counts in the loss (>= 0, finite; 0 counts
+    //            nothing): a mind's relevance on what it perceived, not only whether. Read for
+    //            labelled positions only. (if set to NULL, every labelled position counts 1)
     //
     typedef struct llama_batch {
         int32_t n_tokens;
@@ -268,6 +271,7 @@ extern "C" {
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
         llama_token  *  label;
+        float        *  label_weight;
     } llama_batch;
 
     enum llama_model_kv_override_type {

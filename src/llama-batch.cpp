@@ -1,5 +1,7 @@
 #include "llama-batch.h"
 
+#include <cmath>
+
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-memory.h"
@@ -177,6 +179,10 @@ bool llama_batch_allocr::init(
                 LLAMA_LOG_ERROR("%s: invalid label[%d] = %d\n", __func__, i, batch.label[i]);
                 return false;
             }
+            if (batch.label[i] >= 0 && batch.label_weight && !(std::isfinite(batch.label_weight[i]) && batch.label_weight[i] >= 0.0f)) {
+                LLAMA_LOG_ERROR("%s: invalid label_weight[%d] = %f: a weight is finite and >= 0\n", __func__, i, batch.label_weight[i]);
+                return false;
+            }
             const llama_seq_id s = batch.seq_id[i][0];
             if (batch.label[i] < 0) {
                 for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
@@ -264,6 +270,7 @@ bool llama_batch_allocr::init(
             /*.seq_idx      =*/ this->seq_idx.data(),
             /*.output       =*/ batch.logits,
             /*.label        =*/ batch.label,
+            /*.label_weight =*/ batch.label_weight,
             /*.data         =*/ {},
         };
 
@@ -471,6 +478,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
         /*.label        =*/ nullptr,
+        /*.label_weight =*/ nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -811,6 +819,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
     udata->label     .resize(batch.label ? n_tokens : 0);
+    udata->label_weight.resize(batch.label && batch.label_weight ? n_tokens : 0);
 
     udata->seq_id_data.reserve(n_tokens);
 
@@ -838,6 +847,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         udata->output[i]   = batch.logits[idxs[i]];
         if (batch.label) {
             udata->label[i] = batch.label[idxs[i]];
+            if (batch.label_weight) {
+                udata->label_weight[i] = batch.label_weight[idxs[i]];
+            }
         }
 
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
@@ -882,6 +894,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
         /*.label        =*/ batch.label ? udata->label.data() : nullptr,
+        /*.label_weight =*/ batch.label && batch.label_weight ? udata->label_weight.data() : nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -991,6 +1004,7 @@ struct llama_batch llama_batch_get_one(
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
         /*label    =*/ nullptr,
+        /*label_weight =*/ nullptr,
     };
 }
 
@@ -1004,6 +1018,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
         /*label    =*/ nullptr,
+        /*label_weight =*/ nullptr,
     };
 
     if (embd) {
@@ -1023,6 +1038,8 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     batch.logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens_alloc);
     batch.label    = (llama_token *)   malloc(sizeof(llama_token)    * n_tokens_alloc);
     std::fill(batch.label, batch.label + n_tokens_alloc, -1); // no position trains until labelled
+    batch.label_weight = (float *) malloc(sizeof(float) * n_tokens_alloc);
+    std::fill(batch.label_weight, batch.label_weight + n_tokens_alloc, 1.0f); // every labelled position counts 1 until weighted
 
     return batch;
 }
@@ -1040,4 +1057,5 @@ void llama_batch_free(struct llama_batch batch) {
     }
     if (batch.logits)   free(batch.logits);
     if (batch.label)    free(batch.label);
+    if (batch.label_weight) free(batch.label_weight);
 }
