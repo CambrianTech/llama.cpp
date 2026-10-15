@@ -4755,6 +4755,14 @@ struct test_mul_mat : public test_case {
         return 20000;
     }
 
+    // The loss is linear in each param element, so a central difference has no
+    // truncation error at any eps; its only error is the forward's rounding over 2*eps.
+    // A non-f32 src0 casts b to its vec_dot type, so eps 1e-1 left f16/bf16 cases at
+    // MAA 3e-4..5e-4 against 1e-4 (68 CPU misses); eps 1 passes them all.
+    float grad_eps() override {
+        return 1.0f;
+    }
+
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return 2 * m * n * k * bs[0] * nr[0] * bs[1] * nr[1];
