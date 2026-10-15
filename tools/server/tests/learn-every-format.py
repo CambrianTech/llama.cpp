@@ -4,7 +4,7 @@
 # served model), e.g.: llama-server -m MODEL --port 58199 -np 1 --jinja --train-dir DIR
 # what this catches: a serializer, or a request conversion (the Anthropic one dropped "learn"), that
 # loses the outcome, so a client learns with nothing on the wire
-import os
+import json, os, urllib.request
 U = os.environ.get("LLAMA_SERVER_URL", "http://localhost:58199")
 def raw(path, body):
     req = urllib.request.Request(U + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
