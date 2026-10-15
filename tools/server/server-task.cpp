@@ -526,6 +526,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         deltas.back()["timings"] = stats.to_json();
     }
 
+    if (learned) {
+        deltas.back()["learn"] = learned->to_json(); // the final chunk
+    }
+
     // extra fields for debugging purposes
     if (verbose && !deltas.empty()) {
         deltas.front()["__verbose"] = to_json_non_oaicompat();
@@ -601,6 +605,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
         }},
     };
+
+    if (learned) {
+        res["learn"] = learned->to_json();
+    }
 
     return res;
 }
@@ -719,6 +727,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         server_sent_events.back().at("data")["timings"] = stats.to_json();
     }
 
+    if (learned) {
+        server_sent_events.back().at("data")["learn"] = learned->to_json(); // response.completed
+    }
+
     return server_sent_events;
 }
 
@@ -799,6 +811,10 @@ json server_task_result_cmpl_final::to_json_anthropic() {
             {"output_tokens", n_decoded}
         }}
     };
+
+    if (learned) {
+        res["learn"] = learned->to_json();
+    }
 
     return res;
 }
@@ -980,6 +996,10 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
             }}
         }}
     });
+
+    if (learned) {
+        events.back().at("data")["learn"] = learned->to_json(); // message_delta, beside the usage
+    }
 
     events.push_back({
         {"event", "message_stop"},
