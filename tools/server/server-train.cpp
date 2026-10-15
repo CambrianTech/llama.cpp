@@ -74,7 +74,7 @@ std::string confine_out(const std::string & dir, const std::string & name) {
 //
 // Returns false with `why` when the example is malformed (the run is refused); true otherwise,
 // with `toks`/`loss` filled.
-static bool render_example(const json & messages, const std::vector<bool> & trained, const json & tools,
+bool train_render(const json & messages, const std::vector<bool> & trained, const json & tools,
                            const server_trainer::render_fn & render, const llama_vocab * vocab, const std::string & at,
                            std::vector<llama_token> & toks, std::vector<uint8_t> & loss, std::string & why) {
     auto head = [&](size_t n) { // the first n messages
@@ -267,7 +267,7 @@ static example_fit fit_example(const json & ex, const std::string & at, const se
     }
     toks.clear();
     loss.clear();
-    if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
+    if (!train_render(messages, trained, tools, render, vocab, at, toks, loss, why)) {
         return example_fit::invalid;
     }
     full = (int64_t) toks.size();
@@ -284,7 +284,7 @@ static example_fit fit_example(const json & ex, const std::string & at, const se
         if (dropped) {
             std::vector<llama_token> t;
             std::vector<uint8_t>     l;
-            if (!render_example(m, tr, tools, render, vocab, at, t, l, why)) {
+            if (!train_render(m, tr, tools, render, vocab, at, t, l, why)) {
                 return example_fit::invalid;
             }
             *min = (int64_t) t.size();
@@ -308,7 +308,7 @@ static example_fit fit_example(const json & ex, const std::string & at, const se
             return example_fit::skipped; // the head plus her last exchange alone overflow the window
         }
         cut = true;
-        if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
+        if (!train_render(messages, trained, tools, render, vocab, at, toks, loss, why)) {
             return example_fit::invalid;
         }
     }

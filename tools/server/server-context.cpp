@@ -2919,6 +2919,19 @@ private:
                             + " prompt tokens; the served prefix is " + std::to_string(L.n_prefix) + " and the reply must not be empty");
                         break;
                     }
+                    // the served prompt, when the request carries it: her slot must still hold exactly it (a
+                    // slot that has served other turns since, or compacted, would teach the wrong context)
+                    if (!L.prompt.empty()) {
+                        int32_t i = 0;
+                        while (i < L.n_prefix && slot->prompt.tokens[i] == L.prompt[i]) {
+                            ++i;
+                        }
+                        if (i < L.n_prefix) {
+                            refuse("slot " + std::to_string(slot->id) + " no longer holds this turn's prompt (it differs at token "
+                                + std::to_string(i) + " of " + std::to_string(L.n_prefix) + "): serve the prompt again, then learn");
+                            break;
+                        }
+                    }
                     // the recurrent part cannot be cut back: her state one token before the prompt's end
                     const common_prompt_checkpoint * cp = nullptr;
                     const bool needs_cp = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
@@ -5790,7 +5803,34 @@ void server_routes::init_routes() {
         task.learn.n_prefix = json_value(body, "n_prefix", 0);
         task.learn.lora_id  = json_value(body, "lora_id",  -1);
         task.learn.lr       = json_value(body, "lr",       1e-4f);
-        if (body.contains("reply_tokens")) {
+        if (body.contains("messages")) {
+            // the conversation she was served, its last message her reply (or the correction): rendered
+            // through the same template serving used; the served prompt is everything before the reply
+            const json & messages = body.at("messages");
+            std::vector<bool> trained(messages.size(), false);
+            if (!messages.empty() && messages.back().value("role", std::string()) == "assistant") {
+                trained.back() = true;
+            }
+            std::vector<llama_token> toks;
+            std::vector<uint8_t>     loss;
+            std::string              why;
+            if (!ctx_server.trainer || !train_render(messages, trained, json_value(body, "tools", json()), ctx_server.trainer->renderer(),
+                                                     ctx_server.vocab, "the learn request", toks, loss, why)) {
+                res->error(format_error_response(why.empty() ? "the conversation could not be rendered" : why, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            size_t b = 0;
+            while (b < loss.size() && !loss[b]) {
+                ++b;
+            }
+            size_t e = loss.size();
+            while (e > b && !loss[e - 1]) {
+                --e;
+            }
+            task.learn.prompt.assign(toks.begin(), toks.begin() + b);
+            task.learn.reply.assign(toks.begin() + b, toks.begin() + e);
+            task.learn.n_prefix = (int32_t) b;
+        } else if (body.contains("reply_tokens")) {
             task.learn.reply = body.at("reply_tokens").get<std::vector<llama_token>>();
         } else {
             task.learn.reply = common_tokenize(ctx_server.vocab, json_value(body, "reply", std::string()), false, true);

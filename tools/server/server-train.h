@@ -104,6 +104,9 @@ public:
     };
     ~server_trainer();
 
+    // the serving chat template (train_render's render)
+    const render_fn & renderer() const { return render_chat; }
+
     // Starts a run on a worker thread; refuses (ok=false) while one is running or on bad input.
     common_json start(const common_json & body_in);
     // Measures "examples" against "window" by the same fit rule a run trains by, training
@@ -206,6 +209,13 @@ private:
 // "fit": "left" for one tokenized example (see server-train.cpp): keep the window+1 tokens that
 // end the last trained turn (the leading BOS kept when `bos`), mask a trained turn cut at the
 // front, and return false when the last trained turn alone does not fit.
+// A conversation through the serving chat template: its tokens, and which carry loss (the assistant
+// turns marked trained), tokenized span by span so no token straddles a boundary. /train and /learn
+// share it, so what learns is exactly what serving framed.
+bool train_render(const common_json & messages, const std::vector<bool> & trained, const common_json & tools,
+                  const server_trainer::render_fn & render, const llama_vocab * vocab, const std::string & at,
+                  std::vector<llama_token> & toks, std::vector<uint8_t> & loss, std::string & why);
+
 bool train_fit_left(std::vector<llama_token> & toks, std::vector<uint8_t> & loss, int64_t window, bool bos);
 
 // "fit": "middle" for one conversation (see server-train.cpp): the index of the oldest history

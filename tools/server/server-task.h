@@ -192,6 +192,7 @@ struct server_task {
         int32_t                  id_slot  = -1;
         int32_t                  n_prefix = 0;      // the served prompt's tokens, before the reply
         std::vector<llama_token> reply;             // what she should have said (her reply, or the reviewed correction)
+        std::vector<llama_token> prompt;            // the served prompt, when known: her slot must hold exactly it
         int32_t                  lora_id  = -1;     // the trainable adapter (the shadow), loaded dormant
         float                    lr       = 1e-4f;
     } learn;
