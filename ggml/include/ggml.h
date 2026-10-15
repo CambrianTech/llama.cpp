@@ -2899,6 +2899,10 @@ extern "C" {
             struct ggml_cgraph * cgraph,
             struct ggml_tensor * tensor);
 
+    // whether a backward can be built through this node (ggml_build_backward_expand aborts on one
+    // that cannot: an op without a backward, or an in-place write)
+    GGML_API bool ggml_node_has_backward(const struct ggml_tensor * tensor);
+
     GGML_API void ggml_build_backward_expand(
         struct ggml_context *  ctx,        // context for gradient computation
         struct ggml_cgraph  *  cgraph,

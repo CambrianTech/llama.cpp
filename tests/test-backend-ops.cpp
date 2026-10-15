@@ -44,6 +44,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
@@ -1770,6 +1771,28 @@ struct test_case {
         ggml_set_loss(out);
 
         ggml_build_forward_expand(gf, out);
+        // A param-reachable node whose op has no backward is not supported, not an abort: the
+        // full grad suite must reach its summary (ggml_node_has_backward is the one list).
+        {
+            std::unordered_set<const ggml_tensor *> reach;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                bool reached = false;
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    const ggml_tensor * s = node->src[k];
+                    reached = reached || (s != nullptr && ((s->flags & GGML_TENSOR_FLAG_PARAM) || reach.count(s)));
+                }
+                if (!reached) {
+                    continue;
+                }
+                reach.insert(node);
+                if (!ggml_node_has_backward(node)) {
+                    output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
+                        test_status_t::NOT_SUPPORTED, std::string("no backward for ") + ggml_op_desc(node)));
+                    return true;
+                }
+            }
+        }
         ggml_graph_cpy(gf, gb);
         ggml_build_backward_expand(ctx.get(), gb, nullptr);
         if (expect.size() != 1 || expect[0] != 0.0f) {
@@ -2052,6 +2075,12 @@ struct test_unary : public test_case {
             min = -10.f;
             max =  10.f;
         }
+        // EXPM1's gradient is checked against a finite difference: exp past ~88.7 overflows f32,
+        // and the summed loss must stay small enough in f32 for a small step to register.
+        if (op == GGML_UNARY_OP_EXPM1) {
+            min = -2.f;
+            max =  2.f;
+        }
 
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             // test extended range of values to check for NaNs in GELU
@@ -2060,7 +2089,18 @@ struct test_unary : public test_case {
     }
 
     float grad_eps() override {
-        return 15.0f;
+        // 15 suits the piecewise-linear ops over [-150, 150]; exp's slope changes by e^15 over such
+        // a step, so EXPM1 takes the smooth ops' convention (test_sin): a small step, the 4-point
+        // difference, and an f32-sum tolerance (its range is narrowed above)
+        return op == GGML_UNARY_OP_EXPM1 ? 0.2f : 15.0f;
+    }
+
+    bool grad_precise() override {
+        return op == GGML_UNARY_OP_EXPM1;
+    }
+
+    double max_maa_err() override {
+        return op == GGML_UNARY_OP_EXPM1 ? 1e-3 : test_case::max_maa_err();
     }
 
     std::vector<float> grad_expect() override {
