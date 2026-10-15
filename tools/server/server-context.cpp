@@ -3786,8 +3786,11 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+                        // A lane that learns (--train-dir) also checkpoints ONE token before the end:
+                        // learning a reply re-decodes the last prompt token with the reply's first
+                        // token as its label, from her recurrent state exactly there (llama_opt_learn)
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int checkpoint_offsets[] = {4 + n_ubatch, 4, params_base.train_dir.empty() ? 4 : 1};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {

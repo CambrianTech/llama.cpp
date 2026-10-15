@@ -4302,7 +4302,8 @@ int ggml_metal_op_flash_attn_back(ggml_metal_op_t ctx, int idx) {
     const int br = 8, bc = 16, nsg = 4;
     const size_t shmem = (size_t) (2*br + 2*bc)*args.D*sizeof(uint16_t) + (2*br*bc + 2*br)*sizeof(float) + 2*br*bc*sizeof(uint16_t);
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
-    if (args.D == args.Dv && args.D % 32 == 0 && shmem <= props_dev->max_theadgroup_memory_size) {
+    // and simdgroup matrices exist only on Apple7+ GPUs (M1 and newer): older Macs take the per-row path
+    if (props_dev->has_simdgroup_mm && args.D == args.Dv && args.D % 32 == 0 && shmem <= props_dev->max_theadgroup_memory_size) {
         run("stats", (args.N + br - 1)/br, args.H,   32*nsg, shmem);
         run("dkv",   (args.M + bc - 1)/bc, args.Hkv, 32*nsg, shmem);
         run("dq",    (args.N + br - 1)/br, args.H,   32*nsg, shmem);
