@@ -9258,6 +9258,11 @@ static void ggml_compute_forward_flash_attn_back_f32(
     const int64_t Hkv = k->ne[2];
     const int64_t Dv  = v->ne[0];
     const int64_t G   = H / Hkv; // query head h reads KV head h / G
+    // dK and dV cover key rows [kv0, M) only, row j at j - kv0 (the run's own rows: the context
+    // before it is a constant cache). dQ, lse and D still read every key: the softmax spans them.
+    const int64_t kv0 = ggml_get_op_params_i32(dst, 1);
+    const int64_t Mg  = M - kv0;
+    GGML_ASSERT(kv0 >= 0 && kv0 < M);
 
     float * dq   = (float *) ((char *) dst->data + ggml_flash_attn_back_offset(dst, 0));
     float * dk   = (float *) ((char *) dst->data + ggml_flash_attn_back_offset(dst, 1));
@@ -9399,24 +9404,25 @@ static void ggml_compute_forward_flash_attn_back_f32(
 
     ggml_barrier(params->threadpool);
 
-    // pass 2: blocks of BC KV positions of one KV head, each summed over its group's query heads and
-    // every query row
+    // pass 2: blocks of BC KV positions of one KV head from kv0 on, each summed over its group's query
+    // heads and every query row
     {
         float * kb = wbase;          // [BC][D]
         float * vb = kb + BC*D;      // [BC][Dv]
         float * qr = vb + BC*Dv;     // [D]
         float * dr = qr + D;         // [Dv]
 
-        const int64_t nblk = (M + BC - 1)/BC;
+        const int64_t nblk = (Mg + BC - 1)/BC;
         for (int64_t t = ith; t < nblk*Hkv; t += nth) {
-            const int64_t j0 = (t % nblk)*BC;
+            const int64_t g0 = (t % nblk)*BC; // gradient row of the block's first key; its key is kv0 + g0
+            const int64_t j0 = kv0 + g0;
             const int64_t hk = t / nblk;
             const int64_t nb = std::min(BC, M - j0);
             for (int64_t b = 0; b < nb; ++b) {
                 k_row(j0 + b, hk, kb + b*D);
                 v_row(j0 + b, hk, vb + b*Dv);
-                memset(dk + (hk*M + j0 + b)*D,  0, D*sizeof(float));
-                memset(dv + (hk*M + j0 + b)*Dv, 0, Dv*sizeof(float));
+                memset(dk + (hk*Mg + g0 + b)*D,  0, D*sizeof(float));
+                memset(dv + (hk*Mg + g0 + b)*Dv, 0, Dv*sizeof(float));
             }
             for (int64_t h = hk*G; h < (hk + 1)*G; ++h) {
                 for (int64_t i = 0; i < N; ++i) {
@@ -9440,8 +9446,8 @@ static void ggml_compute_forward_flash_attn_back_f32(
                             continue;
                         }
                         const float ds = p*(dot(dr, vb + b*Dv, Dv) - dvec[h*N + i])*scale;
-                        ggml_vec_mad_f32((int) D,  dk + (hk*M + j0 + b)*D,  qr, ds);
-                        ggml_vec_mad_f32((int) Dv, dv + (hk*M + j0 + b)*Dv, dr, p);
+                        ggml_vec_mad_f32((int) D,  dk + (hk*Mg + g0 + b)*D,  qr, ds);
+                        ggml_vec_mad_f32((int) Dv, dv + (hk*Mg + g0 + b)*Dv, dr, p);
                     }
                 }
             }
