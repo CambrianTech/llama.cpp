@@ -5804,32 +5804,30 @@ void server_routes::init_routes() {
         task.learn.lora_id  = json_value(body, "lora_id",  -1);
         task.learn.lr       = json_value(body, "lr",       1e-4f);
         if (body.contains("messages")) {
-            // the conversation she was served, its last message her reply (or the correction): rendered
-            // through the same template serving used; the served prompt is everything before the reply
+            // the conversation she was served, its last message her reply (or the correction). The
+            // served prompt is every earlier message through the SAME parser and template arguments
+            // /v1/chat/completions used (chat_template_kwargs included: a thinking template renders a
+            // different prompt without them), with the generation prompt; the reply is what the model
+            // would have generated after it: the text's tokens and the end of the turn
             const json & messages = body.at("messages");
-            std::vector<bool> trained(messages.size(), false);
-            if (!messages.empty() && messages.back().value("role", std::string()) == "assistant") {
-                trained.back() = true;
-            }
-            std::vector<llama_token> toks;
-            std::vector<uint8_t>     loss;
-            std::string              why;
-            if (!ctx_server.trainer || !train_render(messages, trained, json_value(body, "tools", json()), ctx_server.trainer->renderer(),
-                                                     ctx_server.vocab, "the learn request", toks, loss, why)) {
-                res->error(format_error_response(why.empty() ? "the conversation could not be rendered" : why, ERROR_TYPE_INVALID_REQUEST));
+            if (!messages.is_array() || messages.size() < 2 || !messages.back().is_object()
+                    || messages.back().value("role", std::string()) != "assistant") {
+                res->error(format_error_response("\"messages\" must end with the assistant reply to learn, after the conversation it answers",
+                                                 ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
-            size_t b = 0;
-            while (b < loss.size() && !loss[b]) {
-                ++b;
+            json served = body;
+            served["messages"] = json::array();
+            for (size_t i = 0; i + 1 < messages.size(); ++i) {
+                served["messages"].push_back(messages[i]);
             }
-            size_t e = loss.size();
-            while (e > b && !loss[e - 1]) {
-                --e;
-            }
-            task.learn.prompt.assign(toks.begin(), toks.begin() + b);
-            task.learn.reply.assign(toks.begin() + b, toks.begin() + e);
-            task.learn.n_prefix = (int32_t) b;
+            std::vector<raw_buffer> files;
+            const json parsed = oaicompat_chat_params_parse(served, meta->chat_params, files);
+            task.learn.prompt   = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, parsed.at("prompt"), true, true)[0].get_text_tokens();
+            task.learn.n_prefix = (int32_t) task.learn.prompt.size();
+            task.learn.reply    = common_tokenize(ctx_server.vocab, messages.back().value("content", std::string()), false, true);
+            const llama_token eot = llama_vocab_eot(ctx_server.vocab) != LLAMA_TOKEN_NULL ? llama_vocab_eot(ctx_server.vocab) : llama_vocab_eos(ctx_server.vocab);
+            task.learn.reply.push_back(eot);
         } else if (body.contains("reply_tokens")) {
             task.learn.reply = body.at("reply_tokens").get<std::vector<llama_token>>();
         } else {

@@ -74,7 +74,7 @@ std::string confine_out(const std::string & dir, const std::string & name) {
 //
 // Returns false with `why` when the example is malformed (the run is refused); true otherwise,
 // with `toks`/`loss` filled.
-bool train_render(const json & messages, const std::vector<bool> & trained, const json & tools,
+static bool train_render(const json & messages, const std::vector<bool> & trained, const json & tools,
                            const server_trainer::render_fn & render, const llama_vocab * vocab, const std::string & at,
                            std::vector<llama_token> & toks, std::vector<uint8_t> & loss, std::string & why) {
     auto head = [&](size_t n) { // the first n messages
