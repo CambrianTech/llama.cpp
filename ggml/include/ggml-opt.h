@@ -284,11 +284,6 @@ extern "C" {
     // zeroes it, except at its own first allocation, which precedes any accumulation.
     GGML_API void ggml_opt_accumulate_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * tensor, struct ggml_tensor * acc);
 
-    // The same for rows [row0, row0 + acc->ne[1]) of a 2-D `tensor`'s gradient only: the rest of
-    // its gradient lives on the device for its consumers and is never kept, so `acc` holds a
-    // span (a reply's positions) of a window-sized tensor (a cache's cells).
-    GGML_API void ggml_opt_accumulate_grad_rows(ggml_opt_context_t opt_ctx, struct ggml_tensor * tensor, int64_t row0, struct ggml_tensor * acc);
-
     // ############################################################################
     // ## The high-level functions start here. They do not depend on any private ##
     // ## functions or structs and can be copied to and adapted for user code.   ##

@@ -7534,13 +7534,15 @@ struct test_flash_attn_ext_grad : public test_case {
 struct test_flash_attn_back : public test_case {
     const int64_t   hs, nh, nhkv, kv, nb;
     const ggml_type type_kv;
+    const int64_t   kv0; // the first key row with a dK/dV (a frozen prefix before it)
 
     std::string vars() override {
-        return VARS_TO_STR6(hs, nh, nhkv, kv, nb, type_kv);
+        return VARS_TO_STR7(hs, nh, nhkv, kv, nb, type_kv, kv0);
     }
 
-    test_flash_attn_back(int64_t hs = 128, int64_t nh = 8, int64_t nhkv = 2, int64_t kv = 512, int64_t nb = 64, ggml_type type_kv = GGML_TYPE_F16)
-        : hs(hs), nh(nh), nhkv(nhkv), kv(kv), nb(nb), type_kv(type_kv) {}
+    test_flash_attn_back(int64_t hs = 128, int64_t nh = 8, int64_t nhkv = 2, int64_t kv = 512, int64_t nb = 64, ggml_type type_kv = GGML_TYPE_F16,
+            int64_t kv0 = 0)
+        : hs(hs), nh(nh), nhkv(nhkv), kv(kv), nb(nb), type_kv(type_kv), kv0(kv0) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nb, nh);
@@ -7549,7 +7551,7 @@ struct test_flash_attn_back : public test_case {
         ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, nb);
         ggml_tensor * d = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh, nb);
         ggml_set_name(q, "q"); ggml_set_name(k, "k"); ggml_set_name(v, "v"); ggml_set_name(m, "m"); ggml_set_name(d, "d");
-        ggml_tensor * out = ggml_flash_attn_back(ctx, q, k, v, m, d, 1.0f/sqrtf((float) hs));
+        ggml_tensor * out = ggml_flash_attn_back(ctx, q, k, v, m, d, 1.0f/sqrtf((float) hs), kv0);
         ggml_set_name(out, "out");
         return out;
     }
@@ -7572,7 +7574,7 @@ struct test_flash_attn_back : public test_case {
     // the forward's two
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return 2ull*nb*kv*nh*(3*hs + 2*hs);
+        return 2ull*nb*nh*(3*kv*hs + 2*(kv - kv0)*hs); // pass 1 over every key, pass 2 from kv0
     }
 };
 
@@ -10544,6 +10546,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_back(256, 16, 4, 300, 37, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_back(512, 4, 2, 128, 9, GGML_TYPE_F16)); // the tiled path's tiles exceed 32 KiB: the per-row path
+    // dK/dV from a first key row: a frozen prefix, unaligned to any tile, and on the per-row path
+    test_cases.emplace_back(new test_flash_attn_back(256, 16, 4, 300, 37, GGML_TYPE_F16, 300 - 37));
+    test_cases.emplace_back(new test_flash_attn_back(128, 8, 2, 512, 64, GGML_TYPE_Q8_0, 203));
+    test_cases.emplace_back(new test_flash_attn_back(512, 4, 2, 128, 9, GGML_TYPE_F16, 100));
     test_cases.emplace_back(new test_cross_entropy_loss_index());
     test_cases.emplace_back(new test_cross_entropy_loss_index({30000, 2, 1, 1})); // a vocabulary's width; few rows keep the finite difference above f32 rounding
     test_cases.emplace_back(new test_cross_entropy_loss_index({10, 5, 4, 3}, true));
@@ -10740,6 +10746,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // heads, 256 rows over a 2048 window, f16 cache): small enough to time on every kernel edit; a
     // backward costs about 2.5 forwards of matmul work
     test_cases.emplace_back(new test_flash_attn_back(256, 16, 4, 2048, 256, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_back(256, 16, 4, 2048, 256, GGML_TYPE_F16, 2048 - 256)); // the reply's keys only
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 2048, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     // OUT_PROD at the shapes a LoRA backward emits (dx = out_prod(W, dy^T), trans_b): a 1.5B

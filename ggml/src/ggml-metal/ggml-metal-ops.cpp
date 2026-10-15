@@ -4169,7 +4169,9 @@ int ggml_metal_op_flash_attn_back(ggml_metal_op_t ctx, int idx) {
         /*.offs_dk  =*/ ggml_flash_attn_back_offset(op, 1),
         /*.offs_dv  =*/ ggml_flash_attn_back_offset(op, 2),
         /*.offs_lse =*/ ggml_flash_attn_back_offset(op, 3),
+        /*.kv0      =*/ ggml_get_op_params_i32(op, 1),
     };
+    const int L = args.M - args.kv0; // the key rows a dK/dV is computed for
 
     auto run = [&](const char * pass, int ngx, int ngy, int nth, size_t shmem) {
         auto pipeline = ggml_metal_library_get_pipeline_flash_attn_back(lib, op, pass);
@@ -4198,12 +4200,12 @@ int ggml_metal_op_flash_attn_back(ggml_metal_op_t ctx, int idx) {
     // and simdgroup matrices exist only on Apple7+ GPUs (M1 and newer): older Macs take the per-row path
     if (props_dev->has_simdgroup_mm && args.D == args.Dv && args.D % 32 == 0 && shmem <= props_dev->max_theadgroup_memory_size) {
         run("stats", (args.N + br - 1)/br, args.H,   32*nsg, shmem);
-        run("dkv",   (args.M + bc - 1)/bc, args.Hkv, 32*nsg, shmem);
+        run("dkv",   (L + bc - 1)/bc,      args.Hkv, 32*nsg, shmem);
         run("dq",    (args.N + br - 1)/br, args.H,   32*nsg, shmem);
     } else {
         // one simdgroup per row
         run("q",  args.N*args.H,   1, 32, 0);
-        run("kv", args.M*args.Hkv, 1, 32, 0);
+        run("kv", L*args.Hkv,      1, 32, 0);
     }
 
     return 1;

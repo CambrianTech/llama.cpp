@@ -930,6 +930,7 @@ typedef struct {
     uint64_t offs_dk;
     uint64_t offs_dv;
     uint64_t offs_lse;
+    int32_t  kv0;     // dK/dV cover the key rows [kv0, M), row j at j - kv0
 } ggml_metal_kargs_flash_attn_back;
 
 // a per-row backward with one scalar parameter (eps for RMS_NORM_BACK, scale for SOFT_MAX_BACK)

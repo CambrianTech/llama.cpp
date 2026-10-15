@@ -9249,12 +9249,14 @@ static void ggml_compute_forward_flash_attn_back_f32(
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * d    = dst->src[4];
 
-    const float scale = ggml_get_op_params_f32(dst, 0);
+    const float   scale = ggml_get_op_params_f32(dst, 0);
+    const int64_t kv0   = ggml_get_op_params_i32(dst, 1); // dK/dV cover the key rows [kv0, M)
 
     const int64_t D   = q->ne[0];
     const int64_t N   = q->ne[1];
     const int64_t H   = q->ne[2];
     const int64_t M   = k->ne[1];
+    const int64_t L   = M - kv0;
     const int64_t Hkv = k->ne[2];
     const int64_t Dv  = v->ne[0];
     const int64_t G   = H / Hkv; // query head h reads KV head h / G
@@ -9407,16 +9409,16 @@ static void ggml_compute_forward_flash_attn_back_f32(
         float * qr = vb + BC*Dv;     // [D]
         float * dr = qr + D;         // [Dv]
 
-        const int64_t nblk = (M + BC - 1)/BC;
+        const int64_t nblk = (L + BC - 1)/BC;
         for (int64_t t = ith; t < nblk*Hkv; t += nth) {
-            const int64_t j0 = (t % nblk)*BC;
+            const int64_t j0 = kv0 + (t % nblk)*BC;
             const int64_t hk = t / nblk;
             const int64_t nb = std::min(BC, M - j0);
             for (int64_t b = 0; b < nb; ++b) {
                 k_row(j0 + b, hk, kb + b*D);
                 v_row(j0 + b, hk, vb + b*Dv);
-                memset(dk + (hk*M + j0 + b)*D,  0, D*sizeof(float));
-                memset(dv + (hk*M + j0 + b)*Dv, 0, Dv*sizeof(float));
+                memset(dk + (hk*L + j0 - kv0 + b)*D,  0, D*sizeof(float));
+                memset(dv + (hk*L + j0 - kv0 + b)*Dv, 0, Dv*sizeof(float));
             }
             for (int64_t h = hk*G; h < (hk + 1)*G; ++h) {
                 for (int64_t i = 0; i < N; ++i) {
@@ -9440,8 +9442,8 @@ static void ggml_compute_forward_flash_attn_back_f32(
                             continue;
                         }
                         const float ds = p*(dot(dr, vb + b*Dv, Dv) - dvec[h*N + i])*scale;
-                        ggml_vec_mad_f32((int) D,  dk + (hk*M + j0 + b)*D,  qr, ds);
-                        ggml_vec_mad_f32((int) Dv, dv + (hk*M + j0 + b)*Dv, dr, p);
+                        ggml_vec_mad_f32((int) D,  dk + (hk*L + j0 - kv0 + b)*D,  qr, ds);
+                        ggml_vec_mad_f32((int) Dv, dv + (hk*L + j0 - kv0 + b)*Dv, dr, p);
                     }
                 }
             }

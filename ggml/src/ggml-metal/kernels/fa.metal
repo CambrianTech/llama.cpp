@@ -2380,8 +2380,9 @@ kernel void kernel_flash_attn_back_kv(
         device       char * dst,
         uint  tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]]) {
-    const int j  = tgpig % args.M;
-    const int hk = tgpig / args.M;
+    const int L  = args.M - args.kv0;
+    const int j  = args.kv0 + tgpig % L;
+    const int hk = tgpig / L;
     const int G  = args.H / args.Hkv;
 
     const int nq = args.D  / 32;
@@ -2425,8 +2426,8 @@ kernel void kernel_flash_attn_back_kv(
             }
         }
     }
-    device float * dk = (device float *) (dst + args.offs_dk) + (hk*args.M + j)*args.D;
-    device float * dv = (device float *) (dst + args.offs_dv) + (hk*args.M + j)*args.Dv;
+    device float * dk = (device float *) (dst + args.offs_dk) + (hk*L + j - args.kv0)*args.D;
+    device float * dv = (device float *) (dst + args.offs_dv) + (hk*L + j - args.kv0)*args.Dv;
     for (int c = 0; c < nq; ++c) {
         dk[tiisg + 32*c] = gk[c];
     }
@@ -2631,7 +2632,7 @@ kernel void kernel_flash_attn_back_dkv(
     const float ds = ((device const float *) (dst + args.offs_lse))[2*args.N*args.H]; // the dO scale
     const int D  = args.D;
     const int hk = tgpig.y;
-    const int j0 = tgpig.x*FAB_BC;
+    const int j0 = args.kv0 + tgpig.x*FAB_BC;
     const int G  = args.H / args.Hkv;
     const int CW = D / FAB_NSG; // the columns this simdgroup owns
     const int c0 = sgitg*CW;
@@ -2697,7 +2698,7 @@ kernel void kernel_flash_attn_back_dkv(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        device float * out = (device float *) (dst + (part == 0 ? args.offs_dk : args.offs_dv)) + (hk*args.M + j0)*D;
+        device float * out = (device float *) (dst + (part == 0 ? args.offs_dk : args.offs_dv)) + (hk*(args.M - args.kv0) + j0 - args.kv0)*D;
         for (int e = tiitg; e < FAB_BC*D; e += FAB_NSG*32) {
             if (j0 + e / D < args.M) {
                 out[e] = so[e]/ds;

@@ -5524,6 +5524,26 @@ void ggml_flash_attn_ext_set_back_tile(
     ggml_set_op_params_i32(a, 4, tile); // scale, max_bias, softcap, prec come first
 }
 
+void ggml_flash_attn_ext_set_grad_sinks(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_tap,
+        struct ggml_tensor * k_cur,
+        struct ggml_tensor * v_tap,
+        struct ggml_tensor * v_cur) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT && k_cur && v_cur && (k_tap == NULL) == (v_tap == NULL));
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+    const int64_t n = k_cur->ne[2] + (k_tap ? k_tap->ne[2] : 0);
+    GGML_ASSERT(v_cur->ne[2] + (v_tap ? v_tap->ne[2] : 0) == n && n <= k->ne[1]);
+    GGML_ASSERT(k_cur->ne[0] == k->ne[0] && k_cur->ne[1] == k->ne[2] && v_cur->ne[0] == v->ne[0] && v_cur->ne[1] == v->ne[2]);
+    GGML_ASSERT(!k_tap || (k_tap->ne[0] == k->ne[0] && k_tap->ne[1] == k->ne[2] && v_tap->ne[0] == v->ne[0] && v_tap->ne[1] == v->ne[2]));
+    // src[4] is sinks (the attention's own); the gradient sinks follow it
+    a->src[5] = k_tap;
+    a->src[6] = k_cur;
+    a->src[7] = v_tap;
+    a->src[8] = v_cur;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -5556,10 +5576,11 @@ size_t ggml_flash_attn_back_offset(const struct ggml_tensor * back, int part) {
     const struct ggml_tensor * q = back->src[0];
     const struct ggml_tensor * k = back->src[1];
     const struct ggml_tensor * v = back->src[2];
+    const int64_t kv0 = ggml_get_op_params_i32(back, 1); // dK/dV hold the key rows [kv0, M)
     const size_t sizes[3] = {
         GGML_PAD((size_t) q->ne[0]*q->ne[1]*q->ne[2]*sizeof(float), GGML_MEM_ALIGN),
-        GGML_PAD((size_t) ggml_nelements(k)*sizeof(float),       GGML_MEM_ALIGN),
-        GGML_PAD((size_t) ggml_nelements(v)*sizeof(float),       GGML_MEM_ALIGN),
+        GGML_PAD((size_t) k->ne[0]*(k->ne[1] - kv0)*k->ne[2]*sizeof(float), GGML_MEM_ALIGN),
+        GGML_PAD((size_t) v->ne[0]*(v->ne[1] - kv0)*v->ne[2]*sizeof(float), GGML_MEM_ALIGN),
     };
     size_t offs = 0;
     for (int i = 0; i < part; ++i) {
@@ -5575,8 +5596,10 @@ struct ggml_tensor * ggml_flash_attn_back(
         struct ggml_tensor  * v,
         struct ggml_tensor  * mask,
         struct ggml_tensor  * d,
-        float                 scale) {
+        float                 scale,
+        int64_t               kv0) {
     // q [D, N, H, 1], k [D, M, Hkv, 1], v [Dv, M, Hkv, 1], d [Dv, H, N, 1], mask [M', N', 1|H, 1]
+    GGML_ASSERT(kv0 >= 0 && kv0 < k->ne[1] && kv0 <= INT32_MAX);
     GGML_ASSERT(q->type == GGML_TYPE_F32 && d->type == GGML_TYPE_F32);
     GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 && "one sequence stream");
     GGML_ASSERT(k->ne[0] == q->ne[0] && v->ne[1] == k->ne[1] && v->ne[2] == k->ne[2]);
@@ -5587,10 +5610,12 @@ struct ggml_tensor * ggml_flash_attn_back(
     const size_t rows  = (size_t) q->ne[1]*q->ne[2];
     struct ggml_tensor tmp = { 0 };
     tmp.src[0] = q; tmp.src[1] = k; tmp.src[2] = v;
+    ggml_set_op_params_i32(&tmp, 1, (int32_t) kv0);
     const size_t bytes = ggml_flash_attn_back_offset(&tmp, 3) + (2*rows + 1)*sizeof(float); // lse, D, the dO scale
 
     struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) (bytes/sizeof(float)));
     ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, (int32_t) kv0);
 
     result->op     = GGML_OP_FLASH_ATTN_BACK;
     result->src[0] = q;
@@ -6815,9 +6840,45 @@ static struct ggml_tensor * ggml_fa_back_join(struct ggml_context * ctx, struct 
     return ggml_concat(ctx, ggml_fa_back_join(ctx, parts, h), ggml_fa_back_join(ctx, parts + h, n - h), 1);
 }
 
+// whether src needs a gradient in this backward pass
+static bool ggml_backward_needs_grad(struct ggml_cgraph * cgraph, const bool * grads_needed, const struct ggml_tensor * src, size_t * isrc) {
+    if (!src) {
+        return false;
+    }
+    *isrc = ggml_hash_find(&cgraph->visited_hash_set, src);
+    return *isrc != GGML_HASHSET_FULL && ggml_bitset_get(cgraph->visited_hash_set.used, *isrc) && grads_needed[*isrc];
+}
+
+// FLASH_ATTN_EXT's K (part 0) or V (part 1) gradient g [D, M - kv0, Hkv] (key rows [kv0, M)): to the
+// grad sinks when the attention has them (ggml_flash_attn_ext_set_grad_sinks), else to K/V itself
+static void ggml_fa_back_route_kv(struct ggml_context * ctx, struct ggml_cgraph * cgraph, const bool * grads_needed,
+        struct ggml_tensor * tensor, int part, struct ggml_tensor * g, size_t isrc, bool needed) {
+    if (tensor->src[6] == NULL) {
+        if (needed) {
+            const struct ggml_tensor * kv = tensor->src[1 + part];
+            ggml_add_or_set(ctx, cgraph, isrc, ggml_reshape_4d(ctx, ggml_cont(ctx, g), kv->ne[0], kv->ne[1], kv->ne[2], kv->ne[3]));
+        }
+        return;
+    }
+    int64_t r = 0;
+    for (int s = 0; s < 2; ++s) {
+        struct ggml_tensor * sink = tensor->src[5 + 2*part + s]; // tap, then the chunk's own
+        size_t is = 0;
+        if (sink == NULL) {
+            continue;
+        }
+        const int64_t n = sink->ne[2];
+        if (ggml_backward_needs_grad(cgraph, grads_needed, sink, &is)) {
+            struct ggml_tensor * rows = ggml_view_3d(ctx, g, g->ne[0], n, g->ne[2], g->nb[1], g->nb[2], r*g->nb[1]);
+            ggml_add_or_set(ctx, cgraph, is, ggml_cont(ctx, ggml_permute(ctx, rows, 0, 2, 1, 3))); // [D, Hkv, n]
+        }
+        r += n;
+    }
+}
+
 static void ggml_flash_attn_ext_backward(
         struct ggml_context * ctx, struct ggml_cgraph * cgraph, struct ggml_tensor * tensor, struct ggml_tensor * grad,
-        size_t isrc0, size_t isrc1, size_t isrc2, bool dq_needed, bool dk_needed, bool dv_needed) {
+        size_t isrc0, size_t isrc1, size_t isrc2, bool dq_needed, bool dk_needed, bool dv_needed, const bool * grads_needed) {
     struct ggml_tensor * q    = tensor->src[0]; // [D,  N, H,   1]
     struct ggml_tensor * k    = tensor->src[1]; // [D,  M, Hkv, 1]
     struct ggml_tensor * v    = tensor->src[2]; // [Dv, M, Hkv, 1]
@@ -6832,25 +6893,31 @@ static void ggml_flash_attn_ext_backward(
     GGML_ASSERT(tensor->src[4] == NULL && "flash_attn_ext backward: sinks are not implemented");
     GGML_ASSERT(q->ne[3] == 1 && "flash_attn_ext backward: one sequence stream");
 
+    // with grad sinks only K/V's last rows carry a gradient: from kv0 on, and nothing to K/V itself
+    const bool sunk = tensor->src[6] != NULL;
+    const int64_t kv0 = sunk ? k->ne[1] - tensor->src[6]->ne[2] - (tensor->src[5] ? tensor->src[5]->ne[2] : 0) : 0;
+    if (sunk) {
+        size_t is = 0;
+        dk_needed = ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[5], &is) || ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[6], &is);
+        dv_needed = ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[7], &is) || ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[8], &is);
+    }
+
     int32_t tile = ggml_get_op_params_i32(tensor, 4);
     if (tile == GGML_FA_BACK_NATIVE) {
-        struct ggml_tensor * b = ggml_flash_attn_back(ctx, q, k, v, mask, grad, scale);
-        // views of the packed result, each a contiguous tensor shaped like its source
+        struct ggml_tensor * b = ggml_flash_attn_back(ctx, q, k, v, mask, grad, scale, kv0);
+        // views of the packed result: dQ shaped like q, dK/dV like k/v from row kv0
+        const int64_t L = k->ne[1] - kv0;
         struct ggml_tensor * dq = ggml_view_3d(ctx, b, q->ne[0], q->ne[1], q->ne[2], q->ne[0]*sizeof(float), q->ne[0]*q->ne[1]*sizeof(float),
                 ggml_flash_attn_back_offset(b, 0));
-        struct ggml_tensor * dk = ggml_view_4d(ctx, b, k->ne[0], k->ne[1], k->ne[2], k->ne[3], k->ne[0]*sizeof(float),
-                k->ne[0]*k->ne[1]*sizeof(float), k->ne[0]*k->ne[1]*k->ne[2]*sizeof(float), ggml_flash_attn_back_offset(b, 1));
-        struct ggml_tensor * dv = ggml_view_4d(ctx, b, v->ne[0], v->ne[1], v->ne[2], v->ne[3], v->ne[0]*sizeof(float),
-                v->ne[0]*v->ne[1]*sizeof(float), v->ne[0]*v->ne[1]*v->ne[2]*sizeof(float), ggml_flash_attn_back_offset(b, 2));
+        struct ggml_tensor * dk = ggml_view_3d(ctx, b, k->ne[0], L, k->ne[2], k->ne[0]*sizeof(float), k->ne[0]*L*sizeof(float),
+                ggml_flash_attn_back_offset(b, 1));
+        struct ggml_tensor * dv = ggml_view_3d(ctx, b, v->ne[0], L, v->ne[2], v->ne[0]*sizeof(float), v->ne[0]*L*sizeof(float),
+                ggml_flash_attn_back_offset(b, 2));
         if (dq_needed) {
             ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape_4d(ctx, ggml_cont(ctx, dq), q->ne[0], q->ne[1], q->ne[2], q->ne[3]));
         }
-        if (dk_needed) {
-            ggml_add_or_set(ctx, cgraph, isrc1, dk);
-        }
-        if (dv_needed) {
-            ggml_add_or_set(ctx, cgraph, isrc2, dv);
-        }
+        ggml_fa_back_route_kv(ctx, cgraph, grads_needed, tensor, 0, dk, isrc1, dk_needed);
+        ggml_fa_back_route_kv(ctx, cgraph, grads_needed, tensor, 1, dv, isrc2, dv_needed);
         return;
     }
     if (tile <= 0) {
@@ -6900,9 +6967,13 @@ static void ggml_flash_attn_ext_backward(
     struct ggml_tensor *  dq = NULL;
     struct ggml_tensor ** dk = (struct ggml_tensor **) alloca(sizeof(struct ggml_tensor *) * nt);
     struct ggml_tensor ** dv = (struct ggml_tensor **) alloca(sizeof(struct ggml_tensor *) * nt);
+    const int t0 = (int) (kv0 / tile); // the first tile holding a key row that carries a gradient
     for (int t = 0; t < nt; ++t) {
         const int64_t j0 = (int64_t) t * tile;
         const int64_t n  = MIN(tile, M - j0);
+        if (t < t0 && !dq_needed) {
+            continue;
+        }
         struct ggml_tensor * kt = ggml_fa_back_f32(ctx, ggml_view_3d(ctx, k, k->ne[0], n, Hkv, k->nb[1], k->nb[2], j0*k->nb[1]));
         struct ggml_tensor * vt = ggml_fa_back_f32(ctx, ggml_view_3d(ctx, v, v->ne[0], n, Hkv, v->nb[1], v->nb[2], j0*v->nb[1]));
         struct ggml_tensor * p  = ggml_exp(ctx, ggml_sub(ctx, ggml_fa_back_scores(ctx, q, k, mask, scale, j0, n), lse));            // [n, N, H]
@@ -6913,11 +6984,11 @@ static void ggml_flash_attn_ext_backward(
             struct ggml_tensor * g = ggml_fa_back_mm(ctx, ggml_cont(ctx, ggml_transpose(ctx, kt)), ds); // [D, N, H]
             dq = dq ? ggml_add(ctx, dq, g) : g;
         }
-        if (dk_needed) {
+        if (dk_needed && t >= t0) {
             // dk[d,j] = sum_i q[d,i] ds[j,i]
             dk[t] = ggml_fa_back_group_sum(ctx, ggml_fa_back_mm(ctx, qT, ggml_cont(ctx, ggml_transpose(ctx, ds))), Hkv); // [D, n, Hkv]
         }
-        if (dv_needed) {
+        if (dv_needed && t >= t0) {
             // dv[d,j] = sum_i dO[d,i] p[j,i]
             dv[t] = ggml_fa_back_group_sum(ctx, ggml_fa_back_mm(ctx, dOT, ggml_cont(ctx, ggml_transpose(ctx, p))), Hkv); // [Dv, n, Hkv]
         }
@@ -6926,11 +6997,14 @@ static void ggml_flash_attn_ext_backward(
     if (dq_needed) {
         ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape_4d(ctx, ggml_cont(ctx, dq), q->ne[0], q->ne[1], q->ne[2], q->ne[3]));
     }
-    if (dk_needed) {
-        ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape_4d(ctx, ggml_fa_back_join(ctx, dk, nt), k->ne[0], k->ne[1], k->ne[2], k->ne[3]));
-    }
-    if (dv_needed) {
-        ggml_add_or_set(ctx, cgraph, isrc2, ggml_reshape_4d(ctx, ggml_fa_back_join(ctx, dv, nt), v->ne[0], v->ne[1], v->ne[2], v->ne[3]));
+    // the tiles from t0 joined, then their rows from kv0 ([D, M - kv0, Hkv])
+    for (int part = 0; part < 2; ++part) {
+        if (!(part == 0 ? dk_needed : dv_needed)) {
+            continue;
+        }
+        struct ggml_tensor * j = ggml_fa_back_join(ctx, (part == 0 ? dk : dv) + t0, nt - t0);
+        struct ggml_tensor * g = ggml_view_3d(ctx, j, j->ne[0], M - kv0, j->ne[2], j->nb[1], j->nb[2], (kv0 - (int64_t) t0*tile)*j->nb[1]);
+        ggml_fa_back_route_kv(ctx, cgraph, grads_needed, tensor, part, g, part == 0 ? isrc1 : isrc2, true);
     }
 }
 
@@ -7537,7 +7611,7 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_FLASH_ATTN_EXT: {
             ggml_flash_attn_ext_backward(ctx, cgraph, tensor, grad, isrc0, isrc1, isrc2,
-                    src0_needs_grads, src1_needs_grads, src2_needs_grads);
+                    src0_needs_grads, src1_needs_grads, src2_needs_grads, grads_needed);
         } break;
         case GGML_OP_NONE: {
             // noop
@@ -7549,8 +7623,10 @@ static void ggml_compute_backward(
     }
 
     GGML_ASSERT(!src0_needs_grads || ggml_are_same_shape(src0, cgraph->grads[isrc0]));
-    GGML_ASSERT(!src1_needs_grads || ggml_are_same_shape(src1, cgraph->grads[isrc1]));
-    GGML_ASSERT(!src2_needs_grads || ggml_are_same_shape(src2, cgraph->grads[isrc2]));
+    // an attention with grad sinks puts its K/V gradient on the sinks, never on K/V themselves
+    const bool kv_sunk = tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[6] != NULL;
+    GGML_ASSERT(!src1_needs_grads || kv_sunk || ggml_are_same_shape(src1, cgraph->grads[isrc1]));
+    GGML_ASSERT(!src2_needs_grads || kv_sunk || ggml_are_same_shape(src2, cgraph->grads[isrc2]));
 }
 
 static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_tensor * node, bool compute) {

@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <array>
 #include <vector>
 #include <memory>
 #include <set>
@@ -1414,6 +1415,9 @@ struct llm_graph_context {
     void build_walk_state_exit(ggml_tensor * cache, ggml_tensor * exit) const;
     // rows [row, row + n) of a layer's walk accumulator, shaped like `like`'s K / V span
     ggml_tensor * walk_acc_rows(ggml_tensor * acc, const ggml_tensor * like, int64_t row) const;
+    // the in-place training attention's K/V grad sinks (tap k, chunk k, tap v, chunk v), set by
+    // build_attn before build_attn_mha and taken by the FLASH_ATTN_EXT it builds
+    mutable std::array<ggml_tensor *, 4> walk_grad_sinks = {};
     // <k_cur, G_k> + <v_cur, G_v>: what later chunks of the run put on this chunk's own K/V
     // (accumulator rows from `row`), carried into it through the loss
     void build_walk_surrogate(int il, ggml_tensor * k_cur, ggml_tensor * v_cur, int64_t row) const;

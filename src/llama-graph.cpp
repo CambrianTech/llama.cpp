@@ -2751,6 +2751,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (cparams.training) {
             ggml_flash_attn_ext_set_back_tile(cur, cparams.fa_back_native ? GGML_FA_BACK_NATIVE : 0);
         }
+        if (walk_grad_sinks[1] != nullptr) {
+            // the in-place training graph's K/V gradient goes to the run's rows only
+            ggml_flash_attn_ext_set_grad_sinks(cur, walk_grad_sinks[0], walk_grad_sinks[1], walk_grad_sinks[2], walk_grad_sinks[3]);
+            walk_grad_sinks = {};
+        }
 
         if (v_mla) {
 #if 0
@@ -2992,41 +2997,52 @@ ggml_tensor * llm_graph_context::build_attn(
         // THE TRAINING GRAPH IS THE SERVING GRAPH. This chunk writes its K/V into the cache
         // exactly as serving does (SET_ROWS, the cache's own type) and attention reads the
         // cache in place: no copy of the context, at any window. The walk decoded the run
-        // into the cache under the same adapter, so the write is idempotent; the backward
-        // gathers this chunk's gradient from the rows it wrote (SET_ROWS backward). In the
-        // exact walk the write is TAPPED: the backward adds dL/d(cached K/V) of the run's
-        // positions before this chunk ([walk_grad_from, n_past)) into the run's host
-        // accumulator (cparams.walk_acc_k / _v, row 0 at walk_acc_base), and what later chunks
-        // put on this chunk's own rows reaches it through the surrogate. A quantized or f16
-        // cache trains on the values serving reads; its gradient passes straight through the
-        // cast.
+        // into the cache under the same adapter, so the write is idempotent.
+        // Only the run's rows carry a K/V gradient, and they are the attention's grad sinks
+        // (ggml_flash_attn_ext_set_grad_sinks): the chunk's own K/V and, in the exact walk, the
+        // run's positions before it ([g0, n_past), read from the cache as F32 and TAPPED: their
+        // gradient adds into the run's host accumulator, row 0 at walk_acc_base). The backward
+        // computes dK/dV from g0 on and nothing for the window before it, a constant (her served
+        // prefix): no window-sized gradient exists. What later chunks put on this chunk's own rows
+        // reaches it through the surrogate. A quantized or f16 cache trains on the values serving
+        // reads; its gradient passes straight through to the F32 K/V.
         const int64_t n_tokens = k_cur->ne[2];
         const int64_t n_past   = ubatch.pos[0];
         const int64_t n_win    = n_past + n_tokens;
         ggml_tensor * rows = build_inp_train_rows();
-        // the run's positions before this chunk carry a gradient: [g0, n_past), rows from base
         const int64_t base = cparams.walk_acc_base;
-        const int64_t g0   = std::max<int64_t>(cparams.walk_grad_from, base);
+        const int64_t g0   = std::min<int64_t>(std::max<int64_t>(cparams.walk_grad_from, base), n_past);
         llm_graph_result::walk_layer io = { il, (uint32_t) n_past, (uint32_t) g0 };
         // the window's cells [0, n_win) of one layer's cache with this chunk's rows written
-        auto write = [&](ggml_tensor * all, ggml_tensor * cur, ggml_tensor * acc, ggml_tensor *& tap, ggml_tensor *& tap_acc) {
+        auto write = [&](ggml_tensor * all, ggml_tensor * cur) {
             const int64_t n_embd = cur->ne[0]*cur->ne[1];
             GGML_ASSERT(all->ne[3] == 1 && "a training context reads one stream");
             GGML_ASSERT(ggml_row_size(cur->type, cur->ne[0]) == cur->nb[1]);
             ggml_tensor * win = ggml_view_2d(ctx0, all, n_embd, n_win, all->nb[2], 0);
             ggml_tensor * w   = ggml_set_rows(ctx0, win, ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[2], 0), rows);
-            if (acc != nullptr && n_past > g0) {
-                tap     = w;
-                tap_acc = ggml_view_2d(ctx0, acc, n_embd, n_past - g0, acc->nb[1], (g0 - base)*acc->nb[1]);
-            }
             return ggml_reshape_3d(ctx0, w, cur->ne[0], cur->ne[1], n_win);
         };
+        // the cached positions [p0, p1) as F32 [D, Hkv, p1 - p0]
+        auto span = [&](ggml_tensor * all, int64_t p0, int64_t p1) {
+            return ggml_cast(ctx0, ggml_view_3d(ctx0, all, all->ne[0], all->ne[1], p1 - p0, all->nb[1], all->nb[2], p0*all->nb[2]),
+                    GGML_TYPE_F32);
+        };
+        ggml_tensor * k_all = mctx_cur->get_k(ctx0, il);
         ggml_tensor * v_all = mctx_cur->get_v(ctx0, il);
         GGML_ASSERT(v_all->nb[1] <= v_all->nb[2] && "a flash-attention cache holds V untransposed");
-        const bool tapped = cparams.walk_exact;
-        k = write(mctx_cur->get_k(ctx0, il), k_cur, tapped ? cparams.walk_acc_k[il] : nullptr, io.tk, io.ak);
-        v = write(v_all,                     v_cur, tapped ? cparams.walk_acc_v[il] : nullptr, io.tv, io.av);
-        if (tapped) {
+        GGML_ASSERT(k_cur->type == GGML_TYPE_F32 && v_cur->type == GGML_TYPE_F32);
+        k = write(k_all, k_cur);
+        v = write(v_all, v_cur);
+        if (cparams.walk_exact && n_past > g0) {
+            io.tk = span(k_all, g0, n_past);
+            io.tv = span(v_all, g0, n_past);
+            ggml_format_name(io.tk, "walk_tk-%d", il);
+            ggml_format_name(io.tv, "walk_tv-%d", il);
+            io.ak = walk_acc_rows(cparams.walk_acc_k[il], io.tk, g0 - base);
+            io.av = walk_acc_rows(cparams.walk_acc_v[il], io.tv, g0 - base);
+        }
+        walk_grad_sinks = { io.tk, k_cur, io.tv, v_cur };
+        if (cparams.walk_exact) {
             if (cparams.walk_surrogate) {
                 build_walk_surrogate(il, k_cur, v_cur, n_past - base);
             }

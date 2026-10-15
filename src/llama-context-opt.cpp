@@ -67,7 +67,7 @@ bool llama_context::opt_fa_back_native() const {
     ggml_tensor * v = ggml_new_tensor_3d(ctx.get(), kv->type_v(), Dv, 64, Hkv);
     ggml_tensor * m = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, 64, 8);
     ggml_tensor * d = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, Dv, H, 8);
-    ggml_tensor * op = ggml_flash_attn_back(ctx.get(), q, k, v, m, d, 1.0f);
+    ggml_tensor * op = ggml_flash_attn_back(ctx.get(), q, k, v, m, d, 1.0f, 0);
     for (const auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
         const auto type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
@@ -387,14 +387,9 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
         ggml_opt_set_next_step(opt_ctx, xc->period_end, xc->loss_scale, res->t_walk_surrogate);
         for (const auto & io : res->t_walk) {
             if (io.tk) {
-                // the explicit path taps the span itself; the in-place path taps the window's cells
-                if (ggml_are_same_shape(io.tk, io.ak)) {
-                    ggml_opt_accumulate_grad(opt_ctx, io.tk, io.ak);
-                    ggml_opt_accumulate_grad(opt_ctx, io.tv, io.av);
-                } else {
-                    ggml_opt_accumulate_grad_rows(opt_ctx, io.tk, io.g0, io.ak);
-                    ggml_opt_accumulate_grad_rows(opt_ctx, io.tv, io.g0, io.av);
-                }
+                // the run's cached rows before this chunk, as F32: their gradient into the accumulator
+                ggml_opt_accumulate_grad(opt_ctx, io.tk, io.ak);
+                ggml_opt_accumulate_grad(opt_ctx, io.tv, io.av);
             }
         }
         for (const auto & ws : res->t_walk_state) {

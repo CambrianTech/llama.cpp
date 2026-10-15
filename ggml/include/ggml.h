@@ -2487,6 +2487,9 @@ extern "C" {
     // ggml_flash_attn_back_offset, then each query row's log-sum-exp and D = sum_j p_ij dp_ij,
     // which the kernels pass between their passes, and the power of two dO is scaled by in a
     // kernel's reduced-precision tiles (ggml_flash_attn_back_scale).
+    // dK and dV cover the key rows [kv0, M) only (row j at j - kv0): keys before kv0 are constants
+    // whose gradient nobody reads (a frozen served prefix), so it is neither computed nor stored.
+    // dQ always sums over every key.
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
            struct ggml_tensor  * q,
@@ -2494,7 +2497,8 @@ extern "C" {
            struct ggml_tensor  * v,
            struct ggml_tensor  * mask,
            struct ggml_tensor  * d,
-           float                 scale);
+           float                 scale,
+           int64_t               kv0);
 
     // byte offset in a ggml_flash_attn_back result of: 0 dQ, 1 dK, 2 dV, 3 the per-row scratch
     // the power of two that brings the largest |dO| to [4, 8): training gradients sit far below half
@@ -2502,6 +2506,18 @@ extern "C" {
     // (the Metal kernel computes the same rule, kernel_flash_attn_back_scale)
     GGML_API float ggml_flash_attn_back_scale(float max_abs_do);
     GGML_API size_t ggml_flash_attn_back_offset(const struct ggml_tensor * back, int part);
+
+    // Where FLASH_ATTN_EXT's K/V gradient goes when only the last rows of its K/V can carry one:
+    // k_tap / v_tap (or NULL) and k_cur / v_cur, each [D, Hkv, rows], hold the values of K/V's last
+    // rows in order, ending at M (a run's cached rows, then the chunk's own). The backward computes
+    // dK/dV from the first of those rows only and adds each part to its sink; the K/V the attention
+    // reads (the whole window) get no gradient. The sinks are not read by the forward.
+    GGML_API void ggml_flash_attn_ext_set_grad_sinks(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_tap,
+            struct ggml_tensor * k_cur,
+            struct ggml_tensor * v_tap,
+            struct ggml_tensor * v_cur);
 
     // the backward of FLASH_ATTN_EXT as the one op above (ggml_flash_attn_ext_set_back_tile)
     #define GGML_FA_BACK_NATIVE (-1)
