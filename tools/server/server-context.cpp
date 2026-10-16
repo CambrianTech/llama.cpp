@@ -6131,7 +6131,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.filepath = filepath;
         task.slot_action.size_only = size_only;
         if (request_data.contains("admitted_bytes")) {
-            if (!request_data.at("admitted_bytes").is_number_unsigned()) {
+            if (!request_data.at("admitted_bytes").is_number_integer()
+                || request_data.at("admitted_bytes").get<double>() < 0.0) {
                 res->error(format_error_response("admitted_bytes must be an unsigned integer", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }

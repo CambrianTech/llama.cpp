@@ -39,6 +39,13 @@ def test_slot_save_restore():
     # 2e3dd9c1: exact file framing and companions are quoted without writing.
     paths = [Path(server.slot_save_path) / ("slot1.bin" + suffix) for suffix in ("", ".ckpt", ".lora")]
     before = [p.read_bytes() if p.exists() else None for p in paths]
+    for invalid in (-1, 0.5, "1"):
+        assert server.make_request("POST", "/slots/1?action=save", data={
+            "filename": "slot1.bin", "admitted_bytes": invalid,
+        }).status_code == 400
+    assert server.make_request("POST", "/slots/1?action=save-size", data={
+        "filename": "slot1.bin", "admitted_bytes": (1 << 64) - 1,
+    }).status_code == 200
     quote = server.make_request("POST", "/slots/1?action=save-size", data={"filename": "slot1.bin"})
     assert quote.status_code == 200
     projected = quote.body["projected_bytes"]
