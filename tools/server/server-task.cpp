@@ -1649,6 +1649,9 @@ std::string server_task_result_metrics::to_metrics() {
 // server_task_result_slot_save_load
 //
 json server_task_result_slot_save_load::to_json() {
+    if (size_only) {
+        return json {{"id_slot", id_slot}, {"filename", filename}, {"projected_bytes", n_bytes}};
+    }
     if (is_save) {
         return json {
             { "id_slot",   id_slot },

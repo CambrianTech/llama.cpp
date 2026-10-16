@@ -227,6 +227,9 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        bool size_only = false;
+        bool has_byte_ceiling = false;
+        uint64_t byte_ceiling = 0;
         std::shared_ptr<server_restore_progress> progress;
     };
     slot_action slot_action;
@@ -596,6 +599,7 @@ struct server_task_result_slots : server_task_result {
 struct server_task_result_slot_save_load : server_task_result {
     std::string filename;
     bool is_save; // true = save, false = load
+    bool size_only = false;
 
     size_t n_tokens;
     size_t n_bytes;

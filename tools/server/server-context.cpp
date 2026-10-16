@@ -1,3 +1,4 @@
+#include <limits>
 #include "server-context.h"
 #include "../../src/llama-ext.h"
 #include "server-train.h"
@@ -2712,26 +2713,7 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
-                        break;
-                    }
-                    // Continuum fork: the CONTEXT CHECKPOINTS are part of the register file.
-                    // On a hybrid/recurrent (or SWA) cache the next request can only reuse a
-                    // prefix by rolling back to a checkpoint at or before the divergence —
-                    // and even an identical prompt rolls back one token [TAG_PROMPT_LOGITS].
-                    // A restored slot with no checkpoints therefore always hits do_reset:
-                    // "restore ok", then a full re-prefill (measured 2026-09-04, n_restored
-                    // 11298 → cache_n 0). The state file carries KV + tokens only, so the
-                    // checkpoints ride in a sidecar beside it; a missing or unreadable
-                    // sidecar degrades to the pre-fork cold restore, never to an error.
-                    {
-                        const std::string ckpt_path = filepath + ".ckpt";
-                        std::ofstream out(ckpt_path, std::ios::binary | std::ios::trunc);
-                        auto put = [&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); };
+                    auto write_checkpoints = [&](auto && put) {
                         const uint32_t magic   = 0x434B5054u; // 'CKPT'
                         const uint32_t version = 1;
                         const uint32_t n_ckpt  = (uint32_t) slot->prompt.checkpoints.size();
@@ -2749,24 +2731,8 @@ private:
                             put(c.data_dft.data(), c.data_dft.size());
                             put(c.data_spec.data(), c.data_spec.size());
                         }
-                        if (!out) {
-                            SLT_WRN(*slot, "checkpoint sidecar could not be written: %s (the restore will be cold)\n", ckpt_path.c_str());
-                        } else {
-                            SLT_INF(*slot, "saved %u context checkpoints beside the slot state: %s\n", n_ckpt, ckpt_path.c_str());
-                        }
-                    }
-
-                    // Continuum fork: the ADAPTER VECTOR is part of the register file too. The state was
-                    // computed under slot->lora; a restore that does not bring it back leaves the slot
-                    // labelled with whatever ran there last, so the next turn under the page's own
-                    // adapters reads as a lora change and launch_slot_with_task clears the restored KV
-                    // (the 5090, 2026-10-10: every gene turn re-prefilled after a restore). Written as
-                    // (path, scale) per loaded adapter, in load order; read back only when the server
-                    // has the same adapters loaded.
-                    {
-                        const std::string lora_path = filepath + ".lora";
-                        std::ofstream out(lora_path, std::ios::binary | std::ios::trunc);
-                        auto put = [&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); };
+                    };
+                    auto write_adapters = [&](auto && put) {
                         const uint32_t magic   = 0x4C4F5241u; // 'LORA'
                         const uint32_t version = 2;
                         const uint32_t n_lora  = (uint32_t) slot->lora.size();
@@ -2779,8 +2745,66 @@ private:
                             put(&l.scale, sizeof(l.scale));
                             put(&rev.first, sizeof(rev.first)); put(&rev.second, sizeof(rev.second));
                         }
+                    };
+                    if (task.slot_action.size_only || task.slot_action.has_byte_ceiling) {
+                        size_t projected_bytes = llama_state_seq_file_size(
+                            ctx_tgt, slot->id, reinterpret_cast<const llama_token *>(packed.data()),
+                            packed.size() / sizeof(llama_token));
+                        if (projected_bytes == 0) {
+                            send_error(task, "Unable to size slot state", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        bool size_overflow = false;
+                        auto count = [&](const void *, size_t n) {
+                            if (n > std::numeric_limits<size_t>::max() - projected_bytes) {
+                                size_overflow = true;
+                            } else {
+                                projected_bytes += n;
+                            }
+                        };
+                        write_checkpoints(count);
+                        write_adapters(count);
+                        if (size_overflow) {
+                            send_error(task, "Slot file size overflow", ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        if (task.slot_action.size_only) {
+                            auto res = std::make_unique<server_task_result_slot_save_load>();
+                            res->id = task.id;
+                            res->id_slot = id_slot;
+                            res->filename = filename;
+                            res->is_save = true;
+                            res->size_only = true;
+                            res->n_bytes = projected_bytes;
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                        // Recheck at this task boundary: decode may have advanced after the quote.
+                        if (task.slot_action.has_byte_ceiling && projected_bytes > task.slot_action.byte_ceiling) {
+                            send_error(task, "Slot state exceeds admitted file bytes", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                    }
+                    const size_t nwrite = llama_state_seq_save_file(
+                        ctx_tgt, filepath.c_str(), slot->id,
+                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                    if (nwrite == 0) {
+                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    // Companion serialization is shared with the pre-write size quote.
+                    {
+                        std::ofstream out(filepath + ".ckpt", std::ios::binary | std::ios::trunc);
+                        write_checkpoints([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
                         if (!out) {
-                            SLT_WRN(*slot, "adapter sidecar could not be written: %s (this page will not restore)\n", lora_path.c_str());
+                            SLT_WRN(*slot, "checkpoint sidecar could not be written: %s (the restore will be cold)\n", filepath.c_str());
+                        }
+                    }
+                    {
+                        std::ofstream out(filepath + ".lora", std::ios::binary | std::ios::trunc);
+                        write_adapters([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
+                        if (!out) {
+                            SLT_WRN(*slot, "adapter sidecar could not be written: %s (this page will not restore)\n", filepath.c_str());
                         }
                     }
 
@@ -5340,8 +5364,8 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
-        if (action == "save") {
-            return handle_slots_save(req, id_slot);
+        if (action == "save" || action == "save-size") {
+            return handle_slots_save(req, id_slot, action == "save-size");
         }
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
@@ -6081,7 +6105,7 @@ void server_routes::init_routes() {
     };
 }
 
-std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
+std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot, bool size_only) {
     auto res = create_response();
     const json request_data = json::parse(req.body);
     std::string filename = request_data.at("filename");
@@ -6105,6 +6129,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.size_only = size_only;
+        if (request_data.contains("admitted_bytes")) {
+            if (!request_data.at("admitted_bytes").is_number_unsigned()) {
+                res->error(format_error_response("admitted_bytes must be an unsigned integer", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            task.slot_action.has_byte_ceiling = true;
+            task.slot_action.byte_ceiling = request_data.at("admitted_bytes").get<uint64_t>();
+        }
         rd.post_task(std::move(task));
     }
 

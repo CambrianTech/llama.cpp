@@ -6,6 +6,7 @@ import struct
 import threading
 import time
 import uuid
+from pathlib import Path
 
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
 STATE_FILE_HEADER_SIZE = 12
@@ -35,12 +36,32 @@ def test_slot_save_restore():
     assert match_regex("(Whiskers|Flana)+", res.body["content"])
     assert res.body["timings"]["prompt_n"] == 21  # all tokens are processed
 
+    # 2e3dd9c1: exact file framing and companions are quoted without writing.
+    paths = [Path(server.slot_save_path) / ("slot1.bin" + suffix) for suffix in ("", ".ckpt", ".lora")]
+    before = [p.read_bytes() if p.exists() else None for p in paths]
+    quote = server.make_request("POST", "/slots/1?action=save-size", data={"filename": "slot1.bin"})
+    assert quote.status_code == 200
+    projected = quote.body["projected_bytes"]
+    assert projected > 0
+    assert [p.read_bytes() if p.exists() else None for p in paths] == before
+    refused = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "slot1.bin", "admitted_bytes": projected - 1,
+    })
+    assert refused.status_code == 400
+    assert [p.read_bytes() if p.exists() else None for p in paths] == before
+
     # Save state of slot 1
     res = server.make_request("POST", "/slots/1?action=save", data={
-        "filename": "slot1.bin",
+        "filename": "slot1.bin", "admitted_bytes": projected,
     })
     assert res.status_code == 200
     assert res.body["n_saved"] == 84
+    assert sum(p.stat().st_size for p in paths) == projected
+    saved = [p.read_bytes() for p in paths]
+    assert server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "slot1.bin", "admitted_bytes": 0,
+    }).status_code == 400
+    assert [p.read_bytes() for p in paths] == saved
 
     # Since we have cache, this should only process the last tokens
     res = server.make_request("POST", "/completion", data={

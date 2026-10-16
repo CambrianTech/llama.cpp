@@ -980,6 +980,13 @@ extern "C" {
                           size_t   size,
                     llama_seq_id   dest_seq_id);
 
+    // Exact serialized file bytes, including file framing and prompt tokens. Does not write.
+    LLAMA_API size_t llama_state_seq_file_size(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+               const llama_token * tokens,
+                          size_t   n_token_count);
+
     LLAMA_API size_t llama_state_seq_save_file(
             struct llama_context * ctx,
                       const char * filepath,

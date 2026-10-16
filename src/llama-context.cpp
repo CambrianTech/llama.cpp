@@ -3242,24 +3242,29 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     return file.tell();
 }
 
+size_t llama_context::state_seq_write_file(llama_io_write_i & io, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    const uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
+    const uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    const uint32_t count = (uint32_t) n_token_count;
+    io.write(&magic, sizeof(magic));
+    io.write(&version, sizeof(version));
+    io.write(&count, sizeof(count));
+    io.write(tokens, sizeof(llama_token) * n_token_count);
+    state_seq_write_data(io, seq_id, 0);
+    return io.n_bytes();
+}
+
+size_t llama_context::state_seq_file_size(llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    llama_io_write_dummy io(false);
+    return state_seq_write_file(io, seq_id, tokens, n_token_count);
+}
+
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
     llama_file file(filepath, "wb");
-
-    file.write_u32(LLAMA_STATE_SEQ_MAGIC);
-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
-
-    // save the prompt
-    file.write_u32((uint32_t) n_token_count);
-    file.write_raw(tokens, sizeof(llama_token) * n_token_count);
-
-    // save the context state using stream saving
     llama_io_write_file io(&file);
-    state_seq_write_data(io, seq_id, 0);
-
-    const size_t res = file.tell();
-    GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
-
-    return res;
+    const size_t written = state_seq_write_file(io, seq_id, tokens, n_token_count);
+    GGML_ASSERT(written == file.tell());
+    return written;
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
@@ -3967,6 +3972,16 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_file_size(llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    ctx->synchronize();
+    try {
+        return ctx->state_seq_file_size(seq_id, tokens, n_token_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error sizing sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

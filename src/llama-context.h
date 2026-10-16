@@ -181,6 +181,8 @@ struct llama_context {
                 llama_state_io_progress_callback progress = nullptr,
                 void * progress_data = nullptr);
 
+    size_t state_seq_file_size(llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count);
+
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
             const char * filepath,
@@ -316,6 +318,7 @@ private:
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
 
+    size_t state_seq_write_file(llama_io_write_i & io, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count);
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
