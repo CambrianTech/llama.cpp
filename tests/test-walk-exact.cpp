@@ -755,6 +755,7 @@ int main(int argc, char ** argv) {
                 ++failures;
             }
         }
+        const auto generation_prefix = seq_state(ctx, 0);
         const bool learned = llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr);
         const std::vector<uint8_t> her_after = seq_state(ctx, 0);
         const std::vector<uint8_t> neighbour_after = seq_state(ctx, 1);
@@ -771,12 +772,28 @@ int main(int argc, char ** argv) {
             FILE * weights = fopen(checkpoint.c_str(), "rb");
             FILE * optimizer = tmpfile();
             GGML_ASSERT(weights && optimizer && llama_opt_state_write(ctx, optimizer, "fixture-generation"));
+            adapter->alora_invocation_tokens.clear();
+            GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
+            GGML_ASSERT(llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
+            const auto uninterrupted_next = adapter_params(adapter);
+            adapter->alora_invocation_tokens = {tokens[0], tokens[1]};
+            // Change every A/B value deterministically, not just metadata or one selected tensor.
+            for (const auto & entry : adapter->ab_map) {
+                for (ggml_tensor * tensor : {entry.second.a, entry.second.b}) {
+                    std::vector<float> changed(ggml_nelements(tensor));
+                    ggml_backend_tensor_get(tensor, changed.data(), 0, ggml_nbytes(tensor));
+                    for (float & value : changed) { value = value * 0.5f + 0.125f; }
+                    ggml_backend_tensor_set(tensor, changed.data(), 0, ggml_nbytes(tensor));
+                }
+            }
+            const auto changed = adapter_params(adapter);
+            GGML_ASSERT(changed != saved);
             rewind(optimizer);
             GGML_ASSERT(!llama_opt_state_restore(ctx, adapter, weights, optimizer, "wrong-generation"));
-            GGML_ASSERT(adapter_params(adapter) == saved && !adapter->restore_quarantined);
+            GGML_ASSERT(adapter_params(adapter) == changed && !adapter->restore_quarantined);
             rewind(weights);
             auto * prepared = llama_adapter_lora_state_prepare(adapter, weights);
-            GGML_ASSERT(prepared && adapter_params(adapter) == saved);
+            GGML_ASSERT(prepared && adapter_params(adapter) == changed);
             GGML_ASSERT(llama_adapter_lora_state_apply(adapter, prepared));
             llama_adapter_lora_state_free(prepared);
             GGML_ASSERT(adapter->restore_quarantined);
@@ -799,12 +816,28 @@ int main(int argc, char ** argv) {
             GGML_ASSERT(!adapter->restore_quarantined && adapter_params(adapter) == saved);
             GGML_ASSERT(adapter->ab_map.begin()->second.a == old_a);
             adapter->alora_invocation_tokens.clear();
+            GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
+            GGML_ASSERT(llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
+            const auto resumed_next = adapter_params(adapter);
+            GGML_ASSERT(resumed_next.size() == uninterrupted_next.size());
+            std::vector<float> resumed_step(saved.size()), uninterrupted_step(saved.size());
+            for (size_t i = 0; i < saved.size(); ++i) {
+                resumed_step[i] = resumed_next[i] - saved[i];
+                uninterrupted_step[i] = uninterrupted_next[i] - saved[i];
+            }
+            GGML_ASSERT(same_step(compare("restored generation next step", resumed_step, uninterrupted_step)));
+            // Restore the original generation for the enclosing live-sequence step comparison.
+            adapter->alora_invocation_tokens = {tokens[0], tokens[1]};
+            rewind(weights); rewind(optimizer);
+            GGML_ASSERT(llama_opt_state_restore(ctx, adapter, weights, optimizer, "fixture-generation"));
+            GGML_ASSERT(adapter_params(adapter) == saved);
+            adapter->alora_invocation_tokens.clear();
             rewind(weights); rewind(optimizer);
             GGML_ASSERT(!llama_opt_state_restore(ctx, adapter, weights, optimizer, "fixture-generation"));
             GGML_ASSERT(adapter_params(adapter) == saved && !adapter->restore_quarantined);
             fclose(weights); fclose(optimizer);
             std::remove(checkpoint.c_str());
-            printf("  generation restore: prepare refusal unchanged, aLoRA exact, addresses stable, quarantine recovered\n");
+            printf("  generation restore: prepare refusal unchanged, aLoRA exact, addresses stable, changed weights restored, next step equivalent, quarantine recovered\n");
         }
         llama_free(ctx);
         const std::vector<float> after = adapter_params(adapter);
