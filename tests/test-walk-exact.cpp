@@ -595,8 +595,14 @@ int main(int argc, char ** argv) {
     }
 
     const bool recompute_only = getenv("WALK_RECOMPUTE_ONLY") != nullptr;
+    const bool live_only = getenv("WALK_LIVE_ONLY") != nullptr;
+    GGML_ASSERT(!(live_only && recompute_only));
+    if (live_only) {
+        printf("WALK_LIVE_ONLY: live-sequence and generation-restore cases only; full cache/walk suite not selected\n");
+    }
     int failures = 0;
     if (!recompute_only) {
+    if (!live_only) {
     {
         // 1. every position labelled: chunk = window is one graph, the true gradient
         std::vector<uint8_t> all(WINDOW + 1, 1);
@@ -669,6 +675,7 @@ int main(int argc, char ** argv) {
         }
     }
 
+    } // !live_only
     {
         // 9. LEARNING ON A LIVE SEQUENCE (llama_opt_learn, P2). What this catches: training that
         // needs its own context, re-decodes her context, disturbs another slot, or leaves the shadow
@@ -862,6 +869,13 @@ int main(int argc, char ** argv) {
       }
     }
 
+    if (live_only) {
+        std::remove(init.c_str());
+        llama_model_free(model);
+        llama_backend_free();
+        printf("test-walk-exact live/generation selection: %s\n", failures ? "FAILED" : "OK");
+        return failures ? 1 : 0;
+    }
     {
         // 8. what this catches: a walk that leaves the shadow in her cache. The reply's cells
         // are written under the shadow while it trains, then restored, so after either walk the
