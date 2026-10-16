@@ -14,27 +14,20 @@
 //          band WASTE measured. Catches reuse=0 end-to-end from real behavior, no model load.
 //
 // BUILD (Linux/CI — the Windows DirectReadFetcher is #ifdef'd out, so no windows.h needed):
-//   c++ -std=c++17 -O2 -I ../ggml/src tests/test-moe-residency.cpp -o /tmp/tmoe && /tmp/tmoe
+//   c++ -std=c++17 -O2 -I ggml/src -I ggml/include tests/test-moe-residency.cpp -o /tmp/tmoe && /tmp/tmoe
 //   VDD replay of a real trace:  /tmp/tmoe path/to/trace.tsv
 //
 // TODO (next session / clean-architecture): give ResidencyCache a SlotAllocator seam (Ggml pinned vs
 // malloc) so the PRODUCTION cache runs these same tests directly instead of the reference model below.
 // The reference model here IS the spec the production cache must match.
 
+#include <cstddef>
+#include "ggml-backend.h"
+
 #ifdef _WIN32
 #include <windows.h>   // the header's DirectReadFetcher (under _WIN32) references Win32 types; pull them
 #include <psapi.h>     // GetMappedFileNameW (declaration only — DirectReadFetcher is never instantiated)
 #endif
-
-// --- ggml stubs so the header parses standalone (ResidencyCache is never instantiated here, so these
-//     are declared-not-defined: name lookup succeeds, nothing is ODR-used, nothing to link). ---
-typedef struct ggml_backend_buffer      * ggml_backend_buffer_t;
-typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
-extern "C" {
-    ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t, size_t);
-    void *                ggml_backend_buffer_get_base(ggml_backend_buffer_t);
-    void                  ggml_backend_buffer_free(ggml_backend_buffer_t);
-}
 
 #include "ggml-moe-residency.hpp"
 #include "ggml-moe-container.h"
