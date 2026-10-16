@@ -839,10 +839,138 @@ static std::pair<int, int> test_regression(
     return std::make_pair(npass, ntest);
 }
 
+static std::pair<int, int> test_checkpoint(
+        ggml_opt_optimizer_type optim, ggml_backend_sched_t sched, ggml_backend_t backend) {
+    int npass = 0, ntest = 0;
+    auto cd = helper_get_ctx_data(optim, sched, backend);
+    const auto step = [&]() {
+        GGML_ASSERT(ggml_opt_alloc(cd.opt_ctx, true));
+        const float input = 2.0f;
+        ggml_backend_tensor_set(cd.inputs, &input, 0, sizeof(input));
+        ggml_opt_eval(cd.opt_ctx, cd.result);
+    };
+    const auto snapshot = [&]() {
+        FILE * copy = tmpfile();
+        GGML_ASSERT(copy);
+        GGML_ASSERT(ggml_opt_state_write(cd.opt_ctx, copy, "test-model/adapter/policy"));
+        rewind(copy);
+        std::vector<uint8_t> bytes;
+        for (int ch; (ch = fgetc(copy)) != EOF;) { bytes.push_back((uint8_t) ch); }
+        fclose(copy);
+        return bytes;
+    };
+    step();
+    FILE * state = tmpfile();
+    GGML_ASSERT(state);
+    float saved_weight;
+    ggml_backend_tensor_get(cd.weights, &saved_weight, 0, sizeof(saved_weight));
+    const bool written = ggml_opt_state_write(cd.opt_ctx, state, "test-model/adapter/policy");
+    print_ok(__func__, written, npass, ntest, "write");
+    step();
+    float expected;
+    ggml_backend_tensor_get(cd.weights, &expected, 0, sizeof(expected));
+    const auto before_refusal = snapshot();
+    rewind(state);
+    print_ok(__func__, !ggml_opt_state_read(cd.opt_ctx, state, "other-binding"), npass, ntest, "binding-refusal");
+    print_ok(__func__, snapshot() == before_refusal, npass, ntest, "binding-refusal-unchanged");
+    rewind(state);
+    const bool restored = ggml_opt_state_read(cd.opt_ctx, state, "test-model/adapter/policy");
+    print_ok(__func__, restored, npass, ntest, "restore");
+    ggml_backend_tensor_set(cd.weights, &saved_weight, 0, sizeof(saved_weight));
+    step();
+    float actual;
+    ggml_backend_tensor_get(cd.weights, &actual, 0, sizeof(actual));
+    print_ok(__func__, almost_equal(expected, actual, 1e-7), npass, ntest, "next-step-equivalence");
+    helper_free_ctx_data(cd);
+    cd = helper_get_ctx_data(optim, sched, backend);
+    step(); // Allocate destination optimizer tensors, with no pending evaluation.
+    rewind(state);
+    print_ok(__func__, ggml_opt_state_read(cd.opt_ctx, state, "test-model/adapter/policy"), npass, ntest, "fresh-context-restore");
+    ggml_backend_tensor_set(cd.weights, &saved_weight, 0, sizeof(saved_weight));
+    step();
+    ggml_backend_tensor_get(cd.weights, &actual, 0, sizeof(actual));
+    print_ok(__func__, almost_equal(expected, actual, 1e-7), npass, ntest, "fresh-context-next-step");
+    GGML_ASSERT(ggml_opt_alloc(cd.opt_ctx, true));
+    rewind(state);
+    print_ok(__func__, !ggml_opt_state_read(cd.opt_ctx, state, "test-model/adapter/policy"), npass, ntest, "prepared-eval-refusal");
+    print_ok(__func__, !ggml_opt_state_write(cd.opt_ctx, state, "test-model/adapter/policy"), npass, ntest, "prepared-export-refusal");
+    ggml_opt_eval(cd.opt_ctx, cd.result);
+    using set_abort_fn = void (*)(ggml_backend_t, ggml_abort_callback, void *);
+    const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    const auto set_abort = reinterpret_cast<set_abort_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback"));
+    if (set_abort) {
+        set_abort(backend, [](void *) { return true; }, nullptr);
+        step();
+        set_abort(backend, nullptr, nullptr);
+        FILE * failed = tmpfile();
+        GGML_ASSERT(failed);
+        print_ok(__func__, !ggml_opt_state_write(cd.opt_ctx, failed, "test-model/adapter/policy"), npass, ntest, "failed-backend-refusal");
+        step();
+        print_ok(__func__, !ggml_opt_state_write(cd.opt_ctx, failed, "test-model/adapter/policy"), npass, ntest, "failure-stays-untrusted");
+        rewind(state);
+        print_ok(__func__, ggml_opt_state_read(cd.opt_ctx, state, "test-model/adapter/policy"), npass, ntest, "known-state-recovery");
+        fclose(failed);
+    }
+    fclose(state);
+    FILE * corrupt = tmpfile();
+    GGML_ASSERT(corrupt);
+    fputs("broken checkpoint", corrupt);
+    rewind(corrupt);
+    const auto before_corrupt = snapshot();
+    print_ok(__func__, !ggml_opt_state_read(cd.opt_ctx, corrupt, "test-model/adapter/policy"), npass, ntest, "corrupt-refusal");
+    print_ok(__func__, snapshot() == before_corrupt, npass, ntest, "corrupt-refusal-unchanged");
+    fclose(corrupt);
+    FILE * truncated = tmpfile();
+    GGML_ASSERT(truncated && !before_corrupt.empty());
+    GGML_ASSERT(fwrite(before_corrupt.data(), 1, before_corrupt.size() - 1, truncated) == before_corrupt.size() - 1);
+    rewind(truncated);
+    print_ok(__func__, !ggml_opt_state_read(cd.opt_ctx, truncated, "test-model/adapter/policy"), npass, ntest, "truncated-refusal");
+    print_ok(__func__, snapshot() == before_corrupt, npass, ntest, "truncated-refusal-unchanged");
+    fclose(truncated);
+    helper_free_ctx_data(cd);
+    auto partial = helper_get_ctx_data(optim, sched, backend, true, true, 3, 1);
+    GGML_ASSERT(ggml_opt_alloc(partial.opt_ctx, true));
+    const float input = 2.0f;
+    ggml_backend_tensor_set(partial.inputs, &input, 0, sizeof(input));
+    ggml_opt_eval(partial.opt_ctx, partial.result);
+    FILE * unfinished = tmpfile();
+    GGML_ASSERT(unfinished);
+    print_ok(__func__, !ggml_opt_state_write(partial.opt_ctx, unfinished, "test-model/adapter/policy"), npass, ntest, "partial-refusal");
+    ggml_opt_set_next_step(partial.opt_ctx, true, 1.0f, nullptr);
+    GGML_ASSERT(ggml_opt_alloc(partial.opt_ctx, true));
+    ggml_opt_eval(partial.opt_ctx, partial.result);
+    print_ok(__func__, ggml_opt_state_write(partial.opt_ctx, unfinished, "manual-period-three"), npass, ntest, "manual-boundary");
+    ggml_backend_tensor_get(partial.weights, &saved_weight, 0, sizeof(saved_weight));
+    GGML_ASSERT(ggml_opt_alloc(partial.opt_ctx, true));
+    ggml_opt_eval(partial.opt_ctx, partial.result);
+    ggml_backend_tensor_get(partial.weights, &expected, 0, sizeof(expected));
+    helper_free_ctx_data(partial);
+    partial = helper_get_ctx_data(optim, sched, backend, true, true, 3, 1);
+    GGML_ASSERT(ggml_opt_alloc(partial.opt_ctx, true));
+    ggml_backend_tensor_set(partial.inputs, &input, 0, sizeof(input));
+    ggml_opt_eval(partial.opt_ctx, partial.result);
+    rewind(unfinished);
+    print_ok(__func__, ggml_opt_state_read(partial.opt_ctx, unfinished, "manual-period-three"), npass, ntest, "manual-fresh-restore");
+    ggml_backend_tensor_set(partial.weights, &saved_weight, 0, sizeof(saved_weight));
+    GGML_ASSERT(ggml_opt_alloc(partial.opt_ctx, true));
+    ggml_opt_eval(partial.opt_ctx, partial.result);
+    ggml_backend_tensor_get(partial.weights, &actual, 0, sizeof(actual));
+    print_ok(__func__, almost_equal(expected, actual, 1e-7), npass, ntest, "manual-next-step-equivalence");
+    fclose(unfinished);
+    helper_free_ctx_data(partial);
+    return {npass, ntest};
+}
+
 static std::pair<int, int> test_backend(
     ggml_backend_sched_t backend_sched, ggml_backend_t backend, enum ggml_opt_optimizer_type optim) {
     int npass = 0;
     int ntest = 0;
+
+    {
+        const auto partial = test_checkpoint(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
 
     for (bool shuffle : {false, true}) {
         std::pair<int, int> partial = test_dataset(optim, backend_sched, backend, shuffle);

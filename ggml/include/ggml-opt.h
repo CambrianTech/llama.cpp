@@ -10,6 +10,7 @@
 #include "ggml-backend.h"
 
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef  __cplusplus
 extern "C" {
@@ -175,6 +176,14 @@ extern "C" {
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 
     GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type);
+
+    // Checkpoint optimizer state at a successful update boundary. Parameters are saved separately.
+    // binding identifies the caller's model, adapter topology and optimizer policy; it must match exactly.
+    // Mutable callback/schedule state must be saved by the caller in the same generation, not inferred from a callback address.
+    // Import requires allocated optimizer tensors and no prepared evaluation; it validates all input before changing state.
+    // The caller owns file integrity, atomic publication and serialization with compute.
+    GGML_API bool ggml_opt_state_write(ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
+    GGML_API bool ggml_opt_state_read (ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
 
     // ====== Optimization Result ======
 
