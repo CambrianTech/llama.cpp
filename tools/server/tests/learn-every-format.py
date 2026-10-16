@@ -13,6 +13,7 @@ sid = json.loads(raw("/lora-adapters/load", {"name": "shadow-05.gguf"}))["id"]
 learn = {"reply": "Topeka is the capital of Kansas.", "lora_id": sid, "lr": 0.001}
 
 # Isolated template/label regression; never run this shadow-adapter fixture on a persona lane.
+# Add --expect-reasoning-refusal only for a known non-reasoning template; the exact refusal must match.
 if "--template-replies" in sys.argv:
     import urllib.error
     messages = [{"role": "user", "content": "Inspect the requested source file."}]
@@ -28,7 +29,16 @@ if "--template-replies" in sys.argv:
                    "chat_template_kwargs": {"enable_thinking": bool(reply.get("reasoning_content"))}}
         raw("/v1/chat/completions", request)
         experience = dict(request, messages=messages + [reply], lora_id=sid)
-        outcome = json.loads(raw("/learn", experience))
+        expect_refusal = bool(reply.get("reasoning_content")) and "--expect-reasoning-refusal" in sys.argv
+        try:
+            outcome = json.loads(raw("/learn", experience))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode()
+            assert expect_refusal and error.code == 400, (error.code, detail)
+            assert "the served template does not render the reply's reasoning_content" in detail, detail
+            print(json.dumps({"template_reply": "reasoning", "expected_refusal": detail}))
+            continue
+        assert not expect_refusal, ("template was expected to refuse reasoning", outcome)
         deadline = time.monotonic() + 300
         while outcome.get("deferred"):
             assert time.monotonic() < deadline, ("deferred fixture deadline", outcome)
