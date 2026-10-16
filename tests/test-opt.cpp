@@ -920,6 +920,13 @@ static std::pair<int, int> test_checkpoint(
     print_ok(__func__, !ggml_opt_state_read(cd.opt_ctx, corrupt, "test-model/adapter/policy"), npass, ntest, "corrupt-refusal");
     print_ok(__func__, snapshot() == before_corrupt, npass, ntest, "corrupt-refusal-unchanged");
     fclose(corrupt);
+    FILE * truncated = tmpfile();
+    GGML_ASSERT(truncated && !before_corrupt.empty());
+    GGML_ASSERT(fwrite(before_corrupt.data(), 1, before_corrupt.size() - 1, truncated) == before_corrupt.size() - 1);
+    rewind(truncated);
+    print_ok(__func__, !ggml_opt_state_read(cd.opt_ctx, truncated, "test-model/adapter/policy"), npass, ntest, "truncated-refusal");
+    print_ok(__func__, snapshot() == before_corrupt, npass, ntest, "truncated-refusal-unchanged");
+    fclose(truncated);
     helper_free_ctx_data(cd);
     auto partial = helper_get_ctx_data(optim, sched, backend, true, true, 3, 1);
     GGML_ASSERT(ggml_opt_alloc(partial.opt_ctx, true));
