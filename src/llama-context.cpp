@@ -1417,6 +1417,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    for (const auto & entry : *loras) {
+        if (entry.first->restore_quarantined) {
+            LLAMA_LOG_ERROR("%s: adapter generation restore is uncertain\n", __func__);
+            return -1;
+        }
+    }
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1655,6 +1662,21 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (opt_shadow && opt_shadow->restore_quarantined && batch_inp.label) {
+        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
+            if (batch_inp.label[i] >= 0) {
+                LLAMA_LOG_ERROR("%s: shadow generation restore is uncertain\n", __func__);
+                return -1;
+            }
+        }
+    }
+    for (const auto & entry : *loras) {
+        if (entry.first->restore_quarantined) {
+            LLAMA_LOG_ERROR("%s: adapter generation restore is uncertain\n", __func__);
+            return -1;
+        }
+    }
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -3734,6 +3756,9 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
+    for (size_t i = 0; i < n_adapters; ++i) {
+        if (scales[i] != 0.0f && adapters[i]->restore_quarantined) { return -1; }
+    }
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;

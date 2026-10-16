@@ -70,6 +70,8 @@ struct llama_adapter_lora {
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     float alpha;
+    // Failed/uncertain generation application prevents both serving and further learning.
+    bool restore_quarantined = false;
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
@@ -89,3 +91,9 @@ struct llama_adapter_lora {
 
 using llama_adapter_loras = std::unordered_map<llama_adapter_lora *, float>;
 using llama_adapter_loras_ptr = std::unique_ptr<llama_adapter_loras>;
+
+// Internal generation restore, serialized by the caller with adapter/context use and retirement.
+struct llama_adapter_lora_state;
+llama_adapter_lora_state * llama_adapter_lora_state_prepare(llama_adapter_lora * adapter, FILE * file);
+bool llama_adapter_lora_state_apply(llama_adapter_lora * adapter, llama_adapter_lora_state * state);
+void llama_adapter_lora_state_free(llama_adapter_lora_state * state);

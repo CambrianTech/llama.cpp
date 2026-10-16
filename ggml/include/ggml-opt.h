@@ -184,6 +184,13 @@ extern "C" {
     // The caller owns file integrity, atomic publication and serialization with compute.
     GGML_API bool ggml_opt_state_write(ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
     GGML_API bool ggml_opt_state_read (ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
+    // Prepare owns validated host payload without changing the destination. The caller must keep
+    // the context alive and serialize prepare/apply with all evaluation and allocation operations.
+    struct ggml_opt_state;
+    GGML_API struct ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
+    GGML_API bool ggml_opt_state_apply(ggml_opt_context_t opt_ctx, struct ggml_opt_state * state);
+    GGML_API void ggml_opt_state_free(struct ggml_opt_state * state);
+
 
     // ====== Optimization Result ======
 

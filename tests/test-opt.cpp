@@ -874,7 +874,10 @@ static std::pair<int, int> test_checkpoint(
     print_ok(__func__, !ggml_opt_state_read(cd.opt_ctx, state, "other-binding"), npass, ntest, "binding-refusal");
     print_ok(__func__, snapshot() == before_refusal, npass, ntest, "binding-refusal-unchanged");
     rewind(state);
-    const bool restored = ggml_opt_state_read(cd.opt_ctx, state, "test-model/adapter/policy");
+    ggml_opt_state * staged = ggml_opt_state_prepare(cd.opt_ctx, state, "test-model/adapter/policy");
+    print_ok(__func__, staged && snapshot() == before_refusal, npass, ntest, "prepare-no-mutation");
+    const bool restored = ggml_opt_state_apply(cd.opt_ctx, staged);
+    ggml_opt_state_free(staged);
     print_ok(__func__, restored, npass, ntest, "restore");
     ggml_backend_tensor_set(cd.weights, &saved_weight, 0, sizeof(saved_weight));
     step();

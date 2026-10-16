@@ -494,7 +494,7 @@ void llama_adapter_lora_free(llama_adapter_lora * adapter) {
 }
 
 int32_t llama_adapter_lora_save(const struct llama_adapter_lora * adapter, const char * path_lora) {
-    if (adapter == nullptr || adapter->model == nullptr || path_lora == nullptr) {
+    if (adapter == nullptr || adapter->model == nullptr || path_lora == nullptr || adapter->restore_quarantined) {
         return -1;
     }
     LLM_KV llm_kv = LLM_KV(LLM_ARCH_UNKNOWN);
@@ -520,6 +520,11 @@ int32_t llama_adapter_lora_save(const struct llama_adapter_lora * adapter, const
     gguf_set_val_str(out.get(), llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str(), llm_arch_name(adapter->model->arch));
     gguf_set_val_str(out.get(), llm_kv(LLM_KV_ADAPTER_TYPE).c_str(), "lora");
     gguf_set_val_f32(out.get(), llm_kv(LLM_KV_ADAPTER_LORA_ALPHA).c_str(), adapter->alpha);
+    if (!adapter->alora_invocation_tokens.empty()) {
+        gguf_set_arr_data(out.get(), llm_kv(LLM_KV_ADAPTER_ALORA_INVOCATION_TOKENS).c_str(),
+            GGUF_TYPE_UINT32, adapter->alora_invocation_tokens.data(), adapter->alora_invocation_tokens.size());
+    }
+
 
     for (const auto & [name, ab] : adapter->ab_map) {
         for (const ggml_tensor * src : { ab.a, ab.b }) {
@@ -549,3 +554,102 @@ const llama_token * llama_adapter_get_alora_invocation_tokens(const llama_adapte
     GGML_ASSERT(adapter);
     return adapter->alora_invocation_tokens.data();
 }
+
+struct llama_adapter_lora_state {
+    llama_adapter_lora * owner;
+    llama_model * model;
+    float alpha;
+    std::vector<llama_token> invocation;
+    std::map<std::string, ggml_tensor *> tensors;
+    std::map<std::string, std::vector<uint8_t>> payload;
+};
+
+static std::map<std::string, ggml_tensor *> lora_state_tensors(llama_adapter_lora * adapter) {
+    std::map<std::string, ggml_tensor *> tensors;
+    for (const auto & entry : adapter->ab_map) {
+        for (ggml_tensor * tensor : {entry.second.a, entry.second.b}) {
+            if (!tensor || !*tensor->name || !tensors.emplace(tensor->name, tensor).second) { return {}; }
+        }
+    }
+    return tensors;
+}
+
+llama_adapter_lora_state * llama_adapter_lora_state_prepare(llama_adapter_lora * adapter, FILE * file) {
+    if (!adapter || !adapter->model || !file) { return nullptr; }
+    fpos_t start;
+    if (fgetpos(file, &start) != 0) { return nullptr; }
+    ggml_context * data = nullptr;
+    gguf_context_ptr metadata {gguf_init_from_file_ptr(file, {true, &data})};
+    ggml_context_ptr tensor_metadata {data};
+    if (!metadata) { return nullptr; }
+    LLM_KV kv = LLM_KV(LLM_ARCH_UNKNOWN);
+    const auto string_is = [&](enum llm_kv name, const char * expected) {
+        const int64_t id = gguf_find_key(metadata.get(), kv(name).c_str());
+        return id >= 0 && gguf_get_kv_type(metadata.get(), id) == GGUF_TYPE_STRING &&
+            std::string(gguf_get_val_str(metadata.get(), id)) == expected;
+    };
+    const int64_t alpha = gguf_find_key(metadata.get(), kv(LLM_KV_ADAPTER_LORA_ALPHA).c_str());
+    if (!string_is(LLM_KV_GENERAL_TYPE, "adapter") ||
+        !string_is(LLM_KV_GENERAL_ARCHITECTURE, llm_arch_name(adapter->model->arch)) ||
+        !string_is(LLM_KV_ADAPTER_TYPE, "lora") || alpha < 0 ||
+        gguf_get_kv_type(metadata.get(), alpha) != GGUF_TYPE_FLOAT32 ||
+        gguf_get_val_f32(metadata.get(), alpha) != adapter->alpha ||
+        gguf_get_alignment(metadata.get()) != GGUF_DEFAULT_ALIGNMENT) { return nullptr; }
+    const int64_t invocation = gguf_find_key(metadata.get(), kv(LLM_KV_ADAPTER_ALORA_INVOCATION_TOKENS).c_str());
+    if (invocation < 0) {
+        if (!adapter->alora_invocation_tokens.empty()) { return nullptr; }
+    } else {
+        if (gguf_get_kv_type(metadata.get(), invocation) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(metadata.get(), invocation) != GGUF_TYPE_UINT32 ||
+            gguf_get_arr_n(metadata.get(), invocation) != adapter->alora_invocation_tokens.size()) { return nullptr; }
+        const auto * tokens = static_cast<const llama_token *>(gguf_get_arr_data(metadata.get(), invocation));
+        if (!std::equal(adapter->alora_invocation_tokens.begin(), adapter->alora_invocation_tokens.end(), tokens)) { return nullptr; }
+    }
+    auto tensors = lora_state_tensors(adapter);
+    if (tensors.empty() || gguf_get_n_tensors(metadata.get()) != (int64_t) tensors.size()) { return nullptr; }
+    // File order can differ from the adapter map. Validate every descriptor before allocating payload.
+    for (int64_t i = 0; i < gguf_get_n_tensors(metadata.get()); ++i) {
+        const char * name = gguf_get_tensor_name(metadata.get(), i);
+        const auto found = tensors.find(name);
+        const ggml_tensor * saved = ggml_get_tensor(data, name);
+        if (found == tensors.end() || !saved || saved->type != found->second->type ||
+            !ggml_are_same_shape(saved, found->second) || ggml_nbytes(saved) != ggml_nbytes(found->second)) { return nullptr; }
+    }
+    std::vector<uint8_t> expected(gguf_get_meta_size(metadata.get()));
+    gguf_get_meta_data(metadata.get(), expected.data());
+    std::vector<uint8_t> actual(expected.size());
+    if (fsetpos(file, &start) != 0 || fread(actual.data(), 1, actual.size(), file) != actual.size() || actual != expected) { return nullptr; }
+    auto prepared = std::make_unique<llama_adapter_lora_state>();
+    prepared->owner = adapter;
+    prepared->model = adapter->model;
+    prepared->alpha = adapter->alpha;
+    prepared->invocation = adapter->alora_invocation_tokens;
+    prepared->tensors = std::move(tensors);
+    size_t offset = 0;
+    uint8_t padding[GGUF_DEFAULT_ALIGNMENT];
+    for (int64_t i = 0; i < gguf_get_n_tensors(metadata.get()); ++i) {
+        const std::string name = gguf_get_tensor_name(metadata.get(), i);
+        if (gguf_get_tensor_offset(metadata.get(), i) != offset) { return nullptr; }
+        auto & bytes = prepared->payload[name];
+        bytes.resize(ggml_nbytes(prepared->tensors.at(name)));
+        const size_t pad = (GGUF_DEFAULT_ALIGNMENT - bytes.size() % GGUF_DEFAULT_ALIGNMENT) % GGUF_DEFAULT_ALIGNMENT;
+        if (fread(bytes.data(), 1, bytes.size(), file) != bytes.size() || fread(padding, 1, pad, file) != pad) { return nullptr; }
+        offset += bytes.size() + pad;
+    }
+    return prepared.release();
+}
+
+bool llama_adapter_lora_state_apply(llama_adapter_lora * adapter, llama_adapter_lora_state * state) {
+    if (!adapter || !state || state->owner != adapter || state->model != adapter->model ||
+        state->alpha != adapter->alpha || state->invocation != adapter->alora_invocation_tokens ||
+        state->tensors != lora_state_tensors(adapter)) { return false; }
+    adapter->restore_quarantined = true;
+    for (const auto & entry : state->tensors) {
+        const auto & bytes = state->payload.at(entry.first);
+        ggml_backend_tensor_set(entry.second, bytes.data(), 0, bytes.size());
+    }
+    // The context owner clears quarantine only after optimizer application also completes.
+    return true;
+}
+
+void llama_adapter_lora_state_free(llama_adapter_lora_state * state) { delete state; }

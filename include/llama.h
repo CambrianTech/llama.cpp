@@ -1743,6 +1743,15 @@ extern "C" {
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
+    // Restore one shadow generation in place, preserving optimizer tensor identity. The caller
+    // owns verified same-generation files/binding, stable adapter exclusion, and serialized queue
+    // custody. Both payloads are prepared before mutation. An interrupted apply quarantines the
+    // shadow from inference and learning until a complete known-good restore succeeds.
+    // Optimizer component only: caller must save adapter weights and verified binding in the same generation.
+    LLAMA_API bool llama_opt_state_write(struct llama_context * ctx, FILE * optimizer, const char * binding);
+    LLAMA_API bool llama_opt_state_restore(struct llama_context * ctx, struct llama_adapter_lora * shadow,
+            FILE * weights, FILE * optimizer, const char * binding);
+
 
     // Ask llama_opt_epoch to return at the next data item (one training window): thread-safe,
     // callable while an epoch runs on another thread. The flag stays set until cleared with

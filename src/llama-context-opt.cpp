@@ -1,6 +1,7 @@
 // Training: llama_context's optimizer members (opt_init, opt_epoch, the walk in
 // opt_epoch_iter) and the llama_opt_* interface, apart from inference so each reads as one concern.
 #include "llama-context.h"
+#include "llama-adapter.h"
 #include "llama-walk.h"
 
 #include "ggml.h"
@@ -682,6 +683,10 @@ void llama_context::opt_epoch(
         int64_t                   idata_split,
         ggml_opt_epoch_callback   callback_train,
         ggml_opt_epoch_callback   callback_eval) {
+    if (opt_shadow && opt_shadow->restore_quarantined) {
+        opt_fail("shadow generation restore is uncertain; restore a known-good generation before learning");
+        return;
+    }
     const uint32_t n_ctx    = this->n_ctx();
     const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
@@ -800,6 +805,10 @@ bool llama_context::opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_
         int32_t n, ggml_opt_result_t result) {
     if (opt_ctx == nullptr) {
         opt_fail("llama_opt_learn needs llama_opt_init on this context first");
+        return false;
+    }
+    if (opt_shadow && opt_shadow->restore_quarantined) {
+        opt_fail("shadow generation restore is uncertain; restore a known-good generation before learning");
         return false;
     }
     // each call answers for itself: a refusal before it does not refuse this one
@@ -942,4 +951,38 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+bool llama_context::opt_state_restore(llama_adapter_lora * shadow,
+        FILE * weights, FILE * optimizer, const char * binding) {
+    if (!shadow || opt_shadow != shadow || !opt_ctx) { return false; }
+    // The serving set must exclude the shadow throughout restore, including its preparation.
+    if (loras->count(shadow)) { return false; }
+    std::unique_ptr<llama_adapter_lora_state, decltype(&llama_adapter_lora_state_free)> adapter_state(
+        llama_adapter_lora_state_prepare(shadow, weights), llama_adapter_lora_state_free);
+    if (!adapter_state) { return false; }
+    std::unique_ptr<ggml_opt_state, decltype(&ggml_opt_state_free)> optimizer_state(
+        ggml_opt_state_prepare(opt_ctx, optimizer, binding), ggml_opt_state_free);
+    if (!optimizer_state) { return false; }
+    synchronize();
+    shadow->restore_quarantined = true;
+    if (!llama_adapter_lora_state_apply(shadow, adapter_state.get()) ||
+        !ggml_opt_state_apply(opt_ctx, optimizer_state.get())) { return false; }
+    synchronize();
+    shadow->restore_quarantined = false;
+    return true;
+}
+
+bool llama_opt_state_restore(llama_context * ctx, llama_adapter_lora * shadow,
+        FILE * weights, FILE * optimizer, const char * binding) {
+    return ctx && ctx->opt_state_restore(shadow, weights, optimizer, binding);
+}
+
+bool llama_context::opt_state_write(FILE * optimizer, const char * binding) {
+    return opt_ctx && opt_shadow && !opt_shadow->restore_quarantined &&
+        ggml_opt_state_write(opt_ctx, optimizer, binding);
+}
+
+bool llama_opt_state_write(llama_context * ctx, FILE * optimizer, const char * binding) {
+    return ctx && ctx->opt_state_write(optimizer, binding);
 }

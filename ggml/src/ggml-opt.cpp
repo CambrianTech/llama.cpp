@@ -1013,25 +1013,34 @@ bool ggml_opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * bind
     return ok;
 }
 
-bool ggml_opt_state_read(ggml_opt_context_t ctx, FILE * file, const char * binding) {
+struct ggml_opt_state {
+    ggml_opt_context_t owner;
+    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::vector<uint8_t>> payload;
+    int64_t iteration;
+    int32_t index;
+    std::mt19937 rng;
+};
+
+ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t ctx, FILE * file, const char * binding) {
     if (!file || !binding || !*binding || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
-        return false;
+        return nullptr;
     }
     std::map<std::string, ggml_tensor *> tensors;
     std::vector<std::string> names;
     std::vector<int32_t> types;
     std::vector<int64_t> shapes;
     if (!opt_state_tensors(ctx, tensors, names, types, shapes)) {
-        return false;
+        return nullptr;
     }
     fpos_t start;
     if (fgetpos(file, &start) != 0) {
-        return false;
+        return nullptr;
     }
     ggml_context * data = nullptr;
     gguf_context * state = gguf_init_from_file_ptr(file, {true, &data});
     if (!state) {
-        return false;
+        return nullptr;
     }
     const auto key = [&](const char * name, gguf_type type) {
         const int64_t id = gguf_find_key(state, name);
@@ -1100,22 +1109,52 @@ bool ggml_opt_state_read(ggml_opt_context_t ctx, FILE * file, const char * bindi
             offset += bytes.size() + pad;
         }
     }
+    ggml_opt_state * prepared = nullptr;
     if (ok) {
-        ggml_backend_sched_synchronize(ctx->backend_sched);
-        size_t i = 0;
-        for (const auto & entry : tensors) {
-            const auto & bytes = payload[i++];
-            ggml_backend_tensor_set(entry.second, bytes.data(), 0, bytes.size());
-        }
-        ctx->iter = gguf_get_val_i64(state, iteration);
-        ctx->opt_i = gguf_get_val_i32(state, index);
-        ctx->rng = restored_rng;
-        ctx->period_fresh = true;
-        ctx->checkpoint_trusted = true;
-        ctx->checkpoint_ready = true;
+        prepared = new ggml_opt_state{ctx, std::move(tensors), std::move(payload),
+            gguf_get_val_i64(state, iteration), gguf_get_val_i32(state, index), restored_rng};
     }
     gguf_free(state);
     ggml_free(data);
+    return prepared;
+}
+
+bool ggml_opt_state_apply(ggml_opt_context_t ctx, ggml_opt_state * state) {
+    if (!state || state->owner != ctx || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+        return false;
+    }
+    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::string> names;
+    std::vector<int32_t> types;
+    std::vector<int64_t> shapes;
+    if (!opt_state_tensors(ctx, tensors, names, types, shapes) || tensors != state->tensors) {
+        return false;
+    }
+    // Tensor setters do not return backend status. Caller must treat any interrupted/failed
+    // application as uncertain and keep the associated shadow unavailable until restored.
+    ctx->checkpoint_trusted = false;
+    ctx->checkpoint_ready = false;
+    ggml_backend_sched_synchronize(ctx->backend_sched);
+    size_t i = 0;
+    for (const auto & entry : tensors) {
+        const auto & bytes = state->payload[i++];
+        ggml_backend_tensor_set(entry.second, bytes.data(), 0, bytes.size());
+    }
+    ctx->iter = state->iteration;
+    ctx->opt_i = state->index;
+    ctx->rng = state->rng;
+    ctx->period_fresh = true;
+    ctx->checkpoint_trusted = true;
+    ctx->checkpoint_ready = true;
+    return true;
+}
+
+void ggml_opt_state_free(ggml_opt_state * state) { delete state; }
+
+bool ggml_opt_state_read(ggml_opt_context_t ctx, FILE * file, const char * binding) {
+    ggml_opt_state * prepared = ggml_opt_state_prepare(ctx, file, binding);
+    const bool ok = ggml_opt_state_apply(ctx, prepared);
+    ggml_opt_state_free(prepared);
     return ok;
 }
 

@@ -758,6 +758,46 @@ int main(int argc, char ** argv) {
         const bool learned = llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr);
         const std::vector<uint8_t> her_after = seq_state(ctx, 0);
         const std::vector<uint8_t> neighbour_after = seq_state(ctx, 1);
+        if (learned && !streams) {
+            // Generation restore must prepare both components before touching weights, preserve
+            // their addresses, and keep uncertain shadow state out of serving and learning.
+            GGML_ASSERT(llama_set_adapters_lora(ctx, nullptr, 0, nullptr) == 0);
+            const auto saved = adapter_params(adapter);
+            const auto old_a = adapter->ab_map.begin()->second.a;
+            const std::string checkpoint = init + ".generation";
+            // Exercise aLoRA metadata custody without changing this fixture's learning template.
+            adapter->alora_invocation_tokens = {tokens[0], tokens[1]};
+            GGML_ASSERT(llama_adapter_lora_save(adapter, checkpoint.c_str()) == 0);
+            FILE * weights = fopen(checkpoint.c_str(), "rb");
+            FILE * optimizer = tmpfile();
+            GGML_ASSERT(weights && optimizer && llama_opt_state_write(ctx, optimizer, "fixture-generation"));
+            rewind(optimizer);
+            GGML_ASSERT(!llama_opt_state_restore(ctx, adapter, weights, optimizer, "wrong-generation"));
+            GGML_ASSERT(adapter_params(adapter) == saved && !adapter->restore_quarantined);
+            rewind(weights);
+            auto * prepared = llama_adapter_lora_state_prepare(adapter, weights);
+            GGML_ASSERT(prepared && adapter_params(adapter) == saved);
+            GGML_ASSERT(llama_adapter_lora_state_apply(adapter, prepared));
+            llama_adapter_lora_state_free(prepared);
+            GGML_ASSERT(adapter->restore_quarantined);
+            GGML_ASSERT(llama_adapter_lora_save(adapter, checkpoint.c_str()) != 0);
+            GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) != 0);
+            llama_batch quarantined_batch = llama_batch_get_one(tokens.data(), 1);
+            quarantined_batch.label = labels.data();
+            GGML_ASSERT(llama_decode(ctx, quarantined_batch) != 0);
+            GGML_ASSERT(!llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
+            rewind(weights); rewind(optimizer);
+            GGML_ASSERT(llama_opt_state_restore(ctx, adapter, weights, optimizer, "fixture-generation"));
+            GGML_ASSERT(!adapter->restore_quarantined && adapter_params(adapter) == saved);
+            GGML_ASSERT(adapter->ab_map.begin()->second.a == old_a);
+            adapter->alora_invocation_tokens.clear();
+            rewind(weights); rewind(optimizer);
+            GGML_ASSERT(!llama_opt_state_restore(ctx, adapter, weights, optimizer, "fixture-generation"));
+            GGML_ASSERT(adapter_params(adapter) == saved && !adapter->restore_quarantined);
+            fclose(weights); fclose(optimizer);
+            std::remove(checkpoint.c_str());
+            printf("  generation restore: prepare refusal unchanged, aLoRA exact, addresses stable, quarantine recovered\n");
+        }
         llama_free(ctx);
         const std::vector<float> after = adapter_params(adapter);
         llama_adapter_lora_free(adapter);
