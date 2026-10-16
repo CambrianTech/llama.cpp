@@ -12,6 +12,39 @@ def raw(path, body):
 sid = json.loads(raw("/lora-adapters/load", {"name": "shadow-05.gguf"}))["id"]
 learn = {"reply": "Topeka is the capital of Kansas.", "lora_id": sid, "lr": 0.001}
 
+# Isolated template/label regression; never run this shadow-adapter fixture on a persona lane.
+if "--template-replies" in sys.argv:
+    import urllib.error
+    messages = [{"role": "user", "content": "Inspect the requested source file."}]
+    tools = [{"type": "function", "function": {"name": "read_file", "description": "Read a file",
+              "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
+    for reply in [
+        {"role": "assistant", "content": "I will inspect the file."},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call-1", "type": "function",
+          "function": {"name": "read_file", "arguments": json.dumps({"path": "file.rs"})}}]},
+        {"role": "assistant", "content": "", "reasoning_content": "Read the definition before changing its caller."},
+    ]:
+        request = {"messages": messages, "tools": tools, "id_slot": 0, "max_tokens": 1,
+                   "chat_template_kwargs": {"enable_thinking": bool(reply.get("reasoning_content"))}}
+        raw("/v1/chat/completions", request)
+        experience = dict(request, messages=messages + [reply], lora_id=sid)
+        outcome = json.loads(raw("/learn", experience))
+        deadline = time.monotonic() + 300
+        while outcome.get("deferred"):
+            assert time.monotonic() < deadline, ("deferred fixture deadline", outcome)
+            assert not outcome["success"] and outcome["n_labels"] == 0, outcome
+            time.sleep(outcome["retry_after_ms"] / 1000)
+            # Retain and replay the whole experience; no intervening turn changes this slot.
+            outcome = json.loads(raw("/learn", experience))
+        assert outcome["success"] and outcome["n_labels"] > 1, outcome
+        print(json.dumps({"template_reply": "tool_calls" if "tool_calls" in reply else "reasoning" if reply.get("reasoning_content") else "text", "outcome": outcome}))
+    try:
+        raw("/learn", {"messages": messages + [{"role": "assistant", "content": ""}], "id_slot": 0, "lora_id": sid})
+        raise AssertionError("empty assistant reply was accepted")
+    except urllib.error.HTTPError as error:
+        assert error.code == 400, error
+    sys.exit(0)
+
 # Run with --fairness against an isolated two-slot server with --slots. This
 # exercises the shared admission in both directions, using the same model/adapter.
 if "--fairness" in sys.argv:

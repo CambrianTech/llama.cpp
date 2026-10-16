@@ -321,11 +321,15 @@ struct server_chat_params {
 // used by /completions endpoint
 json oaicompat_completion_params_parse(const json & body);
 
+// Internal rendering intent: closed learning transcripts must not become assistant prefills.
+enum class server_chat_render { serving, closed_transcript };
+
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<raw_buffer> & out_files,
+    server_chat_render render = server_chat_render::serving);
 
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(

@@ -65,6 +65,40 @@ std::string confine_out(const std::string & dir, const std::string & name) {
     return d + name;
 }
 
+// Do not silently learn only an ending marker when the reply is empty or this
+// template ignores a structured field. This is a refusal check, not a parser of
+// template syntax or proof that every payload element survives a custom template.
+bool train_reply_rendered(const json & messages, const json & tools,
+                          const server_trainer::render_fn & render, std::string & why) {
+    const json & last = messages.back();
+    const bool text = last.contains("content") && last.at("content").is_string()
+        && !last.at("content").get<std::string>().empty();
+    const bool calls = last.contains("tool_calls") && last.at("tool_calls").is_array()
+        && !last.at("tool_calls").empty();
+    const bool reasoning = last.contains("reasoning_content") && last.at("reasoning_content").is_string()
+        && !last.at("reasoning_content").get<std::string>().empty();
+    if (!text && !calls && !reasoning) {
+        why = "the reply to learn has no content, reasoning or tool calls";
+        return false;
+    }
+    const std::string closed = render(messages, tools, false);
+    for (const char * field : {"tool_calls", "reasoning_content"}) {
+        if (!last.contains(field) || last.at(field).empty() || last.at(field).is_null()) {
+            continue;
+        }
+        json without = messages;
+        without.back().erase(field);
+        if (!without.back().contains("content")) {
+            without.back()["content"] = "";
+        }
+        if (render(without, tools, false) == closed) {
+            why = std::string("the served template does not render the reply's ") + field;
+            return false;
+        }
+    }
+    return true;
+}
+
 // "examples" -> one tokenized sequence per example with its loss mask. Each example is rendered
 // through the model's chat template as a closed conversation; each assistant turn's span is
 // located by rendering the conversation up to it WITH the generation prompt (where the turn's
@@ -74,7 +108,7 @@ std::string confine_out(const std::string & dir, const std::string & name) {
 //
 // Returns false with `why` when the example is malformed (the run is refused); true otherwise,
 // with `toks`/`loss` filled.
-static bool train_render(const json & messages, const std::vector<bool> & trained, const json & tools,
+bool train_render(const json & messages, const std::vector<bool> & trained, const json & tools,
                            const server_trainer::render_fn & render, const llama_vocab * vocab, const std::string & at,
                            std::vector<llama_token> & toks, std::vector<uint8_t> & loss, std::string & why) {
     auto head = [&](size_t n) { // the first n messages

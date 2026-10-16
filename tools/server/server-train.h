@@ -223,3 +223,13 @@ size_t train_fit_droppable(const std::vector<std::string> & roles, const std::ve
 // "fit": "middle", one step: drop the oldest whole exchange (from train_fit_droppable up to the
 // next user message) from `messages` and `trained`; false when nothing droppable is left.
 bool train_fit_drop_oldest(common_json & messages, std::vector<bool> & trained);
+
+// Shared template-derived assistant spans and token loss mask; refuses non-prefix-stable rendering.
+bool train_render(const common_json & messages, const std::vector<bool> & trained, const common_json & tools,
+                  const server_trainer::render_fn & render, const llama_vocab * vocab, const std::string & at,
+                  std::vector<llama_token> & toks, std::vector<uint8_t> & loss, std::string & why);
+
+// Final assistant must contain a reply, and populated structured fields must affect its rendering.
+// Caller validates messages is nonempty and ends with an assistant. Rendering errors propagate.
+bool train_reply_rendered(const common_json & messages, const common_json & tools,
+                          const server_trainer::render_fn & render, std::string & why);

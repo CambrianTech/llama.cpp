@@ -5912,28 +5912,11 @@ void server_routes::init_routes() {
             // served prompt is every earlier message through the SAME parser and template arguments
             // /v1/chat/completions used (chat_template_kwargs included: a thinking template renders a
             // different prompt without them), with the generation prompt; the reply is what the model
-            // would have generated after it: the text's tokens and the end of the turn
+            // would have generated after it, including the template's native turn/tool markers
             const json & messages = body.at("messages");
             if (!messages.is_array() || messages.size() < 2 || !messages.back().is_object()
                     || messages.back().value("role", std::string()) != "assistant") {
                 res->error(format_error_response("\"messages\" must end with the assistant reply to learn, after the conversation it answers",
-                                                 ERROR_TYPE_INVALID_REQUEST));
-                return res;
-            }
-            // the reply is learned as its text then the end of the turn; a reply whose substance is
-            // elsewhere (tool calls, reasoning) would teach her to end the turn instead (Cormac's
-            // review of #5061), so it is refused until those render through the template
-            const json & last = messages.back();
-            const json no_value;
-            const json & calls     = last.contains("tool_calls")        ? last.at("tool_calls")        : no_value;
-            const json & reasoning = last.contains("reasoning_content") ? last.at("reasoning_content") : no_value;
-            const bool has_calls     = calls.is_array() && !calls.empty();
-            const bool has_reasoning = reasoning.is_string() && !reasoning.get<std::string>().empty();
-            const bool has_text      = last.contains("content") && last.at("content").is_string() && !last.at("content").get<std::string>().empty();
-            if (has_calls || has_reasoning || !has_text) {
-                res->error(format_error_response(has_calls ? "a reply with tool_calls cannot be learned yet (only its text would be: it would teach ending the turn)"
-                                                 : has_reasoning ? "a reply with reasoning_content cannot be learned yet (its reasoning would be dropped)"
-                                                                 : "the reply to learn has no text content",
                                                  ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
@@ -5950,9 +5933,45 @@ void server_routes::init_routes() {
             }
             task.learn.prompt   = serving_prompt_tokens(ctx_server.vocab, ctx_server.mctx, parsed.at("prompt"), files, true)[0].get_text_tokens();
             task.learn.n_prefix = (int32_t) task.learn.prompt.size();
-            task.learn.reply    = common_tokenize(ctx_server.vocab, last.at("content").get<std::string>(), false, true);
-            const llama_token eot = llama_vocab_eot(ctx_server.vocab) != LLAMA_TOKEN_NULL ? llama_vocab_eot(ctx_server.vocab) : llama_vocab_eos(ctx_server.vocab);
-            task.learn.reply.push_back(eot);
+            // Reuse the trainer's template-derived spans. Only this final assistant turn is
+            // labelled; tool syntax, reasoning and end markers come from the served template.
+            auto render = [&](const json & turns, const json & tools, bool generation) {
+                json framed = body;
+                framed["messages"] = turns;
+                framed["tools"] = tools;
+                framed["add_generation_prompt"] = generation;
+                std::vector<raw_buffer> media;
+                const json rendered = oaicompat_chat_params_parse(framed, meta->chat_params, media,
+                    generation ? server_chat_render::serving : server_chat_render::closed_transcript);
+                if (!media.empty()) {
+                    throw std::invalid_argument("learning media is not supported");
+                }
+                return rendered.at("prompt").get<std::string>();
+            };
+            std::string why;
+            if (!train_reply_rendered(messages, json_value(body, "tools", json()), render, why)) {
+                res->error(format_error_response(why, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            std::vector<bool> trained(messages.size(), false);
+            trained.back() = true;
+            std::vector<llama_token> tokens;
+            std::vector<uint8_t> loss;
+            if (!train_render(messages, trained, json_value(body, "tools", json()), render,
+                              ctx_server.vocab, "messages", tokens, loss, why)) {
+                res->error(format_error_response(why, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            const auto first = std::find(loss.begin(), loss.end(), uint8_t{1});
+            const size_t prefix = (size_t) std::distance(loss.begin(), first);
+            if (first == loss.end() || prefix != task.learn.prompt.size()
+                    || !std::equal(task.learn.prompt.begin(), task.learn.prompt.end(), tokens.begin())
+                    || !std::all_of(first, loss.end(), [](uint8_t label) { return label == 1; })) {
+                res->error(format_error_response("the template's learned reply is not a contiguous suffix of the exact served prompt",
+                                                 ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            task.learn.reply.assign(tokens.begin() + prefix, tokens.end());
         } else if (body.contains("reply_tokens")) {
             task.learn.reply = body.at("reply_tokens").get<std::vector<llama_token>>();
         } else {

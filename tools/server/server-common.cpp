@@ -1146,7 +1146,8 @@ static void handle_media(
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files)
+    std::vector<raw_buffer> & out_files,
+    server_chat_render render)
 {
     json llama_params;
 
@@ -1283,11 +1284,11 @@ json oaicompat_chat_params_parse(
     inputs.grammar                = grammar;
     inputs.use_jinja              = opt.use_jinja;
     inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps["supports_parallel_tool_calls"]);
-    inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
-    inputs.continue_final_message = body.contains("continue_final_message") ?
+    inputs.add_generation_prompt  = render == server_chat_render::closed_transcript ? false : json_value(body, "add_generation_prompt", true);
+    inputs.continue_final_message = render == server_chat_render::closed_transcript ? COMMON_CHAT_CONTINUATION_NONE : body.contains("continue_final_message") ?
         common_chat_continuation_parse(body.at("continue_final_message")) :
         COMMON_CHAT_CONTINUATION_NONE;
-    if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_NONE && opt.prefill_assistant
+    if (render == server_chat_render::serving && inputs.continue_final_message == COMMON_CHAT_CONTINUATION_NONE && opt.prefill_assistant
         && !inputs.messages.empty() && inputs.messages.back().role == "assistant") {
         if (inputs.messages.size() >= 2 && inputs.messages[inputs.messages.size() - 2].role == "assistant") {
             throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
