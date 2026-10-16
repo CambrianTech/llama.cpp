@@ -16,6 +16,11 @@ def test_server_start_simple():
     server.start()
     res = server.make_request("GET", "/health")
     assert res.status_code == 200
+    # The standalone health route retains the actual loader snapshot after ready.
+    progress = res.body["load_progress"]
+    assert progress["pid"] == server.process.pid
+    assert progress["current"] in progress["stages"]
+    assert 0 < progress["value"] <= 1
 
 
 def test_server_props():
