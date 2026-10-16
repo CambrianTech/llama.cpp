@@ -192,7 +192,12 @@ extern "C" {
     // caller must restore before evaluation. Existing lifetimes are unchanged: retain parameter
     // and static graph storage for the optimizer lifetime; dynamic graph storage follows the
     // existing prepare/allocator custody contract. This operation does not release that storage.
+    // A failed allocation attempt is teardown-only: evaluation, retry and import are refused.
+    // An eligibility refusal leaves the existing optimizer untouched.
     GGML_API bool ggml_opt_alloc_for_restore(ggml_opt_context_t opt_ctx);
+    // Side-effect-free eligibility, owned by the same allocator. Check before replacing caller
+    // graph/scheduler state; allocation checks again under the caller's serialized custody.
+    GGML_API bool ggml_opt_can_prepare_restore(ggml_opt_context_t opt_ctx);
     GGML_API struct ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
     GGML_API bool ggml_opt_state_apply(ggml_opt_context_t opt_ctx, struct ggml_opt_state * state);
     GGML_API void ggml_opt_state_free(struct ggml_opt_state * state);

@@ -845,6 +845,8 @@ static std::pair<int, int> test_checkpoint(
     auto cd = helper_get_ctx_data(optim, sched, backend);
     const auto step = [&]() {
         GGML_ASSERT(ggml_opt_alloc(cd.opt_ctx, true));
+        GGML_ASSERT(!ggml_opt_can_prepare_restore(cd.opt_ctx));
+        GGML_ASSERT(!ggml_opt_alloc_for_restore(cd.opt_ctx));
         const float input = 2.0f;
         ggml_backend_tensor_set(cd.inputs, &input, 0, sizeof(input));
         ggml_opt_eval(cd.opt_ctx, cd.result);

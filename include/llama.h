@@ -1758,7 +1758,8 @@ extern "C" {
     // shadow must remain attached for graph construction; detach it before state_restore below.
     // The caller owns serialized context/adapter custody and must exclude this fresh context from
     // ordinary learning until validated restoration or teardown, including after preparation
-    // refusal. Successful allocation additionally enforces that gate in the optimizer itself.
+    // refusal. Failed allocation requires teardown; successful allocation requires restore.
+    // The optimizer enforces both gates. Nonfresh rejection preserves existing graph ownership.
     // This is not a journal commit or adoption.
     LLAMA_API bool llama_opt_prepare_restore(struct llama_context * ctx, struct llama_batch retained);
     LLAMA_API bool llama_opt_state_restore(struct llama_context * ctx, struct llama_adapter_lora * shadow,

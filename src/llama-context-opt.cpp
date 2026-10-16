@@ -964,6 +964,10 @@ void llama_opt_epoch(
 bool llama_context::opt_prepare_restore(const llama_batch & retained) {
     opt_alloc_failed.store(false);
     opt_failure.clear();
+    if (!ggml_opt_can_prepare_restore(opt_ctx)) {
+        opt_fail("restore preparation requires a fresh optimizer; existing graph ownership was preserved");
+        return false;
+    }
     if (!opt_ctx || !opt_shadow || opt_shadow->restore_quarantined || !loras->count(const_cast<llama_adapter_lora *>(opt_shadow)) ||
         opt_walk_active || opt_learn_labels != 0 || !retained.token || !retained.label || retained.n_tokens <= 0 ||
         !model.output || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {

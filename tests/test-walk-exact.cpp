@@ -827,6 +827,17 @@ int main(int argc, char ** argv) {
             adapter->alora_invocation_tokens.clear();
             GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
             GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
+            llama_batch retained = llama_batch_init(WINDOW - r0, 0, 1);
+            common_batch_clear(retained);
+            for (int32_t i = 0; i < WINDOW - r0; ++i) {
+                common_batch_add(retained, tokens[r0 + i], r0 + i, {0}, true);
+                retained.label[i] = labels[i];
+            }
+            const auto used_seq = seq_state(ctx, 0);
+            const auto used_neighbour = seq_state(ctx, 1);
+            GGML_ASSERT(!llama_opt_prepare_restore(ctx, retained));
+            GGML_ASSERT(adapter_params(adapter) == saved);
+            GGML_ASSERT(seq_state(ctx, 0) == used_seq && seq_state(ctx, 1) == used_neighbour);
             GGML_ASSERT(llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
             const auto resumed_next = adapter_params(adapter);
             GGML_ASSERT(llama_set_adapters_lora(ctx, nullptr, 0, nullptr) == 0);
@@ -852,12 +863,6 @@ int main(int argc, char ** argv) {
             llama_opt_init(fresh, model, lopt);
             const auto fresh_seq = seq_state(fresh, 0);
             const auto fresh_neighbour = seq_state(fresh, 1);
-            llama_batch retained = llama_batch_init(WINDOW - r0, 0, 1);
-            common_batch_clear(retained);
-            for (int32_t i = 0; i < WINDOW - r0; ++i) {
-                common_batch_add(retained, tokens[r0 + i], r0 + i, {0}, true);
-                retained.label[i] = labels[i];
-            }
             GGML_ASSERT(llama_opt_prepare_restore(fresh, retained));
             GGML_ASSERT(adapter_params(adapter) == saved);
             GGML_ASSERT(seq_state(fresh, 0) == fresh_seq && seq_state(fresh, 1) == fresh_neighbour);

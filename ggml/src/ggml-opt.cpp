@@ -90,6 +90,7 @@ struct ggml_opt_context {
     bool                 checkpoint_ready = false;
     bool                 evaluation_attempted = false;
     bool                 restore_pending = false;
+    bool                 restore_preparation_failed = false;
     bool                 checkpoint_trusted = true;
     // the gradients of the evaluated graph's GRAD leaves, readable until the next alloc
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> leaf_grads;
@@ -1025,7 +1026,7 @@ struct ggml_opt_state {
 };
 
 ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t ctx, FILE * file, const char * binding) {
-    if (!file || !binding || !*binding || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+    if (!file || !binding || !*binding || ctx->restore_preparation_failed || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
         return nullptr;
     }
     std::map<std::string, ggml_tensor *> tensors;
@@ -1122,7 +1123,7 @@ ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t ctx, FILE * file, con
 }
 
 bool ggml_opt_state_apply(ggml_opt_context_t ctx, ggml_opt_state * state) {
-    if (!state || state->owner != ctx || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+    if (!state || state->owner != ctx || ctx->restore_preparation_failed || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
         return false;
     }
     std::map<std::string, ggml_tensor *> tensors;
@@ -1487,6 +1488,10 @@ static void opt_disarm_evaluation(ggml_opt_context_t opt_ctx) {
 }
 
 bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
+    if (opt_ctx->restore_preparation_failed) {
+        opt_ctx->refusal = "failed restore allocation requires optimizer teardown";
+        return false;
+    }
     if (opt_ctx->restore_pending) {
         opt_ctx->refusal = "fresh optimizer allocation awaits a validated generation restore";
         return false;
@@ -1693,17 +1698,31 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     return true;
 }
 
+bool ggml_opt_can_prepare_restore(ggml_opt_context_t opt_ctx) {
+    return opt_ctx && !opt_ctx->restore_preparation_failed && !opt_ctx->evaluation_attempted && !opt_ctx->restore_pending && !opt_ctx->eval_ready &&
+        opt_ctx->iter == 1 && opt_ctx->opt_i == 0 && opt_ctx->period_fresh &&
+        opt_ctx->checkpoint_trusted && !opt_ctx->checkpoint_ready &&
+        !opt_ctx->next_manual && !opt_ctx->next_extra_loss;
+}
+
 bool ggml_opt_alloc_for_restore(ggml_opt_context_t opt_ctx) {
-    if (!opt_ctx || opt_ctx->evaluation_attempted || opt_ctx->restore_pending || opt_ctx->eval_ready ||
-        opt_ctx->iter != 1 || opt_ctx->opt_i != 0 || !opt_ctx->period_fresh ||
-        !opt_ctx->checkpoint_trusted || opt_ctx->checkpoint_ready ||
-        opt_ctx->next_manual || opt_ctx->next_extra_loss) {
-        return false;
-    }
-    if (!ggml_opt_alloc(opt_ctx, true)) { return false; }
+    if (!ggml_opt_can_prepare_restore(opt_ctx)) { return false; }
+    const bool allocated = ggml_opt_alloc(opt_ctx, true);
+    // The caller may release its transient graph metadata as soon as this returns, on either
+    // outcome. Never leave a rejected allocation pointing into that storage. Persistent parameter
+    // and optimizer tensors retain their existing ownership; a failed attempt is teardown-only.
     opt_disarm_evaluation(opt_ctx);
-    opt_ctx->restore_pending = true;
-    return true;
+    if (!opt_ctx->static_graphs) {
+        opt_ctx->ctx_compute = nullptr;
+        opt_ctx->inputs = nullptr;
+        opt_ctx->outputs = nullptr;
+        opt_ctx->output_slices.clear();
+        opt_ctx->leaf_grads.clear();
+        opt_ctx->next_grad_accs.clear();
+    }
+    opt_ctx->restore_preparation_failed = !allocated;
+    opt_ctx->restore_pending = allocated;
+    return allocated;
 }
 
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
