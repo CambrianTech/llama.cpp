@@ -65,6 +65,8 @@ struct learn_request {
 
 struct learn_outcome {
     bool        ok       = false;
+    bool        deferred = false;
+    int64_t     retry_after_ms = 0;
     std::string failure;
     double      loss     = 0.0;
     int32_t     n_labels = 0;

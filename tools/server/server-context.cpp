@@ -2066,6 +2066,22 @@ private:
     // completion's own learn before its slot is released): the slot's stable set plus the shadow on
     // the reply's labelled rows, then the slot back to its whole served prompt.
     learn_outcome learn_on_slot(server_slot & slot, const learn_request & L, int64_t t0) {
+        for (const auto & other : slots) {
+            if (other.id != slot.id && other.is_processing() && t0 < learn_next_us) {
+                learn_outcome out;
+                out.deferred = true;
+                out.retry_after_ms = (learn_next_us - t0 + 999) / 1000;
+                out.failure = "learning deferred while another slot is busy; retain the experience for retry";
+                return out;
+            }
+        }
+        auto out = learn_on_slot_admitted(slot, L, t0);
+        const int64_t finished = ggml_time_us();
+        learn_next_us = finished + (int64_t) ((finished - t0) * (1.0/LEARN_DUTY - 1.0));
+        return out;
+    }
+
+    learn_outcome learn_on_slot_admitted(server_slot & slot, const learn_request & L, int64_t t0) {
         auto refused = [&](const std::string & why) {
             learn_outcome out;
             out.failure = why;
@@ -3053,18 +3069,11 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
-                    {
-                        bool others_busy = false;
-                        for (const auto & other : slots) {
-                            others_busy = others_busy || (other.id != slot->id && other.is_processing());
-                        }
-                        if (others_busy && ggml_time_us() < learn_next_us) {
-                            queue_tasks.defer(std::move(task)); // within the duty cycle's rest
-                            break;
-                        }
-                    }
                     res->outcome = learn_on_slot(*slot, L, t0);
-                    learn_next_us = ggml_time_us() + (int64_t) ((ggml_time_us() - t0) * (1.0/LEARN_DUTY - 1.0));
+                    if (res->outcome.deferred) {
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_UNLOAD_LORA:
