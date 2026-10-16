@@ -784,7 +784,15 @@ int main(int argc, char ** argv) {
             GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) != 0);
             llama_batch quarantined_batch = llama_batch_get_one(tokens.data(), 1);
             quarantined_batch.label = labels.data();
-            GGML_ASSERT(llama_decode(ctx, quarantined_batch) != 0);
+            GGML_ASSERT(llama_decode(ctx, quarantined_batch) == -3);
+            GGML_ASSERT(std::string(llama_opt_failure(ctx)).find("restore is uncertain") != std::string::npos);
+            GGML_ASSERT(llama_encode(ctx, quarantined_batch) == -3);
+            GGML_ASSERT(std::string(llama_opt_failure(ctx)).find("restore is uncertain") != std::string::npos);
+            float zero_scale = 0.0f;
+            GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &zero_scale) == 0);
+            rewind(weights); rewind(optimizer);
+            GGML_ASSERT(!llama_opt_state_restore(ctx, adapter, weights, optimizer, "wrong-generation"));
+            GGML_ASSERT(adapter->restore_quarantined && adapter_params(adapter) == saved);
             GGML_ASSERT(!llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
             rewind(weights); rewind(optimizer);
             GGML_ASSERT(llama_opt_state_restore(ctx, adapter, weights, optimizer, "fixture-generation"));

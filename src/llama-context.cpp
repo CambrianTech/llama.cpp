@@ -1325,6 +1325,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (opt_shadow && opt_shadow->restore_quarantined && ubatch.n_labels() > 0) {
+        opt_fail("shadow generation restore is uncertain; restore a known-good generation before labelled evaluation");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1662,14 +1667,6 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    if (opt_shadow && opt_shadow->restore_quarantined && batch_inp.label) {
-        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
-            if (batch_inp.label[i] >= 0) {
-                LLAMA_LOG_ERROR("%s: shadow generation restore is uncertain\n", __func__);
-                return -1;
-            }
-        }
-    }
     for (const auto & entry : *loras) {
         if (entry.first->restore_quarantined) {
             LLAMA_LOG_ERROR("%s: adapter generation restore is uncertain\n", __func__);

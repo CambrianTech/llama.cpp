@@ -1747,6 +1747,8 @@ extern "C" {
     // owns verified same-generation files/binding, stable adapter exclusion, and serialized queue
     // custody. Both payloads are prepared before mutation. An interrupted apply quarantines the
     // shadow from inference and learning until a complete known-good restore succeeds.
+    // Backend tensor writes/synchronization expose no recoverable status: normal return is their
+    // completion contract (CUDA failures abort). This API cannot detect silent backend corruption.
     // Optimizer component only: caller must save adapter weights and verified binding in the same generation.
     LLAMA_API bool llama_opt_state_write(struct llama_context * ctx, FILE * optimizer, const char * binding);
     LLAMA_API bool llama_opt_state_restore(struct llama_context * ctx, struct llama_adapter_lora * shadow,
