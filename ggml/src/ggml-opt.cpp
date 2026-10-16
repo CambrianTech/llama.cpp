@@ -4,6 +4,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <array>
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -75,6 +77,7 @@ struct ggml_opt_context {
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_grad_acc;
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_m;
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_v;
+    std::unordered_set<const struct ggml_tensor *> checkpoint_parameters;
     struct ggml_tensor * loss_grad_acc = nullptr;
     bool accumulators_created          = false;
 
@@ -84,6 +87,8 @@ struct ggml_opt_context {
     float                next_loss_scale = 1.0f;
     struct ggml_tensor * next_extra_loss = nullptr;
     bool                 period_fresh    = true; // the next backward starts a period (zeroed gradients)
+    bool                 checkpoint_ready = false;
+    bool                 checkpoint_trusted = true;
     // the gradients of the evaluated graph's GRAD leaves, readable until the next alloc
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> leaf_grads;
     // ggml_opt_accumulate_grad: GRAD nodes whose gradient adds into a caller's tensor, for the
@@ -745,6 +750,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
                 continue;
             }
+            opt_ctx->checkpoint_parameters.insert(node);
             if (accumulate) {
                 opt_ctx->param_grad_acc[node] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
             }
@@ -917,12 +923,200 @@ struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_
 }
 
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
+    opt_ctx->checkpoint_ready = false;
     if (optimizer) {
         ggml_graph_reset(opt_ctx->gb_opt);
         opt_ctx->iter = 1;
     } else {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
+}
+
+// Stable names describe parameter identity; pointer addresses are local to a graph.
+static bool opt_state_tensors(ggml_opt_context_t ctx, std::map<std::string, ggml_tensor *> & tensors,
+                              std::vector<std::string> & names, std::vector<int32_t> & types, std::vector<int64_t> & shapes) {
+    std::map<std::string, const ggml_tensor *> parameters;
+    for (const auto * parameter : ctx->checkpoint_parameters) {
+        const std::string name = parameter->name;
+        if (name.empty() || !parameters.emplace(name, parameter).second) {
+            return false;
+        }
+    }
+    for (const auto & entry : parameters) {
+        const std::string suffix = std::to_string(names.size());
+        names.push_back(entry.first);
+        types.push_back(entry.second->type);
+        shapes.insert(shapes.end(), entry.second->ne, entry.second->ne + GGML_MAX_DIMS);
+        if (ctx->param_grad_acc.count(entry.second)) {
+            tensors.emplace("gradient." + suffix, ctx->param_grad_acc.at(entry.second));
+        }
+        if (ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW) {
+            if (!ctx->param_m.count(entry.second) || !ctx->param_v.count(entry.second)) {
+                return false;
+            }
+            tensors.emplace("moment1." + suffix, ctx->param_m.at(entry.second));
+            tensors.emplace("moment2." + suffix, ctx->param_v.at(entry.second));
+        }
+    }
+    return !parameters.empty();
+}
+
+bool ggml_opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * binding) {
+    if (!file || !binding || !*binding || !ctx->checkpoint_ready || !ctx->checkpoint_trusted ||
+        !ctx->period_fresh || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+        return false;
+    }
+    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::string> names;
+    std::vector<int32_t> types;
+    std::vector<int64_t> shapes;
+    if (!opt_state_tensors(ctx, tensors, names, types, shapes)) {
+        return false;
+    }
+    ggml_backend_sched_synchronize(ctx->backend_sched);
+    gguf_context * state = gguf_init_empty();
+    gguf_set_val_u32(state, "optimizer.state.version", 1);
+    gguf_set_val_str(state, "optimizer.state.binding", binding);
+    gguf_set_val_i32(state, "optimizer.type", ctx->optimizer);
+    gguf_set_val_i32(state, "optimizer.loss", ctx->loss_type);
+    gguf_set_val_i32(state, "optimizer.period", ctx->opt_period);
+    gguf_set_val_i32(state, "optimizer.period_index", ctx->opt_i);
+    gguf_set_val_i64(state, "optimizer.iteration", ctx->iter);
+    std::ostringstream rng;
+    rng << ctx->rng;
+    gguf_set_val_str(state, "optimizer.rng", rng.str().c_str());
+    std::vector<const char *> name_ptrs;
+    for (const auto & name : names) {
+        name_ptrs.push_back(name.c_str());
+    }
+    gguf_set_arr_str(state, "optimizer.parameters", name_ptrs.data(), name_ptrs.size());
+    gguf_set_arr_data(state, "optimizer.parameter_types", GGUF_TYPE_INT32, types.data(), types.size());
+    gguf_set_arr_data(state, "optimizer.parameter_shapes", GGUF_TYPE_INT64, shapes.data(), shapes.size());
+    for (const auto & entry : tensors) {
+        ggml_tensor tensor = *entry.second;
+        ggml_set_name(&tensor, entry.first.c_str());
+        tensor.data = nullptr;
+        tensor.buffer = nullptr;
+        gguf_add_tensor(state, &tensor);
+    }
+    bool ok = gguf_write_to_file_ptr(state, file, true);
+    std::vector<uint8_t> buffer;
+    const uint8_t padding[GGUF_DEFAULT_ALIGNMENT] = {};
+    for (const auto & entry : tensors) {
+        if (!ok) { break; }
+        buffer.resize(ggml_nbytes(entry.second));
+        ggml_backend_tensor_get(entry.second, buffer.data(), 0, buffer.size());
+        const size_t pad = (GGUF_DEFAULT_ALIGNMENT - buffer.size() % GGUF_DEFAULT_ALIGNMENT) % GGUF_DEFAULT_ALIGNMENT;
+        ok = fwrite(buffer.data(), 1, buffer.size(), file) == buffer.size() && fwrite(padding, 1, pad, file) == pad;
+    }
+    gguf_free(state);
+    return ok;
+}
+
+bool ggml_opt_state_read(ggml_opt_context_t ctx, FILE * file, const char * binding) {
+    if (!file || !binding || !*binding || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+        return false;
+    }
+    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::string> names;
+    std::vector<int32_t> types;
+    std::vector<int64_t> shapes;
+    if (!opt_state_tensors(ctx, tensors, names, types, shapes)) {
+        return false;
+    }
+    fpos_t start;
+    if (fgetpos(file, &start) != 0) {
+        return false;
+    }
+    ggml_context * data = nullptr;
+    gguf_context * state = gguf_init_from_file_ptr(file, {true, &data});
+    if (!state) {
+        return false;
+    }
+    const auto key = [&](const char * name, gguf_type type) {
+        const int64_t id = gguf_find_key(state, name);
+        return id >= 0 && gguf_get_kv_type(state, id) == type ? id : -1;
+    };
+    const auto i32_equals = [&](const char * name, int32_t value) {
+        const int64_t id = key(name, GGUF_TYPE_INT32);
+        return id >= 0 && gguf_get_val_i32(state, id) == value;
+    };
+    const int64_t version = key("optimizer.state.version", GGUF_TYPE_UINT32);
+    const int64_t bound = key("optimizer.state.binding", GGUF_TYPE_STRING);
+    const int64_t iteration = key("optimizer.iteration", GGUF_TYPE_INT64);
+    const int64_t index = key("optimizer.period_index", GGUF_TYPE_INT32);
+    const int64_t random = key("optimizer.rng", GGUF_TYPE_STRING);
+    const int64_t params = key("optimizer.parameters", GGUF_TYPE_ARRAY);
+    const int64_t dtypes = key("optimizer.parameter_types", GGUF_TYPE_ARRAY);
+    const int64_t dims = key("optimizer.parameter_shapes", GGUF_TYPE_ARRAY);
+    bool ok = version >= 0 && gguf_get_val_u32(state, version) == 1 &&
+        bound >= 0 && std::string(gguf_get_val_str(state, bound)) == binding &&
+        iteration >= 0 && gguf_get_val_i64(state, iteration) > 1 &&
+        index >= 0 && gguf_get_val_i32(state, index) >= 0 && gguf_get_val_i32(state, index) < ctx->opt_period &&
+        random >= 0 && params >= 0 && dtypes >= 0 && dims >= 0 &&
+        i32_equals("optimizer.type", ctx->optimizer) && i32_equals("optimizer.loss", ctx->loss_type) &&
+        i32_equals("optimizer.period", ctx->opt_period) &&
+        gguf_get_arr_type(state, params) == GGUF_TYPE_STRING && gguf_get_arr_n(state, params) == names.size() &&
+        gguf_get_arr_type(state, dtypes) == GGUF_TYPE_INT32 && gguf_get_arr_n(state, dtypes) == types.size() &&
+        gguf_get_arr_type(state, dims) == GGUF_TYPE_INT64 && gguf_get_arr_n(state, dims) == shapes.size() &&
+        gguf_get_n_tensors(state) == (int64_t) tensors.size() && gguf_get_alignment(state) == GGUF_DEFAULT_ALIGNMENT;
+    std::mt19937 restored_rng;
+    if (ok) {
+        std::istringstream rng(gguf_get_val_str(state, random));
+        ok = bool(rng >> restored_rng);
+        rng >> std::ws;
+        ok = ok && rng.eof();
+        const auto * saved_types = static_cast<const int32_t *>(gguf_get_arr_data(state, dtypes));
+        const auto * saved_shapes = static_cast<const int64_t *>(gguf_get_arr_data(state, dims));
+        ok = ok && std::equal(shapes.begin(), shapes.end(), saved_shapes);
+        for (size_t i = 0; ok && i < names.size(); ++i) {
+            ok = names[i] == gguf_get_arr_str(state, params, i) && types[i] == saved_types[i];
+        }
+    }
+    for (const auto & entry : tensors) {
+        if (!ok) { break; }
+        const ggml_tensor * saved = ggml_get_tensor(data, entry.first.c_str());
+        ok = saved && saved->type == entry.second->type && ggml_are_same_shape(saved, entry.second) &&
+            ggml_nbytes(saved) == ggml_nbytes(entry.second);
+    }
+    std::vector<std::vector<uint8_t>> payload;
+    if (ok) {
+        // Only validated destination sizes allocate memory. Never parse mutable file metadata twice.
+        std::vector<uint8_t> metadata(gguf_get_meta_size(state));
+        gguf_get_meta_data(state, metadata.data());
+        std::vector<uint8_t> actual(metadata.size());
+        ok = fsetpos(file, &start) == 0 && fread(actual.data(), 1, actual.size(), file) == actual.size() && metadata == actual;
+        size_t offset = 0;
+        uint8_t padding[GGUF_DEFAULT_ALIGNMENT];
+        for (const auto & entry : tensors) {
+            if (!ok) { break; }
+            const int64_t id = gguf_find_tensor(state, entry.first.c_str());
+            ok = id >= 0 && gguf_get_tensor_offset(state, id) == offset;
+            if (!ok) { break; }
+            payload.emplace_back(ggml_nbytes(entry.second));
+            auto & bytes = payload.back();
+            const size_t pad = (GGUF_DEFAULT_ALIGNMENT - bytes.size() % GGUF_DEFAULT_ALIGNMENT) % GGUF_DEFAULT_ALIGNMENT;
+            ok = fread(bytes.data(), 1, bytes.size(), file) == bytes.size() && fread(padding, 1, pad, file) == pad;
+            offset += bytes.size() + pad;
+        }
+    }
+    if (ok) {
+        ggml_backend_sched_synchronize(ctx->backend_sched);
+        size_t i = 0;
+        for (const auto & entry : tensors) {
+            const auto & bytes = payload[i++];
+            ggml_backend_tensor_set(entry.second, bytes.data(), 0, bytes.size());
+        }
+        ctx->iter = gguf_get_val_i64(state, iteration);
+        ctx->opt_i = gguf_get_val_i32(state, index);
+        ctx->rng = restored_rng;
+        ctx->period_fresh = true;
+        ctx->checkpoint_trusted = true;
+        ctx->checkpoint_ready = true;
+    }
+    gguf_free(state);
+    ggml_free(data);
+    return ok;
 }
 
 bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx) {
@@ -1480,6 +1674,8 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     }
 
     const enum ggml_status status = ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    opt_ctx->checkpoint_trusted &= status == GGML_STATUS_SUCCESS;
+    opt_ctx->checkpoint_ready = opt_ctx->checkpoint_trusted && opt_ctx->allocated_graph == opt_ctx->gb_opt;
     if (status != GGML_STATUS_SUCCESS) {
         // the step's gradients (and the optimizer update inside this graph) were computed on
         // memory the backend says it did not have: the run must stop, never continue on them
