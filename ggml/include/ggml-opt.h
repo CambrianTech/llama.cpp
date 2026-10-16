@@ -187,6 +187,12 @@ extern "C" {
     // Prepare owns validated host payload without changing the destination. The caller must keep
     // the context alive and serialize prepare/apply with all evaluation and allocation operations.
     struct ggml_opt_state;
+    // Allocate a genuine supplied graph only for importing a fresh optimizer generation. Executes
+    // no graph and consumes no sample; refuses used, pending, partial or failed contexts. The
+    // caller must restore before evaluation. Existing lifetimes are unchanged: retain parameter
+    // and static graph storage for the optimizer lifetime; dynamic graph storage follows the
+    // existing prepare/allocator custody contract. This operation does not release that storage.
+    GGML_API bool ggml_opt_alloc_for_restore(ggml_opt_context_t opt_ctx);
     GGML_API struct ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
     GGML_API bool ggml_opt_state_apply(ggml_opt_context_t opt_ctx, struct ggml_opt_state * state);
     GGML_API void ggml_opt_state_free(struct ggml_opt_state * state);

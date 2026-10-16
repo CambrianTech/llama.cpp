@@ -88,6 +88,8 @@ struct ggml_opt_context {
     struct ggml_tensor * next_extra_loss = nullptr;
     bool                 period_fresh    = true; // the next backward starts a period (zeroed gradients)
     bool                 checkpoint_ready = false;
+    bool                 evaluation_attempted = false;
+    bool                 restore_pending = false;
     bool                 checkpoint_trusted = true;
     // the gradients of the evaluated graph's GRAD leaves, readable until the next alloc
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> leaf_grads;
@@ -1146,6 +1148,7 @@ bool ggml_opt_state_apply(ggml_opt_context_t ctx, ggml_opt_state * state) {
     ctx->period_fresh = true;
     ctx->checkpoint_trusted = true;
     ctx->checkpoint_ready = true;
+    ctx->restore_pending = false;
     return true;
 }
 
@@ -1464,7 +1467,30 @@ size_t ggml_opt_peak_graph_bytes(ggml_opt_context_t opt_ctx) {
     return opt_ctx->peak_graph_bytes;
 }
 
+// Release only the prepared graph lifecycle, not optimizer counters, moments or parameter weights.
+static void opt_disarm_evaluation(ggml_opt_context_t opt_ctx) {
+    opt_ctx->next_manual     = false;
+    opt_ctx->next_period_end = false;
+    opt_ctx->next_loss_scale = 1.0f;
+    opt_ctx->next_extra_loss = nullptr;
+
+    if (!opt_ctx->static_graphs) {
+        opt_ctx->gf                   = nullptr;
+        opt_ctx->gb_grad              = nullptr;
+        opt_ctx->gb_opt               = nullptr;
+        opt_ctx->allocated_graph      = nullptr;
+        opt_ctx->allocated_graph_copy = nullptr;
+    }
+
+    opt_ctx->eval_ready = false;
+
+}
+
 bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
+    if (opt_ctx->restore_pending) {
+        opt_ctx->refusal = "fresh optimizer allocation awaits a validated generation restore";
+        return false;
+    }
     GGML_ASSERT(!opt_ctx->eval_ready);
     if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
         ggml_graph_reset(opt_ctx->gb_grad);
@@ -1667,6 +1693,19 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     return true;
 }
 
+bool ggml_opt_alloc_for_restore(ggml_opt_context_t opt_ctx) {
+    if (!opt_ctx || opt_ctx->evaluation_attempted || opt_ctx->restore_pending || opt_ctx->eval_ready ||
+        opt_ctx->iter != 1 || opt_ctx->opt_i != 0 || !opt_ctx->period_fresh ||
+        !opt_ctx->checkpoint_trusted || opt_ctx->checkpoint_ready ||
+        opt_ctx->next_manual || opt_ctx->next_extra_loss) {
+        return false;
+    }
+    if (!ggml_opt_alloc(opt_ctx, true)) { return false; }
+    opt_disarm_evaluation(opt_ctx);
+    opt_ctx->restore_pending = true;
+    return true;
+}
+
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->eval_ready);
     // a caller-driven step's loss is not scaled by 1/opt_period (ggml_opt_build): recorded as if it
@@ -1712,6 +1751,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
+    opt_ctx->evaluation_attempted = true;
     const enum ggml_status status = ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
     opt_ctx->checkpoint_trusted &= status == GGML_STATUS_SUCCESS;
     opt_ctx->checkpoint_ready = opt_ctx->checkpoint_trusted && opt_ctx->allocated_graph == opt_ctx->gb_opt;
@@ -1729,20 +1769,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     } else if (opt_ctx->allocated_graph == opt_ctx->gb_grad) {
         opt_ctx->period_fresh = false;
     }
-    opt_ctx->next_manual     = false;
-    opt_ctx->next_period_end = false;
-    opt_ctx->next_loss_scale = 1.0f;
-    opt_ctx->next_extra_loss = nullptr;
-
-    if (!opt_ctx->static_graphs) {
-        opt_ctx->gf                   = nullptr;
-        opt_ctx->gb_grad              = nullptr;
-        opt_ctx->gb_opt               = nullptr;
-        opt_ctx->allocated_graph      = nullptr;
-        opt_ctx->allocated_graph_copy = nullptr;
-    }
-
-    opt_ctx->eval_ready = false;
+    opt_disarm_evaluation(opt_ctx);
 
     if (!result) {
         return;
