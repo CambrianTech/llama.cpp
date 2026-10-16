@@ -87,6 +87,13 @@ struct server_http_context {
     bool start();
     void stop() const;
 
+    // The latest model-load progress, served in /health's 503 body while the model loads, so a
+    // supervisor can tell a slow load that is advancing from one that is stuck (continuum card
+    // 011d1b4e). `payload` is the loader's {stages, current, value}; this adds the generation
+    // (pid + start time of THIS process), a sequence number that rises on every report, and
+    // "blind": true once the current stage's counter reached 1 (the work after it has none).
+    void set_loading(const std::string & payload_json);
+
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;
     void del(const std::string & path, const handler_t & handler) const;

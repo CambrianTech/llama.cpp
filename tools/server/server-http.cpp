@@ -9,7 +9,14 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <string>
+
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <thread>
 
 //
@@ -19,7 +26,38 @@
 class server_http_context::Impl {
 public:
     std::unique_ptr<httplib::Server> srv;
+    // written by the loader (at most every 200 ms), read by /health while not ready
+    std::mutex loading_mu;
+    json       loading;
+    uint64_t   loading_seq = 0;
+    const int64_t started_ms = ggml_time_ms();
 };
+
+static int64_t server_pid() {
+#ifdef _WIN32
+    return (int64_t) _getpid();
+#else
+    return (int64_t) getpid();
+#endif
+}
+
+void server_http_context::set_loading(const std::string & payload_json) {
+    json payload;
+    try {
+        payload = json::parse(payload_json);
+    } catch (const std::exception &) {
+        return; // the loader's own dump: unreachable, and progress is advisory, never fatal
+    }
+    if (!payload.is_object()) {
+        return;
+    }
+    const bool blind = json_value(payload, "value", 0.0) >= 1.0;
+    std::lock_guard<std::mutex> lock(pimpl->loading_mu);
+    payload["seq"]        = ++pimpl->loading_seq;
+    payload["blind"]      = blind;
+    payload["generation"] = {{"pid", server_pid()}, {"started_ms", pimpl->started_ms}};
+    pimpl->loading = std::move(payload);
+}
 
 server_http_context::server_http_context()
     : pimpl(std::make_unique<Impl>())
@@ -258,16 +296,20 @@ bool server_http_context::init(const common_params & params) {
             // no endpoints are allowed to be accessed when the server is not ready
             // this is to prevent any data races or inconsistent states
             res.status = 503;
-            res.set_content(
-                safe_json_to_str(json {
-                    {"error", {
-                        {"message", "Loading model"},
-                        {"type", "unavailable_error"},
-                        {"code", 503}
-                    }}
-                }),
-                "application/json; charset=utf-8"
-            );
+            json body = {
+                {"error", {
+                    {"message", "Loading model"},
+                    {"type", "unavailable_error"},
+                    {"code", 503}
+                }}
+            };
+            {
+                std::lock_guard<std::mutex> lock(pimpl->loading_mu);
+                if (!pimpl->loading.is_null()) {
+                    body["loading"] = pimpl->loading;
+                }
+            }
+            res.set_content(safe_json_to_str(body), "application/json; charset=utf-8");
             return false;
         }
         return true;

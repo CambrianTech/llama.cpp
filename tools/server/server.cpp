@@ -467,10 +467,18 @@ int llama_server(common_params & params, int argc, char ** argv) {
             return 1;
         }
 
-        // setup communication child --> router if necessary
+        // setup communication child --> router if necessary; a standalone server shows its load
+        // progress in /health instead (continuum card 011d1b4e: it was dropped, so a supervisor saw
+        // a bare 503 for a whole cold start and could not tell advancing from stuck)
         if (child.is_child()) {
             ctx_server.set_state_callback([&](server_state state, json payload) {
                 child.notify_to_router(server_state_to_str(state), payload);
+            });
+        } else {
+            ctx_server.set_state_callback([&](server_state state, json payload) {
+                if (state == SERVER_STATE_LOADING) {
+                    ctx_http.set_loading(payload.dump());
+                }
             });
         }
 
