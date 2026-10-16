@@ -780,9 +780,11 @@ int main(int argc, char ** argv) {
             FILE * optimizer = tmpfile();
             GGML_ASSERT(weights && optimizer && llama_opt_state_write(ctx, optimizer, "fixture-generation"));
             adapter->alora_invocation_tokens.clear();
+            GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
             GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
             GGML_ASSERT(llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
             const auto uninterrupted_next = adapter_params(adapter);
+            GGML_ASSERT(llama_set_adapters_lora(ctx, nullptr, 0, nullptr) == 0);
             adapter->alora_invocation_tokens = {tokens[0], tokens[1]};
             // Change every A/B value deterministically, not just metadata or one selected tensor.
             for (const auto & entry : adapter->ab_map) {
@@ -823,9 +825,11 @@ int main(int argc, char ** argv) {
             GGML_ASSERT(!adapter->restore_quarantined && adapter_params(adapter) == saved);
             GGML_ASSERT(adapter->ab_map.begin()->second.a == old_a);
             adapter->alora_invocation_tokens.clear();
+            GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
             GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
             GGML_ASSERT(llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
             const auto resumed_next = adapter_params(adapter);
+            GGML_ASSERT(llama_set_adapters_lora(ctx, nullptr, 0, nullptr) == 0);
             GGML_ASSERT(resumed_next.size() == uninterrupted_next.size());
             std::vector<float> resumed_step(saved.size()), uninterrupted_step(saved.size());
             for (size_t i = 0; i < saved.size(); ++i) {
