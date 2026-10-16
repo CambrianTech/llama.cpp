@@ -59,12 +59,19 @@ if "--fairness" in sys.argv:
         completion_rest = assert_deferred()
         before = len(progress)
         t0 = time.monotonic()
-        post = json.loads(raw("/learn", dict(learn, id_slot=0, n_prefix=first["tokens_evaluated"])))
+        post_body = dict(learn, id_slot=0, n_prefix=first["tokens_evaluated"])
+        post_deferred = json.loads(raw("/learn", post_body))
+        assert post_deferred["success"] is False and post_deferred["deferred"] is True, post_deferred
+        assert post_deferred["retry_after_ms"] > 0 and post_deferred["n_labels"] == 0, post_deferred
+        # The client owns this experience during rest; the engine holds neither request nor slot.
+        time.sleep(post_deferred["retry_after_ms"] / 1000)
+        assert_busy()
+        post = json.loads(raw("/learn", post_body))
         post_wall_ms = (time.monotonic() - t0) * 1000
         assert post["success"], post
         post_rest = assert_deferred()
         assert len(progress) > before and not errors, (len(progress), before, errors)
-        print(json.dumps({"completion_rest": completion_rest, "post_learn": post,
+        print(json.dumps({"completion_rest": completion_rest, "post_deferred": post_deferred, "post_learn": post,
                           "post_rest": post_rest, "post_wall_ms": post_wall_ms,
                           "other_slot_frames": len(progress) - before}))
     finally:

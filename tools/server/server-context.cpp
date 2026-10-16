@@ -3070,10 +3070,6 @@ private:
                         break;
                     }
                     res->outcome = learn_on_slot(*slot, L, t0);
-                    if (res->outcome.deferred) {
-                        queue_tasks.defer(std::move(task));
-                        break;
-                    }
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_UNLOAD_LORA:
@@ -5849,6 +5845,8 @@ void server_routes::init_routes() {
     // POST /learn: one reply learned on the slot that served its prompt, between that slot's turns, in
     // this serving context (SERVER_TASK_TYPE_LEARN). Body: id_slot, n_prefix (the served prompt's
     // tokens), reply (text) or reply_tokens, lora_id (a loaded adapter: the shadow), lr.
+    // Duty rest returns a deferred outcome: the caller retains the experience and retries after
+    // retry_after_ms. The slot-release queue cannot wake a cooldown on an already idle slot.
     this->post_learn = [this](const server_http_req & req) {
         auto res = create_response();
         if (params.train_dir.empty()) {
