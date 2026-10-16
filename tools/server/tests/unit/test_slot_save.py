@@ -26,6 +26,10 @@ def test_slot_save_restore():
     server.server_slots = True
     server.start()
 
+    props = server.make_request("GET", "/props")
+    assert props.status_code == 200
+    assert props.body["slot_save_size_version"] == 1
+
     # First prompt in slot 1 should be fully processed
     res = server.make_request("POST", "/completion", data={
         "prompt": "What is the capital of France?",
