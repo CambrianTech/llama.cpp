@@ -8,10 +8,40 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <atomic>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
+
+// One immutable operation identity with cheap counters. The route holds at most
+// one snapshot per configured slot; task ownership keeps an in-flight one alive.
+struct server_restore_progress {
+    enum phase_t { queued, state, sidecar, completed, failed, cancelled };
+    const std::string operation_id;
+    const int slot;
+    std::atomic<phase_t> phase{queued};
+    std::atomic<uint64_t> state_bytes{0}, state_total{0}, sidecar_bytes{0}, sidecar_total{0}, checkpoints{0};
+    std::atomic<bool> cancel_requested{false};
+
+    server_restore_progress(std::string id, int slot) : operation_id(std::move(id)), slot(slot) {}
+    bool terminal() const { return phase.load(std::memory_order_relaxed) >= completed; }
+    static bool on_state_io(uint64_t done, uint64_t total, void * data) {
+        auto & p = *static_cast<server_restore_progress *>(data);
+        p.state_total.store(total, std::memory_order_relaxed);
+        p.state_bytes.store(done, std::memory_order_relaxed);
+        return !p.cancel_requested.load(std::memory_order_relaxed);
+    }
+    json snapshot() const {
+        return {{"operation_id", operation_id}, {"id_slot", slot}, {"action", "restore"},
+                {"phase", int(phase.load(std::memory_order_relaxed))},
+                {"state_bytes", state_bytes.load(std::memory_order_relaxed)},
+                {"state_total", state_total.load(std::memory_order_relaxed)},
+                {"sidecar_bytes", sidecar_bytes.load(std::memory_order_relaxed)},
+                {"sidecar_total", sidecar_total.load(std::memory_order_relaxed)},
+                {"checkpoints", checkpoints.load(std::memory_order_relaxed)}};
+    }
+};
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
@@ -197,6 +227,7 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        std::shared_ptr<server_restore_progress> progress;
     };
     slot_action slot_action;
 

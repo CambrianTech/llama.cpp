@@ -2812,6 +2812,14 @@ private:
                         break;
                     }
 
+                    auto progress = task.slot_action.progress;
+                    if (progress) {
+                        auto expected = server_restore_progress::queued;
+                        if (!progress->phase.compare_exchange_strong(expected, server_restore_progress::state)) {
+                            send_error(task, "Restore operation cancelled", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                    }
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -2860,7 +2868,9 @@ private:
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
                         if (nread != 0) {
                             packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                            nread = llama_state_seq_load_file_with_progress(ctx_tgt, filepath.c_str(), slot->id,
+                                packed.data(), packed.size(), &n_packed,
+                                progress ? server_restore_progress::on_state_io : nullptr, progress.get());
                         }
                         if (nread == 0) {
                             throw std::runtime_error("No available space in KV cache or invalid slot save file");
@@ -2886,9 +2896,25 @@ private:
                         {
                             const std::string ckpt_path = filepath + ".ckpt";
                             std::ifstream in(ckpt_path, std::ios::binary);
+                            if (progress) {
+                                progress->phase.store(server_restore_progress::sidecar, std::memory_order_relaxed);
+                                if (in) {
+                                    in.seekg(0, std::ios::end);
+                                    const auto total = in.tellg();
+                                    if (total >= 0) progress->sidecar_total.store(uint64_t(total), std::memory_order_relaxed);
+                                    in.seekg(0);
+                                }
+                            }
                             std::list<common_prompt_checkpoint> loaded;
                             bool ok = (bool) in;
-                            auto get = [&](void * ptr, size_t n) { in.read(reinterpret_cast<char *>(ptr), n); ok = ok && (bool) in; };
+                            auto get = [&](void * ptr, size_t n) {
+                                if (progress && progress->cancel_requested.load(std::memory_order_relaxed)) {
+                                    throw std::runtime_error("Restore operation cancelled");
+                                }
+                                in.read(reinterpret_cast<char *>(ptr), n);
+                                ok = ok && (bool) in;
+                                if (progress && in.gcount() > 0) progress->sidecar_bytes.fetch_add(uint64_t(in.gcount()), std::memory_order_relaxed);
+                            };
                             if (ok) {
                                 uint32_t magic = 0, version = 0, n_ckpt = 0;
                                 get(&magic, sizeof(magic)); get(&version, sizeof(version)); get(&n_ckpt, sizeof(n_ckpt));
@@ -2907,6 +2933,7 @@ private:
                                     c.data_tgt.resize(sz_tgt);   get(c.data_tgt.data(),  sz_tgt);
                                     c.data_dft.resize(sz_dft);   get(c.data_dft.data(),  sz_dft);
                                     c.data_spec.resize(sz_spec); get(c.data_spec.data(), sz_spec);
+                                    if (progress && ok) progress->checkpoints.fetch_add(1, std::memory_order_relaxed);
                                 }
                             }
                             if (ok) {
@@ -2917,12 +2944,18 @@ private:
                                 SLT_WRN(*slot, "no usable checkpoint sidecar (%s): the restore is cold — the next divergence re-prefills from the head\n", ckpt_path.c_str());
                             }
                         }
+                        if (progress && progress->cancel_requested.load(std::memory_order_relaxed)) {
+                            throw std::runtime_error("Restore operation cancelled");
+                        }
                     } catch (const std::exception & err) {
+                        if (progress) progress->phase.store(progress->cancel_requested.load(std::memory_order_relaxed)
+                            ? server_restore_progress::cancelled : server_restore_progress::failed, std::memory_order_relaxed);
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 
+                    if (progress) progress->phase.store(server_restore_progress::completed, std::memory_order_relaxed);
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
@@ -5234,6 +5267,19 @@ void server_routes::init_routes() {
             return res;
         }
 
+        const auto operation_id = req.get_param("operation_id");
+        if (!operation_id.empty()) {
+            std::lock_guard<std::mutex> lock(mutex_restore_progress);
+            for (const auto & entry : restore_progress) {
+                if (entry.second->operation_id == operation_id) {
+                    res->ok(entry.second->snapshot());
+                    return res;
+                }
+            }
+            res->error(format_error_response("Restore operation is unknown", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+
         // request slots data using task queue
         {
             server_task task(SERVER_TASK_TYPE_SLOT_GET);
@@ -6063,6 +6109,33 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     }
     std::string filepath = params.slot_save_path + filename;
 
+    std::shared_ptr<server_restore_progress> progress;
+    if (request_data.contains("operation_id")) {
+        const auto id = request_data.at("operation_id").get<std::string>();
+        bool valid = id.size() == 36; // canonical UUID, bounded opaque identity
+        for (size_t i = 0; valid && i < id.size(); ++i) {
+            valid = (i == 8 || i == 13 || i == 18 || i == 23) ? id[i] == '-'
+                : ((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'));
+        }
+        if (!valid || id_slot < 0 || id_slot >= params.n_parallel) {
+            res->error(format_error_response("Invalid restore operation identity or slot", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::lock_guard<std::mutex> lock(mutex_restore_progress);
+        for (const auto & entry : restore_progress) {
+            if (entry.second->operation_id == id) {
+                res->error(format_error_response("Restore operation identity is already retained", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        auto previous = restore_progress.find(id_slot);
+        if (previous != restore_progress.end() && !previous->second->terminal()) {
+            res->error(format_error_response("A restore operation already owns this slot", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        progress = std::make_shared<server_restore_progress>(id, id_slot);
+        restore_progress[id_slot] = progress;
+    }
     auto & rd = res->rd;
     {
         server_task task(SERVER_TASK_TYPE_SLOT_RESTORE);
@@ -6084,12 +6157,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
         task.slot_action.id_slot  = id_slot;
         task.slot_action.filename = filename;
         task.slot_action.filepath = filepath;
+        task.slot_action.progress = progress;
         rd.post_task(std::move(task));
     }
 
     auto result = rd.next(req.should_stop);
     if (!result) {
-        // connection was closed
+        // Request cancellation is distinct from acknowledgement that IO stopped.
+        if (progress) {
+            progress->cancel_requested.store(true, std::memory_order_relaxed);
+            auto expected = server_restore_progress::queued;
+            progress->phase.compare_exchange_strong(expected, server_restore_progress::cancelled);
+        }
         GGML_ASSERT(req.should_stop());
         return res;
     }

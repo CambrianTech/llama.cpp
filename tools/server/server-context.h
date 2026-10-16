@@ -203,6 +203,9 @@ private:
 
     // cached responses, to be used during sleep
     std::mutex     mutex_cache;
+    // Only admission/query use this lock; IO callbacks touch relaxed atomics only.
+    std::mutex mutex_restore_progress;
+    std::map<int, std::shared_ptr<server_restore_progress>> restore_progress;
     json           cached_models  = nullptr;
     json           cached_props   = nullptr;
     server_metrics cached_metrics;

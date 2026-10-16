@@ -2755,11 +2755,15 @@ private:
 
 class llama_io_read_file : public llama_io_read_i {
 public:
-    llama_io_read_file(llama_file * f) : file(f) {}
+    llama_io_read_file(llama_file * f, llama_state_io_progress_callback cb = nullptr, void * data = nullptr)
+        : file(f), progress(cb), progress_data(data), total(cb ? f->size() : 0) {}
 
     void read(void * dst, size_t size) override {
         file->read_raw(dst, size);
         size_read += size;
+        if (progress && !progress(file->tell(), total, progress_data)) {
+            throw std::runtime_error("state file load cancelled");
+        }
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
@@ -2774,6 +2778,9 @@ public:
 
 private:
     llama_file * file;
+    llama_state_io_progress_callback progress;
+    void * progress_data;
+    uint64_t total;
     size_t size_read = 0;
     std::vector<uint8_t> temp_buffer;
 };
@@ -3162,7 +3169,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     return true;
 }
 
-size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, llama_state_io_progress_callback progress, void * progress_data) {
     llama_file file(filepath, "rb");
 
     // version checks
@@ -3203,7 +3210,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     // restore the context state
     {
         const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file);
+        llama_io_read_file io(&file, progress, progress_data);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
@@ -3952,10 +3959,14 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
 }
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    return llama_state_seq_load_file_with_progress(ctx, filepath, dest_seq_id, tokens_out, n_token_capacity, n_token_count_out, nullptr, nullptr);
+}
+
+size_t llama_state_seq_load_file_with_progress(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, llama_state_io_progress_callback progress, void * user_data) {
     ctx->synchronize();
 
     try {
-        return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);
+        return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out, progress, user_data);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
         return 0;

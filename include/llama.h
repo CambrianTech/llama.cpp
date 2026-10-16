@@ -996,6 +996,14 @@ extern "C" {
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
 
+    // Completed state-file IO bytes; returning false cancels the load. The callback
+    // must be cheap and must not call back into the context. Existing API is unchanged.
+    typedef bool (*llama_state_io_progress_callback)(uint64_t completed, uint64_t total, void * user_data);
+    LLAMA_API size_t llama_state_seq_load_file_with_progress(
+            struct llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id,
+            llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out,
+            llama_state_io_progress_callback progress, void * user_data);
+
 #define LLAMA_STATE_SEQ_FLAGS_NONE 0
 
 // for backwards-compat

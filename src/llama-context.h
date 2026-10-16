@@ -173,7 +173,9 @@ struct llama_context {
             const char * filepath,
            llama_token * tokens_out,
                 size_t   n_token_capacity,
-                size_t * n_token_count_out);
+                size_t * n_token_count_out,
+                llama_state_io_progress_callback progress = nullptr,
+                void * progress_data = nullptr);
 
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
