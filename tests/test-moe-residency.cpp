@@ -859,6 +859,25 @@ static void test_container_lifetime_custody() {
 }
 
 int main(int argc, char ** argv) {
+#ifdef _WIN32
+    // Cross-process fixture: keep a writable mapping after closing its original
+    // file handle, so Rust's deny-write sharing is tested against the mapping.
+    if (argc == 3 && std::strcmp(argv[1], "--container-write-map") == 0) {
+        const auto path = std::filesystem::u8path(argv[2]);
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) { return 3; }
+        HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+        void * view = mapping ? MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0) : nullptr;
+        CloseHandle(file);
+        if (!view) { if (mapping) { CloseHandle(mapping); } return 3; }
+        std::puts("held"); std::fflush(stdout);
+        (void) std::getchar();
+        UnmapViewOfFile(view); CloseHandle(mapping);
+        return 0;
+    }
+#endif
     if ((argc == 4 || argc == 5) && std::strcmp(argv[1], "--container-lease") == 0) {
         ggml_moe::ContainerLease lease(argv[2], std::strcmp(argv[3], "writer") == 0);
         if (lease.ok() && argc == 5 && std::strcmp(argv[4], "hold") == 0) {
