@@ -4,6 +4,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-opt.h"
+#include "gguf.h"
 
 #include <cmath>
 #include <cinttypes>
@@ -954,7 +955,10 @@ static std::pair<int, int> test_checkpoint(
         ggml_backend_tensor_set(dynamic.inputs, &input, 0, sizeof(input));
         ggml_opt_eval(dynamic.opt_ctx, dynamic.result);
     };
+    float initial_weight, first_expected;
+    ggml_backend_tensor_get(dynamic.weights, &initial_weight, 0, sizeof(initial_weight));
     step_dynamic();
+    ggml_backend_tensor_get(dynamic.weights, &first_expected, 0, sizeof(first_expected));
     FILE * dynamic_state = tmpfile();
     GGML_ASSERT(dynamic_state && ggml_opt_state_write(dynamic.opt_ctx, dynamic_state, "dynamic-policy"));
     float dynamic_saved, dynamic_expected;
@@ -978,6 +982,49 @@ static std::pair<int, int> test_checkpoint(
     step_dynamic();
     ggml_backend_tensor_get(dynamic.weights, &actual, 0, sizeof(actual));
     print_ok(__func__, almost_equal(dynamic_expected, actual, 1e-7), npass, ntest, "dynamic-restored-next-step");
+    helper_free_ctx_data(dynamic);
+    dynamic = make_dynamic();
+    dynamic_graph = nullptr;
+    prepare_dynamic();
+    GGML_ASSERT(ggml_opt_alloc_for_restore(dynamic.opt_ctx));
+    FILE * initial = tmpfile();
+    GGML_ASSERT(initial);
+    print_ok(__func__, ggml_opt_state_write_initial(dynamic.opt_ctx, initial, "dynamic-policy"), npass, ntest, "initial-generation-export");
+    ggml_backend_tensor_get(dynamic.weights, &actual, 0, sizeof(actual));
+    print_ok(__func__, actual == initial_weight, npass, ntest, "initial-generation-keeps-weights");
+    print_ok(__func__, !ggml_opt_alloc(dynamic.opt_ctx, true), npass, ntest, "initial-export-keeps-import-gate");
+    FILE * not_completed = tmpfile();
+    GGML_ASSERT(not_completed);
+    print_ok(__func__, !ggml_opt_state_write(dynamic.opt_ctx, not_completed, "dynamic-policy"), npass, ntest, "initial-not-completed");
+    rewind(initial);
+    gguf_context * initial_meta = gguf_init_from_file_ptr(initial, {true, nullptr});
+    GGML_ASSERT(initial_meta);
+    FILE * bad_boundary = tmpfile();
+    GGML_ASSERT(bad_boundary);
+    gguf_set_val_str(initial_meta, "optimizer.state.boundary", "completed");
+    GGML_ASSERT(gguf_write_to_file_ptr(initial_meta, bad_boundary, true));
+    rewind(bad_boundary);
+    print_ok(__func__, !ggml_opt_state_read(dynamic.opt_ctx, bad_boundary, "dynamic-policy"), npass, ntest, "initial-wrong-boundary-refused");
+    fclose(bad_boundary);
+    gguf_free(initial_meta);
+    print_ok(__func__, !ggml_opt_alloc(dynamic.opt_ctx, true), npass, ntest, "invalid-initial-import-stays-pending");
+    rewind(initial);
+    print_ok(__func__, ggml_opt_state_read(dynamic.opt_ctx, initial, "dynamic-policy"), npass, ntest, "initial-generation-restore");
+    print_ok(__func__, !ggml_opt_state_write(dynamic.opt_ctx, not_completed, "dynamic-policy"), npass, ntest, "restored-initial-not-completed");
+    step_dynamic();
+    ggml_backend_tensor_get(dynamic.weights, &actual, 0, sizeof(actual));
+    print_ok(__func__, almost_equal(first_expected, actual, 1e-7), npass, ntest, "initial-generation-first-update-equivalent");
+    print_ok(__func__, !ggml_opt_state_write_initial(dynamic.opt_ctx, not_completed, "dynamic-policy"), npass, ntest, "used-initial-export-refused");
+    // Simulate an update whose enclosing generation commit failed: restore BOTH initial
+    // parameter weights and optimizer state, then retry that same first real sample.
+    rewind(initial);
+    print_ok(__func__, ggml_opt_state_read(dynamic.opt_ctx, initial, "dynamic-policy"), npass, ntest, "first-commit-rollback");
+    ggml_backend_tensor_set(dynamic.weights, &initial_weight, 0, sizeof(initial_weight));
+    step_dynamic();
+    ggml_backend_tensor_get(dynamic.weights, &actual, 0, sizeof(actual));
+    print_ok(__func__, almost_equal(first_expected, actual, 1e-7), npass, ntest, "initial-rollback-next-update-equivalent");
+    fclose(initial);
+    fclose(not_completed);
     helper_free_ctx_data(dynamic);
     fclose(dynamic_state);
     fclose(state);

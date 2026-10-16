@@ -964,11 +964,7 @@ static bool opt_state_tensors(ggml_opt_context_t ctx, std::map<std::string, ggml
     return !parameters.empty();
 }
 
-bool ggml_opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * binding) {
-    if (!file || !binding || !*binding || !ctx->checkpoint_ready || !ctx->checkpoint_trusted ||
-        !ctx->period_fresh || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
-        return false;
-    }
+static bool opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * binding, bool initial) {
     std::map<std::string, ggml_tensor *> tensors;
     std::vector<std::string> names;
     std::vector<int32_t> types;
@@ -978,7 +974,8 @@ bool ggml_opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * bind
     }
     ggml_backend_sched_synchronize(ctx->backend_sched);
     gguf_context * state = gguf_init_empty();
-    gguf_set_val_u32(state, "optimizer.state.version", 1);
+    gguf_set_val_u32(state, "optimizer.state.version", initial ? 2 : 1);
+    if (initial) { gguf_set_val_str(state, "optimizer.state.boundary", "initial"); }
     gguf_set_val_str(state, "optimizer.state.binding", binding);
     gguf_set_val_i32(state, "optimizer.type", ctx->optimizer);
     gguf_set_val_i32(state, "optimizer.loss", ctx->loss_type);
@@ -1016,6 +1013,38 @@ bool ggml_opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * bind
     return ok;
 }
 
+bool ggml_opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * binding) {
+    if (!file || !binding || !*binding || !ctx->checkpoint_ready || !ctx->checkpoint_trusted ||
+        !ctx->period_fresh || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+        return false;
+    }
+    return opt_state_write(ctx, file, binding, false);
+}
+
+bool ggml_opt_state_write_initial(ggml_opt_context_t ctx, FILE * file, const char * binding) {
+    if (!ctx || !file || !binding || !*binding || !ctx->restore_pending || ctx->restore_preparation_failed ||
+        ctx->evaluation_attempted || ctx->eval_ready || ctx->checkpoint_ready || !ctx->checkpoint_trusted ||
+        ctx->iter != 1 || ctx->opt_i != 0 || !ctx->period_fresh || ctx->next_manual || ctx->next_extra_loss) {
+        return false;
+    }
+    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::string> names;
+    std::vector<int32_t> types;
+    std::vector<int64_t> shapes;
+    if (!opt_state_tensors(ctx, tensors, names, types, shapes)) { return false; }
+    // Allocation is not initialization. Explicitly establish the zero-step persistent state;
+    // no parameter weights, RNG, counters or sample are touched. Backend writes have the same
+    // documented completion contract as restore, not a recoverable hardware-failure status.
+    ggml_backend_sched_synchronize(ctx->backend_sched);
+    for (const auto & entry : tensors) {
+        ggml_backend_tensor_memset(entry.second, 0, 0, ggml_nbytes(entry.second));
+    }
+    ggml_backend_sched_synchronize(ctx->backend_sched);
+    // Even a successful export leaves the import gate closed: caller must commit and restore
+    // the same-generation weights/policy and this artifact before the first real update.
+    return opt_state_write(ctx, file, binding, true);
+}
+
 struct ggml_opt_state {
     ggml_opt_context_t owner;
     std::map<std::string, ggml_tensor *> tensors;
@@ -1023,6 +1052,7 @@ struct ggml_opt_state {
     int64_t iteration;
     int32_t index;
     std::mt19937 rng;
+    bool initial;
 };
 
 ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t ctx, FILE * file, const char * binding) {
@@ -1061,9 +1091,15 @@ ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t ctx, FILE * file, con
     const int64_t params = key("optimizer.parameters", GGUF_TYPE_ARRAY);
     const int64_t dtypes = key("optimizer.parameter_types", GGUF_TYPE_ARRAY);
     const int64_t dims = key("optimizer.parameter_shapes", GGUF_TYPE_ARRAY);
-    bool ok = version >= 0 && gguf_get_val_u32(state, version) == 1 &&
+    const int64_t boundary = key("optimizer.state.boundary", GGUF_TYPE_STRING);
+    const bool initial = version >= 0 && gguf_get_val_u32(state, version) == 2 &&
+        boundary >= 0 && std::string(gguf_get_val_str(state, boundary)) == "initial";
+    const bool completed = version >= 0 && gguf_get_val_u32(state, version) == 1 &&
+        gguf_find_key(state, "optimizer.state.boundary") < 0;
+    bool ok = (initial || completed) &&
         bound >= 0 && std::string(gguf_get_val_str(state, bound)) == binding &&
-        iteration >= 0 && gguf_get_val_i64(state, iteration) > 1 &&
+        iteration >= 0 && (initial ? gguf_get_val_i64(state, iteration) == 1 : gguf_get_val_i64(state, iteration) > 1) &&
+        (!initial || (index >= 0 && gguf_get_val_i32(state, index) == 0)) &&
         index >= 0 && gguf_get_val_i32(state, index) >= 0 && gguf_get_val_i32(state, index) < ctx->opt_period &&
         random >= 0 && params >= 0 && dtypes >= 0 && dims >= 0 &&
         i32_equals("optimizer.type", ctx->optimizer) && i32_equals("optimizer.loss", ctx->loss_type) &&
@@ -1109,13 +1145,14 @@ ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t ctx, FILE * file, con
             auto & bytes = payload.back();
             const size_t pad = (GGUF_DEFAULT_ALIGNMENT - bytes.size() % GGUF_DEFAULT_ALIGNMENT) % GGUF_DEFAULT_ALIGNMENT;
             ok = fread(bytes.data(), 1, bytes.size(), file) == bytes.size() && fread(padding, 1, pad, file) == pad;
+            if (initial) { ok = ok && std::all_of(bytes.begin(), bytes.end(), [](uint8_t b) { return b == 0; }); }
             offset += bytes.size() + pad;
         }
     }
     ggml_opt_state * prepared = nullptr;
     if (ok) {
         prepared = new ggml_opt_state{ctx, std::move(tensors), std::move(payload),
-            gguf_get_val_i64(state, iteration), gguf_get_val_i32(state, index), restored_rng};
+            gguf_get_val_i64(state, iteration), gguf_get_val_i32(state, index), restored_rng, initial};
     }
     gguf_free(state);
     ggml_free(data);
@@ -1148,7 +1185,7 @@ bool ggml_opt_state_apply(ggml_opt_context_t ctx, ggml_opt_state * state) {
     ctx->rng = state->rng;
     ctx->period_fresh = true;
     ctx->checkpoint_trusted = true;
-    ctx->checkpoint_ready = true;
+    ctx->checkpoint_ready = !state->initial;
     ctx->restore_pending = false;
     return true;
 }

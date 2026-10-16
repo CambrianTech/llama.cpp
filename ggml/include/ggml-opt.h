@@ -182,6 +182,11 @@ extern "C" {
     // Mutable callback/schedule state must be saved by the caller in the same generation, not inferred from a callback address.
     // Import requires allocated optimizer tensors and no prepared evaluation; it validates all input before changing state.
     // The caller owns file integrity, atomic publication and serialization with compute.
+    // Explicit generation zero: only a fresh, allocated, import-pending optimizer is eligible.
+    // Initializes persistent optimizer state to zero, without a weight/counter/RNG update. Writes
+    // a distinct initial-boundary artifact; never enables evaluation or claims sample consumption.
+    // Caller must publish weights/policy/integrity atomically and restore before first evaluation.
+    GGML_API bool ggml_opt_state_write_initial(ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
     GGML_API bool ggml_opt_state_write(ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
     GGML_API bool ggml_opt_state_read (ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
     // Prepare owns validated host payload without changing the destination. The caller must keep

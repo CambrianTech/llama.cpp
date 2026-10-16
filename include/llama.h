@@ -1750,6 +1750,10 @@ extern "C" {
     // Backend tensor writes/synchronization expose no recoverable status: normal return is their
     // completion contract (CUDA failures abort). This API cannot detect silent backend corruption.
     // Optimizer component only: caller must save adapter weights and verified binding in the same generation.
+    // Explicit zero-step optimizer artifact after prepare_restore; shadow must be detached.
+    // Does not consume experience or enable learning. Caller commits same-generation weights,
+    // policy and integrity, then state_restore releases the initial generation for its first update.
+    LLAMA_API bool llama_opt_state_write_initial(struct llama_context * ctx, FILE * optimizer, const char * binding);
     LLAMA_API bool llama_opt_state_write(struct llama_context * ctx, FILE * optimizer, const char * binding);
     // Fresh-context allocation only, from the caller's retained native experience. The first
     // labelled ubatch supplies graph topology; no token, label or experience is evaluated or

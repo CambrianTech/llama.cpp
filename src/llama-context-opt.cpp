@@ -1074,3 +1074,12 @@ bool llama_context::opt_state_write(FILE * optimizer, const char * binding) {
 bool llama_opt_state_write(llama_context * ctx, FILE * optimizer, const char * binding) {
     return ctx && ctx->opt_state_write(optimizer, binding);
 }
+
+bool llama_context::opt_state_write_initial(FILE * optimizer, const char * binding) {
+    return opt_ctx && opt_shadow && !opt_shadow->restore_quarantined && !loras->count(const_cast<llama_adapter_lora *>(opt_shadow)) &&
+        ggml_opt_state_write_initial(opt_ctx, optimizer, binding);
+}
+
+bool llama_opt_state_write_initial(llama_context * ctx, FILE * optimizer, const char * binding) {
+    return ctx && ctx->opt_state_write_initial(optimizer, binding);
+}
