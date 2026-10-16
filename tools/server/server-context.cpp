@@ -2071,7 +2071,7 @@ private:
                 learn_outcome out;
                 out.deferred = true;
                 out.retry_after_ms = (learn_next_us - t0 + 999) / 1000;
-                out.failure = "learning deferred while another slot is busy; retain the experience for retry";
+                out.failure = "learning deferred while another slot is busy; retain replayable input context and learning inputs for retry";
                 return out;
             }
         }
@@ -5845,8 +5845,9 @@ void server_routes::init_routes() {
     // POST /learn: one reply learned on the slot that served its prompt, between that slot's turns, in
     // this serving context (SERVER_TASK_TYPE_LEARN). Body: id_slot, n_prefix (the served prompt's
     // tokens), reply (text) or reply_tokens, lora_id (a loaded adapter: the shadow), lr.
-    // Duty rest returns a deferred outcome: the caller retains the experience and retries after
-    // retry_after_ms. The slot-release queue cannot wake a cooldown on an already idle slot.
+    // Duty rest returns a deferred outcome: the caller retains replayable input context, reply or
+    // labels, and adapter parameters, then retries after retry_after_ms. A slot's prompt may have
+    // changed by then. The slot-release queue cannot wake a cooldown on an already idle slot.
     this->post_learn = [this](const server_http_req & req) {
         auto res = create_response();
         if (params.train_dir.empty()) {
