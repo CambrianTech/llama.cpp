@@ -1751,6 +1751,14 @@ extern "C" {
     // completion contract (CUDA failures abort). This API cannot detect silent backend corruption.
     // Optimizer component only: caller must save adapter weights and verified binding in the same generation.
     LLAMA_API bool llama_opt_state_write(struct llama_context * ctx, FILE * optimizer, const char * binding);
+    // Fresh-context allocation only, from the caller's retained native experience. The first
+    // labelled ubatch supplies graph topology; no token, label or experience is evaluated or
+    // acknowledged. Uses the existing worst-case memory planning view and allocation budget,
+    // so capacity refusal is possible even when a smaller live sequence would fit. The initialized
+    // shadow must remain attached for graph construction; detach it before state_restore below.
+    // The caller owns serialized context/adapter custody. Successful preparation requires a
+    // validated generation restore before training; this is not a journal commit or adoption.
+    LLAMA_API bool llama_opt_prepare_restore(struct llama_context * ctx, struct llama_batch retained);
     LLAMA_API bool llama_opt_state_restore(struct llama_context * ctx, struct llama_adapter_lora * shadow,
             FILE * weights, FILE * optimizer, const char * binding);
 

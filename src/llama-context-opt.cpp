@@ -350,7 +350,7 @@ bool llama_context::opt_walk::train_chunk(uint32_t pos_ctx, uint32_t n_chunk) {
     return true;
 }
 
-bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch) {
+bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch, bool prepare_restore) {
     const uint32_t n_labels = ubatch.n_labels();
     opt_walk * walk = opt_walk_active;
     const llama_walk_chunk * xc = walk != nullptr ? walk->xc : nullptr;
@@ -384,6 +384,14 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
     }
     ggml_opt_prepare_alloc_slices(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(),
             res->t_loss_slices.data(), res->t_loss_slices.size());
+    if (prepare_restore) {
+        const bool ok = ggml_opt_alloc_for_restore(opt_ctx);
+        ggml_free(ctx_compute_opt);
+        if (!ok) {
+            opt_fail(ggml_opt_refusal(opt_ctx), "fresh restore graph allocation refused; no sample evaluated");
+        }
+        return ok;
+    }
     if (xc == nullptr && opt_learn_labels > 0) {
         // llama_opt_learn: one step per call, at the ubatch that completes its labelled rows
         const int64_t nl = ubatch.n_labels();
@@ -951,6 +959,82 @@ void llama_opt_epoch(
         idata_split,
         callback_train,
         callback_eval);
+}
+
+bool llama_context::opt_prepare_restore(const llama_batch & retained) {
+    opt_alloc_failed.store(false);
+    opt_failure.clear();
+    if (!opt_ctx || !opt_shadow || opt_shadow->restore_quarantined || !loras->count(const_cast<llama_adapter_lora *>(opt_shadow)) ||
+        opt_walk_active || opt_learn_labels != 0 || !retained.token || !retained.label || retained.n_tokens <= 0 ||
+        !model.output || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        opt_fail("restore preparation requires an initialized attached shadow and retained labelled token experience");
+        return false;
+    }
+    llama_batch_allocr retained_batches(model.hparams.n_pos_per_embd());
+    const uint32_t max_seq = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
+    // Retained positions are historical; do not infer new positions or change current cache custody.
+    if (!retained_batches.init(retained, model.vocab, nullptr, model.hparams.n_embd_inp(), max_seq, false) ||
+        retained_batches.get_n_labels() == 0) {
+        opt_fail("restore preparation refused invalid or unlabelled retained experience");
+        return false;
+    }
+    if (memory) {
+        if (const char * why = memory->training_error(retained_batches.get_batch(), cparams.flash_attn)) {
+            opt_fail(why);
+            return false;
+        }
+    }
+    llama_ubatch ubatch{};
+    do {
+        ubatch = retained_batches.split_seq(n_ubatch());
+    } while (ubatch.n_tokens && ubatch.n_labels() == 0);
+    if (!ubatch.n_tokens) {
+        opt_fail("restore preparation could not form a labelled ubatch");
+        return false;
+    }
+    // init_full is the existing read-only graph-planning view. Never call apply, decode, or
+    // graph_reserve here: allocation does not insert cache cells or execute a retained sample.
+    auto planning = memory ? memory->init_full() : llama_memory_context_ptr{};
+    if (planning && llama_memory_status_is_fail(planning->get_status())) {
+        opt_fail("restore memory planning refused");
+        return false;
+    }
+    synchronize();
+    const bool was_training = cparams.training;
+    const bool was_walk = cparams.walk_active;
+    const auto prior_outputs = n_outputs;
+    auto * res = gf_res_prev.get();
+    const auto release_graph = [&]() {
+        cparams.training = was_training;
+        cparams.walk_active = was_walk;
+        n_outputs = prior_outputs;
+        res->reset();
+        ggml_backend_sched_reset(sched.get());
+        sched_need_reserve = true;
+    };
+    bool prepared = false;
+    try {
+        cparams.training = true;
+        cparams.walk_active = false;
+        n_outputs = ubatch.n_tokens;
+        res->reset();
+        ggml_backend_sched_reset(sched.get());
+        auto * graph = model.build_graph(graph_params(res, ubatch, planning.get(), graph_type()));
+        if (graph) {
+            prepared = opt_ubatch(res, graph, ubatch, true);
+        } else {
+            opt_fail("restore preparation could not build retained-experience graph");
+        }
+    } catch (...) {
+        release_graph();
+        throw;
+    }
+    release_graph();
+    return prepared;
+}
+
+bool llama_opt_prepare_restore(llama_context * ctx, llama_batch retained) {
+    return ctx && ctx->opt_prepare_restore(retained);
 }
 
 bool llama_context::opt_state_restore(llama_adapter_lora * shadow,

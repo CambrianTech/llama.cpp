@@ -846,6 +846,42 @@ int main(int argc, char ** argv) {
             rewind(weights); rewind(optimizer);
             GGML_ASSERT(!llama_opt_state_restore(ctx, adapter, weights, optimizer, "fixture-generation"));
             GGML_ASSERT(adapter_params(adapter) == saved && !adapter->restore_quarantined);
+            // A genuinely fresh context must restore without a warmup update or cache insertion.
+            llama_context * fresh = two_seq_ctx();
+            GGML_ASSERT(llama_set_adapters_lora(fresh, &adapter, 1, &scale) == 0);
+            llama_opt_init(fresh, model, lopt);
+            const auto fresh_seq = seq_state(fresh, 0);
+            const auto fresh_neighbour = seq_state(fresh, 1);
+            llama_batch retained = llama_batch_init(WINDOW - r0, 0, 1);
+            common_batch_clear(retained);
+            for (int32_t i = 0; i < WINDOW - r0; ++i) {
+                common_batch_add(retained, tokens[r0 + i], r0 + i, {0}, true);
+                retained.label[i] = labels[i];
+            }
+            GGML_ASSERT(llama_opt_prepare_restore(fresh, retained));
+            GGML_ASSERT(adapter_params(adapter) == saved);
+            GGML_ASSERT(seq_state(fresh, 0) == fresh_seq && seq_state(fresh, 1) == fresh_neighbour);
+            FILE * uninitialized = tmpfile();
+            GGML_ASSERT(uninitialized && !llama_opt_state_write(fresh, uninitialized, "fixture-generation"));
+            fclose(uninitialized);
+            llama_batch_free(retained);
+            GGML_ASSERT(llama_set_adapters_lora(fresh, nullptr, 0, nullptr) == 0);
+            adapter->alora_invocation_tokens = {tokens[0], tokens[1]};
+            rewind(weights); rewind(optimizer);
+            GGML_ASSERT(llama_opt_state_restore(fresh, adapter, weights, optimizer, "fixture-generation"));
+            adapter->alora_invocation_tokens.clear();
+            GGML_ASSERT(llama_set_adapters_lora(fresh, &adapter, 1, &scale) == 0);
+            decode_span(fresh, 0, tokens.data(), 0, r0);
+            GGML_ASSERT(llama_opt_learn(fresh, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
+            const auto cold_next = adapter_params(adapter);
+            for (size_t i = 0; i < saved.size(); ++i) { resumed_step[i] = cold_next[i] - saved[i]; }
+            GGML_ASSERT(same_step(compare("fresh context restored next step without warmup", resumed_step, uninterrupted_step)));
+            GGML_ASSERT(llama_set_adapters_lora(fresh, nullptr, 0, nullptr) == 0);
+            adapter->alora_invocation_tokens = {tokens[0], tokens[1]};
+            rewind(weights); rewind(optimizer);
+            GGML_ASSERT(llama_opt_state_restore(fresh, adapter, weights, optimizer, "fixture-generation"));
+            adapter->alora_invocation_tokens.clear();
+            llama_free(fresh);
             fclose(weights); fclose(optimizer);
             std::remove(checkpoint.c_str());
             printf("  generation restore: prepare refusal unchanged, aLoRA exact, addresses stable, changed weights restored, next step equivalent, quarantine recovered\n");

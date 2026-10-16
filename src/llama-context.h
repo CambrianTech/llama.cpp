@@ -59,6 +59,7 @@ struct llama_context {
     void synchronize();
     bool opt_state_write(FILE * optimizer, const char * binding);
     bool opt_state_restore(llama_adapter_lora * shadow, FILE * weights, FILE * optimizer, const char * binding);
+    bool opt_prepare_restore(const llama_batch & retained);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -255,7 +256,7 @@ private:
     // ubatch whose rows carry labels through ggml_opt instead of graph_compute: the same graph,
     // plus the loss over the labelled rows, the backward and, at a period's end, the optimizer
     // step. A walk driving the decode adds its taps to that graph.
-    bool opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch);
+    bool opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch, bool prepare_restore = false);
     bool opt_fa_back_native() const;
 
     //
