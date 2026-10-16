@@ -925,32 +925,59 @@ static std::pair<int, int> test_checkpoint(
         fclose(failed);
     }
     // The serving owner supplies a dynamic graph; allocation-only must disarm that path too.
-    auto dynamic = helper_get_ctx_data(optim, sched, backend, false);
-    auto dynamic_params = dynamic.opt_params;
-    dynamic_params.ctx_compute = nullptr;
-    dynamic_params.inputs = nullptr;
-    dynamic_params.outputs = nullptr;
-    dynamic.opt_ctx = ggml_opt_init(dynamic_params);
-    ggml_cgraph * dynamic_graph = ggml_new_graph_custom(dynamic.ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
-    ggml_build_forward_expand(dynamic_graph, dynamic.outputs);
-    ggml_opt_prepare_alloc(dynamic.opt_ctx, dynamic.ctx_compute, dynamic_graph, dynamic.inputs, dynamic.outputs);
+    const auto make_dynamic = [&]() {
+        auto data = helper_get_ctx_data(optim, sched, backend, false);
+        auto params = data.opt_params;
+        params.ctx_compute = nullptr;
+        params.inputs = nullptr;
+        params.outputs = nullptr;
+        data.opt_ctx = ggml_opt_init(params);
+        return data;
+    };
+    auto dynamic = make_dynamic();
+    ggml_cgraph * dynamic_graph = nullptr;
+    const auto prepare_dynamic = [&]() {
+        if (!dynamic_graph) {
+            dynamic_graph = ggml_new_graph_custom(dynamic.ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
+        } else {
+            ggml_graph_clear(dynamic_graph);
+        }
+        ggml_build_forward_expand(dynamic_graph, dynamic.outputs);
+        ggml_opt_prepare_alloc(dynamic.opt_ctx, dynamic.ctx_compute, dynamic_graph, dynamic.inputs, dynamic.outputs);
+    };
+    const auto step_dynamic = [&]() {
+        prepare_dynamic();
+        GGML_ASSERT(ggml_opt_alloc(dynamic.opt_ctx, true));
+        const float input = 2.0f;
+        ggml_backend_tensor_set(dynamic.inputs, &input, 0, sizeof(input));
+        ggml_opt_eval(dynamic.opt_ctx, dynamic.result);
+    };
+    step_dynamic();
+    FILE * dynamic_state = tmpfile();
+    GGML_ASSERT(dynamic_state && ggml_opt_state_write(dynamic.opt_ctx, dynamic_state, "dynamic-policy"));
+    float dynamic_saved, dynamic_expected;
+    ggml_backend_tensor_get(dynamic.weights, &dynamic_saved, 0, sizeof(dynamic_saved));
+    step_dynamic();
+    ggml_backend_tensor_get(dynamic.weights, &dynamic_expected, 0, sizeof(dynamic_expected));
+    helper_free_ctx_data(dynamic);
+    dynamic = make_dynamic();
+    dynamic_graph = nullptr;
+    prepare_dynamic();
     ggml_backend_tensor_get(dynamic.weights, &fresh_weight, 0, sizeof(fresh_weight));
     print_ok(__func__, ggml_opt_alloc_for_restore(dynamic.opt_ctx), npass, ntest, "dynamic-allocation-only");
     ggml_backend_tensor_get(dynamic.weights, &actual, 0, sizeof(actual));
     print_ok(__func__, actual == fresh_weight, npass, ntest, "dynamic-allocation-keeps-weights");
     rewind(state);
-    print_ok(__func__, ggml_opt_state_read(dynamic.opt_ctx, state, "test-model/adapter/policy"), npass, ntest, "dynamic-fresh-restore");
-    ggml_backend_tensor_set(dynamic.weights, &saved_weight, 0, sizeof(saved_weight));
-    ggml_graph_clear(dynamic_graph);
-    ggml_build_forward_expand(dynamic_graph, dynamic.outputs);
-    ggml_opt_prepare_alloc(dynamic.opt_ctx, dynamic.ctx_compute, dynamic_graph, dynamic.inputs, dynamic.outputs);
-    GGML_ASSERT(ggml_opt_alloc(dynamic.opt_ctx, true));
-    const float dynamic_input = 2.0f;
-    ggml_backend_tensor_set(dynamic.inputs, &dynamic_input, 0, sizeof(dynamic_input));
-    ggml_opt_eval(dynamic.opt_ctx, dynamic.result);
+    print_ok(__func__, !ggml_opt_state_read(dynamic.opt_ctx, state, "test-model/adapter/policy"), npass, ntest, "static-dynamic-layout-refusal");
+    print_ok(__func__, !ggml_opt_alloc(dynamic.opt_ctx, true), npass, ntest, "failed-import-stays-pending");
+    rewind(dynamic_state);
+    print_ok(__func__, ggml_opt_state_read(dynamic.opt_ctx, dynamic_state, "dynamic-policy"), npass, ntest, "dynamic-fresh-restore");
+    ggml_backend_tensor_set(dynamic.weights, &dynamic_saved, 0, sizeof(dynamic_saved));
+    step_dynamic();
     ggml_backend_tensor_get(dynamic.weights, &actual, 0, sizeof(actual));
-    print_ok(__func__, almost_equal(expected, actual, 1e-7), npass, ntest, "dynamic-restored-next-step");
+    print_ok(__func__, almost_equal(dynamic_expected, actual, 1e-7), npass, ntest, "dynamic-restored-next-step");
     helper_free_ctx_data(dynamic);
+    fclose(dynamic_state);
     fclose(state);
     FILE * corrupt = tmpfile();
     GGML_ASSERT(corrupt);
