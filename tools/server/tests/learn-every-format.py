@@ -9,8 +9,34 @@ U = os.environ.get("LLAMA_SERVER_URL", "http://localhost:58199")
 def raw(path, body):
     req = urllib.request.Request(U + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=300) as r: return r.read().decode()
+if "--shadow-retirement" in sys.argv:
+    with urllib.request.urlopen(U + "/props", timeout=300) as r:
+        props = json.load(r)
+    # No competing lane: the duty gate defers only while another slot is processing.
+    assert props["total_slots"] == 1, "shadow-retirement requires an isolated single-slot server"
 sid = json.loads(raw("/lora-adapters/load", {"name": "shadow-05.gguf"}))["id"]
 learn = {"reply": "Topeka is the capital of Kansas.", "lora_id": sid, "lr": 0.001}
+
+# Isolated adapter lifetime regression, with no live persona or other clients on this server.
+if "--shadow-retirement" in sys.argv:
+    import urllib.error
+    retired = json.loads(raw("/lora-adapters/unload", {"id": sid}))
+    assert retired["success"] and retired["retired"] and retired["id"] == sid, retired
+    sid = json.loads(raw("/lora-adapters/load", {"name": "shadow-05.gguf"}))["id"]
+    learn["lora_id"] = sid
+    turn = {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0, "learn": learn}
+    first = json.loads(raw("/completion", turn))
+    assert first["learn"]["success"], first
+    try:
+        raw("/lora-adapters/unload", {"id": sid})
+        raise AssertionError("optimizer-bound shadow was unloaded")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode()
+        assert error.code == 400 and "bound to the learning optimizer" in detail, (error.code, detail)
+    following = json.loads(raw("/completion", turn))
+    assert following["learn"]["success"], following
+    print(json.dumps({"unbound_retired": retired, "bound_retirement_refused": sid, "next_learn": following["learn"]}))
+    sys.exit(0)
 
 # Isolated template/label regression; never run this shadow-adapter fixture on a persona lane.
 # Add --expect-reasoning-refusal only for a known non-reasoning template; the exact refusal must match.

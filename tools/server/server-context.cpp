@@ -3113,6 +3113,12 @@ private:
                         send_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
+                    if (id == learn_lora_id) {
+                        // Optimizer moments and opt_shadow still reference this adapter's tensors.
+                        send_error(task, "LoRA adapter " + std::to_string(id) +
+                                   " is bound to the learning optimizer; unload requires optimizer teardown", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     llama_adapter_lora * ptr = loras[id].ptr;
                     if (loras[id].scale != 0.0f) {
                         send_error(task, "LoRA adapter " + std::to_string(id) + " is active by default (scale " +
