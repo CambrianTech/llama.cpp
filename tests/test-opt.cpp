@@ -940,11 +940,13 @@ static std::pair<int, int> test_checkpoint(
     auto dynamic = make_dynamic();
     ggml_cgraph * dynamic_graph = nullptr;
     const auto prepare_dynamic = [&]() {
-        if (!dynamic_graph) {
-            dynamic_graph = ggml_new_graph_custom(dynamic.ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
-        } else {
-            ggml_graph_clear(dynamic_graph);
-        }
+        // Dynamic serving owns fresh graph metadata per ubatch. Release the previous graph
+        // before rebuilding; parameters and optimizer state live in their separate owners.
+        ggml_backend_sched_reset(sched);
+        ggml_reset(dynamic.ctx_compute);
+        dynamic.outputs = ggml_scale(dynamic.ctx_compute, ggml_add(dynamic.ctx_compute, dynamic.inputs, dynamic.weights), 1.0f);
+        ggml_set_name(dynamic.outputs, "outputs");
+        dynamic_graph = ggml_new_graph_custom(dynamic.ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
         ggml_build_forward_expand(dynamic_graph, dynamic.outputs);
         ggml_opt_prepare_alloc(dynamic.opt_ctx, dynamic.ctx_compute, dynamic_graph, dynamic.inputs, dynamic.outputs);
     };
