@@ -5175,6 +5175,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
         { "slot_save_size_version",      1 },
+        { "expert_container_custody_version", 1 },
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },

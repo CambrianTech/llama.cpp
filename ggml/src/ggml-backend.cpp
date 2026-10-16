@@ -1610,6 +1610,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 static ggml_moe::DirectReadFetcher moe_direct_fetcher;
 #endif
 static ggml_moe::MmapFaultFetcher  moe_mmap_fetcher;
+static ggml_moe::DirContainerFetcher & moe_container_fetcher() {
+    static ggml_moe::DirContainerFetcher fetcher(ggml_moe::moe_config().container_dir);
+    return fetcher;
+}
 static ggml_moe::ExpertFetcher &   moe_pick_base_fetcher() {
     // Container-serve (#268): when a packed per-layer expert container is configured, read from it.
     // Its records are contiguous + 16KiB-aligned, so this is the honest ~GB/s sequential path — vs
@@ -1617,9 +1621,8 @@ static ggml_moe::ExpertFetcher &   moe_pick_base_fetcher() {
     // (layer, byte_offset) into `src` via DirContainerFetcher::pack_src; the cache passes it opaquely.
     // Constructed once with the configured dir (banks open lazily); a bad dir opens no banks and every
     // fetch fails LOUD (zeroed record -> downstream validation), never a silent wrong-source serve.
-    if (const char * cdir = ggml_moe::moe_config().container_dir) {
-        static ggml_moe::DirContainerFetcher container_fetcher(cdir);
-        return container_fetcher;
+    if (ggml_moe::moe_config().container_dir) {
+        return moe_container_fetcher();
     }
 #ifdef _WIN32
     if (ggml_moe::moe_config().direct_read) { return moe_direct_fetcher; }
@@ -1757,6 +1760,10 @@ static ggml_backend_moe_gather_entry_t moe_gather_entry_fn(ggml_backend_t backen
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    if (ggml_moe::moe_config().container_dir && !moe_container_fetcher().ok()) {
+        GGML_LOG_ERROR("%s: expert container custody unavailable; refusing graph execution\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -2114,7 +2121,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // parses from the tensor name's `blk.N.` (names may be backend-prefixed, so
                         // anchor on the substring, not the string start).
                         static const uint64_t moec_record_bytes =
-                            ggml_moe::dir_container_record_bytes(ggml_moe::moe_config().container_dir);
+                            ggml_moe::moe_config().container_dir ? moe_container_fetcher().record_bytes() : 0;
                         uint32_t moec_layer = 0;
                         const char * moec_blk = std::strstr(tname, "blk.");
                         const bool moec_active = moec_record_bytes > 0 && moec_blk != nullptr &&
