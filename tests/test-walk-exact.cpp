@@ -829,7 +829,7 @@ int main(int argc, char ** argv) {
             GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
             llama_batch retained = llama_batch_init(WINDOW - r0, 0, 1);
             common_batch_clear(retained);
-            for (int32_t i = 0; i < WINDOW - r0; ++i) {
+            for (uint32_t i = 0; i < WINDOW - r0; ++i) {
                 common_batch_add(retained, tokens[r0 + i], r0 + i, {0}, true);
                 retained.label[i] = labels[i];
             }
