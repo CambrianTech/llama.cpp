@@ -964,6 +964,27 @@ public:
                     properties, required, name,
                     schema.contains("additionalProperties") ? schema["additionalProperties"] : json()));
         }
+        // A singleton union wrapper adds no constraint unless a sibling does.
+        if (schema.contains("allOf") && schema["allOf"].is_array() && schema["allOf"].size() == 1) {
+            bool transparent = true;
+            for (const auto & item : schema.items()) {
+                const auto & key = item.key();
+                if (key != "allOf" && key != "description" && key != "title" && key != "$comment" &&
+                    key != "default" && key != "examples" && key != "definitions" && key != "$defs") {
+                    transparent = false;
+                }
+            }
+            const json * component = &schema["allOf"][0];
+            if (component->is_object() && component->contains("$ref")) {
+                auto ref = _refs.find((*component)["$ref"]);
+                if (ref != _refs.end() && component->size() == 1) {
+                    component = &ref->second;
+                }
+            }
+            if (transparent && (component->contains("oneOf") || component->contains("anyOf"))) {
+                return visit(*component, name);
+            }
+        }
         if ((schema_type.is_null() || schema_type == "object" || schema_type == "string") && schema.contains("allOf")) {
             std::unordered_set<std::string> required;
             std::vector<std::pair<std::string, json>> properties;
