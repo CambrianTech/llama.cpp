@@ -1,4 +1,3 @@
-#include "json-schema-to-grammar.h"
 //  Tests chat handling, including grammar genration and parsing for tool calling, for various templates.
 //
 //  Also acts as a CLI to generate a Markdown summary of the formats of Jinja templates,
@@ -15,6 +14,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "log.h"
+#include "json-schema-to-grammar.h"
 
 #include <algorithm>
 #include <chrono>
@@ -2124,23 +2124,24 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         const auto tagged_schema = common_json::parse(tagged_edit_tool.parameters);
         const auto tagged_grammar = json_schema_to_grammar(tagged_schema);
         const std::string edit_args = R"({"edit_mode":{"replace":"new","search":"old","type":"search_replace"},"file_path":"file.rs"})";
-        assert(match_string(edit_args, build_grammar(tagged_grammar).get()));
-        assert(match_string(R"({"edit_mode":{"content":"new","type":"append"},"file_path":"file.rs"})",
+        assert_equals(true, match_string(edit_args, build_grammar(tagged_grammar).get()));
+        assert_equals(true, match_string(R"({"edit_mode":{"content":"new","type":"append"},"file_path":"file.rs"})",
                             build_grammar(tagged_grammar).get()));
-        assert(!match_string(R"({"edit_mode":{},"file_path":"file.rs"})", build_grammar(tagged_grammar).get()));
-        assert(!match_string(R"({"edit_mode":{"type":"unknown"},"file_path":"file.rs"})",
+        assert_equals(false, match_string(R"({"edit_mode":{},"file_path":"file.rs"})", build_grammar(tagged_grammar).get()));
+        assert_equals(false, match_string(R"({"edit_mode":{"type":"unknown"},"file_path":"file.rs"})",
                              build_grammar(tagged_grammar).get()));
         auto closed = tagged_schema;
         closed["properties"]["edit_mode"]["additionalProperties"] = false;
-        assert(!match_string(edit_args, build_grammar(json_schema_to_grammar(closed)).get()));
+        assert_equals(false, match_string(edit_args, build_grammar(json_schema_to_grammar(closed)).get()));
         auto constrained = tagged_schema;
         constrained["properties"]["edit_mode"]["properties"] = {{"guard", {{"const", "kept"}}}};
         constrained["properties"]["edit_mode"]["required"] = {"guard"};
-        assert(!match_string(edit_args, build_grammar(json_schema_to_grammar(constrained)).get()));
+        assert_equals(false, match_string(edit_args, build_grammar(json_schema_to_grammar(constrained)).get()));
         tst.test("<tool_call>\n<function=edit_file>\n"
                  "<parameter=edit_mode>\n{\"replace\":\"new\",\"search\":\"old\",\"type\":\"search_replace\"}\n</parameter>\n"
                  "<parameter=file_path>\nfile.rs\n</parameter>\n</function>\n</tool_call>")
             .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .tools({tagged_edit_tool})
             .expect_tool_calls({{"edit_file", edit_args, {}}})
             .run();
