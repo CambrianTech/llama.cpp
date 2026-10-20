@@ -112,6 +112,11 @@ struct task_params {
     bool return_progress = false;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
+    // index among the request's USER messages where the client's stable prefix ends; the
+    // prefill checkpoints at that message's start unconditionally (-1 = none). A hybrid or SWA
+    // model resumes only from a checkpoint, so the next request sharing that prefix re-reads
+    // nothing before it.
+    int32_t checkpoint_user_message = -1;
 
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half

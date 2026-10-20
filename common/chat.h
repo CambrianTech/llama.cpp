@@ -179,6 +179,19 @@ struct common_chat_msg_spans {
         return false;
     }
 
+    // token position of the k-th user message (0-based), or -1 when there is none
+    int32_t user_message_pos(int32_t k) const {
+        if (k < 0) {
+            return -1;
+        }
+        for (const auto & span : spans) {
+            if (span.role == COMMON_CHAT_ROLE_USER && k-- == 0) {
+                return (int32_t) span.pos;
+            }
+        }
+        return -1;
+    }
+
     int32_t last_user_message_pos() const {
         for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
             if (it->role == COMMON_CHAT_ROLE_USER) {

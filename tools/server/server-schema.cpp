@@ -51,6 +51,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Specify the minimum line indentation for the generated text in number of whitespace characters. Useful for code completion tasks"));
 
+    add((new field_num("checkpoint_user_message", params.checkpoint_user_message))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Index among the request's user messages where the client's stable prefix ends: the prompt is checkpointed at that message's start regardless of the checkpoint step, so a following request sharing the prefix resumes there. -1 disables"));
+
     add((new field_num("n_keep", params.n_keep))
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Specify the number of tokens from the initial prompt to retain when context size is exceeded. Use -1 to retain all tokens from the prompt"));
