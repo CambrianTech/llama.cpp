@@ -350,6 +350,89 @@ kernel void kernel_cross_entropy_loss_back_f32(
 }
 
 
+// the same with one target index per row (I32 labels, -1: the row carries no loss), so no
+// vocabulary-wide one-hot tensor exists beside the logits
+kernel void kernel_cross_entropy_loss_i32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const  char * src0,
+        device const  char * src1,
+        device        char * dst,
+        device const float * weights,
+        threadgroup  float * buf [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint3  tptg[[threads_per_threadgroup]]) {
+    const int32_t row = tgpig.x;
+    const int32_t t   = ((device const int32_t *) src1)[row];
+
+    device const float * s0 = (device const float *) (src0 + row*args.nb01);
+
+    float lmax = -INFINITY;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lmax = MAX(lmax, s0[i]);
+    }
+    const float max_val = ce_reduce_max<float>(lmax, buf, sgitg, tiisg, tptg);
+
+    float lsum = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lsum += exp(s0[i] - max_val);
+    }
+    const float lse = log(ce_reduce_sum(lsum, buf, sgitg, tiisg, tptg));
+
+    if (tpitg.x == 0) {
+        const float w = args.has_weights ? weights[row] : 1.0f;
+        ((device float *) dst)[row] = t >= 0 && w != 0.0f ? -w*(s0[t] - max_val - lse)/(float) args.nr : 0.0f;
+    }
+}
+
+kernel void kernel_cross_entropy_loss_back_i32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const  char * src0,   // grad: one float
+        device const  char * src1,   // logits
+        device const  char * src2,   // labels: one target per row
+        device        char * dst,
+        device const float * weights,
+        threadgroup  float * buf [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint3  tptg[[threads_per_threadgroup]]) {
+    const int32_t row = tgpig.x;
+    const int32_t t   = ((device const int32_t *) src2)[row];
+
+    device const float * s0 = (device const float *) (src1 + row*args.nb01);
+    device       float * d  = (device       float *) (dst  + row*args.nb1);
+
+    const float w = args.has_weights ? weights[row] : 1.0f;
+    if (t < 0 || w == 0.0f) {
+        for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+            d[i] = 0.0f;
+        }
+        return;
+    }
+
+    const float d_by_nr = w*((device const float *) src0)[0]/(float) args.nr;
+
+    float lmax = -INFINITY;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lmax = MAX(lmax, s0[i]);
+    }
+    const float max_val = ce_reduce_max<float>(lmax, buf, sgitg, tiisg, tptg);
+
+    float lsum = 0.0f;
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        lsum += exp(s0[i] - max_val);
+    }
+    const float inv_sum = 1.0f/ce_reduce_sum(lsum, buf, sgitg, tiisg, tptg);
+
+    for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
+        d[i] = (exp(s0[i] - max_val)*inv_sum - (i == t ? 1.0f : 0.0f))*d_by_nr;
+    }
+}
+
 // RMS_NORM_BACK: dx = (dz - x * sum(x*dz)/(sum(x*x) + eps*n)) / sqrt(sum(x*x)/n + eps)
 // (the CPU reference, ggml-cpu ops.cpp rms_norm_back_f32). src0 = dz, src1 = x.
 kernel void kernel_rms_norm_back_f32(
@@ -363,11 +446,9 @@ kernel void kernel_rms_norm_back_f32(
         uint  sgitg[[simdgroup_index_in_threadgroup]],
         uint  tiisg[[thread_index_in_simdgroup]],
         uint3  tptg[[threads_per_threadgroup]]) {
-    const int32_t row = tgpig.x;
-
-    device const float * dz = (device const float *) (src0 + row*args.nb01);
-    device const float * x  = (device const float *) (src1 + row*args.nb11);
-    device       float * dx = (device       float *) (dst  + row*args.nb1);
+    device const float * dz = (device const float *) (src0 + tgpig.x*args.nb01 + tgpig.y*args.nb02 + tgpig.z*args.nb03);
+    device const float * x  = (device const float *) (src1 + tgpig.x*args.nb11 + tgpig.y*args.nb12 + tgpig.z*args.nb13);
+    device       float * dx = (device       float *) (dst  + tgpig.x*args.nb1  + tgpig.y*args.nb2  + tgpig.z*args.nb3);
 
     float lxx = 0.0f;
     float lxdz = 0.0f;
@@ -400,11 +481,9 @@ kernel void kernel_soft_max_back_f32(
         uint  sgitg[[simdgroup_index_in_threadgroup]],
         uint  tiisg[[thread_index_in_simdgroup]],
         uint3  tptg[[threads_per_threadgroup]]) {
-    const int32_t row = tgpig.x;
-
-    device const float * dy = (device const float *) (src0 + row*args.nb01);
-    device const float * y  = (device const float *) (src1 + row*args.nb11);
-    device       float * dx = (device       float *) (dst  + row*args.nb1);
+    device const float * dy = (device const float *) (src0 + tgpig.x*args.nb01 + tgpig.y*args.nb02 + tgpig.z*args.nb03);
+    device const float * y  = (device const float *) (src1 + tgpig.x*args.nb11 + tgpig.y*args.nb12 + tgpig.z*args.nb13);
+    device       float * dx = (device       float *) (dst  + tgpig.x*args.nb1  + tgpig.y*args.nb2  + tgpig.z*args.nb3);
 
     float ldot = 0.0f;
     for (int i = tpitg.x; i < args.ne00; i += tptg.x) {
@@ -454,5 +533,29 @@ kernel void kernel_repeat_back_f32(
             }
         }
         d[k0] = acc;
+    }
+}
+
+// GET_ROWS_BACK: one threadgroup per dst row r; each thread owns columns and sums, in id order,
+// every src0 row whose id is r. No atomics, and the order of the sum is the CPU reference's.
+kernel void kernel_get_rows_back_f32(
+        constant ggml_metal_kargs_get_rows_back & args,
+        device const char    * src0,
+        device const int32_t * ids,
+        device       char    * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3  tptg[[threads_per_threadgroup]]) {
+    const int32_t r = tgpig.x;
+    device float * d = (device float *) (dst + r*args.nb1);
+
+    for (int c = tpitg.x; c < args.ne00; c += tptg.x) {
+        float acc = 0.0f;
+        for (int i = 0; i < args.nr; i++) {
+            if (ids[i] == r) {
+                acc += ((device const float *) (src0 + i*args.nb01))[c];
+            }
+        }
+        d[c] = acc;
     }
 }

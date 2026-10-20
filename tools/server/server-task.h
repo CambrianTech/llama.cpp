@@ -3,14 +3,45 @@
 #include "common.h"
 #include "llama.h"
 
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <atomic>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
+
+// One immutable operation identity with cheap counters. The route holds at most
+// one snapshot per configured slot; task ownership keeps an in-flight one alive.
+struct server_restore_progress {
+    enum phase_t { queued, state, sidecar, completed, failed, cancelled };
+    const std::string operation_id;
+    const int slot;
+    std::atomic<phase_t> phase{queued};
+    std::atomic<uint64_t> state_bytes{0}, state_total{0}, sidecar_bytes{0}, sidecar_total{0}, checkpoints{0};
+    std::atomic<bool> cancel_requested{false};
+
+    server_restore_progress(std::string id, int slot) : operation_id(std::move(id)), slot(slot) {}
+    bool terminal() const { return phase.load(std::memory_order_relaxed) >= completed; }
+    static bool on_state_io(uint64_t done, uint64_t total, void * data) {
+        auto & p = *static_cast<server_restore_progress *>(data);
+        p.state_total.store(total, std::memory_order_relaxed);
+        p.state_bytes.store(done, std::memory_order_relaxed);
+        return !p.cancel_requested.load(std::memory_order_relaxed);
+    }
+    json snapshot() const {
+        return {{"operation_id", operation_id}, {"id_slot", slot}, {"action", "restore"},
+                {"phase", int(phase.load(std::memory_order_relaxed))},
+                {"state_bytes", state_bytes.load(std::memory_order_relaxed)},
+                {"state_total", state_total.load(std::memory_order_relaxed)},
+                {"sidecar_bytes", sidecar_bytes.load(std::memory_order_relaxed)},
+                {"sidecar_total", sidecar_total.load(std::memory_order_relaxed)},
+                {"checkpoints", checkpoints.load(std::memory_order_relaxed)}};
+    }
+};
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
@@ -29,6 +60,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,
     SERVER_TASK_TYPE_UNLOAD_LORA,
+    SERVER_TASK_TYPE_LEARN,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -49,6 +81,29 @@ enum stop_type {
     STOP_TYPE_LIMIT,
 };
 
+// One reply learned on the slot that served its prompt, in this serving context (llama_opt_learn):
+// no second context, her prompt never decoded again. Asked by POST /learn, or carried by a
+// completion request (task_params::learn), which learns on its own slot before releasing it.
+struct learn_request {
+    int32_t                  id_slot  = -1;
+    int32_t                  n_prefix = 0;      // the served prompt's tokens, before the reply
+    std::vector<llama_token> reply;             // what she should have said (her reply, or the reviewed correction)
+    std::vector<llama_token> prompt;            // the served prompt, when known: her slot must hold exactly it
+    int32_t                  lora_id  = -1;     // the trainable adapter (the shadow), loaded dormant
+    float                    lr       = 1e-4f;
+};
+
+struct learn_outcome {
+    bool        ok       = false;
+    bool        deferred = false;
+    int64_t     retry_after_ms = 0;
+    std::string failure;
+    double      loss     = 0.0;
+    int32_t     n_labels = 0;
+    double      t_ms     = 0.0;
+    json to_json() const;
+};
+
 struct task_params {
     bool stream          = false;
     bool include_usage   = false;
@@ -57,6 +112,11 @@ struct task_params {
     bool return_progress = false;
 
     int32_t sse_ping_interval = 30; // seconds between SSE comment pings while the stream stays silent, -1 disables
+    // index among the request's USER messages where the client's stable prefix ends; the
+    // prefill checkpoints at that message's start unconditionally (-1 = none). A hybrid or SWA
+    // model resumes only from a checkpoint, so the next request sharing that prefix re-reads
+    // nothing before it.
+    int32_t checkpoint_user_message = -1;
 
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
@@ -101,6 +161,10 @@ struct task_params {
 
     json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
     json to_json(bool only_metrics = false) const;
+
+    // learn a reply on this request's slot when it finishes, before the slot is released (no other
+    // request can take the slot in between): POST /learn's work, atomic with the turn
+    std::optional<learn_request> learn;
 };
 
 // struct for tracking the state of a task (e.g., for streaming)
@@ -168,6 +232,10 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        bool size_only = false;
+        bool has_byte_ceiling = false;
+        uint64_t byte_ceiling = 0;
+        std::shared_ptr<server_restore_progress> progress;
     };
     slot_action slot_action;
 
@@ -184,6 +252,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_UNLOAD_LORA: the adapter id to retire
     int32_t unload_lora = -1;
+
+    // used by SERVER_TASK_TYPE_LEARN
+    learn_request learn;
 
     server_task() = default;
 
@@ -328,6 +399,8 @@ struct completion_token_output {
 };
 
 struct server_task_result_cmpl_final : server_task_result {
+    // the outcome of the request's learn (task_params::learn), run before its slot was released
+    std::optional<learn_outcome> learned;
     std::string content;
     llama_tokens tokens;
 
@@ -531,6 +604,7 @@ struct server_task_result_slots : server_task_result {
 struct server_task_result_slot_save_load : server_task_result {
     std::string filename;
     bool is_save; // true = save, false = load
+    bool size_only = false;
 
     size_t n_tokens;
     size_t n_bytes;
@@ -580,6 +654,11 @@ struct server_task_result_lora_change : server_task_result {
     std::string path;
     bool        loaded  = true;
     virtual json to_json() override;
+};
+
+struct server_task_result_learn : server_task_result {
+    learn_outcome outcome;
+    virtual json to_json() override { return outcome.to_json(); }
 };
 
 struct server_prompt {

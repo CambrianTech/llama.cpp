@@ -283,3 +283,10 @@ const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn()
 const llama_memory_recurrent_context * llama_memory_hybrid_iswa_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
 }
+
+const char * llama_memory_hybrid_iswa::training_error(const llama_batch & batch, bool flash_attn) const {
+    if (const char * why = mem_attn->training_error(batch, flash_attn)) {
+        return why;
+    }
+    return mem_recr->training_error(batch, flash_attn);
+}

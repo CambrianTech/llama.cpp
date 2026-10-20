@@ -10,6 +10,7 @@
 #include "ggml-backend.h"
 
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef  __cplusplus
 extern "C" {
@@ -32,6 +33,10 @@ extern "C" {
         GGML_OPT_LOSS_TYPE_SUM,
         GGML_OPT_LOSS_TYPE_CROSS_ENTROPY,
         GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR,
+        // GGML_OPT_LOSS_TYPE_CROSS_ENTROPY with one I32 target per output row (-1: no loss) in place of a one-hot
+        // row as wide as the outputs: what a language model's training step needs (its outputs are
+        // vocabulary-wide logits)
+        GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS,
     };
 
     // ====== Dataset ======
@@ -154,7 +159,13 @@ extern "C" {
     // if not using static graphs these pointers become invalid with the next call to ggml_opt_alloc
     GGML_API struct ggml_tensor * ggml_opt_inputs(  ggml_opt_context_t opt_ctx); // forward graph input tensor
     GGML_API struct ggml_tensor * ggml_opt_outputs( ggml_opt_context_t opt_ctx); // forward graph output tensor
-    GGML_API struct ggml_tensor * ggml_opt_labels(  ggml_opt_context_t opt_ctx); // labels to compare outputs against
+    GGML_API struct ggml_tensor * ggml_opt_labels(  ggml_opt_context_t opt_ctx);
+    // the per-row weights of a weighted cross-entropy step (F32, one per label), or NULL when the
+    // graph prepared last is unweighted (ggml_opt_set_next_label_weights)
+    GGML_API struct ggml_tensor * ggml_opt_label_weights(ggml_opt_context_t opt_ctx);
+    // whether the next graph's cross-entropy weighs each row (by ggml_opt_label_weights); an
+    // unweighted step keeps the unweighted loss, whose kernels every backend has
+    GGML_API void ggml_opt_set_next_label_weights(ggml_opt_context_t opt_ctx, bool weighted); // labels to compare outputs against
     GGML_API struct ggml_tensor * ggml_opt_loss(    ggml_opt_context_t opt_ctx); // scalar tensor that contains the loss
     GGML_API struct ggml_tensor * ggml_opt_pred(    ggml_opt_context_t opt_ctx); // predictions made by outputs
     GGML_API struct ggml_tensor * ggml_opt_ncorrect(ggml_opt_context_t opt_ctx); // number of matching predictions between outputs and labels
@@ -165,6 +176,37 @@ extern "C" {
     GGML_API enum ggml_opt_optimizer_type ggml_opt_context_optimizer_type(ggml_opt_context_t); //TODO consistent naming scheme
 
     GGML_API const char * ggml_opt_optimizer_name(enum ggml_opt_optimizer_type);
+
+    // Checkpoint optimizer state at a successful update boundary. Parameters are saved separately.
+    // binding identifies the caller's model, adapter topology and optimizer policy; it must match exactly.
+    // Mutable callback/schedule state must be saved by the caller in the same generation, not inferred from a callback address.
+    // Import requires allocated optimizer tensors and no prepared evaluation; it validates all input before changing state.
+    // The caller owns file integrity, atomic publication and serialization with compute.
+    // Explicit generation zero: only a fresh, allocated, import-pending optimizer is eligible.
+    // Initializes persistent optimizer state to zero, without a weight/counter/RNG update. Writes
+    // a distinct initial-boundary artifact; never enables evaluation or claims sample consumption.
+    // Caller must publish weights/policy/integrity atomically and restore before first evaluation.
+    GGML_API bool ggml_opt_state_write_initial(ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
+    GGML_API bool ggml_opt_state_write(ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
+    GGML_API bool ggml_opt_state_read (ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
+    // Prepare owns validated host payload without changing the destination. The caller must keep
+    // the context alive and serialize prepare/apply with all evaluation and allocation operations.
+    struct ggml_opt_state;
+    // Allocate a genuine supplied graph only for importing a fresh optimizer generation. Executes
+    // no graph and consumes no sample; refuses used, pending, partial or failed contexts. The
+    // caller must restore before evaluation. Existing lifetimes are unchanged: retain parameter
+    // and static graph storage for the optimizer lifetime; dynamic graph storage follows the
+    // existing prepare/allocator custody contract. This operation does not release that storage.
+    // A failed allocation attempt is teardown-only: evaluation, retry and import are refused.
+    // An eligibility refusal leaves the existing optimizer untouched.
+    GGML_API bool ggml_opt_alloc_for_restore(ggml_opt_context_t opt_ctx);
+    // Side-effect-free eligibility, owned by the same allocator. Check before replacing caller
+    // graph/scheduler state; allocation checks again under the caller's serialized custody.
+    GGML_API bool ggml_opt_can_prepare_restore(ggml_opt_context_t opt_ctx);
+    GGML_API struct ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t opt_ctx, FILE * file, const char * binding);
+    GGML_API bool ggml_opt_state_apply(ggml_opt_context_t opt_ctx, struct ggml_opt_state * state);
+    GGML_API void ggml_opt_state_free(struct ggml_opt_state * state);
+
 
     // ====== Optimization Result ======
 
@@ -187,6 +229,48 @@ extern "C" {
         struct ggml_cgraph  * gf,
         struct ggml_tensor  * inputs,
         struct ggml_tensor  * outputs);
+
+    // The same, for an `outputs` that is a row-wise function of `hidden` (a language model's
+    // head: logits = W x, with its adapters and scales; MUL_MAT, MUL, ADD and SCALE nodes): that
+    // head is taken out of gf and computed for `rows` rows of hidden at a time, and the loss is
+    // the mean over every row (GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS only). Under recompute
+    // (checkpoint_prefix) only one slice's outputs and their gradient exist at a time, never the
+    // [n_outputs x rows] tensor and its gradient. A head with any other node is not sliced.
+    // Returns the number of slices (1: not sliced; accuracy is reported only then).
+    GGML_API int ggml_opt_prepare_alloc_head(
+        ggml_opt_context_t    opt_ctx,
+        struct ggml_context * ctx_compute,
+        struct ggml_cgraph  * gf,
+        struct ggml_tensor  * inputs,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * outputs,
+        int64_t               rows);
+
+    // Project the existing row-wise head before consumers such as sampling are built.
+    // Row indices address hidden's token rows. A null public_rows requests no public logits.
+    // Returns zero without changing gf when the head cannot be replayed.
+    GGML_API int ggml_opt_project_head(
+        struct ggml_context * ctx_compute,
+        struct ggml_cgraph  * gf,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * outputs,
+        struct ggml_tensor  * shadow_rows,
+        struct ggml_tensor  * public_rows,
+        struct ggml_tensor  * label_rows,
+        struct ggml_tensor  * public_shadow_rows,
+        struct ggml_tensor ** slice_shadow_rows,
+        int64_t               rows,
+        struct ggml_tensor ** public_outputs,
+        struct ggml_tensor ** slices,
+        size_t                slices_capacity);
+
+    GGML_API void ggml_opt_prepare_alloc_slices(
+        ggml_opt_context_t    opt_ctx,
+        struct ggml_context * ctx_compute,
+        struct ggml_cgraph  * gf,
+        struct ggml_tensor  * inputs,
+        struct ggml_tensor ** slices,
+        size_t                n_slices);
 
     // allocate the next graph for evaluation, either forward or forward + backward
     // must be called exactly once prior to calling ggml_opt_eval

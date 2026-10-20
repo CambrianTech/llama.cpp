@@ -5351,7 +5351,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
+            return op->src[2] == nullptr; // per-row weights: not on CUDA yet, they run on the CPU
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            return op->src[3] == nullptr;
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_FILL:

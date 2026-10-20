@@ -14,6 +14,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "log.h"
+#include "json-schema-to-grammar.h"
 
 #include <algorithm>
 #include <chrono>
@@ -2115,6 +2116,35 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     {
         // Qwen3.5 (basically same as Nemotron, but keeping separate tests just in case)
         auto tst = peg_tester("models/templates/Qwen3.5-4B.jinja", detailed_debug);
+
+        // Captured tagged edit schema: allOf -> local reference -> oneOf.
+        const common_chat_tool tagged_edit_tool{
+            "edit_file", "Edit an existing file", R"SCHEMA({"definitions":{"EditMode":{"description":"How to edit a file (four modes).","oneOf":[{"description":"Replace content between line numbers (1-indexed, inclusive).","properties":{"end_line":{"format":"uint32","minimum":0.0,"type":"integer"},"new_content":{"type":"string"},"start_line":{"format":"uint32","minimum":1.0,"type":"integer"},"type":{"enum":["line_range"],"type":"string"}},"required":["end_line","new_content","start_line","type"],"type":"object"},{"description":"Find text and replace it.","properties":{"all":{"default":false,"type":"boolean"},"replace":{"type":"string"},"search":{"type":"string"},"type":{"enum":["search_replace"],"type":"string"}},"required":["replace","search","type"],"type":"object"},{"description":"Insert content at a specific line (pushes existing lines down).","properties":{"content":{"type":"string"},"line":{"format":"uint32","minimum":1.0,"type":"integer"},"type":{"enum":["insert_at"],"type":"string"}},"required":["content","line","type"],"type":"object"},{"description":"Append content to end of file.","properties":{"content":{"type":"string"},"type":{"enum":["append"],"type":"string"}},"required":["content","type"],"type":"object"}]}},"properties":{"description":{"description":"Optional note recorded in change history.","type":["string","null"]},"edit_mode":{"allOf":[{"$ref":"#/definitions/EditMode"}],"description":"Operation to apply."},"file_path":{"description":"Path relative to the workspace root.","type":"string"}},"required":["edit_mode","file_path"],"type":"object"})SCHEMA"
+        };
+        const auto tagged_schema = common_json::parse(tagged_edit_tool.parameters);
+        const auto tagged_grammar = json_schema_to_grammar(tagged_schema);
+        const std::string edit_args = R"({"edit_mode":{"replace":"new","search":"old","type":"search_replace"},"file_path":"file.rs"})";
+        assert_equals(true, match_string(edit_args, build_grammar(tagged_grammar).get()));
+        assert_equals(true, match_string(R"({"edit_mode":{"content":"new","type":"append"},"file_path":"file.rs"})",
+                            build_grammar(tagged_grammar).get()));
+        assert_equals(false, match_string(R"({"edit_mode":{},"file_path":"file.rs"})", build_grammar(tagged_grammar).get()));
+        assert_equals(false, match_string(R"({"edit_mode":{"type":"unknown"},"file_path":"file.rs"})",
+                             build_grammar(tagged_grammar).get()));
+        auto closed = tagged_schema;
+        closed["properties"]["edit_mode"]["additionalProperties"] = false;
+        assert_equals(false, match_string(edit_args, build_grammar(json_schema_to_grammar(closed)).get()));
+        auto constrained = tagged_schema;
+        constrained["properties"]["edit_mode"]["properties"] = {{"guard", {{"const", "kept"}}}};
+        constrained["properties"]["edit_mode"]["required"] = {"guard"};
+        assert_equals(false, match_string(edit_args, build_grammar(json_schema_to_grammar(constrained)).get()));
+        tst.test("<tool_call>\n<function=edit_file>\n"
+                 "<parameter=edit_mode>\n{\"replace\":\"new\",\"search\":\"old\",\"type\":\"search_replace\"}\n</parameter>\n"
+                 "<parameter=file_path>\nfile.rs\n</parameter>\n</function>\n</tool_call>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({tagged_edit_tool})
+            .expect_tool_calls({{"edit_file", edit_args, {}}})
+            .run();
 
         tst.test("I'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
@@ -6997,6 +7027,81 @@ static void test_deepseek_v4_tool_result_ordering() {
     }
 }
 
+static void test_learning_closed_transcript() {
+    server_chat_params opt{};
+    opt.tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+    opt.use_jinja = true;
+    opt.prefill_assistant = true;
+    opt.enable_thinking = true;
+    json body = {{"messages", json::array({json{{"role", "user"}, {"content", "inspect the file"}}})},
+                 {"chat_template_kwargs", {{"enable_thinking", false}}}};
+    std::vector<raw_buffer> files;
+    const std::string prefix = oaicompat_chat_params_parse(body, opt, files).at("prompt");
+    const json replies = json::parse(R"([
+        {"role":"assistant","content":"done"},
+        {"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"file.rs\"}"}},{"id":"call-2","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"caller.rs\"}"}}]}
+    ])");
+    for (const auto & reply : replies) {
+        json closed = body;
+        closed["messages"].push_back(reply);
+        const std::string full = oaicompat_chat_params_parse(closed, opt, files,
+            server_chat_render::closed_transcript).at("prompt");
+        if (full.compare(0, prefix.size(), prefix) != 0) {
+            throw std::runtime_error("closed reply lost the served request template prefix");
+        }
+        const auto suffix = full.substr(prefix.size());
+        assert_contains(suffix, "<|im_end|>");
+        if (reply.contains("tool_calls")) {
+            assert_contains(suffix, "read_file");
+            assert_contains(suffix, "file.rs");
+            assert_contains(suffix, "caller.rs");
+        } else {
+            assert_contains(suffix, "done");
+        }
+    }
+    json thinking = body;
+    thinking["chat_template_kwargs"]["enable_thinking"] = true;
+    const std::string thinking_prefix = oaicompat_chat_params_parse(thinking, opt, files).at("prompt");
+    thinking["messages"].push_back({{"role", "assistant"}, {"content", ""}, {"reasoning_content", "inspect before changing"}});
+    const std::string reasoning = oaicompat_chat_params_parse(thinking, opt, files,
+        server_chat_render::closed_transcript).at("prompt");
+    if (reasoning.compare(0, thinking_prefix.size(), thinking_prefix) != 0) {
+        throw std::runtime_error("reasoning reply lost its served prefix");
+    }
+    assert_contains(reasoning.substr(thinking_prefix.size()), "inspect before changing");
+    assert_contains(reasoning.substr(thinking_prefix.size()), "</think>");
+    assert_contains(reasoning.substr(thinking_prefix.size()), "<|im_end|>");
+    auto ignores_fields = [](const json &, const json &, bool) { return std::string("only an ending marker"); };
+    std::string refusal;
+    if (train_reply_rendered(thinking.at("messages"), json(), ignores_fields, refusal)
+            || refusal.find("reasoning_content") == std::string::npos) {
+        throw std::runtime_error("template ignoring reasoning was accepted");
+    }
+    json ignored_calls = body.at("messages");
+    ignored_calls.push_back(replies.at(1));
+    if (train_reply_rendered(ignored_calls, json(), ignores_fields, refusal)
+            || refusal.find("tool_calls") == std::string::npos) {
+        throw std::runtime_error("template ignoring tool calls was accepted");
+    }
+    ignored_calls.back() = {{"role", "assistant"}, {"content", ""}};
+    if (train_reply_rendered(ignored_calls, json(), ignores_fields, refusal)) {
+        throw std::runtime_error("empty reply was accepted");
+    }
+    // Refuse a rewritten prefix before tokenization rather than guessing assistant labels.
+    std::vector<llama_token> tokens;
+    std::vector<uint8_t> loss;
+    std::string why;
+    auto changed = [](const json &, const json &, bool generation) {
+        return generation ? std::string("served prefix") : std::string("different prefix reply");
+    };
+    json turns = body.at("messages");
+    turns.push_back({{"role", "assistant"}, {"content", "reply"}});
+    if (train_render(turns, {false, true}, json(), changed, nullptr, "test", tokens, loss, why)
+            || why.find("prefix-stably") == std::string::npos) {
+        throw std::runtime_error("rewritten template prefix was not refused");
+    }
+}
+
 static void test_reasoning_budget_tokens_per_request() {
     LOG_DBG("%s\n", __func__);
     // Use Qwen3 template which has <think>...</think> reasoning markers.
@@ -7416,6 +7521,7 @@ int main(int argc, char ** argv) {
         test_deepseek_v4_tool_result_ordering();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
+        test_learning_closed_transcript();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);

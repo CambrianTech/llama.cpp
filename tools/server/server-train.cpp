@@ -65,6 +65,40 @@ std::string confine_out(const std::string & dir, const std::string & name) {
     return d + name;
 }
 
+// Do not silently learn only an ending marker when the reply is empty or this
+// template ignores a structured field. This is a refusal check, not a parser of
+// template syntax or proof that every payload element survives a custom template.
+bool train_reply_rendered(const json & messages, const json & tools,
+                          const server_trainer::render_fn & render, std::string & why) {
+    const json & last = messages.back();
+    const bool text = last.contains("content") && last.at("content").is_string()
+        && !last.at("content").get<std::string>().empty();
+    const bool calls = last.contains("tool_calls") && last.at("tool_calls").is_array()
+        && !last.at("tool_calls").empty();
+    const bool reasoning = last.contains("reasoning_content") && last.at("reasoning_content").is_string()
+        && !last.at("reasoning_content").get<std::string>().empty();
+    if (!text && !calls && !reasoning) {
+        why = "the reply to learn has no content, reasoning or tool calls";
+        return false;
+    }
+    const std::string closed = render(messages, tools, false);
+    for (const char * field : {"tool_calls", "reasoning_content"}) {
+        if (!last.contains(field) || last.at(field).empty() || last.at(field).is_null()) {
+            continue;
+        }
+        json without = messages;
+        without.back().erase(field);
+        if (!without.back().contains("content")) {
+            without.back()["content"] = "";
+        }
+        if (render(without, tools, false) == closed) {
+            why = std::string("the served template does not render the reply's ") + field;
+            return false;
+        }
+    }
+    return true;
+}
+
 // "examples" -> one tokenized sequence per example with its loss mask. Each example is rendered
 // through the model's chat template as a closed conversation; each assistant turn's span is
 // located by rendering the conversation up to it WITH the generation prompt (where the turn's
@@ -74,7 +108,7 @@ std::string confine_out(const std::string & dir, const std::string & name) {
 //
 // Returns false with `why` when the example is malformed (the run is refused); true otherwise,
 // with `toks`/`loss` filled.
-static bool render_example(const json & messages, const std::vector<bool> & trained, const json & tools,
+bool train_render(const json & messages, const std::vector<bool> & trained, const json & tools,
                            const server_trainer::render_fn & render, const llama_vocab * vocab, const std::string & at,
                            std::vector<llama_token> & toks, std::vector<uint8_t> & loss, std::string & why) {
     auto head = [&](size_t n) { // the first n messages
@@ -267,7 +301,7 @@ static example_fit fit_example(const json & ex, const std::string & at, const se
     }
     toks.clear();
     loss.clear();
-    if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
+    if (!train_render(messages, trained, tools, render, vocab, at, toks, loss, why)) {
         return example_fit::invalid;
     }
     full = (int64_t) toks.size();
@@ -284,7 +318,7 @@ static example_fit fit_example(const json & ex, const std::string & at, const se
         if (dropped) {
             std::vector<llama_token> t;
             std::vector<uint8_t>     l;
-            if (!render_example(m, tr, tools, render, vocab, at, t, l, why)) {
+            if (!train_render(m, tr, tools, render, vocab, at, t, l, why)) {
                 return example_fit::invalid;
             }
             *min = (int64_t) t.size();
@@ -308,7 +342,7 @@ static example_fit fit_example(const json & ex, const std::string & at, const se
             return example_fit::skipped; // the head plus her last exchange alone overflow the window
         }
         cut = true;
-        if (!render_example(messages, trained, tools, render, vocab, at, toks, loss, why)) {
+        if (!train_render(messages, trained, tools, render, vocab, at, toks, loss, why)) {
             return example_fit::invalid;
         }
     }
@@ -397,6 +431,32 @@ json server_trainer::measure(const json & body) const {
     return json::object({{"ok", true}, {"window", window}, {"examples", rows}});
 }
 
+// REPACKED WEIGHTS CANNOT BE TRAINED THROUGH (Cormac on the /train plan; card 5b497852): the
+// backward reads quantized blocks in the standard layout, and a weight in an extra buffer type
+// (CPU_REPACK) is not in it, and its buffer cannot even be read back (get_tensor/cpy_tensor NULL,
+// ggml-cpu/repack.cpp). Measured 2026-10-15: on x86 a learn fails ("no backend can run" an
+// OUT_PROD on blk.23.ffn_down.weight); on a Metal host at -ngl 0 the scheduler copies the weight to
+// Metal and crashes in ggml_backend_tensor_copy. With --no-repack the same learn succeeds. Extra
+// buffer types only apply to weights kept on the CPU, so training is allowed when they are
+// disabled, or when every layer is offloaded and no tensor override pins a weight elsewhere.
+std::string train_repack_refusal(const llama_model * model, const common_params & params) {
+    const int32_t n_layer = llama_model_n_layer(model);
+    const int32_t ngl     = params.n_gpu_layers;
+    const bool    all_gpu = ngl <= -2 || ngl > n_layer;
+    // the list carries a {nullptr, nullptr} terminator when parsed from args: count real entries
+    bool override = false;
+    for (const auto & o : params.tensor_buft_overrides) {
+        override = override || o.pattern != nullptr;
+    }
+    if (params.no_extra_bufts || (all_gpu && !override)) {
+        return "";
+    }
+    return "this server may hold base weights in a repacked CPU buffer (n_gpu_layers " + std::to_string(ngl) +
+           " of " + std::to_string(n_layer) + " layers" + (override ? ", tensor overrides set" : "") +
+           "), and training's backward needs the standard layout. "
+           "Serve with every layer offloaded (-ngl all) or with --no-repack.";
+}
+
 json server_trainer::start(const json & body_in) {
     json body = body_in;
     examples_data prepared;
@@ -466,27 +526,8 @@ json server_trainer::start(const json & body_in) {
     if (confine_out(params_base.train_dir, body.at("out").get<std::string>()).empty()) {
         return json::object({{"ok", false}, {"error", "\"out\" must be a bare file name ending in .gguf (no directories, no \"..\"); it is written inside the server's --train-dir"}});
     }
-    // REPACKED WEIGHTS GIVE WRONG GRADIENTS, SILENTLY (Cormac on the /train plan): the backward
-    // reads quantized blocks in the standard layout, and a weight in an extra buffer type
-    // (CPU_REPACK) is not in it — no crash, garbage gradients. Extra buffer types only apply to
-    // weights kept on the CPU, so training is allowed when they are disabled, or when every layer
-    // is offloaded and no tensor override pins a weight elsewhere; otherwise refuse and say so.
-    {
-        const int32_t n_layer  = llama_model_n_layer(model);
-        const int32_t ngl      = params_base.n_gpu_layers;
-        const bool    all_gpu  = ngl <= -2 || ngl > n_layer;
-        // the list carries a {nullptr, nullptr} terminator when parsed from args: count real entries
-        bool override = false;
-        for (const auto & o : params_base.tensor_buft_overrides) {
-            override = override || o.pattern != nullptr;
-        }
-        if (!params_base.no_extra_bufts && (!all_gpu || override)) {
-            return json::object({{"ok", false}, {"error",
-                "refusing to train: this server may hold base weights in a repacked CPU buffer (n_gpu_layers " +
-                std::to_string(ngl) + " of " + std::to_string(n_layer) + " layers" + (override ? ", tensor overrides set" : "") +
-                "), and the backward reads the standard layout, so gradients would be silently wrong. "
-                "Serve with every layer offloaded (-ngl all) or with --no-repack."}});
-        }
+    if (const std::string why = train_repack_refusal(model, params_base); !why.empty()) {
+        return json::object({{"ok", false}, {"error", "refusing to train: " + why}});
     }
     if (body.contains("parse_special") && !body.at("parse_special").is_boolean()) {
         return json::object({{"ok", false}, {"error", "\"parse_special\" must be true or false"}});
@@ -907,10 +948,8 @@ void server_trainer::run(json req, examples_data ex) {
     cparams.n_ctx           = window;
     cparams.n_batch         = chunk;
     cparams.n_ubatch        = chunk;
-    // two sequences: 0 is the walk; 1 is the scratch a recurrent state is snapshotted into
-    // around each training chunk (llama_context::opt_epoch_iter). Unified, so the attention
-    // cache stays one stream of the window, not one per sequence.
-    cparams.n_seq_max       = 2;
+    // one sequence, the walk (it checkpoints a recurrent state through the sequence-state API)
+    cparams.n_seq_max       = 1;
     cparams.kv_unified      = true;
     // Flash attention ON for the context: the walk's context decodes use it, and the cache then
     // stores V un-transposed, which a quantized V cache requires. The training graphs build

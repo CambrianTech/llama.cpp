@@ -15,8 +15,84 @@
 // math both ends must agree on. Keep the two reconciled; this is the seam.
 
 #include <cstdint>
+#include <filesystem>
+#include <string>
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace ggml_moe {
+
+// Shared with the model artifact owner's fs2 placement lock. Readers retain
+// this across manifest interpretation and every lazy bank open; packers own it
+// exclusively before their first write. Never unlink the lock inode.
+class ContainerLease {
+#if defined(_WIN32)
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int handle_ = -1;
+#endif
+    bool ready_ = false;
+    std::string root_;
+public:
+    ContainerLease(const ContainerLease &) = delete;
+    ContainerLease & operator=(const ContainerLease &) = delete;
+    explicit ContainerLease(const char * directory, bool writer = false) {
+        ready_ = acquire(directory, writer);
+        if (!ready_) { release(); }
+    }
+    ~ContainerLease() { release(); }
+    bool ok() const { return ready_; }
+    const std::string & root() const { return root_; }
+private:
+    bool acquire(const char * directory, bool writer) {
+        if (!directory) { return false; }
+        namespace fs = std::filesystem;
+        std::error_code error;
+        const auto root = fs::canonical(fs::u8path(directory), error);
+        if (error || !fs::is_directory(root, error) || error) { return false; }
+        root_ = root.u8string();
+        auto lock = root;
+        lock += ".container-placement.lock";
+#if defined(_WIN32)
+        handle_ = CreateFileW(lock.c_str(), GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) { return false; }
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(handle_, &info) ||
+            (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))) { return false; }
+        OVERLAPPED overlap{};
+        if (!LockFileEx(handle_, LOCKFILE_FAIL_IMMEDIATELY | (writer ? LOCKFILE_EXCLUSIVE_LOCK : 0),
+                        0, MAXDWORD, MAXDWORD, &overlap)) { return false; }
+#else
+        handle_ = ::open(lock.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+        struct stat info{};
+        if (handle_ < 0 || ::fstat(handle_, &info) != 0 || !S_ISREG(info.st_mode) ||
+            ::flock(handle_, (writer ? LOCK_EX : LOCK_SH) | LOCK_NB) != 0) { return false; }
+#endif
+        auto receipt = root;
+        receipt += ".container-placement.json";
+        const auto status = fs::symlink_status(receipt, error);
+        if (error && error != std::errc::no_such_file_or_directory) { return false; }
+        // Copying, Frozen, corrupt and unknown receipts all refuse. Promotion
+        // needs its own supported transition, not a raw-path bypass.
+        if (fs::exists(status)) { return false; }
+        return true;
+    }
+    void release() {
+#if defined(_WIN32)
+        if (handle_ != INVALID_HANDLE_VALUE) { CloseHandle(handle_); handle_ = INVALID_HANDLE_VALUE; }
+#else
+        if (handle_ >= 0) { ::close(handle_); handle_ = -1; }
+#endif
+    }
+};
 
 // "MOEC" (little-endian): 'M'|'O'<<8|'E'<<16|'C'<<24
 static const uint32_t MOEC_MAGIC   = 0x43454F4Du;

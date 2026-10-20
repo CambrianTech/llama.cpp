@@ -127,11 +127,13 @@ kernel void kernel_pad_impl(
     const int32_t k0 = tgpig.x/args.ne1;
     const int32_t i1 = tgpig.x - k0*args.ne1;
 
-    const int32_t i03 = i3;
-    const int32_t i02 = i2;
-    const int32_t i01 = i1;
+    // the source element of dst[i] is src[i - lp]; outside the source it is zero
+    const int32_t i03 = i3 - args.lp3;
+    const int32_t i02 = i2 - args.lp2;
+    const int32_t i01 = i1 - args.lp1;
+    const bool    row = i01 >= 0 && i01 < args.ne01 && i02 >= 0 && i02 < args.ne02 && i03 >= 0 && i03 < args.ne03;
 
-    device const T * src0_ptr = (device const T *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+    device const char * src0_row = src0 + (row ? i03*args.nb03 + i02*args.nb02 + i01*args.nb01 : 0);
     device       T * dst_ptr  = (device       T *) (dst  +  i3*args.nb3  +  i2*args.nb2  +  i1*args.nb1);
 
     for (int32_t l0 = 0; l0 < 1024; l0 += ntg.x) {
@@ -140,8 +142,9 @@ kernel void kernel_pad_impl(
             break;
         }
 
-        if (i0 < args.ne00 && i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
-            dst_ptr[i0] = src0_ptr[i0];
+        const int32_t i00 = i0 - args.lp0;
+        if (row && i00 >= 0 && i00 < args.ne00) {
+            dst_ptr[i0] = *(device const T *) (src0_row + i00*args.nb00); // a view may have any element stride
         } else {
             dst_ptr[i0] = 0.0f;
         }

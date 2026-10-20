@@ -340,7 +340,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_lo
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_cross_entropy_loss%s_f32", op->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK ? "_back" : "");
+    const bool back = op->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK;
+    const ggml_tensor * labels = back ? op->src[2] : op->src[1];
+    snprintf(base, 256, "kernel_cross_entropy_loss%s_%s", back ? "_back" : "", labels->type == GGML_TYPE_I32 ? "i32" : "f32");
     snprintf(name, 256, "%s", base);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -351,13 +353,32 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_lo
     return res;
 }
 
-// RMS_NORM_BACK, SOFT_MAX_BACK, REPEAT_BACK: one f32 kernel each, named after the op.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_back(ggml_metal_library_t lib, const ggml_tensor * op, const char * pass) {
+    assert(op->op == GGML_OP_FLASH_ATTN_BACK);
+
+    char name[256];
+    if (strcmp(pass, "scale") == 0) {
+        snprintf(name, 256, "kernel_flash_attn_back_scale");
+    } else {
+        snprintf(name, 256, "kernel_flash_attn_back_%s_%s", pass, ggml_type_name(op->src[1]->type));
+    }
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
+// RMS_NORM_BACK, SOFT_MAX_BACK, REPEAT_BACK, GET_ROWS_BACK: one f32 kernel each, named after the op.
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_row_back(ggml_metal_library_t lib, const ggml_tensor * op) {
     const char * kernel = nullptr;
     switch (op->op) {
         case GGML_OP_RMS_NORM_BACK: kernel = "kernel_rms_norm_back_f32"; break;
         case GGML_OP_SOFT_MAX_BACK: kernel = "kernel_soft_max_back_f32"; break;
         case GGML_OP_REPEAT_BACK:   kernel = "kernel_repeat_back_f32";   break;
+        case GGML_OP_GET_ROWS_BACK: kernel = "kernel_get_rows_back_f32"; break;
         default: GGML_ABORT("fatal error");
     }
 
@@ -905,6 +926,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     }
 
     res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_out_prod(ggml_metal_library_t lib, const ggml_tensor * op) {
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_out_prod_%s", ggml_type_name(op->src[0]->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    // kernels/out_prod.metal: a 64 x 32 tile, float staging of both 32-deep operands
+    res.nr0  = 64;
+    res.nr1  = 32;
+    res.nsg  = 4;
+    res.smem = (64 + 32)*32*sizeof(float);
 
     return res;
 }

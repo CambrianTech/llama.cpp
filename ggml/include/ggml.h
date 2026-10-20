@@ -2480,14 +2480,47 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    // TODO: needs to be adapted to ggml_flash_attn_ext
+    // The gradients of ggml_flash_attn_ext(q, k, v, mask, scale) (no ALiBi, softcap or sinks), given
+    // d, the gradient of its output in the output's layout [Dv, H, N]. One op, recomputing the
+    // scores per block instead of keeping them: memory is the gradients alone. The result is F32:
+    // dQ ([D, N, H]), dK (k's shape), dV (v's shape), each contiguous at
+    // ggml_flash_attn_back_offset, then each query row's log-sum-exp and D = sum_j p_ij dp_ij,
+    // which the kernels pass between their passes, and the power of two dO is scaled by in a
+    // kernel's reduced-precision tiles (ggml_flash_attn_back_scale).
+    // dK and dV cover the key rows [kv0, M) only (row j at j - kv0): keys before kv0 are constants
+    // whose gradient nobody reads (a frozen served prefix), so it is neither computed nor stored.
+    // dQ always sums over every key.
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
            struct ggml_tensor  * q,
            struct ggml_tensor  * k,
            struct ggml_tensor  * v,
+           struct ggml_tensor  * mask,
            struct ggml_tensor  * d,
-           bool                  masked);
+           float                 scale,
+           int64_t               kv0);
+
+    // byte offset in a ggml_flash_attn_back result of: 0 dQ, 1 dK, 2 dV, 3 the per-row scratch
+    // the power of two that brings the largest |dO| to [4, 8): training gradients sit far below half
+    // precision's normal range (6.1e-5) and lose their precision in half tiles; 1 when dO is zero
+    // (the Metal kernel computes the same rule, kernel_flash_attn_back_scale)
+    GGML_API float ggml_flash_attn_back_scale(float max_abs_do);
+    GGML_API size_t ggml_flash_attn_back_offset(const struct ggml_tensor * back, int part);
+
+    // Where FLASH_ATTN_EXT's K/V gradient goes when only the last rows of its K/V can carry one:
+    // k_tap / v_tap (or NULL) and k_cur / v_cur, each [D, Hkv, rows], hold the values of K/V's last
+    // rows in order, ending at M (a run's cached rows, then the chunk's own). The backward computes
+    // dK/dV from the first of those rows only and adds each part to its sink; the K/V the attention
+    // reads (the whole window) get no gradient. The sinks are not read by the forward.
+    GGML_API void ggml_flash_attn_ext_set_grad_sinks(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_tap,
+            struct ggml_tensor * k_cur,
+            struct ggml_tensor * v_tap,
+            struct ggml_tensor * v_cur);
+
+    // the backward of FLASH_ATTN_EXT as the one op above (ggml_flash_attn_ext_set_back_tile)
+    #define GGML_FA_BACK_NATIVE (-1)
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
@@ -2779,7 +2812,21 @@ extern "C" {
             int                   n_tasks,
             void                * userdata);
 
-    // loss function
+    // loss function: the mean over rows of -sum(labels * log softmax(logits)). The labels are
+    // either a distribution per row (F32, the logits' shape) or one target index per row (I32,
+    // one per row of the logits, -1 for a row that carries no loss): a target index never builds
+    // a vocabulary-wide one-hot tensor beside the logits.
+
+    GGML_API bool ggml_cross_entropy_labels_ok(const struct ggml_tensor * logits, const struct ggml_tensor * labels);
+
+    // The same with one target index per row (I32) and a weight per row (F32, one per row): row i
+    // contributes w_i * -log softmax(logits_i)[t_i] / rows, and its gradient scales by w_i. How much a
+    // row counts is the caller's to say (a mind's relevance on what it perceived), not only whether.
+    GGML_API struct ggml_tensor * ggml_cross_entropy_loss_weighted(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * targets,
+            struct ggml_tensor  * weights);
 
     GGML_API struct ggml_tensor * ggml_cross_entropy_loss(
             struct ggml_context * ctx,
@@ -2851,6 +2898,10 @@ extern "C" {
     GGML_API void ggml_build_forward_order(
             struct ggml_cgraph * cgraph,
             struct ggml_tensor * tensor);
+
+    // whether a backward can be built through this node (ggml_build_backward_expand aborts on one
+    // that cannot: an op without a backward, or an in-place write)
+    GGML_API bool ggml_node_has_backward(const struct ggml_tensor * tensor);
 
     GGML_API void ggml_build_backward_expand(
         struct ggml_context *  ctx,        // context for gradient computation

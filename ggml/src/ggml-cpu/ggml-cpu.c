@@ -2003,10 +2003,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
-                int32_t t = ggml_get_op_params_i32(tensor, 0);
-                GGML_ASSERT(t == 0 || t == 1);
-                bool masked = t != 0;
-                ggml_compute_forward_flash_attn_back(params, masked, tensor);
+                ggml_compute_forward_flash_attn_back(params, tensor);
             } break;
         case GGML_OP_SSM_CONV:
             {
@@ -2887,9 +2884,9 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
-                        if (ggml_is_quantized(node->src[0]->type) ||
-                            node->src[0]->type == GGML_TYPE_F16) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                        if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F16) {
+                            // the blocked kernel's tile and gathered values (ops.h)
+                            cur = ggml_type_size(GGML_TYPE_F32) * ggml_out_prod_cpu_wsize(node->src[0]->ne[0]) * n_tasks;
                         }
                     } break;
                 case GGML_OP_SET_ROWS:
@@ -2975,19 +2972,11 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
-                        const int64_t    D = node->src[0]->ne[0];
-                        const int64_t ne11 = ggml_up(node->src[1]->ne[1], GGML_SOFT_MAX_UNROLL);
-                        const int64_t mxDn = MAX(D, ne11) * 2; // *2 because of S and SM in ggml_compute_forward_flash_attn_back
-                        if (node->src[1]->type == GGML_TYPE_F32) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
-                        } else if (node->src[1]->type == GGML_TYPE_F16) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
-                        } else if (node->src[1]->type == GGML_TYPE_BF16) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
-                        }
+                        // per thread: the blocked kernel's scratch (ops.h)
+                        const int64_t D  = node->src[0]->ne[0];
+                        const int64_t M  = node->src[1]->ne[1];
+                        const int64_t Dv = node->src[2]->ne[0];
+                        cur = sizeof(float)*ggml_flash_attn_back_cpu_wsize(D, Dv, M)*n_tasks;
                     } break;
 
                 case GGML_OP_CROSS_ENTROPY_LOSS:

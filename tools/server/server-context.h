@@ -167,6 +167,7 @@ struct server_routes {
     server_http_context::handler_t post_lora_adapters;
     server_http_context::handler_t post_lora_adapters_load;
     server_http_context::handler_t post_lora_adapters_unload;
+    server_http_context::handler_t post_learn;
     server_http_context::handler_t get_train;
     server_http_context::handler_t post_train;
     server_http_context::handler_t post_train_cancel;
@@ -184,7 +185,7 @@ private:
             const json & data,
             const std::vector<raw_buffer> & files,
             task_response_type res_type);
-    std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot, bool size_only);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
@@ -202,6 +203,9 @@ private:
 
     // cached responses, to be used during sleep
     std::mutex     mutex_cache;
+    // Only admission/query use this lock; IO callbacks touch relaxed atomics only.
+    std::mutex mutex_restore_progress;
+    std::map<int, std::shared_ptr<server_restore_progress>> restore_progress;
     json           cached_models  = nullptr;
     json           cached_props   = nullptr;
     server_metrics cached_metrics;

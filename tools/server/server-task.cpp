@@ -359,6 +359,9 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
+    if (learned) {
+        res["learn"] = learned->to_json();
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -403,6 +406,9 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     // extra fields for debugging purposes
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
+    }
+    if (learned) {
+        res["learn"] = learned->to_json();
     }
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
@@ -451,6 +457,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     // extra fields for debugging purposes
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
+    }
+    if (learned) {
+        res["learn"] = learned->to_json();
     }
     if (stats.is_set()) {
         res["timings"] = stats.to_json();
@@ -515,6 +524,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
 
     if (stats.is_set()) {
         deltas.back()["timings"] = stats.to_json();
+    }
+
+    if (learned) {
+        deltas.back()["learn"] = learned->to_json(); // the final chunk
     }
 
     // extra fields for debugging purposes
@@ -592,6 +605,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
         }},
     };
+
+    if (learned) {
+        res["learn"] = learned->to_json();
+    }
 
     return res;
 }
@@ -710,6 +727,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         server_sent_events.back().at("data")["timings"] = stats.to_json();
     }
 
+    if (learned) {
+        server_sent_events.back().at("data")["learn"] = learned->to_json(); // response.completed
+    }
+
     return server_sent_events;
 }
 
@@ -790,6 +811,10 @@ json server_task_result_cmpl_final::to_json_anthropic() {
             {"output_tokens", n_decoded}
         }}
     };
+
+    if (learned) {
+        res["learn"] = learned->to_json();
+    }
 
     return res;
 }
@@ -971,6 +996,10 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
             }}
         }}
     });
+
+    if (learned) {
+        events.back().at("data")["learn"] = learned->to_json(); // message_delta, beside the usage
+    }
 
     events.push_back({
         {"event", "message_stop"},
@@ -1620,6 +1649,9 @@ std::string server_task_result_metrics::to_metrics() {
 // server_task_result_slot_save_load
 //
 json server_task_result_slot_save_load::to_json() {
+    if (size_only) {
+        return json {{"id_slot", id_slot}, {"filename", filename}, {"projected_bytes", n_bytes}};
+    }
     if (is_save) {
         return json {
             { "id_slot",   id_slot },
@@ -1689,6 +1721,18 @@ json server_task_result_lora_change::to_json() {
     json res = { { "success", true }, { "id", lora_id }, { "path", path } };
     if (!loaded) {
         res["retired"] = true;
+    }
+    return res;
+}
+
+json learn_outcome::to_json() const {
+    json res = { { "success", ok }, { "loss", loss }, { "n_labels", n_labels }, { "t_ms", t_ms } };
+    if (deferred) {
+        res["deferred"] = true;
+        res["retry_after_ms"] = retry_after_ms;
+    }
+    if (!ok) {
+        res["failure"] = failure;
     }
     return res;
 }
