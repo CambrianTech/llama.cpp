@@ -62,6 +62,8 @@ struct server_context_meta {
     // itself measures it — what a scheduler reads where no per-process GPU reading exists
     // (Windows/WDDM) or the lane was adopted without a spawn baseline.
     json memory_breakdown;
+    // Realized context capacity; shared KV is not slots times a slot window.
+    json context_geometry;
 };
 
 enum server_state {

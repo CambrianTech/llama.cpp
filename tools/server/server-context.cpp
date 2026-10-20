@@ -4775,6 +4775,11 @@ server_context_meta server_context::get_meta() const {
             }
             return out;
         }(),
+        /* context_geometry       */ json {
+            { "allocated_tokens",        llama_n_ctx(impl->ctx_tgt) },
+            { "max_tokens_per_sequence", llama_n_ctx_seq(impl->ctx_tgt) },
+            { "sequence_capacity",       llama_n_seq_max(impl->ctx_tgt) },
+        },
     };
 }
 
@@ -5181,6 +5186,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "model_path",                  meta.model_path },
         { "model_weight_buffers",        meta.model_weight_buffers },
         { "memory_breakdown",            meta.memory_breakdown },
+        { "context_geometry",            meta.context_geometry },
         { "modalities",                  json {
             {"vision", meta.has_inp_image},
             {"video",  meta.has_inp_video},
