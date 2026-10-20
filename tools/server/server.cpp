@@ -219,6 +219,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.post_lora_adapters_load     = models_routes->proxy_post;
         routes.post_lora_adapters_unload   = models_routes->proxy_post;
+        routes.post_learn                  = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
 
@@ -273,6 +274,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
     ctx_http.post("/lora-adapters/load",       ex_wrapper(routes.post_lora_adapters_load));
     ctx_http.post("/lora-adapters/unload",     ex_wrapper(routes.post_lora_adapters_unload));
+    ctx_http.post("/learn",                    ex_wrapper(routes.post_learn));
     ctx_http.get ("/train",                    ex_wrapper(routes.get_train));
     ctx_http.post("/train",                    ex_wrapper(routes.post_train));
     ctx_http.post("/train/cancel",             ex_wrapper(routes.post_train_cancel));
@@ -465,12 +467,15 @@ int llama_server(common_params & params, int argc, char ** argv) {
             return 1;
         }
 
-        // setup communication child --> router if necessary
-        if (child.is_child()) {
-            ctx_server.set_state_callback([&](server_state state, json payload) {
+        // Publish the same load snapshot to health and, when present, the router.
+        ctx_server.set_state_callback([&](server_state state, json payload) {
+            if (state == SERVER_STATE_LOADING) {
+                ctx_http.note_loading_progress(payload);
+            }
+            if (child.is_child()) {
                 child.notify_to_router(server_state_to_str(state), payload);
-            });
-        }
+            }
+        });
 
         if (!ctx_server.load_model(params)) {
             clean_up();

@@ -9,6 +9,12 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <string>
 #include <thread>
 
@@ -19,6 +25,8 @@
 class server_http_context::Impl {
 public:
     std::unique_ptr<httplib::Server> srv;
+    std::mutex loading_mutex;
+    json loading_progress;
 };
 
 server_http_context::server_http_context()
@@ -26,6 +34,17 @@ server_http_context::server_http_context()
 {}
 
 server_http_context::~server_http_context() = default;
+
+void server_http_context::note_loading_progress(const json & progress) {
+    std::lock_guard<std::mutex> lock(pimpl->loading_mutex);
+    pimpl->loading_progress = progress;
+#ifdef _WIN32
+    pimpl->loading_progress["pid"] = _getpid();
+#else
+    pimpl->loading_progress["pid"] = getpid();
+#endif
+}
+
 
 static void log_server_request(const httplib::Request & req, const httplib::Response & res) {
     // skip logging requests that are regularly sent, to avoid log spam
@@ -251,6 +270,24 @@ bool server_http_context::init(const common_params & params) {
     };
 
     auto middleware_server_state = [this](const httplib::Request & req, httplib::Response & res) {
+        if (req.method == "GET" && (req.path == path_prefix + "/health" || req.path == path_prefix + "/v1/health")) {
+            json progress;
+            {
+                std::lock_guard<std::mutex> lock(pimpl->loading_mutex);
+                progress = pimpl->loading_progress;
+            }
+            const bool ready = is_ready.load();
+            res.status = ready ? 200 : 503;
+            json body = {
+                {"status", ready ? "ok" : "loading"},
+                {"load_progress", progress},
+            };
+            if (!ready) {
+                body["error"] = {{"message", "Loading model"}, {"type", "unavailable_error"}, {"code", 503}};
+            }
+            res.set_content(safe_json_to_str(body), "application/json; charset=utf-8");
+            return false;
+        }
         if (!is_ready.load()) {
             if (frontend_paths.count(req.path)) {
                 return true; // frontend asset, allow it to load and show "loading"

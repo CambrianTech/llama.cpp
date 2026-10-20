@@ -57,6 +57,10 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+    bool opt_state_write_initial(FILE * optimizer, const char * binding);
+    bool opt_state_write(FILE * optimizer, const char * binding);
+    bool opt_state_restore(llama_adapter_lora * shadow, FILE * weights, FILE * optimizer, const char * binding);
+    bool opt_prepare_restore(const llama_batch & retained);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -173,7 +177,11 @@ struct llama_context {
             const char * filepath,
            llama_token * tokens_out,
                 size_t   n_token_capacity,
-                size_t * n_token_count_out);
+                size_t * n_token_count_out,
+                llama_state_io_progress_callback progress = nullptr,
+                void * progress_data = nullptr);
+
+    size_t state_seq_file_size(llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count);
 
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
@@ -215,6 +223,9 @@ struct llama_context {
     // the largest training graph the allocation preflight measured on a GPU device (bytes)
     size_t opt_graph_bytes() const;
 
+    bool opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens, const llama_token * labels, int32_t n,
+            ggml_opt_result_t result);
+
     void opt_epoch(
             ggml_opt_dataset_t      dataset,
             ggml_opt_result_t       result_train,
@@ -243,6 +254,13 @@ private:
     // for the memory gate, which the exact walk answers by shrinking its horizon); `what` names
     // the step that failed, for the log
     void opt_fail(std::string why, const std::string & what = "");
+
+    // THE EXTRAS A LABELLED UBATCH SWITCHES ON (llama-context-opt.cpp). process_ubatch runs a
+    // ubatch whose rows carry labels through ggml_opt instead of graph_compute: the same graph,
+    // plus the loss over the labelled rows, the backward and, at a period's end, the optimizer
+    // step. A walk driving the decode adds its taps to that graph.
+    bool opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch, bool prepare_restore = false);
+    bool opt_fa_back_native() const;
 
     //
     // output
@@ -300,6 +318,7 @@ private:
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
 
+    size_t state_seq_write_file(llama_io_write_i & io, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count);
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
@@ -387,6 +406,24 @@ private:
     bool     opt_walk_exact   = false; // llama_opt_params::walk_exact
     uint32_t opt_walk_horizon_req = 0; // llama_opt_params::walk_horizon, as requested
     uint32_t opt_walk_horizon = 0;     // this window's: starts at the request, shrinks to fit the device
+
+    // the adapter being trained (llama_opt_params::adapter): applied to labelled rows only
+    // (llm_graph_params::shadow); null when the base itself trains
+    const llama_adapter_lora * opt_shadow = nullptr;
+
+    // set by a walk for the decode it drives: whose taps join the graph, where the loss lands,
+    // whether its labelled rows only fill the cache (the shadow on, no loss, no backward), and
+    // that the logits rows are the loss's alone (no host copy)
+    opt_walk *        opt_walk_active   = nullptr;
+    ggml_opt_result_t opt_result_active = nullptr;
+    bool              opt_forward_only  = false;
+    // the batch's outputs feed only the in-graph loss (llama_opt_learn; a walk): no host logits are
+    // reserved, copied or mapped for them (a 512-row chunk at a 248k vocabulary is 485 MiB of host RAM)
+    bool              opt_outputs_internal = false;
+    // llama_opt_learn's one step: its labelled rows in all, and those trained so far (the ubatch that
+    // completes them takes the step, each weighted by its share)
+    int64_t           opt_learn_labels      = 0;
+    int64_t           opt_learn_labels_done = 0;
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;

@@ -14,6 +14,7 @@
 // the cache — the same adapter discipline the module was built for.
 
 #include "ggml-moe-residency.hpp"   // ExpertFetcher, FetchItem
+#include "ggml-moe-container.h"
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -83,11 +84,13 @@ public:
     }
 
 private:
+    ContainerLease lease_;
     std::string dir_;
     std::mutex  mtx_;
     std::unordered_map<uint32_t, FILE *> banks_;   // layer -> lazily-opened experts-L{layer}.bin (nullptr cached)
 
     FILE * bank(uint32_t layer) {
+        if (!lease_.ok()) { return nullptr; }
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = banks_.find(layer);
         if (it != banks_.end()) { return it->second; }
@@ -98,7 +101,9 @@ private:
     }
 
 public:
-    explicit DirContainerFetcher(const char * dir) : dir_(dir) {}
+    explicit DirContainerFetcher(const char * dir) : lease_(dir), dir_(lease_.root()) {}
+    bool ok() const { return lease_.ok(); }
+    uint64_t record_bytes() const;
     ~DirContainerFetcher() override {
         for (auto & kv : banks_) { if (kv.second) { std::fclose(kv.second); } }
     }
@@ -175,7 +180,9 @@ public:
 // never guess a stride: a wrong stride reads the wrong expert's bytes silently.
 static inline uint64_t dir_container_record_bytes(const char * dir) {
     if (!dir) { return 0; }
-    const std::string mp = std::string(dir) + "/manifest.json";
+    ContainerLease lease(dir);
+    if (!lease.ok()) { return 0; }
+    const std::string mp = lease.root() + "/manifest.json";
     FILE * f = std::fopen(mp.c_str(), "rb");
     if (!f) { return 0; }
     char buf[4096];
@@ -194,6 +201,10 @@ static inline uint64_t dir_container_record_bytes(const char * dir) {
     return (uint64_t) v;
 }
 
+inline uint64_t DirContainerFetcher::record_bytes() const {
+    return lease_.ok() ? dir_container_record_bytes(dir_.c_str()) : 0;
+}
+
 // TIERED read primitive: reads an expert from a specific PRECISION TIER of a tiered container (manifest
 // v2, per-(layer,tier) banks). The pager selects the tier per expert (all-star … cruft, rate-distortion
 // under budget); this reads that tier's bank at offset = expert_id * tier_record_bytes (one positional
@@ -202,11 +213,13 @@ static inline uint64_t dir_container_record_bytes(const char * dir) {
 // side that pairs with moec_pack_dir_tiered; the serving direct-I/O variant swaps in the same way as
 // ContainerFetcher (identical offset contract). record_bytes comes from the manifest tier row.
 class TieredContainerFetcher {
+    ContainerLease lease_;
     std::string dir_;
     std::mutex  mtx_;
     std::unordered_map<uint64_t, FILE *> banks_;   // key = (layer<<16 | tier) -> lazily-opened bank
 
     FILE * bank(uint32_t layer, uint32_t tier) {
+        if (!lease_.ok()) { return nullptr; }
         const uint64_t key = ((uint64_t) layer << 16) | tier;
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = banks_.find(key);
@@ -217,7 +230,7 @@ class TieredContainerFetcher {
         return f;
     }
 public:
-    explicit TieredContainerFetcher(const char * dir) : dir_(dir) {}
+    explicit TieredContainerFetcher(const char * dir) : lease_(dir), dir_(lease_.root()) {}
     ~TieredContainerFetcher() { for (auto & kv : banks_) { if (kv.second) { std::fclose(kv.second); } } }
 
     // Read expert `expert` of layer `layer` at precision `tier` (record is `record_bytes`, from manifest).

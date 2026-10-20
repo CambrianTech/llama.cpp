@@ -16,10 +16,17 @@ def test_server_start_simple():
     server.start()
     res = server.make_request("GET", "/health")
     assert res.status_code == 200
+    # The standalone health route retains the actual loader snapshot after ready.
+    progress = res.body["load_progress"]
+    assert progress["pid"] == server.process.pid
+    assert progress["current"] in progress["stages"]
+    assert 0 < progress["value"] <= 1
 
 
-def test_server_props():
+@pytest.mark.parametrize("kv_unified", [False, True])
+def test_server_props(kv_unified):
     global server
+    server.kv_unified = kv_unified
     server.start()
     res = server.make_request("GET", "/props")
     assert res.status_code == 200
@@ -27,7 +34,12 @@ def test_server_props():
     assert res.body["total_slots"] == server.n_slots
     default_val = res.body["default_generation_settings"]
     assert server.n_ctx is not None and server.n_slots is not None
-    assert default_val["n_ctx"] == server.n_ctx / server.n_slots
+    expected_window = server.n_ctx if kv_unified else server.n_ctx // server.n_slots
+    assert default_val["n_ctx"] == expected_window
+    geometry = res.body["context_geometry"]
+    assert geometry["allocated_tokens"] == server.n_ctx
+    assert geometry["max_tokens_per_sequence"] == expected_window
+    assert geometry["sequence_capacity"] == server.n_slots
     assert default_val["params"]["seed"] == server.seed
 
 

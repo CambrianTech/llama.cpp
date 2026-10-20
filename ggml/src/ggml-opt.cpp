@@ -4,6 +4,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <array>
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -75,6 +77,7 @@ struct ggml_opt_context {
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_grad_acc;
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_m;
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> param_v;
+    std::unordered_set<const struct ggml_tensor *> checkpoint_parameters;
     struct ggml_tensor * loss_grad_acc = nullptr;
     bool accumulators_created          = false;
 
@@ -84,12 +87,22 @@ struct ggml_opt_context {
     float                next_loss_scale = 1.0f;
     struct ggml_tensor * next_extra_loss = nullptr;
     bool                 period_fresh    = true; // the next backward starts a period (zeroed gradients)
+    bool                 checkpoint_ready = false;
+    bool                 evaluation_attempted = false;
+    bool                 restore_pending = false;
+    bool                 restore_preparation_failed = false;
+    bool                 checkpoint_trusted = true;
     // the gradients of the evaluated graph's GRAD leaves, readable until the next alloc
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> leaf_grads;
     // ggml_opt_accumulate_grad: GRAD nodes whose gradient adds into a caller's tensor, for the
     // graph prepared last (ggml_opt_prepare_alloc clears them)
     std::unordered_map<const struct ggml_tensor *, struct ggml_tensor *> next_grad_accs;
     std::vector<struct ggml_tensor *> grad_accs;
+    // a weighted cross-entropy for the next graph, and that graph's weights (one per label row)
+    bool                 next_label_weights = false;
+    struct ggml_tensor * label_weights      = nullptr;
+    // ggml_opt_prepare_alloc_head: the outputs' row slices, in row order (empty: one outputs)
+    std::vector<struct ggml_tensor *> output_slices;
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
@@ -327,6 +340,13 @@ static ggml_tensor * ggml_opt_recompute_node(
     if (node->flags & (GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_INPUT)) {
         return node;
     }
+    // an in-place write into a buffer the forward did not compute (a cache, a state) is a side
+    // effect: a clone would apply it a second time to the live buffer (Cormac's review of #5057)
+    const bool view_op = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                         node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
+    if (node->view_src != nullptr && !view_op && !forward.count(ggml_opt_view_root(node))) {
+        return node;
+    }
     switch (node->op) {
         case GGML_OP_NONE:
         case GGML_OP_SET_ROWS:
@@ -365,7 +385,8 @@ static ggml_tensor * ggml_opt_recompute_node(
 static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, const char * prefix) {
     std::unordered_set<ggml_tensor *> forward;
     std::unordered_set<ggml_tensor *> keep;
-    std::unordered_set<ggml_tensor *> mutated; // roots of the buffers the forward pass writes in place
+    // roots of the buffers the forward pass writes in place, each with its last write's position
+    std::unordered_map<ggml_tensor *, int> mutated;
     const size_t plen = strlen(prefix);
     for (int i = 0; i < n_fwd; ++i) {
         ggml_tensor * node = g->nodes[i];
@@ -378,18 +399,27 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
         const bool view_op = node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
                              node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE;
         if ((node->op == GGML_OP_CPY && !ggml_opt_is_cast(node)) || node->op == GGML_OP_SET_ROWS || (node->view_src != nullptr && !view_op)) {
-            mutated.insert(ggml_opt_view_root(node));
+            mutated[ggml_opt_view_root(node)] = i;
         }
     }
+    // A clone runs after the whole forward pass, so it sees a mutated buffer as the forward left
+    // it: the same value the original read unless the buffer is written AFTER the original. A read
+    // of a buffer whose writes all precede it (a layer's cache read after its own chunk's write) is
+    // recomputed like any other node; keeping it held a window-sized cast of the cache per layer
+    // from the forward to the backward (the M5, qwen3.5-4b, q8_0 cache, window 32768: 16 x 64 MiB).
+    auto written_after = [&](ggml_tensor * t, int i) {
+        const auto it = mutated.find(ggml_opt_view_root(t));
+        return it != mutated.end() && it->second > i;
+    };
     for (int i = 0; i < n_fwd; ++i) {
         ggml_tensor * node = g->nodes[i];
         bool reads_mutated = false;
         for (int k = 0; k < GGML_MAX_SRC && !reads_mutated; ++k) {
-            reads_mutated = node->src[k] != nullptr && mutated.count(ggml_opt_view_root(node->src[k]));
+            reads_mutated = node->src[k] != nullptr && written_after(node->src[k], i);
         }
         if (strncmp(ggml_get_name(node), prefix, plen) == 0 || (node->flags & GGML_TENSOR_FLAG_LOSS) ||
                 (node->flags & GGML_TENSOR_FLAG_OUTPUT) || reads_mutated ||
-                (node->view_src != nullptr && mutated.count(ggml_opt_view_root(node)))) {
+                (node->view_src != nullptr && written_after(node, i))) {
             keep.insert(node);
         }
     }
@@ -440,6 +470,7 @@ static void ggml_opt_checkpoint(ggml_context * ctx, ggml_cgraph * g, int n_fwd, 
     GGML_ASSERT((int) order.size() <= g->size && "recompute clones overflow the graph: raise the training node budget");
     std::copy(order.begin(), order.end(), g->nodes);
     g->n_nodes = (int) order.size();
+    ggml_graph_update_use_counts(g);
 }
 
 static ggml_tensor * map_tensor(std::map<ggml_tensor *, ggml_tensor *> & tensor_map, ggml_context * ctx, ggml_tensor * tensor) {
@@ -502,6 +533,18 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     return dst;
 }
 
+// the outputs' rows: every slice's when sliced
+static int64_t ggml_opt_output_rows(ggml_opt_context_t opt_ctx) {
+    if (opt_ctx->output_slices.empty()) {
+        return opt_ctx->outputs->ne[1];
+    }
+    int64_t n = 0;
+    for (const ggml_tensor * out : opt_ctx->output_slices) {
+        n += out->ne[1];
+    }
+    return n;
+}
+
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
@@ -515,7 +558,9 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW;
 
     ggml_set_input(opt_ctx->inputs);
-    ggml_set_output(opt_ctx->outputs);
+    if (opt_ctx->output_slices.empty()) {
+        ggml_set_output(opt_ctx->outputs);
+    }
 
     int n_param = 0;
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
@@ -582,11 +627,43 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->loss_per_datapoint = false;
             break;
         }
-        case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY: {
-            opt_ctx->labels = ggml_dup_tensor(ctx_results, opt_ctx->outputs);
+        case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY:
+        case GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS: {
+            opt_ctx->labels = opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS
+                ? ggml_new_tensor_1d(ctx_results, GGML_TYPE_I32, ggml_opt_output_rows(opt_ctx))
+                : ggml_dup_tensor(ctx_results, opt_ctx->outputs);
             ggml_set_input(opt_ctx->labels);
             ggml_set_name(opt_ctx->labels, "labels");
-            opt_ctx->loss = ggml_cross_entropy_loss(ctx_results, opt_ctx->outputs, opt_ctx->labels);
+            opt_ctx->label_weights = nullptr;
+            if (opt_ctx->next_label_weights) {
+                GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS && "a weight per row needs one target index per row");
+                opt_ctx->label_weights = ggml_new_tensor_1d(ctx_results, GGML_TYPE_F32, opt_ctx->labels->ne[0]);
+                ggml_set_input(opt_ctx->label_weights);
+                ggml_set_name(opt_ctx->label_weights, "label_weights");
+            }
+            auto row_loss = [&](ggml_tensor * out, ggml_tensor * lab, int64_t r0) {
+                if (opt_ctx->label_weights == nullptr) {
+                    return ggml_cross_entropy_loss(ctx_results, out, lab);
+                }
+                ggml_tensor * w = ggml_view_1d(ctx_results, opt_ctx->label_weights, out->ne[1], r0*sizeof(float));
+                return ggml_cross_entropy_loss_weighted(ctx_results, out, lab, w);
+            };
+            if (opt_ctx->output_slices.empty()) {
+                opt_ctx->loss = row_loss(opt_ctx->outputs, opt_ctx->labels, 0);
+            } else {
+                // the mean over every row: each slice's mean weighted by its share of the rows
+                const int64_t n = opt_ctx->labels->ne[0];
+                int64_t r0 = 0;
+                ggml_tensor * sum = nullptr;
+                for (ggml_tensor * out : opt_ctx->output_slices) {
+                    const int64_t nr = out->ne[1];
+                    ggml_tensor * lab = ggml_view_1d(ctx_results, opt_ctx->labels, nr, r0*sizeof(int32_t));
+                    ggml_tensor * l   = ggml_scale(ctx_results, row_loss(out, lab, r0), (float) nr / (float) n);
+                    sum = sum ? ggml_add(ctx_results, sum, l) : l;
+                    r0 += nr;
+                }
+                opt_ctx->loss = sum;
+            }
             ggml_set_name(opt_ctx->loss, "loss_cross_entropy");
             if (opt_ctx->next_manual) {
                 // weighted by the caller below, beside its extra term
@@ -617,7 +694,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     ggml_set_output(opt_ctx->loss);
     if (opt_ctx->next_manual) {
         GGML_ASSERT(!opt_ctx->static_graphs && "a caller-driven period needs graphs built per step");
-        GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
+        GGML_ASSERT(opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS);
         // the loss the backward differentiates: the caller's weight of this graph's loss, plus
         // its extra term; opt_ctx->loss stays the unweighted loss the result reports
         struct ggml_tensor * total = ggml_scale(ctx_results, opt_ctx->loss, opt_ctx->next_loss_scale);
@@ -634,13 +711,19 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->loss);
     }
 
-    if (opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY) {
+    // per-step graphs rebuild these: one left from the previous graph would be read after it is freed
+    opt_ctx->pred     = nullptr;
+    opt_ctx->ncorrect = nullptr;
+    if ((opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY || opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS)
+            && opt_ctx->output_slices.empty()) {
         opt_ctx->pred = ggml_argmax(ctx_results, opt_ctx->outputs);
         ggml_set_name(opt_ctx->pred, "pred");
         ggml_set_output(opt_ctx->pred);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->pred);
 
-        opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, ggml_argmax(ctx_results, opt_ctx->labels));
+        ggml_tensor * truth = opt_ctx->loss_type == GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS
+            ? opt_ctx->labels : ggml_argmax(ctx_results, opt_ctx->labels);
+        opt_ctx->ncorrect = ggml_count_equal(ctx_results, opt_ctx->pred, truth);
         ggml_set_name(opt_ctx->ncorrect, "ncorrect");
         ggml_set_output(opt_ctx->ncorrect);
         ggml_build_forward_expand(opt_ctx->gf, opt_ctx->ncorrect);
@@ -670,6 +753,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             if (!(node->flags & GGML_TENSOR_FLAG_PARAM)) {
                 continue;
             }
+            opt_ctx->checkpoint_parameters.insert(node);
             if (accumulate) {
                 opt_ctx->param_grad_acc[node] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
             }
@@ -842,12 +926,277 @@ struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_
 }
 
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
+    opt_ctx->checkpoint_ready = false;
     if (optimizer) {
         ggml_graph_reset(opt_ctx->gb_opt);
         opt_ctx->iter = 1;
     } else {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
+}
+
+// Stable names describe parameter identity; pointer addresses are local to a graph.
+static bool opt_state_tensors(ggml_opt_context_t ctx, std::map<std::string, ggml_tensor *> & tensors,
+                              std::vector<std::string> & names, std::vector<int32_t> & types, std::vector<int64_t> & shapes) {
+    std::map<std::string, const ggml_tensor *> parameters;
+    for (const auto * parameter : ctx->checkpoint_parameters) {
+        const std::string name = parameter->name;
+        if (name.empty() || !parameters.emplace(name, parameter).second) {
+            return false;
+        }
+    }
+    for (const auto & entry : parameters) {
+        const std::string suffix = std::to_string(names.size());
+        names.push_back(entry.first);
+        types.push_back(entry.second->type);
+        shapes.insert(shapes.end(), entry.second->ne, entry.second->ne + GGML_MAX_DIMS);
+        if (ctx->param_grad_acc.count(entry.second)) {
+            tensors.emplace("gradient." + suffix, ctx->param_grad_acc.at(entry.second));
+        }
+        if (ctx->optimizer == GGML_OPT_OPTIMIZER_TYPE_ADAMW) {
+            if (!ctx->param_m.count(entry.second) || !ctx->param_v.count(entry.second)) {
+                return false;
+            }
+            tensors.emplace("moment1." + suffix, ctx->param_m.at(entry.second));
+            tensors.emplace("moment2." + suffix, ctx->param_v.at(entry.second));
+        }
+    }
+    return !parameters.empty();
+}
+
+static bool opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * binding, bool initial) {
+    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::string> names;
+    std::vector<int32_t> types;
+    std::vector<int64_t> shapes;
+    if (!opt_state_tensors(ctx, tensors, names, types, shapes)) {
+        return false;
+    }
+    ggml_backend_sched_synchronize(ctx->backend_sched);
+    gguf_context * state = gguf_init_empty();
+    gguf_set_val_u32(state, "optimizer.state.version", initial ? 2 : 1);
+    if (initial) { gguf_set_val_str(state, "optimizer.state.boundary", "initial"); }
+    gguf_set_val_str(state, "optimizer.state.binding", binding);
+    gguf_set_val_i32(state, "optimizer.type", ctx->optimizer);
+    gguf_set_val_i32(state, "optimizer.loss", ctx->loss_type);
+    gguf_set_val_i32(state, "optimizer.period", ctx->opt_period);
+    gguf_set_val_i32(state, "optimizer.period_index", ctx->opt_i);
+    gguf_set_val_i64(state, "optimizer.iteration", ctx->iter);
+    std::ostringstream rng;
+    rng << ctx->rng;
+    gguf_set_val_str(state, "optimizer.rng", rng.str().c_str());
+    std::vector<const char *> name_ptrs;
+    for (const auto & name : names) {
+        name_ptrs.push_back(name.c_str());
+    }
+    gguf_set_arr_str(state, "optimizer.parameters", name_ptrs.data(), name_ptrs.size());
+    gguf_set_arr_data(state, "optimizer.parameter_types", GGUF_TYPE_INT32, types.data(), types.size());
+    gguf_set_arr_data(state, "optimizer.parameter_shapes", GGUF_TYPE_INT64, shapes.data(), shapes.size());
+    for (const auto & entry : tensors) {
+        ggml_tensor tensor = *entry.second;
+        ggml_set_name(&tensor, entry.first.c_str());
+        tensor.data = nullptr;
+        tensor.buffer = nullptr;
+        gguf_add_tensor(state, &tensor);
+    }
+    bool ok = gguf_write_to_file_ptr(state, file, true);
+    std::vector<uint8_t> buffer;
+    const uint8_t padding[GGUF_DEFAULT_ALIGNMENT] = {};
+    for (const auto & entry : tensors) {
+        if (!ok) { break; }
+        buffer.resize(ggml_nbytes(entry.second));
+        ggml_backend_tensor_get(entry.second, buffer.data(), 0, buffer.size());
+        const size_t pad = (GGUF_DEFAULT_ALIGNMENT - buffer.size() % GGUF_DEFAULT_ALIGNMENT) % GGUF_DEFAULT_ALIGNMENT;
+        ok = fwrite(buffer.data(), 1, buffer.size(), file) == buffer.size() && fwrite(padding, 1, pad, file) == pad;
+    }
+    gguf_free(state);
+    return ok;
+}
+
+bool ggml_opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * binding) {
+    if (!file || !binding || !*binding || !ctx->checkpoint_ready || !ctx->checkpoint_trusted ||
+        !ctx->period_fresh || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+        return false;
+    }
+    return opt_state_write(ctx, file, binding, false);
+}
+
+bool ggml_opt_state_write_initial(ggml_opt_context_t ctx, FILE * file, const char * binding) {
+    if (!ctx || !file || !binding || !*binding || !ctx->restore_pending || ctx->restore_preparation_failed ||
+        ctx->evaluation_attempted || ctx->eval_ready || ctx->checkpoint_ready || !ctx->checkpoint_trusted ||
+        ctx->iter != 1 || ctx->opt_i != 0 || !ctx->period_fresh || ctx->next_manual || ctx->next_extra_loss) {
+        return false;
+    }
+    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::string> names;
+    std::vector<int32_t> types;
+    std::vector<int64_t> shapes;
+    if (!opt_state_tensors(ctx, tensors, names, types, shapes)) { return false; }
+    // Allocation is not initialization. Explicitly establish the zero-step persistent state;
+    // no parameter weights, RNG, counters or sample are touched. Backend writes have the same
+    // documented completion contract as restore, not a recoverable hardware-failure status.
+    ggml_backend_sched_synchronize(ctx->backend_sched);
+    for (const auto & entry : tensors) {
+        ggml_backend_tensor_memset(entry.second, 0, 0, ggml_nbytes(entry.second));
+    }
+    ggml_backend_sched_synchronize(ctx->backend_sched);
+    // Even a successful export leaves the import gate closed: caller must commit and restore
+    // the same-generation weights/policy and this artifact before the first real update.
+    return opt_state_write(ctx, file, binding, true);
+}
+
+struct ggml_opt_state {
+    ggml_opt_context_t owner;
+    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::vector<uint8_t>> payload;
+    int64_t iteration;
+    int32_t index;
+    std::mt19937 rng;
+    bool initial;
+};
+
+ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t ctx, FILE * file, const char * binding) {
+    if (!file || !binding || !*binding || ctx->restore_preparation_failed || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+        return nullptr;
+    }
+    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::string> names;
+    std::vector<int32_t> types;
+    std::vector<int64_t> shapes;
+    if (!opt_state_tensors(ctx, tensors, names, types, shapes)) {
+        return nullptr;
+    }
+    fpos_t start;
+    if (fgetpos(file, &start) != 0) {
+        return nullptr;
+    }
+    ggml_context * data = nullptr;
+    gguf_context * state = gguf_init_from_file_ptr(file, {true, &data});
+    if (!state) {
+        return nullptr;
+    }
+    const auto key = [&](const char * name, gguf_type type) {
+        const int64_t id = gguf_find_key(state, name);
+        return id >= 0 && gguf_get_kv_type(state, id) == type ? id : -1;
+    };
+    const auto i32_equals = [&](const char * name, int32_t value) {
+        const int64_t id = key(name, GGUF_TYPE_INT32);
+        return id >= 0 && gguf_get_val_i32(state, id) == value;
+    };
+    const int64_t version = key("optimizer.state.version", GGUF_TYPE_UINT32);
+    const int64_t bound = key("optimizer.state.binding", GGUF_TYPE_STRING);
+    const int64_t iteration = key("optimizer.iteration", GGUF_TYPE_INT64);
+    const int64_t index = key("optimizer.period_index", GGUF_TYPE_INT32);
+    const int64_t random = key("optimizer.rng", GGUF_TYPE_STRING);
+    const int64_t params = key("optimizer.parameters", GGUF_TYPE_ARRAY);
+    const int64_t dtypes = key("optimizer.parameter_types", GGUF_TYPE_ARRAY);
+    const int64_t dims = key("optimizer.parameter_shapes", GGUF_TYPE_ARRAY);
+    const int64_t boundary = key("optimizer.state.boundary", GGUF_TYPE_STRING);
+    const bool initial = version >= 0 && gguf_get_val_u32(state, version) == 2 &&
+        boundary >= 0 && std::string(gguf_get_val_str(state, boundary)) == "initial";
+    const bool completed = version >= 0 && gguf_get_val_u32(state, version) == 1 &&
+        gguf_find_key(state, "optimizer.state.boundary") < 0;
+    bool ok = (initial || completed) &&
+        bound >= 0 && std::string(gguf_get_val_str(state, bound)) == binding &&
+        iteration >= 0 && (initial ? gguf_get_val_i64(state, iteration) == 1 : gguf_get_val_i64(state, iteration) > 1) &&
+        (!initial || (index >= 0 && gguf_get_val_i32(state, index) == 0)) &&
+        index >= 0 && gguf_get_val_i32(state, index) >= 0 && gguf_get_val_i32(state, index) < ctx->opt_period &&
+        random >= 0 && params >= 0 && dtypes >= 0 && dims >= 0 &&
+        i32_equals("optimizer.type", ctx->optimizer) && i32_equals("optimizer.loss", ctx->loss_type) &&
+        i32_equals("optimizer.period", ctx->opt_period) &&
+        gguf_get_arr_type(state, params) == GGUF_TYPE_STRING && gguf_get_arr_n(state, params) == names.size() &&
+        gguf_get_arr_type(state, dtypes) == GGUF_TYPE_INT32 && gguf_get_arr_n(state, dtypes) == types.size() &&
+        gguf_get_arr_type(state, dims) == GGUF_TYPE_INT64 && gguf_get_arr_n(state, dims) == shapes.size() &&
+        gguf_get_n_tensors(state) == (int64_t) tensors.size() && gguf_get_alignment(state) == GGUF_DEFAULT_ALIGNMENT;
+    std::mt19937 restored_rng;
+    if (ok) {
+        std::istringstream rng(gguf_get_val_str(state, random));
+        ok = bool(rng >> restored_rng);
+        rng >> std::ws;
+        ok = ok && rng.eof();
+        const auto * saved_types = static_cast<const int32_t *>(gguf_get_arr_data(state, dtypes));
+        const auto * saved_shapes = static_cast<const int64_t *>(gguf_get_arr_data(state, dims));
+        ok = ok && std::equal(shapes.begin(), shapes.end(), saved_shapes);
+        for (size_t i = 0; ok && i < names.size(); ++i) {
+            ok = names[i] == gguf_get_arr_str(state, params, i) && types[i] == saved_types[i];
+        }
+    }
+    for (const auto & entry : tensors) {
+        if (!ok) { break; }
+        const ggml_tensor * saved = ggml_get_tensor(data, entry.first.c_str());
+        ok = saved && saved->type == entry.second->type && ggml_are_same_shape(saved, entry.second) &&
+            ggml_nbytes(saved) == ggml_nbytes(entry.second);
+    }
+    std::vector<std::vector<uint8_t>> payload;
+    if (ok) {
+        // Only validated destination sizes allocate memory. Never parse mutable file metadata twice.
+        std::vector<uint8_t> metadata(gguf_get_meta_size(state));
+        gguf_get_meta_data(state, metadata.data());
+        std::vector<uint8_t> actual(metadata.size());
+        ok = fsetpos(file, &start) == 0 && fread(actual.data(), 1, actual.size(), file) == actual.size() && metadata == actual;
+        size_t offset = 0;
+        uint8_t padding[GGUF_DEFAULT_ALIGNMENT];
+        for (const auto & entry : tensors) {
+            if (!ok) { break; }
+            const int64_t id = gguf_find_tensor(state, entry.first.c_str());
+            ok = id >= 0 && gguf_get_tensor_offset(state, id) == offset;
+            if (!ok) { break; }
+            payload.emplace_back(ggml_nbytes(entry.second));
+            auto & bytes = payload.back();
+            const size_t pad = (GGUF_DEFAULT_ALIGNMENT - bytes.size() % GGUF_DEFAULT_ALIGNMENT) % GGUF_DEFAULT_ALIGNMENT;
+            ok = fread(bytes.data(), 1, bytes.size(), file) == bytes.size() && fread(padding, 1, pad, file) == pad;
+            if (initial) { ok = ok && std::all_of(bytes.begin(), bytes.end(), [](uint8_t b) { return b == 0; }); }
+            offset += bytes.size() + pad;
+        }
+    }
+    ggml_opt_state * prepared = nullptr;
+    if (ok) {
+        prepared = new ggml_opt_state{ctx, std::move(tensors), std::move(payload),
+            gguf_get_val_i64(state, iteration), gguf_get_val_i32(state, index), restored_rng, initial};
+    }
+    gguf_free(state);
+    ggml_free(data);
+    return prepared;
+}
+
+bool ggml_opt_state_apply(ggml_opt_context_t ctx, ggml_opt_state * state) {
+    if (!state || state->owner != ctx || ctx->restore_preparation_failed || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+        return false;
+    }
+    std::map<std::string, ggml_tensor *> tensors;
+    std::vector<std::string> names;
+    std::vector<int32_t> types;
+    std::vector<int64_t> shapes;
+    if (!opt_state_tensors(ctx, tensors, names, types, shapes) || tensors != state->tensors) {
+        return false;
+    }
+    // Tensor setters do not return backend status. Caller must treat any interrupted/failed
+    // application as uncertain and keep the associated shadow unavailable until restored.
+    ctx->checkpoint_trusted = false;
+    ctx->checkpoint_ready = false;
+    ggml_backend_sched_synchronize(ctx->backend_sched);
+    size_t i = 0;
+    for (const auto & entry : tensors) {
+        const auto & bytes = state->payload[i++];
+        ggml_backend_tensor_set(entry.second, bytes.data(), 0, bytes.size());
+    }
+    ctx->iter = state->iteration;
+    ctx->opt_i = state->index;
+    ctx->rng = state->rng;
+    ctx->period_fresh = true;
+    ctx->checkpoint_trusted = true;
+    ctx->checkpoint_ready = !state->initial;
+    ctx->restore_pending = false;
+    return true;
+}
+
+void ggml_opt_state_free(ggml_opt_state * state) { delete state; }
+
+bool ggml_opt_state_read(ggml_opt_context_t ctx, FILE * file, const char * binding) {
+    ggml_opt_state * prepared = ggml_opt_state_prepare(ctx, file, binding);
+    const bool ok = ggml_opt_state_apply(ctx, prepared);
+    ggml_opt_state_free(prepared);
+    return ok;
 }
 
 bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx) {
@@ -864,6 +1213,15 @@ struct ggml_tensor * ggml_opt_outputs(ggml_opt_context_t opt_ctx) {
 
 struct ggml_tensor * ggml_opt_labels(ggml_opt_context_t opt_ctx) {
     return opt_ctx->labels;
+}
+
+struct ggml_tensor * ggml_opt_label_weights(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->label_weights;
+}
+
+void ggml_opt_set_next_label_weights(ggml_opt_context_t opt_ctx, bool weighted) {
+    GGML_ASSERT(!opt_ctx->eval_ready && "set before ggml_opt_alloc");
+    opt_ctx->next_label_weights = weighted;
 }
 
 struct ggml_tensor * ggml_opt_loss(ggml_opt_context_t opt_ctx) {
@@ -976,8 +1334,169 @@ void ggml_opt_prepare_alloc(
     opt_ctx->inputs      = inputs;
     opt_ctx->outputs     = outputs;
     opt_ctx->next_grad_accs.clear(); // registrations belong to the graph prepared last
+    opt_ctx->output_slices.clear();
 }
 
+int ggml_opt_project_head(
+        struct ggml_context * ctx_compute,
+        struct ggml_cgraph  * gf,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * outputs,
+        struct ggml_tensor * shadow_rows,
+        struct ggml_tensor * public_rows,
+        struct ggml_tensor * label_rows,
+        struct ggml_tensor * public_shadow_rows,
+        struct ggml_tensor ** slice_shadow_rows,
+        int64_t               rows,
+        struct ggml_tensor ** public_outputs,
+        struct ggml_tensor ** slices,
+        size_t                slices_capacity) {
+    const int64_t n = label_rows ? label_rows->ne[0] : hidden->ne[1];
+    if (rows <= 0 || n <= 0 || !ggml_is_contiguous(hidden) || ggml_n_dims(hidden) > 2 ||
+            outputs->ne[1] != hidden->ne[1] || slices_capacity < (size_t) ((n + rows - 1) / rows)) {
+        return 0;
+    }
+    // the head: the nodes between hidden and outputs, in graph order
+    std::unordered_set<const ggml_tensor *> on_path = { hidden };
+    std::vector<ggml_tensor *> head;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        ggml_tensor * node = gf->nodes[i];
+        bool reads_path = false;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            reads_path |= node->src[k] != nullptr && on_path.count(node->src[k]) > 0;
+        }
+        if (!reads_path) {
+            continue;
+        }
+        const bool replayable = node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL ||
+                                node->op == GGML_OP_ADD || node->op == GGML_OP_SCALE ||
+                                (shadow_rows && (node->op == GGML_OP_DUP || node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_SET_ROWS));
+        if (!replayable || (node->view_src != nullptr && node->op != GGML_OP_SET_ROWS)) {
+            return 0; // unsupported head
+        }
+        if ((node->op == GGML_OP_GET_ROWS && node->src[1] != shadow_rows) ||
+                (node->op == GGML_OP_SET_ROWS && node->src[1] != shadow_rows)) {
+            return 0;
+        }
+        if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
+            for (int k = 0; k < 2; ++k) {
+                if (!on_path.count(node->src[k]) && node->src[k]->ne[1] != 1) {
+                    return 0;
+                }
+            }
+        }
+        on_path.insert(node);
+        head.push_back(node);
+    }
+    if (head.empty() || head.back() != outputs) {
+        return 0;
+    }
+    // nothing else in the graph may read the head (it is about to leave the graph)
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const ggml_tensor * node = gf->nodes[i];
+        if (on_path.count(node) > 0) {
+            continue;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (node->src[k] != nullptr && node->src[k] != hidden && on_path.count(node->src[k]) > 0) {
+                return 0;
+            }
+        }
+    }
+    int j = 0;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        if (gf->nodes[i] == hidden || on_path.count(gf->nodes[i]) == 0) {
+            gf->nodes[j++] = gf->nodes[i];
+        }
+    }
+    gf->n_nodes = j;
+    auto replay = [&](ggml_tensor * selected, ggml_tensor * local_shadow_rows, int64_t row) {
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> as_slice;
+        as_slice[hidden] = selected;
+        if (shadow_rows) {
+            as_slice[shadow_rows] = local_shadow_rows;
+        }
+        for (ggml_tensor * node : head) {
+            auto src = [&](int k) { const auto it = as_slice.find(node->src[k]); return it != as_slice.end() ? it->second : node->src[k]; };
+            ggml_tensor * t = nullptr;
+            if (node->op == GGML_OP_SET_ROWS && shadow_rows && !local_shadow_rows) {
+                as_slice[node] = src(2);
+                continue;
+            }
+            bool missing = false;
+            for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                missing |= node->src[k] != nullptr && src(k) == nullptr;
+            }
+            if (missing) {
+                as_slice[node] = nullptr;
+                continue;
+            }
+            switch (node->op) {
+                case GGML_OP_DUP:      t = ggml_dup(ctx_compute, src(0)); break;
+                case GGML_OP_GET_ROWS: t = ggml_get_rows(ctx_compute, src(0), src(1)); break;
+                case GGML_OP_SET_ROWS: t = ggml_set_rows(ctx_compute, src(2), src(0), src(1)); break;
+                case GGML_OP_MUL_MAT: t = ggml_mul_mat(ctx_compute, src(0), src(1)); break;
+                case GGML_OP_MUL:     t = ggml_mul    (ctx_compute, src(0), src(1)); break;
+                case GGML_OP_ADD:     t = ggml_add    (ctx_compute, src(0), src(1)); break;
+                case GGML_OP_SCALE: {
+                    float s, b;
+                    memcpy(&s, (const float *) node->op_params + 0, sizeof(float));
+                    memcpy(&b, (const float *) node->op_params + 1, sizeof(float));
+                    t = ggml_scale_bias(ctx_compute, src(0), s, b);
+                } break;
+                default: GGML_ABORT("not a head op");
+            }
+            ggml_set_op_params(t, node->op_params, sizeof(node->op_params));
+            ggml_format_name(t, "%s-rows%lld", node->name, (long long) row);
+            as_slice[node] = t;
+        }
+        return as_slice.at(outputs);
+    };
+    *public_outputs = nullptr;
+    if (public_rows) {
+        *public_outputs = replay(ggml_get_rows(ctx_compute, hidden, public_rows),
+                public_shadow_rows, -1);
+        ggml_build_forward_expand(gf, *public_outputs);
+    }
+    ggml_tensor * selected = label_rows ? ggml_get_rows(ctx_compute, hidden, label_rows) : hidden;
+    size_t count = 0;
+    for (int64_t r0 = 0; r0 < n; r0 += rows) {
+        const int64_t nr = std::min(rows, n - r0);
+        slices[count] = replay(
+                ggml_view_2d(ctx_compute, selected, selected->ne[0], nr, selected->nb[1], r0 * selected->nb[1]),
+                slice_shadow_rows ? slice_shadow_rows[count] : nullptr, r0);
+        ++count;
+    }
+    ggml_graph_update_use_counts(gf);
+    return (int) count;
+}
+
+void ggml_opt_prepare_alloc_slices(
+        ggml_opt_context_t opt_ctx, ggml_context * ctx_compute, ggml_cgraph * gf,
+        ggml_tensor * inputs, ggml_tensor ** slices, size_t n_slices) {
+    GGML_ASSERT(n_slices > 0);
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, slices[0]);
+    opt_ctx->output_slices.assign(slices, slices + n_slices);
+}
+
+int ggml_opt_prepare_alloc_head(
+        ggml_opt_context_t opt_ctx, ggml_context * ctx_compute, ggml_cgraph * gf,
+        ggml_tensor * inputs, ggml_tensor * hidden, ggml_tensor * outputs, int64_t rows) {
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
+    const int64_t n = hidden->ne[1];
+    if (opt_ctx->loss_type != GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS || rows <= 0 || rows >= n) {
+        return 1;
+    }
+    std::vector<ggml_tensor *> slices((n + rows - 1) / rows);
+    ggml_tensor * public_outputs = nullptr;
+    const int count = ggml_opt_project_head(ctx_compute, gf, hidden, outputs, nullptr, nullptr, nullptr, nullptr, nullptr,
+            rows, &public_outputs, slices.data(), slices.size());
+    if (count == 0) {
+        return 1;
+    }
+    ggml_opt_prepare_alloc_slices(opt_ctx, ctx_compute, gf, inputs, slices.data(), count);
+    return count;
+}
 void ggml_opt_set_alloc_budget(ggml_opt_context_t opt_ctx, size_t bytes) {
     opt_ctx->alloc_budget = bytes;
 }
@@ -986,7 +1505,34 @@ size_t ggml_opt_peak_graph_bytes(ggml_opt_context_t opt_ctx) {
     return opt_ctx->peak_graph_bytes;
 }
 
+// Release only the prepared graph lifecycle, not optimizer counters, moments or parameter weights.
+static void opt_disarm_evaluation(ggml_opt_context_t opt_ctx) {
+    opt_ctx->next_manual     = false;
+    opt_ctx->next_period_end = false;
+    opt_ctx->next_loss_scale = 1.0f;
+    opt_ctx->next_extra_loss = nullptr;
+
+    if (!opt_ctx->static_graphs) {
+        opt_ctx->gf                   = nullptr;
+        opt_ctx->gb_grad              = nullptr;
+        opt_ctx->gb_opt               = nullptr;
+        opt_ctx->allocated_graph      = nullptr;
+        opt_ctx->allocated_graph_copy = nullptr;
+    }
+
+    opt_ctx->eval_ready = false;
+
+}
+
 bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
+    if (opt_ctx->restore_preparation_failed) {
+        opt_ctx->refusal = "failed restore allocation requires optimizer teardown";
+        return false;
+    }
+    if (opt_ctx->restore_pending) {
+        opt_ctx->refusal = "fresh optimizer allocation awaits a validated generation restore";
+        return false;
+    }
     GGML_ASSERT(!opt_ctx->eval_ready);
     if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
         ggml_graph_reset(opt_ctx->gb_grad);
@@ -1061,8 +1607,7 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     if (backward) {
         ggml_backend_sched_t sched  = opt_ctx->backend_sched;
         ggml_backend_t       device = ggml_backend_sched_get_backend(sched, 0);
-        ggml_backend_dev_t   dev    = device ? ggml_backend_get_device(device) : nullptr;
-        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        if (device != nullptr) {
             ggml_cgraph * g = opt_ctx->allocated_graph_copy;
             for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
                 ggml_tensor * node = ggml_graph_node(g, i);
@@ -1150,12 +1695,78 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
     opt_ctx->allocated_graph = graph;
 
+    // GGML_OPT_TOP=N: the graph's N largest tensors, nodes and the leaves it allocates (inputs, not
+    // views or weights), where its memory goes
+    if (const char * top = getenv("GGML_OPT_TOP")) {
+        ggml_cgraph * g = opt_ctx->allocated_graph_copy;
+        std::vector<std::pair<size_t, const ggml_tensor *>> rows;
+        for (int i = 0; i < g->n_nodes; ++i) {
+            if (g->nodes[i]->view_src == nullptr) {
+                rows.emplace_back(ggml_nbytes(g->nodes[i]), g->nodes[i]);
+            }
+        }
+        for (int i = 0; i < g->n_leafs; ++i) {
+            const ggml_tensor * l = g->leafs[i];
+            if (l->view_src == nullptr && (l->flags & GGML_TENSOR_FLAG_INPUT)) {
+                rows.emplace_back(ggml_nbytes(l), l);
+            }
+        }
+        std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
+        size_t sum = 0;
+        for (const auto & r : rows) {
+            sum += r.first;
+        }
+        GGML_LOG_INFO("%s: graph of %d nodes, %d leafs: its tensors sum to %.1f MiB, the peak so far %.1f MiB\n", __func__,
+            g->n_nodes, g->n_leafs, sum/1048576.0, opt_ctx->peak_graph_bytes/1048576.0);
+        const size_t n = std::min<size_t>(rows.size(), (size_t) atoi(top));
+        for (size_t i = 0; i < n; ++i) {
+            const ggml_tensor * t = rows[i].second;
+            GGML_LOG_INFO("%s: top %2zu: %8.1f MiB %-12s %-6s [%lld,%lld,%lld,%lld] %s <- %s %s [%lld,%lld] | %s %s [%lld,%lld]\n", __func__, i,
+                rows[i].first/1048576.0, ggml_op_desc(t), ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1],
+                (long long) t->ne[2], (long long) t->ne[3], t->name,
+                t->src[0] ? ggml_op_desc(t->src[0]) : "-", t->src[0] ? t->src[0]->name : "", t->src[0] ? (long long) t->src[0]->ne[0] : 0LL,
+                t->src[0] ? (long long) t->src[0]->ne[1] : 0LL,
+                t->src[1] ? ggml_op_desc(t->src[1]) : "-", t->src[1] ? t->src[1]->name : "", t->src[1] ? (long long) t->src[1]->ne[0] : 0LL,
+                t->src[1] ? (long long) t->src[1]->ne[1] : 0LL);
+        }
+    }
+
     opt_ctx->eval_ready = true;
     return true;
 }
 
+bool ggml_opt_can_prepare_restore(ggml_opt_context_t opt_ctx) {
+    return opt_ctx && !opt_ctx->restore_preparation_failed && !opt_ctx->evaluation_attempted && !opt_ctx->restore_pending && !opt_ctx->eval_ready &&
+        opt_ctx->iter == 1 && opt_ctx->opt_i == 0 && opt_ctx->period_fresh &&
+        opt_ctx->checkpoint_trusted && !opt_ctx->checkpoint_ready &&
+        !opt_ctx->next_manual && !opt_ctx->next_extra_loss;
+}
+
+bool ggml_opt_alloc_for_restore(ggml_opt_context_t opt_ctx) {
+    if (!ggml_opt_can_prepare_restore(opt_ctx)) { return false; }
+    const bool allocated = ggml_opt_alloc(opt_ctx, true);
+    // The caller may release its transient graph metadata as soon as this returns, on either
+    // outcome. Never leave a rejected allocation pointing into that storage. Persistent parameter
+    // and optimizer tensors retain their existing ownership; a failed attempt is teardown-only.
+    opt_disarm_evaluation(opt_ctx);
+    if (!opt_ctx->static_graphs) {
+        opt_ctx->ctx_compute = nullptr;
+        opt_ctx->inputs = nullptr;
+        opt_ctx->outputs = nullptr;
+        opt_ctx->output_slices.clear();
+        opt_ctx->leaf_grads.clear();
+        opt_ctx->next_grad_accs.clear();
+    }
+    opt_ctx->restore_preparation_failed = !allocated;
+    opt_ctx->restore_pending = allocated;
+    return allocated;
+}
+
 void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->eval_ready);
+    // a caller-driven step's loss is not scaled by 1/opt_period (ggml_opt_build): recorded as if it
+    // were, so the result's reader (which multiplies a per-datapoint loss by opt_period) reports it right
+    const bool manual = opt_ctx->next_manual;
     if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
 
@@ -1196,7 +1807,10 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         }
     }
 
+    opt_ctx->evaluation_attempted = true;
     const enum ggml_status status = ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    opt_ctx->checkpoint_trusted &= status == GGML_STATUS_SUCCESS;
+    opt_ctx->checkpoint_ready = opt_ctx->checkpoint_trusted && opt_ctx->allocated_graph == opt_ctx->gb_opt;
     if (status != GGML_STATUS_SUCCESS) {
         // the step's gradients (and the optimizer update inside this graph) were computed on
         // memory the backend says it did not have: the run must stop, never continue on them
@@ -1211,20 +1825,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     } else if (opt_ctx->allocated_graph == opt_ctx->gb_grad) {
         opt_ctx->period_fresh = false;
     }
-    opt_ctx->next_manual     = false;
-    opt_ctx->next_period_end = false;
-    opt_ctx->next_loss_scale = 1.0f;
-    opt_ctx->next_extra_loss = nullptr;
-
-    if (!opt_ctx->static_graphs) {
-        opt_ctx->gf                   = nullptr;
-        opt_ctx->gb_grad              = nullptr;
-        opt_ctx->gb_opt               = nullptr;
-        opt_ctx->allocated_graph      = nullptr;
-        opt_ctx->allocated_graph_copy = nullptr;
-    }
-
-    opt_ctx->eval_ready = false;
+    opt_disarm_evaluation(opt_ctx);
 
     if (!result) {
         return;
@@ -1238,7 +1839,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         GGML_ASSERT(result->opt_period         == opt_ctx->opt_period);
     }
 
-    const int64_t ndata = opt_ctx->outputs->ne[1];
+    const int64_t ndata = ggml_opt_output_rows(opt_ctx);
     result->ndata += ndata;
     result->ndata_batch.push_back(ndata);
 
@@ -1246,7 +1847,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     GGML_ASSERT(opt_ctx->loss->type == GGML_TYPE_F32);
     float loss;
     ggml_backend_tensor_get(opt_ctx->loss, &loss, 0, ggml_nbytes(opt_ctx->loss));
-    result->loss.push_back(loss);
+    result->loss.push_back(manual && opt_ctx->loss_per_datapoint ? loss / opt_ctx->opt_period : loss);
 
     if (opt_ctx->pred) {
         GGML_ASSERT(opt_ctx->pred->type == GGML_TYPE_I32);

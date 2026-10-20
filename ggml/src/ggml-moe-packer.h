@@ -87,6 +87,9 @@ static inline bool moec_pack(const char * path, uint32_t layers, uint32_t expert
 static inline bool moec_pack_dir(const char * dir, const char * model, uint32_t fmt,
                                  uint32_t layers, uint32_t experts, uint64_t record_bytes,
                                  uint32_t activated_per_token, uint32_t top_k_per_layer, ExpertSource & src) {
+    ContainerLease lease(dir, true);
+    if (!lease.ok()) { return false; }
+    dir = lease.root().c_str();
     if (record_bytes == 0 || record_bytes % 4096 != 0) { return false; }   // her open() refuses otherwise
     if (top_k_per_layer != 0 && activated_per_token != top_k_per_layer * layers) { return false; } // total, not per-layer
 
@@ -151,6 +154,9 @@ static inline bool moec_pack_dir_tiered(const char * dir, const char * model, ui
                                         uint32_t activated_per_token, uint32_t top_k_per_layer,
                                         const TierSpec * tiers, uint32_t n_tiers,
                                         ExpertSource & (*source_for)(uint32_t tier, void * user), void * user) {
+    ContainerLease lease(dir, true);
+    if (!lease.ok()) { return false; }
+    dir = lease.root().c_str();
     if (n_tiers == 0) { return false; }
     if (top_k_per_layer != 0 && activated_per_token != top_k_per_layer * layers) { return false; }
     for (uint32_t t = 0; t < n_tiers; t++) {

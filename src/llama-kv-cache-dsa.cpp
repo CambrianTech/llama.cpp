@@ -260,3 +260,7 @@ const llama_kv_cache_context * llama_kv_cache_dsa_context::get_lid()  const {
 
     return static_cast<const llama_kv_cache_context *>(ctx_lid.get());
 }
+
+const char * llama_kv_cache_dsa::training_error(const llama_batch &, bool) const {
+    return "DSA cache row gradients are not supported";
+}

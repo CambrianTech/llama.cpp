@@ -82,6 +82,9 @@ struct llama_memory_i {
 
     virtual ~llama_memory_i() = default;
 
+    // Read-only admission for a validated batch; nullptr means admitted.
+    virtual const char * training_error(const llama_batch & batch, bool flash_attn) const = 0;
+
     // split the input batch into a set of ubatches and verify that they can fit into the cache
     // return a context object containing the ubatches and memory state required to process them
     // check the llama_memory_context_i::get_status() for the result

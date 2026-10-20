@@ -14,27 +14,20 @@
 //          band WASTE measured. Catches reuse=0 end-to-end from real behavior, no model load.
 //
 // BUILD (Linux/CI — the Windows DirectReadFetcher is #ifdef'd out, so no windows.h needed):
-//   c++ -std=c++17 -O2 -I ../ggml/src tests/test-moe-residency.cpp -o /tmp/tmoe && /tmp/tmoe
+//   c++ -std=c++17 -O2 -I ggml/src -I ggml/include tests/test-moe-residency.cpp -o /tmp/tmoe && /tmp/tmoe
 //   VDD replay of a real trace:  /tmp/tmoe path/to/trace.tsv
 //
 // TODO (next session / clean-architecture): give ResidencyCache a SlotAllocator seam (Ggml pinned vs
 // malloc) so the PRODUCTION cache runs these same tests directly instead of the reference model below.
 // The reference model here IS the spec the production cache must match.
 
+#include <cstddef>
+#include "ggml-backend.h"
+
 #ifdef _WIN32
 #include <windows.h>   // the header's DirectReadFetcher (under _WIN32) references Win32 types; pull them
 #include <psapi.h>     // GetMappedFileNameW (declaration only — DirectReadFetcher is never instantiated)
 #endif
-
-// --- ggml stubs so the header parses standalone (ResidencyCache is never instantiated here, so these
-//     are declared-not-defined: name lookup succeeds, nothing is ODR-used, nothing to link). ---
-typedef struct ggml_backend_buffer      * ggml_backend_buffer_t;
-typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
-extern "C" {
-    ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t, size_t);
-    void *                ggml_backend_buffer_get_base(ggml_backend_buffer_t);
-    void                  ggml_backend_buffer_free(ggml_backend_buffer_t);
-}
 
 #include "ggml-moe-residency.hpp"
 #include "ggml-moe-container.h"
@@ -51,6 +44,7 @@ extern "C" {
 #include <unordered_map>
 #include <list>
 #include <fstream>
+#include <chrono>
 #include <sstream>
 #include <filesystem>
 
@@ -805,12 +799,99 @@ static void test_serving_config_from_env() {
     CHECK(d.plan_path.empty(), "unset plan path => empty");
 }
 
+static void test_container_lifetime_custody() {
+    using namespace ggml_moe;
+    namespace fs = std::filesystem;
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path dir = fs::temp_directory_path() / ("moec_custody_test_" + std::to_string(nonce));
+    const bool created = fs::create_directory(dir);
+    CHECK(created, "custody fixture exclusively creates its disposable directory");
+    if (!created) { return; }
+    auto receipt = dir; receipt += ".container-placement.json";
+    fs::remove(receipt);
+    WexpSource src(1);
+    CHECK(moec_pack_dir(dir.string().c_str(), "custody", MOEC_Q_RVQ3, 1, 2, 4096, 1, 1, src), "pack before reader custody");
+    {
+        DirContainerFetcher reader(dir.string().c_str());
+        CHECK(reader.ok() && reader.record_bytes() == 4096, "manifest snapshot belongs to retained reader lease");
+        ContainerLease writer(dir.string().c_str(), true);
+        CHECK(!writer.ok(), "reader excludes migration before its first lazy bank open");
+        CHECK(!moec_pack_dir(dir.string().c_str(), "replacement", MOEC_Q_RVQ3, 1, 2, 4096, 1, 1, src), "packer cannot mutate a live reader closure");
+        std::vector<unsigned char> bytes(4096);
+        CHECK(reader.fetch(bytes.data(), nullptr, bytes.size()), "retained reader still opens its original bank");
+    }
+    {
+        TieredContainerFetcher reader(dir.string().c_str());
+        ContainerLease writer(dir.string().c_str(), true);
+        CHECK(!writer.ok(), "tiered reader excludes migration before bank selection");
+    }
+    {
+        ContainerLease writer(dir.string().c_str(), true);
+        CHECK(writer.ok(), "writer acquires only after both reader lifetimes end");
+        DirContainerFetcher reader(dir.string().c_str());
+        CHECK(!reader.ok() && reader.record_bytes() == 0, "writer excludes a new reader and manifest snapshot");
+    }
+    { std::ofstream marker(receipt); marker << "{corrupt-or-frozen}"; }
+    CHECK(!ContainerLease(dir.string().c_str()).ok(), "every placement receipt refuses raw-path reading");
+    CHECK(!ContainerLease(dir.string().c_str(), true).ok(), "packer cannot overwrite a placed container");
+    fs::remove(receipt);
+    CHECK(ContainerLease(dir.string().c_str(), true).ok(), "failed constructors release their file handles");
+    std::error_code link_error;
+    fs::create_symlink(dir / "missing-receipt", receipt, link_error);
+    if (!link_error) {
+        CHECK(!ContainerLease(dir.string().c_str()).ok(), "dangling receipt refuses native reading");
+        fs::remove(receipt);
+    } else {
+        std::printf("custody receipt symlink fixture unavailable: %s\n", link_error.message().c_str());
+    }
+    auto alias = dir; alias += ".alias";
+    fs::create_directory_symlink(dir, alias, link_error);
+    if (!link_error) {
+        ContainerLease lease(alias.string().c_str());
+        CHECK(lease.ok() && fs::u8path(lease.root()) == fs::canonical(dir), "reader alias resolves to the same physical lock root");
+        fs::remove(alias);
+    } else {
+        std::printf("custody directory alias fixture unavailable: %s\n", link_error.message().c_str());
+    }
+    fs::remove_all(dir);
+    // No live lease remains: fixture-owned protocol inode cleanup only.
+    auto lock = dir; lock += ".container-placement.lock"; fs::remove(lock);
+}
+
 int main(int argc, char ** argv) {
+#ifdef _WIN32
+    // Cross-process fixture: keep a writable mapping after closing its original
+    // file handle, so Rust's deny-write sharing is tested against the mapping.
+    if (argc == 3 && std::strcmp(argv[1], "--container-write-map") == 0) {
+        const auto path = std::filesystem::u8path(argv[2]);
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) { return 3; }
+        HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+        void * view = mapping ? MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0) : nullptr;
+        CloseHandle(file);
+        if (!view) { if (mapping) { CloseHandle(mapping); } return 3; }
+        std::puts("held"); std::fflush(stdout);
+        (void) std::getchar();
+        UnmapViewOfFile(view); CloseHandle(mapping);
+        return 0;
+    }
+#endif
+    if ((argc == 4 || argc == 5) && std::strcmp(argv[1], "--container-lease") == 0) {
+        ggml_moe::ContainerLease lease(argv[2], std::strcmp(argv[3], "writer") == 0);
+        if (lease.ok() && argc == 5 && std::strcmp(argv[4], "hold") == 0) {
+            std::puts("held"); std::fflush(stdout);
+            (void) std::getchar();
+        }
+        return lease.ok() ? 0 : 3;
+    }
     // VDD mode: replay a captured trace if a path is given.
     if (argc > 1) { int rc = replay_trace(argv[1]); std::printf("%d passed, %d failed\n", g_pass, g_fail); return rc; }
 
     // TDD suite
     test_serving_config_from_env();
+    test_container_lifetime_custody();
     test_key_stable_across_tokens();
     test_key_distinct_axes();
     test_canonical_strips_decoration();

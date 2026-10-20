@@ -1,5 +1,7 @@
 #include "llama-batch.h"
 
+#include <cmath>
+
 #include "llama-impl.h"
 #include "llama-vocab.h"
 #include "llama-memory.h"
@@ -56,7 +58,15 @@ bool llama_batch_allocr::init(
     }
 
     if (batch.seq_id) {
+        if (!batch.n_seq_id) {
+            LLAMA_LOG_ERROR("%s: sequence IDs require sequence counts\n", __func__);
+            return false;
+        }
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.n_seq_id[i] <= 0 || batch.n_seq_id[i] > (int32_t) n_seq_max || !batch.seq_id[i]) {
+                LLAMA_LOG_ERROR("%s: invalid sequence list at position %d\n", __func__, i);
+                return false;
+            }
             for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
                 if (batch.seq_id && (batch.seq_id[i][s] < 0 || batch.seq_id[i][s] >= (llama_seq_id) n_seq_max)) {
                     LLAMA_LOG_ERROR("%s: invalid seq_id[%d][%d] = %d >= %d\n", __func__, i, s, batch.seq_id[i][s], (llama_seq_id) n_seq_max);
@@ -157,6 +167,41 @@ bool llama_batch_allocr::init(
         n_outputs += batch.logits[i] != 0;
     }
 
+    // a labelled position is a training row: its logits row is what the loss reads. A run of
+    // them trains given everything before it as served (the shadow adapter applies to labelled
+    // rows only) and is restored to her stable set after, so in one batch a sequence's labelled
+    // rows are one run that ends its rows: anything after it would read the run through the
+    // shadow instead of as served.
+    if (batch.label) {
+        bool in_run[LLAMA_MAX_SEQ] = {};
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.label[i] < -1 || (batch.label[i] >= 0 && (uint32_t) batch.label[i] >= vocab.n_tokens())) {
+                LLAMA_LOG_ERROR("%s: invalid label[%d] = %d\n", __func__, i, batch.label[i]);
+                return false;
+            }
+            if (batch.label[i] >= 0 && batch.label_weight && !(std::isfinite(batch.label_weight[i]) && batch.label_weight[i] >= 0.0f)) {
+                LLAMA_LOG_ERROR("%s: invalid label_weight[%d] = %f: a weight is finite and >= 0\n", __func__, i, batch.label_weight[i]);
+                return false;
+            }
+            const llama_seq_id s = batch.seq_id[i][0];
+            if (batch.label[i] < 0) {
+                for (int32_t j = 0; j < batch.n_seq_id[i]; ++j) {
+                    if (in_run[batch.seq_id[i][j]]) {
+                        LLAMA_LOG_ERROR("%s: position %d follows a labelled run of sequence %d in one batch: a run ends its sequence's rows\n", __func__, i, batch.seq_id[i][j]);
+                        return false;
+                    }
+                }
+                continue;
+            }
+            if (batch.n_seq_id[i] != 1) {
+                LLAMA_LOG_ERROR("%s: position %d has a label and %d sequences: a training row belongs to one sequence\n", __func__, i, batch.n_seq_id[i]);
+                return false;
+            }
+            in_run[s] = true;
+            ++n_labels;
+        }
+    }
+
     has_cpl = false;
 
     // determine coupled sequences
@@ -224,6 +269,8 @@ bool llama_batch_allocr::init(
             /*.seq_id_unq   =*/ this->seq_id_unq.data(),
             /*.seq_idx      =*/ this->seq_idx.data(),
             /*.output       =*/ batch.logits,
+            /*.label        =*/ batch.label,
+            /*.label_weight =*/ batch.label_weight,
             /*.data         =*/ {},
         };
 
@@ -430,6 +477,8 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.label        =*/ nullptr,
+        /*.label_weight =*/ nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -446,6 +495,10 @@ uint32_t llama_batch_allocr::get_n_tokens() const {
 
 uint32_t llama_batch_allocr::get_n_outputs() const {
     return n_outputs;
+}
+
+uint32_t llama_batch_allocr::get_n_labels() const {
+    return n_labels;
 }
 
 uint32_t llama_batch_allocr::get_n_used() const {
@@ -722,6 +775,7 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 
 void llama_batch_allocr::clear() {
     n_outputs = 0;
+    n_labels  = 0;
 
     batch = {};
 
@@ -764,6 +818,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+    udata->label     .resize(batch.label ? n_tokens : 0);
+    udata->label_weight.resize(batch.label && batch.label_weight ? n_tokens : 0);
 
     udata->seq_id_data.reserve(n_tokens);
 
@@ -789,6 +845,12 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
 
         udata->n_seq_id[i] = batch.n_seq_id[idxs[i]];
         udata->output[i]   = batch.logits[idxs[i]];
+        if (batch.label) {
+            udata->label[i] = batch.label[idxs[i]];
+            if (batch.label_weight) {
+                udata->label_weight[i] = batch.label_weight[idxs[i]];
+            }
+        }
 
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
             const llama_seq_id seq_id = batch.seq_id[idxs[i]][s];
@@ -831,6 +893,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
+        /*.label        =*/ batch.label ? udata->label.data() : nullptr,
+        /*.label_weight =*/ batch.label && batch.label_weight ? udata->label_weight.data() : nullptr,
         /*.data         =*/ std::move(udata),
     };
 
@@ -939,6 +1003,8 @@ struct llama_batch llama_batch_get_one(
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*label    =*/ nullptr,
+        /*label_weight =*/ nullptr,
     };
 }
 
@@ -951,6 +1017,8 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
+        /*label    =*/ nullptr,
+        /*label_weight =*/ nullptr,
     };
 
     if (embd) {
@@ -968,6 +1036,10 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     batch.seq_id[n_tokens_alloc] = nullptr;
 
     batch.logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens_alloc);
+    batch.label    = (llama_token *)   malloc(sizeof(llama_token)    * n_tokens_alloc);
+    std::fill(batch.label, batch.label + n_tokens_alloc, -1); // no position trains until labelled
+    batch.label_weight = (float *) malloc(sizeof(float) * n_tokens_alloc);
+    std::fill(batch.label_weight, batch.label_weight + n_tokens_alloc, 1.0f); // every labelled position counts 1 until weighted
 
     return batch;
 }
@@ -984,4 +1056,6 @@ void llama_batch_free(struct llama_batch batch) {
         free(batch.seq_id);
     }
     if (batch.logits)   free(batch.logits);
+    if (batch.label)    free(batch.label);
+    if (batch.label_weight) free(batch.label_weight);
 }

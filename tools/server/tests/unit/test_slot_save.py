@@ -5,6 +5,8 @@ import requests
 import struct
 import threading
 import time
+import uuid
+from pathlib import Path
 
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
 STATE_FILE_HEADER_SIZE = 12
@@ -21,7 +23,12 @@ def create_server():
 
 def test_slot_save_restore():
     global server
+    server.server_slots = True
     server.start()
+
+    props = server.make_request("GET", "/props")
+    assert props.status_code == 200
+    assert props.body["slot_save_size_version"] == 1
 
     # First prompt in slot 1 should be fully processed
     res = server.make_request("POST", "/completion", data={
@@ -33,12 +40,39 @@ def test_slot_save_restore():
     assert match_regex("(Whiskers|Flana)+", res.body["content"])
     assert res.body["timings"]["prompt_n"] == 21  # all tokens are processed
 
+    # 2e3dd9c1: exact file framing and companions are quoted without writing.
+    paths = [Path(server.slot_save_path) / ("slot1.bin" + suffix) for suffix in ("", ".ckpt", ".lora")]
+    before = [p.read_bytes() if p.exists() else None for p in paths]
+    for invalid in (-1, 0.5, "1"):
+        assert server.make_request("POST", "/slots/1?action=save", data={
+            "filename": "slot1.bin", "admitted_bytes": invalid,
+        }).status_code == 400
+    assert server.make_request("POST", "/slots/1?action=save-size", data={
+        "filename": "slot1.bin", "admitted_bytes": (1 << 64) - 1,
+    }).status_code == 200
+    quote = server.make_request("POST", "/slots/1?action=save-size", data={"filename": "slot1.bin"})
+    assert quote.status_code == 200
+    projected = quote.body["projected_bytes"]
+    assert projected > 0
+    assert [p.read_bytes() if p.exists() else None for p in paths] == before
+    refused = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "slot1.bin", "admitted_bytes": projected - 1,
+    })
+    assert refused.status_code == 400
+    assert [p.read_bytes() if p.exists() else None for p in paths] == before
+
     # Save state of slot 1
     res = server.make_request("POST", "/slots/1?action=save", data={
-        "filename": "slot1.bin",
+        "filename": "slot1.bin", "admitted_bytes": projected,
     })
     assert res.status_code == 200
     assert res.body["n_saved"] == 84
+    assert sum(p.stat().st_size for p in paths) == projected
+    saved = [p.read_bytes() for p in paths]
+    assert server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "slot1.bin", "admitted_bytes": 0,
+    }).status_code == 400
+    assert [p.read_bytes() for p in paths] == saved
 
     # Since we have cache, this should only process the last tokens
     res = server.make_request("POST", "/completion", data={
@@ -51,11 +85,26 @@ def test_slot_save_restore():
     assert res.body["timings"]["prompt_n"] == 6  # only different part is processed
 
     # Loading the saved cache into slot 0
+    operation = str(uuid.uuid4())
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "slot1.bin",
+        "operation_id": operation,
     })
     assert res.status_code == 200
     assert res.body["n_restored"] == 84
+    # c610ef8f: same operation/slot, real IO count, terminal observation separate
+    # from the successful restore response above. Unknown identities are refused.
+    progress = server.make_request("GET", f"/slots?operation_id={operation}")
+    assert progress.status_code == 200
+    assert progress.body["operation_id"] == operation and progress.body["id_slot"] == 0
+    assert progress.body["action"] == "restore" and progress.body["phase"] == 3
+    assert 0 < progress.body["state_bytes"] <= progress.body["state_total"]
+    assert progress.body["sidecar_bytes"] <= progress.body["sidecar_total"]
+    assert server.make_request("GET", f"/slots?operation_id={uuid.uuid4()}").status_code == 404
+    # One retained identity cannot alias another slot (even after completion).
+    assert server.make_request("POST", "/slots/1?action=restore", data={
+        "filename": "slot1.bin", "operation_id": operation,
+    }).status_code == 400
 
     # Since we have cache, slot 0 should only process the last tokens
     res = server.make_request("POST", "/completion", data={
@@ -76,6 +125,17 @@ def test_slot_save_restore():
     assert res.status_code == 200
     assert match_regex("(Jack|said)+", res.body["content"])
     assert res.body["timings"]["prompt_n"] == 1
+
+    # A later failed operation replaces the bounded per-slot snapshot. The old
+    # UUID becomes unknown; the new failure remains distinct from completion.
+    failed_operation = str(uuid.uuid4())
+    failed = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": f"missing-{failed_operation}.bin", "operation_id": failed_operation,
+    })
+    assert failed.status_code != 200
+    progress = server.make_request("GET", f"/slots?operation_id={failed_operation}")
+    assert progress.status_code == 200 and progress.body["phase"] == 4
+    assert server.make_request("GET", f"/slots?operation_id={operation}").status_code == 404
 
 
 def test_slot_save_while_slot_is_processing():
@@ -226,12 +286,19 @@ def test_deferred_restore_is_bound_to_its_slot():
     # Queue a restore for the STILL-BUSY long slot 1 FIRST (deferred). Without the
     # id_slot bind this is the task pop_deferred_task wrongly pops when slot 0 frees.
     r1_result = {}
+    operation = str(uuid.uuid4())
     def restore_slot1():
-        rr = server.make_request("POST", "/slots/1?action=restore", data={"filename": "page.bin"})
+        rr = server.make_request("POST", "/slots/1?action=restore", data={"filename": "page.bin", "operation_id": operation})
         r1_result["code"] = rr.status_code
     tr1 = threading.Thread(target=restore_slot1, daemon=True)
     tr1.start()
     time.sleep(0.3)  # ensure the slot-1 restore is enqueued (deferred) before the slot-0 one
+    progress = server.make_request("GET", f"/slots?operation_id={operation}")
+    assert progress.status_code == 200 and progress.body["id_slot"] == 1
+    assert progress.body["operation_id"] == operation
+    # Even while queued behind a long generation the progress query is answered.
+    # Runner speed may have advanced it, so do not assume it is still queued.
+    assert progress.body["phase"] in (0, 1, 2, 3)
 
     # THE regression: restore into slot 0. Slot 0's short gen ends well before slot 1's.
     started = time.time()

@@ -546,6 +546,22 @@ task_params eval_llama_cmpl_schema(
         f->eval(ctx, data);
     }
 
+    // learn a reply on this request's slot before it is released: {"reply": text, "lora_id", "lr"};
+    // the reply is learned as the tokens the model would generate after this prompt (its text, then
+    // the end of the turn)
+    if (data.contains("learn")) {
+        const json & l = data.at("learn");
+        if (!l.is_object() || !l.contains("reply") || !l.at("reply").is_string() || l.at("reply").get<std::string>().empty()) {
+            throw std::invalid_argument("\"learn\" must be an object with a non-empty \"reply\" string");
+        }
+        learn_request L;
+        L.lora_id = json_value(l, "lora_id", -1);
+        L.lr      = json_value(l, "lr", 1e-4f);
+        L.reply   = common_tokenize(vocab, l.at("reply").get<std::string>(), false, true);
+        L.reply.push_back(llama_vocab_eot(vocab) != LLAMA_TOKEN_NULL ? llama_vocab_eot(vocab) : llama_vocab_eos(vocab));
+        params.learn = std::move(L);
+    }
+
     // post-processing
     {
         // if "reasoning_format" is not provided, its handler will not be called, we will need to handle it here

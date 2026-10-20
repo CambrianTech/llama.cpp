@@ -2401,8 +2401,21 @@ bool common_lora_write_fresh(const llama_model * model, const std::string & path
     std::vector<shape> shapes;
     const int32_t n_layer = llama_model_n_layer(model);
     const int32_t first   = top_layers > 0 && top_layers < n_layer ? n_layer - top_layers : 0;
+    for (const auto & target : targets) {
+        if (target == "token_embd.weight") {
+            LOG_ERR("%s: embedding adapters require the embedding-specific layout\n", __func__);
+            return false;
+        }
+        const ggml_tensor * w = llama_model_get_tensor(model, target.c_str());
+        if (w != nullptr && ggml_n_dims(w) == 2) {
+            shapes.push_back({ target, w->ne[0], w->ne[1] });
+        }
+    }
     for (int32_t il = first; il < n_layer; ++il) {
         for (const auto & target : targets) {
+            if (llama_model_get_tensor(model, target.c_str()) != nullptr) {
+                continue;
+            }
             const std::string name = "blk." + std::to_string(il) + "." + target + ".weight";
             const ggml_tensor * w = llama_model_get_tensor(model, name.c_str());
             if (w != nullptr && ggml_n_dims(w) == 2) {

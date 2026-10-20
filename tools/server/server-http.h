@@ -1,5 +1,7 @@
 #pragma once
 
+#include "json.h"
+
 #include <atomic>
 #include <functional>
 #include <map>
@@ -86,6 +88,7 @@ struct server_http_context {
     bool init(const common_params & params);
     bool start();
     void stop() const;
+    void note_loading_progress(const common_json & progress);
 
     void get(const std::string & path, const handler_t & handler) const;
     void post(const std::string & path, const handler_t & handler) const;

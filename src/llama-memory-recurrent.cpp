@@ -1270,3 +1270,12 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     }
     return (int32_t)(idx * mem->size) + src0;
 }
+
+const char * llama_memory_recurrent::training_error(const llama_batch & batch, bool) const {
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.label[i] >= 0 && rollback_pending(batch.seq_id[i][0])) {
+            return "a labelled sequence has pending recurrent rollback";
+        }
+    }
+    return nullptr;
+}

@@ -1325,6 +1325,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (opt_shadow && opt_shadow->restore_quarantined && ubatch.n_labels() > 0) {
+        opt_fail("shadow generation restore is uncertain; restore a known-good generation before labelled evaluation");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1334,11 +1339,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
+    // a ubatch with labelled rows is a training step on this context's trainable adapter
+    // (llama_opt_init): the same graph with the extras on, the shadow's masked term
+    // (graph_params) and the loss and backward (opt_ubatch). It is built fresh, and
+    // cparams.training is part of the reuse key, so a serving graph never reuses it.
+    bool train = false;
+    if (opt_ctx != nullptr) {
+        train = !opt_forward_only && ubatch.n_labels() > 0;
+        cparams.training = train;
+        cparams.walk_active = opt_walk_active != nullptr;
+    }
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!train && !graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1365,6 +1381,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+
+        if (train) {
+            if (!opt_ubatch(res, gf, ubatch)) {
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            ret = GGML_STATUS_SUCCESS;
+            return res;
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -1397,6 +1422,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    for (const auto & entry : *loras) {
+        if (entry.first->restore_quarantined) {
+            LLAMA_LOG_ERROR("%s: adapter generation restore is uncertain\n", __func__);
+            return -1;
+        }
+    }
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1635,6 +1667,13 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    for (const auto & entry : *loras) {
+        if (entry.first->restore_quarantined) {
+            LLAMA_LOG_ERROR("%s: adapter generation restore is uncertain\n", __func__);
+            return -1;
+        }
+    }
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1698,6 +1737,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    if (balloc->get_n_labels() > 0) {
+        if (!model.output) {
+            LLAMA_LOG_ERROR("%s: labelled training requires a language-model output weight\n", __func__);
+            return -1;
+        }
+        if (cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+            LLAMA_LOG_ERROR("%s: labelled training requires a token-wise output head, not pooled outputs\n", __func__);
+            return -1;
+        }
+        if (!opt_ctx) {
+            LLAMA_LOG_ERROR("%s: labelled rows require an initialized optimizer\n", __func__);
+            return -1;
+        }
+        if (const char * why = memory->training_error(balloc->get_batch(), cparams.flash_attn)) {
+            LLAMA_LOG_ERROR("%s: %s\n", __func__, why);
+            return -1;
+        }
+    }
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
@@ -1780,8 +1837,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
-    // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    // reserve output buffer (none for outputs that only feed a training loss)
+    const bool host_outputs = !opt_outputs_internal && opt_walk_active == nullptr;
+    if (output_reserve(host_outputs ? n_outputs_all : 0) < (host_outputs ? n_outputs_all : 0)) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
@@ -1862,7 +1920,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && host_outputs && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -1877,7 +1935,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract embeddings
-        if (embd.data && t_embd && n_outputs > 0) {
+        if (embd.data && t_embd && n_outputs > 0 && host_outputs) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
 
@@ -1945,7 +2003,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (embd_nextn.data && t_h_nextn && n_rows > 0 && host_outputs && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -1972,7 +2030,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
-    n_outputs = n_outputs_all;
+    n_outputs = host_outputs ? n_outputs_all : 0;
 
     // set output mappings
     if (n_outputs > 0) {
@@ -2487,10 +2545,12 @@ llm_graph_params llama_context::graph_params(
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
+        /*.shadow      =*/ opt_shadow,
+        /*.n_shadow_rows =*/ opt_shadow != nullptr ? ubatch.n_labels() : 0,
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
-        /*.n_outputs   =*/ n_outputs,
+        /*.n_outputs   =*/ (cparams.training || (opt_shadow && ubatch.n_labels() > 0)) ? ubatch.n_tokens : n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -2714,11 +2774,15 @@ private:
 
 class llama_io_read_file : public llama_io_read_i {
 public:
-    llama_io_read_file(llama_file * f) : file(f) {}
+    llama_io_read_file(llama_file * f, llama_state_io_progress_callback cb = nullptr, void * data = nullptr)
+        : file(f), progress(cb), progress_data(data), total(cb ? f->size() : 0) {}
 
     void read(void * dst, size_t size) override {
         file->read_raw(dst, size);
         size_read += size;
+        if (progress && !progress(file->tell(), total, progress_data)) {
+            throw std::runtime_error("state file load cancelled");
+        }
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
@@ -2733,6 +2797,9 @@ public:
 
 private:
     llama_file * file;
+    llama_state_io_progress_callback progress;
+    void * progress_data;
+    uint64_t total;
     size_t size_read = 0;
     std::vector<uint8_t> temp_buffer;
 };
@@ -3121,7 +3188,7 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
     return true;
 }
 
-size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, llama_state_io_progress_callback progress, void * progress_data) {
     llama_file file(filepath, "rb");
 
     // version checks
@@ -3162,7 +3229,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     // restore the context state
     {
         const size_t state_size = file.size() - file.tell();
-        llama_io_read_file io(&file);
+        llama_io_read_file io(&file, progress, progress_data);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
@@ -3175,24 +3242,29 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
     return file.tell();
 }
 
+size_t llama_context::state_seq_write_file(llama_io_write_i & io, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    const uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
+    const uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    const uint32_t count = (uint32_t) n_token_count;
+    io.write(&magic, sizeof(magic));
+    io.write(&version, sizeof(version));
+    io.write(&count, sizeof(count));
+    io.write(tokens, sizeof(llama_token) * n_token_count);
+    state_seq_write_data(io, seq_id, 0);
+    return io.n_bytes();
+}
+
+size_t llama_context::state_seq_file_size(llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    llama_io_write_dummy io(false);
+    return state_seq_write_file(io, seq_id, tokens, n_token_count);
+}
+
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
     llama_file file(filepath, "wb");
-
-    file.write_u32(LLAMA_STATE_SEQ_MAGIC);
-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
-
-    // save the prompt
-    file.write_u32((uint32_t) n_token_count);
-    file.write_raw(tokens, sizeof(llama_token) * n_token_count);
-
-    // save the context state using stream saving
     llama_io_write_file io(&file);
-    state_seq_write_data(io, seq_id, 0);
-
-    const size_t res = file.tell();
-    GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
-
-    return res;
+    const size_t written = state_seq_write_file(io, seq_id, tokens, n_token_count);
+    GGML_ASSERT(written == file.tell());
+    return written;
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
@@ -3686,6 +3758,9 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
+    for (size_t i = 0; i < n_adapters; ++i) {
+        if (scales[i] != 0.0f && adapters[i]->restore_quarantined) { return -1; }
+    }
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
     return 0;
@@ -3899,6 +3974,16 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     return ctx->state_seq_set_data(seq_id, src, size, flags);
 }
 
+size_t llama_state_seq_file_size(llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+    ctx->synchronize();
+    try {
+        return ctx->state_seq_file_size(seq_id, tokens, n_token_count);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error sizing sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
     ctx->synchronize();
 
@@ -3911,10 +3996,14 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
 }
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    return llama_state_seq_load_file_with_progress(ctx, filepath, dest_seq_id, tokens_out, n_token_capacity, n_token_count_out, nullptr, nullptr);
+}
+
+size_t llama_state_seq_load_file_with_progress(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out, llama_state_io_progress_callback progress, void * user_data) {
     ctx->synchronize();
 
     try {
-        return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);
+        return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out, progress, user_data);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading sequence state file: %s\n", __func__, err.what());
         return 0;
