@@ -3242,6 +3242,10 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
+
+    // time-fair interleave: after a prefill step, generating slots are owed decode-only time equal to that step
+    int64_t t_decode_owed_us = 0;
+    int32_t n_batch_gen      = 0; // batch size before prompt tokens are added
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
@@ -3342,6 +3346,8 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+        const bool    has_prompt   = batch.size() > n_batch_gen;
+        const int64_t t_step_start = ggml_time_us();
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -3379,6 +3385,10 @@ private:
                 break; // stop any further processing
             }
         }
+
+        // a prefill step adds its duration to the decode time owed; a decode-only step pays it back
+        const int64_t t_step = ggml_time_us() - t_step_start;
+        t_decode_owed_us = has_prompt ? t_decode_owed_us + t_step : std::max<int64_t>(0, t_decode_owed_us - t_step);
     }
 
     void pre_decode() {
@@ -3583,7 +3593,13 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        // a generating slot owed decode time gets a decode-only step first (time-fair interleave)
+        if (generating.empty()) {
+            t_decode_owed_us = 0;
+        }
+        n_batch_gen = batch.size();
+        const bool decode_owed = t_decode_owed_us > 0 && !generating.empty();
+        if (!decode_owed && (params_base.cont_batching || batch.size() == 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
