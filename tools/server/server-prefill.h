@@ -8,13 +8,14 @@ class server_prefill_order {
     size_t next = 0;
 
 public:
-    std::vector<size_t> order(size_t count) const {
+    std::vector<size_t> order(size_t count, bool kv_unified = false) const {
         std::vector<size_t> result;
         result.reserve(count);
         if (count == 0) {
             return result;
         }
-        const size_t start = next % count;
+        // Shared KV has no per-prompt reservation; keep its existing admission order.
+        const size_t start = kv_unified ? 0 : next % count;
         for (size_t offset = 0; offset < count; ++offset) {
             result.push_back((start + offset) % count);
         }
