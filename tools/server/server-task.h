@@ -230,6 +230,12 @@ struct server_task {
         bool size_only = false;
         bool has_byte_ceiling = false;
         uint64_t byte_ceiling = 0;
+        // Continuum fork: how many of the slot's NEWEST context checkpoints a saved page
+        // carries beside its oldest one; -1 = every checkpoint (the upstream-compatible
+        // default). A restore resumes from the newest checkpoint at or before the point the
+        // next prompt diverges, and an append-only prompt diverges near its end or at the
+        // head of its first user turn, so the middle of the list is bytes nobody reads.
+        int32_t keep_newest_checkpoints = -1;
         std::shared_ptr<server_restore_progress> progress;
     };
     slot_action slot_action;

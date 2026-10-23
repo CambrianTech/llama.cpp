@@ -2713,12 +2713,29 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                    // The checkpoints this page carries: the oldest (the head of the first user
+                    // turn) and the newest `keep_newest_checkpoints`, in list order, or all of them
+                    // when the caller asked for no subset. The quote and the write share this list.
+                    std::vector<const common_prompt_checkpoint *> kept_checkpoints;
+                    {
+                        const auto & all  = slot->prompt.checkpoints;
+                        const int32_t keep = task.slot_action.keep_newest_checkpoints;
+                        const size_t  n    = all.size();
+                        size_t i = 0;
+                        for (const auto & c : all) {
+                            if (keep < 0 || i == 0 || i + (size_t) keep >= n) {
+                                kept_checkpoints.push_back(&c);
+                            }
+                            ++i;
+                        }
+                    }
                     auto write_checkpoints = [&](auto && put) {
                         const uint32_t magic   = 0x434B5054u; // 'CKPT'
                         const uint32_t version = 1;
-                        const uint32_t n_ckpt  = (uint32_t) slot->prompt.checkpoints.size();
+                        const uint32_t n_ckpt  = (uint32_t) kept_checkpoints.size();
                         put(&magic, sizeof(magic)); put(&version, sizeof(version)); put(&n_ckpt, sizeof(n_ckpt));
-                        for (const auto & c : slot->prompt.checkpoints) {
+                        for (const auto * kept : kept_checkpoints) {
+                            const auto & c = *kept;
                             const int64_t  n_tokens = c.n_tokens;
                             const int32_t  pos_min  = c.pos_min;
                             const int32_t  pos_max  = c.pos_max;
@@ -6162,6 +6179,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
             }
             task.slot_action.has_byte_ceiling = true;
             task.slot_action.byte_ceiling = request_data.at("admitted_bytes").get<uint64_t>();
+        }
+        // Continuum fork: the checkpoint subset this page carries (see slot_action). The quote
+        // (`save-size`) and the write must name the same subset, or the admitted bytes lie.
+        if (request_data.contains("keep_newest_checkpoints")) {
+            const auto & keep = request_data.at("keep_newest_checkpoints");
+            if (!keep.is_number_integer() || keep.get<int64_t>() < 0 || keep.get<int64_t>() > 4096) {
+                res->error(format_error_response("keep_newest_checkpoints must be an integer in [0, 4096]", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            task.slot_action.keep_newest_checkpoints = (int32_t) keep.get<int64_t>();
         }
         rd.post_task(std::move(task));
     }
