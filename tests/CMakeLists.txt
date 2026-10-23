@@ -1,5 +1,11 @@
 llama_add_compile_flags()
 
+# Model-free scheduling validator: compile the same traversal used by server-context.
+add_executable(test-server-prefill test-server-prefill.cpp)
+target_compile_features(test-server-prefill PRIVATE cxx_std_17)
+add_test(NAME test-server-prefill COMMAND test-server-prefill)
+set_tests_properties(test-server-prefill PROPERTIES LABELS "main")
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 

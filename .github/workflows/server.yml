@@ -91,7 +91,10 @@ jobs:
         run: |
           cmake -B build \
             -DGGML_SCHED_NO_REALLOC=ON
-          cmake --build build --config Release -j $(nproc) --target llama-server
+          cmake --build build --config Release -j $(nproc) --target llama-server test-server-prefill
+
+      - name: Prefill scheduling test
+        run: ctest --test-dir build -C Release -R ^test-server-prefill$ --output-on-failure --no-tests=error
 
       - name: Python setup
         id: setup_python
@@ -166,7 +169,10 @@ jobs:
             -DLLAMA_BUILD_BORINGSSL=ON ^
             -DGGML_SCHED_NO_REALLOC=ON
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS% --target llama-server
+          cmake --build build --config Release -j %NINJA_JOBS% --target llama-server test-server-prefill
+
+      - name: Prefill scheduling test
+        run: ctest --test-dir build -C Release -R ^test-server-prefill$ --output-on-failure --no-tests=error
 
       - name: Python setup
         id: setup_python
