@@ -3605,7 +3605,7 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             std::vector<server_slot *> prompt_slots;
-            for (const size_t index : prefill_order.order(slots.size())) {
+            for (const size_t index : prefill_order.order(slots.size(), params_base.kv_unified)) {
                 prompt_slots.push_back(&slots[index]);
             }
             iterate(prompt_slots, [&](server_slot & slot) {

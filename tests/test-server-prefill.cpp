@@ -64,5 +64,9 @@ int main() {
     require(remaining[0] == 32 && remaining[2] == 32, "incompatible prompts were admitted");
     require(order.order(3).front() == 2, "skips must not override last actual contributor");
     require(order.order(1) == std::vector<size_t>{0}, "pool resize normalizes cursor");
+    require(order.order(3, true) == std::vector<size_t>({0, 1, 2}), "shared KV keeps physical order after service");
+    require(order.order(3, false).front() == 2, "separate KV keeps cyclic service");
+    require(order.order(0, true).empty(), "empty shared KV pool");
+    require(order.order(1, true) == std::vector<size_t>{0}, "shared KV pool resize");
     return 0;
 }
