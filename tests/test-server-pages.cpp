@@ -166,6 +166,35 @@ static void publish_generation(const fs::path & file, const std::string & tag) {
     server_page_publish(file.string(), files);
 }
 
+// `op` fails on every path ending in `suffix` (and, when given, containing `within`) while this lives
+struct page_fault {
+    page_fault(server_page_fault op, std::string suffix, std::string within = "") {
+        server_page_files_inject_fault([=](server_page_fault o, const std::string & path) {
+            return o == op && path.find(within) != std::string::npos && path.size() >= suffix.size() &&
+                path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
+        });
+    }
+    ~page_fault() { server_page_files_inject_fault(nullptr); }
+};
+
+static bool publish_refused(const fs::path & file, const std::string & tag) {
+    try {
+        publish_generation(file, tag);
+    } catch (const server_page_error &) {
+        return true;
+    }
+    return false;
+}
+
+static bool reader_refused(const fs::path & file) {
+    try {
+        server_page_reader reader(file.string());
+    } catch (const server_page_error &) {
+        return true;
+    }
+    return false;
+}
+
 [[noreturn]] static void disk_full(const server_page_put &) {
     throw std::runtime_error("disk full");
 }
@@ -203,6 +232,18 @@ static void test_a_failed_publication_keeps_the_committed_generation(const fs::p
     server_page_publish(file.string(), { text_file("", "three"), text_file(".ckpt", "three.ckpt"), text_file(".lora", "three.lora") });
     CHECK(read_file(file) == "three" && read_file(file.string() + ".dft") == "<absent>");
     check_no_leftovers(dir);
+
+    // a staged member's status cannot be read after the commit: never taken for already moved, so
+    // the record and stage keep custody until a reader can read it, then the generation is whole
+    const fs::path record = dir / "..page-staging" / "mind-a.bin.commit";
+    {
+        page_fault fault(server_page_fault::status, "mind-a.bin.ckpt", "..page-staging");
+        CHECK(publish_refused(file, "four"));
+        CHECK(fs::exists(record));
+        CHECK(reader_refused(file) && fs::exists(record));
+    }
+    { server_page_reader reader(file.string()); check_generation(file, "four"); }
+    check_no_leftovers(dir);
 }
 
 static void test_an_interrupted_publication_restores_whole(const fs::path & dir) {
@@ -234,25 +275,6 @@ static void test_an_interrupted_publication_restores_whole(const fs::path & dir)
     check_no_leftovers(dir);
 }
 
-// the sync of every dir whose name ends in `suffix` fails while this lives
-struct sync_fault {
-    explicit sync_fault(std::string suffix) {
-        server_page_files_inject_sync_fault([suffix](const std::string & dir) {
-            return dir.size() >= suffix.size() && dir.compare(dir.size() - suffix.size(), suffix.size(), suffix) == 0;
-        });
-    }
-    ~sync_fault() { server_page_files_inject_sync_fault(nullptr); }
-};
-
-static bool publish_refused(const fs::path & file, const std::string & tag) {
-    try {
-        publish_generation(file, tag);
-    } catch (const server_page_error &) {
-        return true;
-    }
-    return false;
-}
-
 static void test_a_failed_dir_sync_never_reports_or_loses_a_generation(const fs::path & dir) {
     const fs::path file    = dir / "mind-d.bin";
     const fs::path staging = dir / "..page-staging";
@@ -261,7 +283,7 @@ static void test_a_failed_dir_sync_never_reports_or_loses_a_generation(const fs:
     // the stage's sync fails (every sync fails; the stage's is the first reached): refused before
     // the commit, the committed generation as it was
     {
-        sync_fault fault("");
+        page_fault fault(server_page_fault::sync, "");
         CHECK(publish_refused(file, "two"));
     }
     { server_page_reader reader(file.string()); check_generation(file, "one"); }
@@ -269,7 +291,7 @@ static void test_a_failed_dir_sync_never_reports_or_loses_a_generation(const fs:
 
     // the commit record's dir sync fails: refused, but the record keeps custody; the next reader completes it
     {
-        sync_fault fault("..page-staging");
+        page_fault fault(server_page_fault::sync, "..page-staging");
         CHECK(publish_refused(file, "three"));
         CHECK(fs::exists(staging / "mind-d.bin.commit"));
     }
@@ -278,16 +300,10 @@ static void test_a_failed_dir_sync_never_reports_or_loses_a_generation(const fs:
 
     // the destination's sync fails after the files moved: refused, the record kept until a sync succeeds
     {
-        sync_fault fault(dir.filename().string());
+        page_fault fault(server_page_fault::sync, dir.filename().string());
         CHECK(publish_refused(file, "four"));
         CHECK(fs::exists(staging / "mind-d.bin.commit"));
-        bool reader_refused = false;
-        try {
-            server_page_reader reader(file.string());
-        } catch (const server_page_error &) {
-            reader_refused = true;
-        }
-        CHECK(reader_refused && fs::exists(staging / "mind-d.bin.commit"));
+        CHECK(reader_refused(file) && fs::exists(staging / "mind-d.bin.commit"));
     }
     { server_page_reader reader(file.string()); check_generation(file, "four"); }
     check_no_leftovers(dir);

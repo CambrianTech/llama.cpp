@@ -50,9 +50,12 @@ server_page_file server_page_sidecar(std::string suffix, std::function<void(cons
 // bytes written.
 size_t server_page_publish(const std::string & filepath, const std::vector<server_page_file> & files);
 
-// Test seam: `fault(dir)` returning true makes that directory sync fail, as a full or failing disk
-// would. Empty (the default) syncs for real.
-void server_page_files_inject_sync_fault(std::function<bool(const std::string & dir)> fault);
+// What a test seam can make fail: a directory's sync, or reading a file's status.
+enum class server_page_fault { sync, status };
+
+// Test seam: `fault(op, path)` returning true makes that operation on that path fail, as a full or
+// failing disk would. Empty (the default) runs for real.
+void server_page_files_inject_fault(std::function<bool(server_page_fault op, const std::string & path)> fault);
 
 // Writes `page` to `filepath` (+ .ckpt, .lora, .dft) with every checkpoint, as one generation.
 // Touches no context, so it runs off the task thread. Returns the bytes written.
