@@ -215,19 +215,51 @@ static bool sync_file(const fs::path & path) {
 #endif
 }
 
-static std::function<bool(const std::string &)> & sync_dir_fault() {
-    static std::function<bool(const std::string &)> fault;
+static std::function<bool(server_page_fault, const std::string &)> & injected_fault() {
+    static std::function<bool(server_page_fault, const std::string &)> fault;
     return fault;
 }
 
-void server_page_files_inject_sync_fault(std::function<bool(const std::string & dir)> fault) {
-    sync_dir_fault() = std::move(fault);
+void server_page_files_inject_fault(std::function<bool(server_page_fault op, const std::string & path)> fault) {
+    injected_fault() = std::move(fault);
+}
+
+static bool faulted(server_page_fault op, const fs::path & path) {
+    return injected_fault() && injected_fault()(op, path.string());
+}
+
+// Whether `path` exists, or throws: an I/O or permission error is never read as absence, since
+// recovery takes an absent staged file for one already moved.
+static bool present(const fs::path & path) {
+    std::error_code ec;
+    const auto st = fs::symlink_status(path, ec);
+    if (faulted(server_page_fault::status, path) || (ec && st.type() != fs::file_type::not_found)) {
+        throw server_page_error(ERROR_TYPE_SERVER, "a page file's status could not be read: " + path.string() + (ec ? ": " + ec.message() : ""));
+    }
+    return st.type() != fs::file_type::not_found;
+}
+
+// Moves `from` onto `to`. Every name a generation depends on is placed this way. On Windows the move
+// is durable when it returns ("MOVEFILE_WRITE_THROUGH: the function does not return until the file is
+// actually moved on the disk"); on POSIX, sync_dir of the dir makes it durable.
+static std::error_code place(const fs::path & from, const fs::path & to) {
+#if defined(_WIN32)
+    if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return {};
+    }
+    return std::error_code((int) GetLastError(), std::system_category());
+#else
+    std::error_code ec;
+    fs::rename(from, to, ec);
+    return ec;
+#endif
 }
 
 // Makes a dir's entries (a rename into it) durable, or throws: a rename not proven durable is never
-// reported as published. Windows has no handle for this; NTFS journals the entries.
+// reported as published. On Windows every entry was placed by a write-through move, so there is
+// nothing left to sync.
 static void sync_dir(const fs::path & dir) {
-    bool ok = !(sync_dir_fault() && sync_dir_fault()(dir.string()));
+    bool ok = !faulted(server_page_fault::sync, dir);
 #if !defined(_WIN32)
     if (ok) {
         const int fd = open(dir.c_str(), O_RDONLY);
@@ -278,30 +310,37 @@ static void write_commit_record(const fs::path & file, const fs::path & stage, c
             throw server_page_error(ERROR_TYPE_SERVER, "the page's commit record could not be written: " + tmp.string());
         }
     }
-    std::error_code ec;
-    if (!sync_file(tmp) || (fs::rename(tmp, commit_record(file), ec), ec)) {
+    if (!sync_file(tmp) || place(tmp, commit_record(file))) {
         throw server_page_error(ERROR_TYPE_SERVER, "the page's commit record could not be placed: " + commit_record(file).string());
     }
 }
 
-// Moves a committed generation over the page's files, removes the files it lacks, then its stage and
-// record. Idempotent: a file a crash already moved is not in the stage. Throws, keeping the record, so
-// the next reader finishes it.
+// Moves a committed generation over the page's files, retires the files it lacks into its stage, then
+// removes the stage and record. Idempotent: a file a crash already moved is not in the stage. Throws,
+// keeping the record, so the next reader finishes it.
 static void roll_forward(const fs::path & file, const fs::path & stage, const std::vector<std::string> & suffixes) {
     const std::string name = file.filename().string();
-    std::error_code ec;
     for (const auto & s : suffixes) {
         const fs::path staged = stage / (name + s);
-        if (fs::exists(staged, ec) && (fs::rename(staged, file.string() + s, ec), ec)) {
+        if (!present(staged)) {
+            continue;
+        }
+        if (const auto ec = place(staged, file.string() + s)) {
             throw server_page_error(ERROR_TYPE_SERVER, "a committed page file could not be moved into place: " + staged.string() + ": " + ec.message());
         }
     }
     for (const char * s : PAGE_SUFFIXES) {
-        if (std::find(suffixes.begin(), suffixes.end(), s) == suffixes.end() && !fs::remove(file.string() + s, ec) && ec) {
-            throw server_page_error(ERROR_TYPE_SERVER, "an older page file could not be removed: " + file.string() + s + ": " + ec.message());
+        const fs::path older = file.string() + s;
+        if (std::find(suffixes.begin(), suffixes.end(), s) != suffixes.end() || !present(older)) {
+            continue;
+        }
+        // a move, not a delete: on Windows only a move is made durable before the record goes
+        if (const auto ec = place(older, stage / (std::string("..retired") + s))) {
+            throw server_page_error(ERROR_TYPE_SERVER, "an older page file could not be removed: " + older.string() + ": " + ec.message());
         }
     }
     sync_dir(file.parent_path()); // throws, keeping the record: the moved names are not yet durable
+    std::error_code ec;
     fs::remove_all(stage, ec);
     fs::remove(commit_record(file), ec);
     try {
@@ -399,14 +438,15 @@ size_t server_page_publish(const std::string & filepath, const std::vector<serve
     std::vector<std::string> suffixes;
     for (const auto & f : files) {
         GGML_ASSERT(std::find(std::begin(PAGE_SUFFIXES), std::end(PAGE_SUFFIXES), f.suffix) != std::end(PAGE_SUFFIXES));
-        const fs::path staged = stage / (file.filename().string() + f.suffix);
+        const fs::path staged  = stage / (file.filename().string() + f.suffix);
+        const fs::path written = stage / ("..written" + f.suffix); // placed, so its name is durable too
         size_t n = 0;
         try {
-            n = f.write(staged.string());
+            n = f.write(written.string());
         } catch (const std::exception & err) {
             throw server_page_error(ERROR_TYPE_SERVER, "a page file could not be written: " + staged.string() + ": " + err.what());
         }
-        if (n == 0 || !sync_file(staged)) {
+        if (n == 0 || !sync_file(written) || place(written, staged)) {
             throw server_page_error(ERROR_TYPE_SERVER, "a page file could not be written: " + staged.string());
         }
         n_written += n;
