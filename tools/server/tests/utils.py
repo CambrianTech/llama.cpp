@@ -121,6 +121,8 @@ class ServerProcess:
     mcp_servers_config: str | None = None
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
+    ctx_checkpoints_bytes: int | None = None
+    page_ram_bytes: int | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -285,6 +287,10 @@ class ServerProcess:
             server_args.extend(["--mcp-servers-json", self.mcp_servers_json])
         if self.backend_sampling:
             server_args.append("--backend_sampling")
+        if self.ctx_checkpoints_bytes is not None:
+            server_args.extend(["--ctx-checkpoints-bytes", self.ctx_checkpoints_bytes])
+        if self.page_ram_bytes is not None:
+            server_args.extend(["--page-ram-bytes", self.page_ram_bytes])
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
 

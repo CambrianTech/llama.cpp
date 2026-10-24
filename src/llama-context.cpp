@@ -3995,6 +3995,36 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
     }
 }
 
+size_t llama_state_seq_save_file_from_data(const char * filepath, const uint8_t * data, size_t size, const llama_token * tokens, size_t n_token_count) {
+    // get_data writes [io_magic][seq_id][state]; the file is [magic][version][count][tokens][state]
+    const size_t prefix = sizeof(io_magic) + sizeof(llama_seq_id);
+    if (data == nullptr || size <= prefix) {
+        LLAMA_LOG_ERROR("%s: no sequence state to write\n", __func__);
+        return 0;
+    }
+    uint32_t magic_read = 0;
+    std::memcpy(&magic_read, data, sizeof(magic_read));
+    if (magic_read != io_magic) {
+        LLAMA_LOG_ERROR("%s: the bytes are not a sequence state (magic %08x)\n", __func__, magic_read);
+        return 0;
+    }
+    try {
+        llama_file file(filepath, "wb");
+        const uint32_t magic   = LLAMA_STATE_SEQ_MAGIC;
+        const uint32_t version = LLAMA_STATE_SEQ_VERSION;
+        const uint32_t count   = (uint32_t) n_token_count;
+        file.write_raw(&magic,   sizeof(magic));
+        file.write_raw(&version, sizeof(version));
+        file.write_raw(&count,   sizeof(count));
+        file.write_raw(tokens,   sizeof(llama_token) * n_token_count);
+        file.write_raw(data + prefix, size - prefix);
+        return file.tell();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error writing sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     return llama_state_seq_load_file_with_progress(ctx, filepath, dest_seq_id, tokens_out, n_token_capacity, n_token_count_out, nullptr, nullptr);
 }

@@ -16,6 +16,10 @@ add_library(${TARGET} STATIC
     server-context.cpp
     server-train.cpp
     server-context.h
+    server-pages.cpp
+    server-pages.h
+    server-checkpoints.cpp
+    server-checkpoints.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
