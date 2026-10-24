@@ -7102,6 +7102,65 @@ static void test_learning_closed_transcript() {
     }
 }
 
+// A verb loaded into the TAIL is callable without moving the head (continuum goal 10): the
+// rendered prompt is byte-identical to the head-only render, and the parser and the lazy grammar
+// accept the tail verb as a real tool call. Without `tail_tools` the same output is no call to
+// it at all, which is the gap this closes.
+static void test_tail_tools() {
+    LOG_DBG("%s\n", __func__);
+    auto tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+    common_chat_templates_inputs head;
+    head.messages         = { message_user };
+    head.tools            = { special_function_tool };
+    head.enable_thinking  = false;
+    head.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    common_chat_templates_inputs loaded = head;
+    loaded.tail_tools = { python_tool, special_function_tool };
+
+    const auto head_params   = common_chat_templates_apply(tmpls.get(), head);
+    const auto loaded_params = common_chat_templates_apply(tmpls.get(), loaded);
+    assert_equals(head_params.prompt, loaded_params.prompt);
+    assert_equals(head_params.generation_prompt, loaded_params.generation_prompt);
+    assert_not_contains(loaded_params.prompt, python_tool.description);
+    assert_not_contains(head_params.grammar, "python");
+    assert_contains(loaded_params.grammar, "python");
+
+    const std::string call =
+        "<tool_call>\n<function=python>\n<parameter=code>\nprint(1)\n</parameter>\n</function>\n</tool_call>";
+    const auto parsed = make_peg_parser(tmpls.get(), loaded).parse(call, false);
+    assert_equals(size_t(1), parsed.tool_calls.size());
+    assert_equals(std::string("python"), parsed.tool_calls[0].name);
+    assert_equals(renormalize_json(R"J({"code":"print(1)"})J"), renormalize_json(parsed.tool_calls[0].arguments));
+    bool head_called_python = false;
+    try {
+        const auto unloaded = make_peg_parser(tmpls.get(), head).parse(call, false);
+        head_called_python  = std::any_of(unloaded.tool_calls.begin(), unloaded.tool_calls.end(),
+                                          [](const common_chat_tool_call & c) { return c.name == "python"; });
+    } catch (const std::exception &) {
+        head_called_python = false; // the head-only parser refuses the call outright: also no call
+    }
+    if (head_called_python) {
+        throw std::runtime_error("a verb absent from tools and tail_tools parsed as a call");
+    }
+
+    // The same through the server's request parsing: the body's `tail_tools` reach the parser
+    // and grammar and leave the prompt bytes alone.
+    server_chat_params opt{};
+    opt.tmpls     = read_templates("models/templates/Qwen3.5-4B.jinja");
+    opt.use_jinja = true;
+    json body = {{"messages", json::array({json{{"role", "user"}, {"content", "run it"}}})},
+                 {"tools", common_chat_tools_to_json_oaicompat({ special_function_tool })},
+                 {"chat_template_kwargs", {{"enable_thinking", false}}}};
+    std::vector<raw_buffer> files;
+    const json served = oaicompat_chat_params_parse(body, opt, files);
+    json with_tail = body;
+    with_tail["tail_tools"] = common_chat_tools_to_json_oaicompat({ python_tool });
+    const json served_tail = oaicompat_chat_params_parse(with_tail, opt, files);
+    assert_equals(served.at("prompt").get<std::string>(), served_tail.at("prompt").get<std::string>());
+    assert_contains(served_tail.at("grammar").get<std::string>(), "python");
+    assert_equals(true, served_tail.at("parse_tool_calls").get<bool>());
+}
+
 static void test_reasoning_budget_tokens_per_request() {
     LOG_DBG("%s\n", __func__);
     // Use Qwen3 template which has <think>...</think> reasoning markers.
@@ -7522,6 +7581,7 @@ int main(int argc, char ** argv) {
         test_template_generation_prompt();
         test_reasoning_effort_caps();
         test_learning_closed_transcript();
+        test_tail_tools();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);
