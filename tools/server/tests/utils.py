@@ -123,6 +123,7 @@ class ServerProcess:
     cors_origins: str | None = None
     ctx_checkpoints_bytes: int | None = None
     page_ram_bytes: int | None = None
+    train_dir: str | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -291,6 +292,8 @@ class ServerProcess:
             server_args.extend(["--ctx-checkpoints-bytes", self.ctx_checkpoints_bytes])
         if self.page_ram_bytes is not None:
             server_args.extend(["--page-ram-bytes", self.page_ram_bytes])
+        if self.train_dir is not None:
+            server_args.extend(["--train-dir", self.train_dir])
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
 

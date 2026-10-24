@@ -796,6 +796,20 @@ extern "C" {
     // NOTE: loaded adapters that are not manually freed will be freed when the associated model is deleted
     LLAMA_API void llama_adapter_lora_free(struct llama_adapter_lora * adapter);
 
+    // Continuum fork: page an adapter's tensors between their device buffers and host memory, so a
+    // loaded adapter no context applies costs host RAM instead of device memory, and comes back
+    // with a copy instead of a read from disk. The adapter stays loaded and keeps its identity;
+    // a paged-out adapter must be paged in before a context applies it. The caller serializes
+    // these with every use of the adapter (synchronize the contexts that ran it first).
+    // Return the bytes moved; 0 when it is already there; -1 when an allocation failed (the
+    // adapter is then left exactly as it was).
+    LLAMA_API int64_t llama_adapter_lora_page_out(struct llama_adapter_lora * adapter);
+    LLAMA_API int64_t llama_adapter_lora_page_in (struct llama_adapter_lora * adapter);
+    LLAMA_API bool    llama_adapter_lora_is_paged_out(const struct llama_adapter_lora * adapter);
+    // The bytes the adapter's tensors take where they are now: its device buffers when resident,
+    // host memory when paged out.
+    LLAMA_API uint64_t llama_adapter_lora_n_bytes(const struct llama_adapter_lora * adapter);
+
     // Get the invocation tokens if the current lora is an alora
     LLAMA_API uint64_t            llama_adapter_get_alora_n_invocation_tokens(const struct llama_adapter_lora * adapter);
     LLAMA_API const llama_token * llama_adapter_get_alora_invocation_tokens  (const struct llama_adapter_lora * adapter);

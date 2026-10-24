@@ -488,6 +488,11 @@ struct server_metrics {
     uint64_t n_page_failed          = 0; // page_out, page_in or spill refused or failed
     uint64_t n_ckpt_evicted_budget  = 0; // checkpoints dropped to keep within --ctx-checkpoints-bytes
     uint64_t n_ckpt_skipped_budget  = 0; // checkpoints not taken: one alone exceeds the budget
+    // Continuum fork: genes (adapters) paged between the device and host RAM (server-genes.h)
+    uint64_t n_gene_page_out        = 0;
+    uint64_t n_gene_page_in         = 0;
+    uint64_t n_gene_page_in_demand  = 0; // a task applied a host-resident adapter: paged in on its path
+    uint64_t n_gene_page_failed     = 0;
 
     void init() {
         t_start = ggml_time_us();
