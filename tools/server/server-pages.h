@@ -50,6 +50,9 @@ struct server_page_charge {
 };
 
 struct server_page {
+    // declared first so it is destroyed LAST: the bytes stay counted until every buffer below is freed
+    server_page_charge charge;
+
     uint64_t gen = 0; // identity within the store: a page replaced under the same name is another page
 
     server_prompt      prompt;    // tokens and context checkpoints
@@ -57,8 +60,6 @@ struct server_page {
     std::vector<uint8_t> spec;    // speculative tail state (common_speculative_get_state); may be empty
 
     std::vector<common_adapter_lora_info> lora; // the slot's adapter list the state was computed under
-
-    server_page_charge charge;
 
     size_t n_checkpoint_bytes() const;
     size_t n_bytes() const; // server_page_bytes of what the page holds

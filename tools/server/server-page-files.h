@@ -50,6 +50,10 @@ server_page_file server_page_sidecar(std::string suffix, std::function<void(cons
 // bytes written.
 size_t server_page_publish(const std::string & filepath, const std::vector<server_page_file> & files);
 
+// Test seam: `fault(dir)` returning true makes that directory sync fail, as a full or failing disk
+// would. Empty (the default) syncs for real.
+void server_page_files_inject_sync_fault(std::function<bool(const std::string & dir)> fault);
+
 // Writes `page` to `filepath` (+ .ckpt, .lora, .dft) with every checkpoint, as one generation.
 // Touches no context, so it runs off the task thread. Returns the bytes written.
 size_t server_page_spill(const server_page & page, const std::string & filepath);
