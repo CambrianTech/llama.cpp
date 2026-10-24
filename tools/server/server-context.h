@@ -26,6 +26,7 @@ struct server_context_meta {
     json json_ui_settings;
     int slot_n_ctx;
     enum llama_pooling_type pooling_type;
+    int32_t n_slots; // Continuum fork: changes with /reconfigure, so routes read it here, not from params
 
     // chat params
     server_chat_params & chat_params;
@@ -136,7 +137,7 @@ struct server_routes {
 
     // note: this is not thread-safe and can only when ctx_http.is_ready is false
     void update_meta(const server_context & ctx_server) {
-        this->meta = std::make_unique<server_context_meta>(ctx_server.get_meta());
+        set_meta(std::make_shared<const server_context_meta>(ctx_server.get_meta()));
     }
 
     // handlers using lambda function, so that they can capture `this` without `std::bind`
@@ -176,6 +177,7 @@ struct server_routes {
     server_http_context::handler_t post_train_measure;
     server_http_context::handler_t post_train_pause;
     server_http_context::handler_t post_train_resume;
+    server_http_context::handler_t post_reconfigure; // Continuum fork (server-reconfigure.h)
 
     // to be used in router mode
     json get_model_info() const;
@@ -194,8 +196,11 @@ private:
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const server_http_req & req, task_response_type res_type);
 
-    // using unique_ptr to allow late initialization of const
-    std::unique_ptr<const server_context_meta> meta;
+    // late-initialized, and replaced by /reconfigure while other HTTP threads read it: every access
+    // goes through meta_now() / set_meta() (atomic shared_ptr operations)
+    std::shared_ptr<const server_context_meta> meta;
+    std::shared_ptr<const server_context_meta> meta_now() const { return std::atomic_load(&meta); }
+    void set_meta(std::shared_ptr<const server_context_meta> m) { std::atomic_store(&meta, std::move(m)); }
 
     const common_params & params;
     server_context_impl & ctx_server;

@@ -96,6 +96,15 @@ struct common_speculative_init_result {
     llama_model   * model();
     llama_context * context();
 
+    // Continuum fork: frees the draft context and builds one for `ctx_tgt` (a rebuilt target
+    // context) on the same draft model, or on `model_tgt` for MTP. The draft model stays loaded.
+    // Returns nullptr when the new context cannot be created. Free the draft context (this call
+    // does it first) before the target it points at.
+    llama_context * reinit_context(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+
+    // Continuum fork: frees the draft context only (it points at the target context, so it goes first)
+    void free_context();
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;

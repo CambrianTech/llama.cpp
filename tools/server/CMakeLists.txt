@@ -20,6 +20,8 @@ add_library(${TARGET} STATIC
     server-pages.h
     server-page-files.cpp
     server-page-files.h
+    server-reconfigure.cpp
+    server-reconfigure.h
     server-checkpoints.cpp
     server-checkpoints.h
     server-stream.cpp

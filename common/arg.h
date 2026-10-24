@@ -127,6 +127,9 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
 // load all backends and print the list of available (non-CPU) devices to stdout
 void common_print_available_devices();
 
+// a KV cache type by its ggml name (the --cache-type-k/-v values); throws std::runtime_error otherwise
+ggml_type common_kv_cache_type_from_str(const std::string & s);
+
 // parse input arguments from CLI into a map
 bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<common_arg, std::string> & out_map);
 

@@ -1604,6 +1604,14 @@ std::string server_task_result_metrics::to_metrics() {
             "page_out, page_in or spill operations refused or failed",
             (double) metrics.n_page_failed
         }, {
+            "reconfigure_total",
+            "Context geometry changes made without reloading the model (/reconfigure)",
+            (double) metrics.n_reconfigure
+        }, {
+            "reconfigure_failed_total",
+            "/reconfigure requests refused",
+            (double) metrics.n_reconfigure_failed
+        }, {
             "ctx_checkpoints_evicted_budget_total",
             "Context checkpoints dropped to keep within --ctx-checkpoints-bytes",
             (double) metrics.n_ckpt_evicted_budget
