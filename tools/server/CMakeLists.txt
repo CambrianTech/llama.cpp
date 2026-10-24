@@ -20,6 +20,7 @@ add_library(${TARGET} STATIC
     server-pages.h
     server-page-files.cpp
     server-page-files.h
+    server-page-os.h
     server-checkpoints.cpp
     server-checkpoints.h
     server-stream.cpp
@@ -34,6 +35,13 @@ add_library(${TARGET} STATIC
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# the page files' OS adapter: each OS supplies only its own calls
+if (WIN32)
+    target_sources(${TARGET} PRIVATE server-page-os-win32.cpp)
+else()
+    target_sources(${TARGET} PRIVATE server-page-os-posix.cpp)
 endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
