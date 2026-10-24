@@ -1604,6 +1604,22 @@ std::string server_task_result_metrics::to_metrics() {
             "page_out, page_in or spill operations refused or failed",
             (double) metrics.n_page_failed
         }, {
+            "lora_page_out_total",
+            "LoRA adapters paged out to host RAM",
+            (double) metrics.n_gene_page_out
+        }, {
+            "lora_page_in_total",
+            "LoRA adapters paged back onto the device (on demand included)",
+            (double) metrics.n_gene_page_in
+        }, {
+            "lora_page_in_on_demand_total",
+            "LoRA adapters a task applied while in host RAM, paged in on its path",
+            (double) metrics.n_gene_page_in_demand
+        }, {
+            "lora_page_failed_total",
+            "LoRA page_out or page_in refused or failed",
+            (double) metrics.n_gene_page_failed
+        }, {
             "ctx_checkpoints_evicted_budget_total",
             "Context checkpoints dropped to keep within --ctx-checkpoints-bytes",
             (double) metrics.n_ckpt_evicted_budget
@@ -1647,6 +1663,14 @@ std::string server_task_result_metrics::to_metrics() {
             "ctx_checkpoint_bytes",
             "Bytes held by every slot's context checkpoints",
             (double) ctx_checkpoint_bytes
+        }, {
+            "lora_device_bytes",
+            "Bytes of loaded LoRA adapters on the device",
+            (double) gene_device_bytes
+        }, {
+            "lora_host_bytes",
+            "Bytes of loaded LoRA adapters paged out to host RAM",
+            (double) gene_host_bytes
         },
     };
 
@@ -1759,6 +1783,8 @@ json server_task_result_get_lora::to_json() {
             {"scale",         lora.info.scale},
             {"task_name",     lora.info.task_name},
             {"prompt_prefix", lora.info.prompt_prefix},
+            {"resident",      lora.on_device ? "device" : "host"},
+            {"n_bytes",       lora.n_bytes},
         };
         if (!lora.alora_invocation_tokens.empty()) {
             entry["alora_invocation_string"] = lora.alora_invocation_string;

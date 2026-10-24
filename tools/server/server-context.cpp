@@ -5,6 +5,7 @@
 #include "server-checkpoints.h"
 #include "server-page-files.h"
 #include "server-pages.h"
+#include "server-genes.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -1695,6 +1696,21 @@ private:
         {
             auto task_loras = task.params.lora.empty() ? params_base.lora_adapters
                                                        : construct_lora_list(task.params.lora);
+            // A gene this task applies that the core paged out to host RAM comes back before the
+            // slot computes with it, never a decode on freed memory; each one is a counted miss
+            // (the core pages genes in ahead of the turns that need them).
+            try {
+                for (const auto & m : server_gene_page_in_applied(task_loras)) {
+                    metrics.n_gene_page_in++;
+                    metrics.n_gene_page_in_demand++;
+                    SLT_WRN(slot, "LoRA adapter %d paged in on demand: %llu bytes in %.2f ms\n",
+                            m.id, (unsigned long long) m.n_moved, m.t_ms);
+                }
+            } catch (const server_page_error & e) {
+                metrics.n_gene_page_failed++;
+                send_error(task, e.what(), e.type);
+                return false;
+            }
             if (!are_lora_equal(task_loras, slot.lora)) {
                 // if lora has changed, check to see if the cache should be cleared
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
@@ -2101,6 +2117,15 @@ private:
         }
         if (learn_lora_id >= 0 && learn_lora_id != L.lora_id) {
             return refused("this server trains adapter " + std::to_string(learn_lora_id) + "; one shadow per server run");
+        }
+        if (llama_adapter_lora_is_paged_out(loras[L.lora_id].ptr)) {
+            // the gene it trains is in host RAM: back on the device before the optimizer binds it
+            if (llama_adapter_lora_page_in(loras[L.lora_id].ptr) < 0) {
+                metrics.n_gene_page_failed++;
+                return refused("adapter " + std::to_string(L.lora_id) + " is paged out and could not be paged back in");
+            }
+            metrics.n_gene_page_in++;
+            metrics.n_gene_page_in_demand++;
         }
         const int32_t n0 = L.n_prefix - 1; // the last prompt token is re-decoded with the reply's first token as its label
         if (n0 < 0 || L.n_prefix > slot.prompt.n_tokens() || L.reply.empty()) {
@@ -2778,6 +2803,7 @@ private:
                     for (const server_slot & slot : slots) {
                         res->ctx_checkpoint_bytes += server_checkpoints_bytes(slot.prompt.checkpoints);
                     }
+                    std::tie(res->gene_device_bytes, res->gene_host_bytes) = server_gene_bytes(params_base.lora_adapters);
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -3228,6 +3254,8 @@ private:
                             lora,
                             alora_invocation_string,
                             alora_invocation_tokens,
+                            !llama_adapter_lora_is_paged_out(lora.ptr),
+                            llama_adapter_lora_n_bytes(lora.ptr),
                         });
                     }
                     queue_results.send(std::move(res));
@@ -3311,6 +3339,42 @@ private:
                     }
                     res->outcome = learn_on_slot(*slot, L, t0);
                     queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_PAGE_LORA:
+                {
+                    const int32_t id = task.page_lora;
+                    auto applied_by_processing_slot = [&](int32_t lora_id) -> int {
+                        for (const auto & slot : slots) {
+                            if (slot.is_processing() && (size_t) lora_id < slot.lora.size() &&
+                                slot.lora[lora_id].ptr == params_base.lora_adapters[lora_id].ptr &&
+                                slot.lora[lora_id].scale != 0.0f) {
+                                return slot.id;
+                            }
+                        }
+                        return -1;
+                    };
+                    try {
+                        if (!task.page_lora_to_device) {
+                            // the last batch may still be reading it, and the context may still
+                            // hold it: settle both before its device buffers are freed. Only
+                            // ctx_tgt ever receives adapters (common_set_adapter_lora in update_slots).
+                            llama_synchronize(ctx_tgt);
+                            llama_set_adapters_lora(ctx_tgt, nullptr, 0, nullptr);
+                        }
+                        auto res = std::make_unique<server_task_result_gene_move>();
+                        res->id   = task.id;
+                        res->move = server_gene_page(params_base.lora_adapters, id, task.page_lora_to_device,
+                                                     learn_lora_id, applied_by_processing_slot);
+                        if (res->move.n_moved > 0) {
+                            (task.page_lora_to_device ? metrics.n_gene_page_in : metrics.n_gene_page_out)++;
+                        }
+                        SRV_INF("lora adapter id=%d %s: %llu bytes in %.2f ms\n", id, res->move.on_device ? "on device" : "in host RAM",
+                                (unsigned long long) res->move.n_moved, res->move.t_ms);
+                        queue_results.send(std::move(res));
+                    } catch (const server_page_error & e) {
+                        metrics.n_gene_page_failed++;
+                        send_error(task, e.what(), e.type);
+                    }
                 } break;
             case SERVER_TASK_TYPE_UNLOAD_LORA:
                 {
@@ -5381,6 +5445,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "total_slots",                 params.n_parallel },
         { "slot_save_size_version",      1 },
         { "slot_page_version",           1 }, // Continuum fork: /slots page_out, page_in, spill, page_drop
+        { "lora_page_version",           1 }, // Continuum fork: /lora-adapters/page_out, page_in (server-genes.h)
         { "expert_container_custody_version", 1 },
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
@@ -6263,6 +6328,38 @@ void server_routes::init_routes() {
         res->ok(result->to_json());
         return res;
     };
+
+    // POST /lora-adapters/page_out and /page_in {"id": N}: a loaded gene's tensors to host RAM or back
+    // to the device (server-genes.h). Idempotent: a gene already there answers n_moved 0.
+    auto page_lora = [this](const server_http_req & req, bool to_device) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        if (!body.contains("id") || !body.at("id").is_number_integer()) {
+            res->error(format_error_response("\"id\" (an integer adapter id) is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_PAGE_LORA);
+            task.id                  = rd.get_new_id();
+            task.page_lora           = body.at("id").get<int32_t>();
+            task.page_lora_to_device = to_device;
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+    this->post_lora_adapters_page_out = [page_lora](const server_http_req & req) { return page_lora(req, false); };
+    this->post_lora_adapters_page_in  = [page_lora](const server_http_req & req) { return page_lora(req, true); };
 
     auto train_control = [this](const server_http_req & req, bool pause) {
         auto res = create_response();

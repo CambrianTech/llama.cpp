@@ -6,6 +6,7 @@
 
 #include <map>
 #include <cassert>
+#include <functional>
 #include <mutex>
 #include <shared_mutex>
 #include <sstream>
@@ -477,6 +478,97 @@ int32_t llama_adapter_meta_val_str_by_index(const llama_adapter_lora * adapter, 
     auto it = adapter->gguf_kv.begin();
     std::advance(it, i);
     return snprintf(buf, buf_size, "%s", it->second.c_str());
+}
+
+// Continuum fork: adapter paging between device buffers and host memory (llama.h).
+
+static void lora_for_each_tensor(const llama_adapter_lora & adapter, const std::function<void(size_t, ggml_tensor *)> & fn) {
+    for (size_t i = 0; i < adapter.ctxs.size(); ++i) {
+        for (ggml_tensor * t = ggml_get_first_tensor(adapter.ctxs[i].get()); t; t = ggml_get_next_tensor(adapter.ctxs[i].get(), t)) {
+            fn(i, t);
+        }
+    }
+}
+
+int64_t llama_adapter_lora_page_out(llama_adapter_lora * adapter) {
+    if (adapter->paged) {
+        return 0;
+    }
+    auto page = std::make_unique<llama_adapter_lora_host_page>();
+    page->bufts.assign(adapter->ctxs.size(), nullptr);
+    size_t total = 0;
+    lora_for_each_tensor(*adapter, [&](size_t i, ggml_tensor * t) {
+        if (page->bufts[i] == nullptr && t->buffer != nullptr) {
+            page->bufts[i] = ggml_backend_buffer_get_type(t->buffer);
+        }
+        total += ggml_nbytes(t);
+    });
+    try {
+        page->host.resize(total);
+    } catch (const std::bad_alloc &) {
+        LLAMA_LOG_ERROR("%s: no host memory for %zu bytes of LoRA tensors\n", __func__, total);
+        return -1;
+    }
+    size_t off = 0;
+    lora_for_each_tensor(*adapter, [&](size_t, ggml_tensor * t) {
+        ggml_backend_tensor_get(t, page->host.data() + off, 0, ggml_nbytes(t));
+        off += ggml_nbytes(t);
+    });
+    adapter->bufs.clear(); // frees the device buffers
+    lora_for_each_tensor(*adapter, [](size_t, ggml_tensor * t) {
+        t->data   = nullptr;
+        t->buffer = nullptr;
+    });
+    adapter->paged = std::move(page);
+    return (int64_t) total;
+}
+
+int64_t llama_adapter_lora_page_in(llama_adapter_lora * adapter) {
+    if (!adapter->paged) {
+        return 0;
+    }
+    const llama_adapter_lora_host_page & page = *adapter->paged;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    for (size_t i = 0; i < adapter->ctxs.size(); ++i) {
+        if (page.bufts[i] == nullptr) {
+            continue; // a context with no tensors
+        }
+        ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(adapter->ctxs[i].get(), page.bufts[i]) };
+        if (!buf) {
+            LLAMA_LOG_ERROR("%s: failed to re-allocate a %s LoRA buffer\n", __func__, ggml_backend_buft_name(page.bufts[i]));
+            bufs.clear();
+            lora_for_each_tensor(*adapter, [](size_t, ggml_tensor * t) {
+                t->data   = nullptr;
+                t->buffer = nullptr;
+            });
+            return -1;
+        }
+        bufs.emplace_back(std::move(buf));
+    }
+    size_t off = 0;
+    lora_for_each_tensor(*adapter, [&](size_t, ggml_tensor * t) {
+        ggml_backend_tensor_set(t, page.host.data() + off, 0, ggml_nbytes(t));
+        off += ggml_nbytes(t);
+    });
+    adapter->bufs = std::move(bufs);
+    const int64_t moved = (int64_t) page.host.size();
+    adapter->paged.reset();
+    return moved;
+}
+
+bool llama_adapter_lora_is_paged_out(const llama_adapter_lora * adapter) {
+    return adapter->paged != nullptr;
+}
+
+uint64_t llama_adapter_lora_n_bytes(const llama_adapter_lora * adapter) {
+    if (adapter->paged) {
+        return adapter->paged->host.size();
+    }
+    uint64_t n = 0;
+    for (const auto & buf : adapter->bufs) {
+        n += ggml_backend_buffer_get_size(buf.get());
+    }
+    return n;
 }
 
 void llama_adapter_lora_free(llama_adapter_lora * adapter) {

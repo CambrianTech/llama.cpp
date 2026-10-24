@@ -60,6 +60,15 @@ struct llama_adapter_lora_weight {
     llama_adapter_lora_weight(ggml_tensor * a, ggml_tensor * b) : a(a), b(b) {}
 };
 
+// Continuum fork: an adapter's tensors held in host memory while its device buffers are freed
+// (llama_adapter_lora_page_out). `bufts` is aligned with `ctxs`: the buffer type each context's
+// tensors are re-allocated from on page-in; `host` is every tensor's bytes, contexts in order and
+// tensors in context order.
+struct llama_adapter_lora_host_page {
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    std::vector<uint8_t> host;
+};
+
 struct llama_adapter_lora {
     llama_model * model = nullptr;
 
@@ -78,6 +87,9 @@ struct llama_adapter_lora {
 
     // activated lora (aLoRA)
     std::vector<llama_token> alora_invocation_tokens;
+
+    // non-null while paged out to host memory: the tensors then have no device data
+    std::unique_ptr<llama_adapter_lora_host_page> paged;
 
     explicit llama_adapter_lora(llama_model * model) : model(model) {}
     ~llama_adapter_lora() = default;

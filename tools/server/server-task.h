@@ -64,6 +64,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,
     SERVER_TASK_TYPE_UNLOAD_LORA,
+    SERVER_TASK_TYPE_PAGE_LORA,   // Continuum fork: an adapter's tensors to host RAM or back (server-genes.h)
     SERVER_TASK_TYPE_LEARN,
 };
 
@@ -261,6 +262,10 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_UNLOAD_LORA: the adapter id to retire
     int32_t unload_lora = -1;
+
+    // used by SERVER_TASK_TYPE_PAGE_LORA: the adapter id, and where it goes
+    int32_t page_lora           = -1;
+    bool    page_lora_to_device = true;
 
     // used by SERVER_TASK_TYPE_LEARN
     learn_request learn;
@@ -589,6 +594,8 @@ struct server_task_result_metrics : server_task_result {
     size_t page_store_bytes     = 0; // Continuum fork: the host-RAM page store
     size_t page_store_pages     = 0;
     size_t ctx_checkpoint_bytes = 0; // every slot's context checkpoints
+    uint64_t gene_device_bytes  = 0; // Continuum fork: loaded adapters on the device
+    uint64_t gene_host_bytes    = 0; //   and paged out to host RAM
 
     server_metrics metrics;
 
@@ -677,6 +684,8 @@ struct server_task_result_get_lora : server_task_result {
         common_adapter_lora_info info;
         std::string  alora_invocation_string;
         llama_tokens alora_invocation_tokens;
+        bool     on_device = true; // Continuum fork: false while paged out to host RAM
+        uint64_t n_bytes   = 0;    //   its bytes where it is
     };
     std::vector<lora> loras;
 
