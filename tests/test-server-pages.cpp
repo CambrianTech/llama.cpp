@@ -10,6 +10,7 @@
 // - a repeated publication over existing page files (rename onto an existing name) that leaves the old one.
 
 #include "server-page-files.h"
+#include "server-page-os.h"
 #include "server-pages.h"
 
 #include <cstdio>
@@ -21,13 +22,8 @@
 #include <iterator>
 #include <string>
 
-#if defined(_WIN32)
-#   include <process.h>
-static long current_pid() { return (long) _getpid(); }
-#else
-#   include <unistd.h>
-static long current_pid() { return (long) getpid(); }
-#endif
+
+using page_os::current_pid;
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
 

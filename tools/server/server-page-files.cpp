@@ -1,4 +1,5 @@
 #include "server-page-files.h"
+#include "server-page-os.h"
 
 #include "../../src/llama-ext.h"
 
@@ -10,20 +11,6 @@
 #include <set>
 #include <system_error>
 
-#if defined(_WIN32)
-#   ifndef NOMINMAX
-#       define NOMINMAX
-#   endif
-#   include <windows.h>
-#   include <fcntl.h>
-#   include <io.h>
-#   include <process.h>
-#else
-#   include <cerrno>
-#   include <fcntl.h>
-#   include <signal.h>
-#   include <unistd.h>
-#endif
 
 namespace fs = std::filesystem;
 
@@ -147,28 +134,6 @@ static page_publications & publications() {
     return pubs;
 }
 
-static long current_pid() {
-#if defined(_WIN32)
-    return (long) _getpid();
-#else
-    return (long) getpid();
-#endif
-}
-
-static bool process_alive(long pid) {
-#if defined(_WIN32)
-    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD) pid);
-    if (h == nullptr) {
-        return false;
-    }
-    const bool alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
-    CloseHandle(h);
-    return alive;
-#else
-    return kill((pid_t) pid, 0) == 0 || errno == EPERM;
-#endif
-}
-
 // A stage is "<pid>-<n>": live while its publication runs in this process, or while its process runs.
 static bool stage_live(const std::string & id) {
     const auto dash = id.find('-');
@@ -181,38 +146,12 @@ static bool stage_live(const std::string & id) {
     if (pid <= 0) {
         return false;
     }
-    if (pid != current_pid()) {
-        return process_alive(pid);
+    if (pid != page_os::current_pid()) {
+        return page_os::process_alive(pid);
     }
     auto & pubs = publications();
     std::lock_guard<std::mutex> lock(pubs.stages_mutex);
     return pubs.stages.count(id) > 0;
-}
-
-// Makes the file's contents durable before anything that depends on them (the commit record).
-static bool sync_file(const fs::path & path) {
-#if defined(_WIN32)
-    const int fd = _wopen(path.c_str(), _O_RDWR | _O_BINARY);
-    if (fd < 0) {
-        return false;
-    }
-    const bool ok = _commit(fd) == 0;
-    _close(fd);
-    return ok;
-#else
-    const int fd = open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        return false;
-    }
-#   if defined(__APPLE__)
-    // macOS fsync stops at the drive's cache; only F_FULLFSYNC orders the data before the record
-    bool ok = fcntl(fd, F_FULLFSYNC) == 0 || fsync(fd) == 0;
-#   else
-    bool ok = fsync(fd) == 0;
-#   endif
-    ok = close(fd) == 0 && ok;
-    return ok;
-#endif
 }
 
 static std::function<bool(server_page_fault, const std::string &)> & injected_fault() {
@@ -239,35 +178,10 @@ static bool present(const fs::path & path) {
     return st.type() != fs::file_type::not_found;
 }
 
-// Moves `from` onto `to`. Every name a generation depends on is placed this way. On Windows the move
-// is durable when it returns ("MOVEFILE_WRITE_THROUGH: the function does not return until the file is
-// actually moved on the disk"); on POSIX, sync_dir of the dir makes it durable.
-static std::error_code place(const fs::path & from, const fs::path & to) {
-#if defined(_WIN32)
-    if (MoveFileExW(from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        return {};
-    }
-    return std::error_code((int) GetLastError(), std::system_category());
-#else
-    std::error_code ec;
-    fs::rename(from, to, ec);
-    return ec;
-#endif
-}
-
 // Makes a dir's entries (a rename into it) durable, or throws: a rename not proven durable is never
-// reported as published. On Windows every entry was placed by a write-through move, so there is
-// nothing left to sync.
+// reported as published.
 static void sync_dir(const fs::path & dir) {
-    bool ok = !faulted(server_page_fault::sync, dir);
-#if !defined(_WIN32)
-    if (ok) {
-        const int fd = open(dir.c_str(), O_RDONLY);
-        ok = fd >= 0 && fsync(fd) == 0;
-        ok = (fd < 0 || close(fd) == 0) && ok;
-    }
-#endif
-    if (!ok) {
+    if (faulted(server_page_fault::sync, dir) || !page_os::sync_dir(dir)) {
         throw server_page_error(ERROR_TYPE_SERVER, "a page directory could not be synced: " + dir.string());
     }
 }
@@ -310,7 +224,7 @@ static void write_commit_record(const fs::path & file, const fs::path & stage, c
             throw server_page_error(ERROR_TYPE_SERVER, "the page's commit record could not be written: " + tmp.string());
         }
     }
-    if (!sync_file(tmp) || place(tmp, commit_record(file))) {
+    if (!page_os::sync_file(tmp) || page_os::place(tmp, commit_record(file))) {
         throw server_page_error(ERROR_TYPE_SERVER, "the page's commit record could not be placed: " + commit_record(file).string());
     }
 }
@@ -325,7 +239,7 @@ static void roll_forward(const fs::path & file, const fs::path & stage, const st
         if (!present(staged)) {
             continue;
         }
-        if (const auto ec = place(staged, file.string() + s)) {
+        if (const auto ec = page_os::place(staged, file.string() + s)) {
             throw server_page_error(ERROR_TYPE_SERVER, "a committed page file could not be moved into place: " + staged.string() + ": " + ec.message());
         }
     }
@@ -335,7 +249,7 @@ static void roll_forward(const fs::path & file, const fs::path & stage, const st
             continue;
         }
         // a move, not a delete: on Windows only a move is made durable before the record goes
-        if (const auto ec = place(older, stage / (std::string("..retired") + s))) {
+        if (const auto ec = page_os::place(older, stage / (std::string("..retired") + s))) {
             throw server_page_error(ERROR_TYPE_SERVER, "an older page file could not be removed: " + older.string() + ": " + ec.message());
         }
     }
@@ -390,7 +304,7 @@ struct stage_owner {
     explicit stage_owner(const fs::path & staging) {
         auto & pubs = publications();
         std::lock_guard<std::mutex> lock(pubs.stages_mutex);
-        id    = std::to_string(current_pid()) + "-" + std::to_string(pubs.next++);
+        id    = std::to_string(page_os::current_pid()) + "-" + std::to_string(pubs.next++);
         stage = staging / id;
         pubs.stages.insert(id);
     }
@@ -446,7 +360,7 @@ size_t server_page_publish(const std::string & filepath, const std::vector<serve
         } catch (const std::exception & err) {
             throw server_page_error(ERROR_TYPE_SERVER, "a page file could not be written: " + staged.string() + ": " + err.what());
         }
-        if (n == 0 || !sync_file(written) || place(written, staged)) {
+        if (n == 0 || !page_os::sync_file(written) || page_os::place(written, staged)) {
             throw server_page_error(ERROR_TYPE_SERVER, "a page file could not be written: " + staged.string());
         }
         n_written += n;
