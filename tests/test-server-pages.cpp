@@ -4,7 +4,10 @@
 // - a page out of the store but still held by a spill that stops counting, so the live RAM passes the ceiling;
 // - a refused page_out that has already moved the slot's state out (the incumbent is lost);
 // - a publication that removes or overwrites the committed files before its own are whole: a failed
-//   sidecar write, or a crash between files, that loses the last durable page.
+//   sidecar write, or a crash between files, that loses the last durable page;
+// - a directory sync that fails (stage, commit record, destination) yet reports a publication or drops
+//   the commit record before the moved names are durable;
+// - a repeated publication over existing page files (rename onto an existing name) that leaves the old one.
 
 #include "server-page-files.h"
 #include "server-pages.h"
@@ -163,6 +166,10 @@ static void publish_generation(const fs::path & file, const std::string & tag) {
     server_page_publish(file.string(), files);
 }
 
+[[noreturn]] static void disk_full(const server_page_put &) {
+    throw std::runtime_error("disk full");
+}
+
 static void test_a_failed_publication_keeps_the_committed_generation(const fs::path & dir) {
     const fs::path file = dir / "mind-a.bin";
     publish_generation(file, "one");
@@ -184,7 +191,7 @@ static void test_a_failed_publication_keeps_the_committed_generation(const fs::p
     refused = false;
     try {
         server_page_publish(file.string(), { text_file("", "two"),
-            server_page_sidecar(".ckpt", [](const server_page_put &) { throw std::runtime_error("disk full"); }) });
+            server_page_sidecar(".ckpt", disk_full) });
     } catch (const server_page_error &) {
         refused = true;
     }
@@ -227,6 +234,75 @@ static void test_an_interrupted_publication_restores_whole(const fs::path & dir)
     check_no_leftovers(dir);
 }
 
+// the sync of every dir whose name ends in `suffix` fails while this lives
+struct sync_fault {
+    explicit sync_fault(std::string suffix) {
+        server_page_files_inject_sync_fault([suffix](const std::string & dir) {
+            return dir.size() >= suffix.size() && dir.compare(dir.size() - suffix.size(), suffix.size(), suffix) == 0;
+        });
+    }
+    ~sync_fault() { server_page_files_inject_sync_fault(nullptr); }
+};
+
+static bool publish_refused(const fs::path & file, const std::string & tag) {
+    try {
+        publish_generation(file, tag);
+    } catch (const server_page_error &) {
+        return true;
+    }
+    return false;
+}
+
+static void test_a_failed_dir_sync_never_reports_or_loses_a_generation(const fs::path & dir) {
+    const fs::path file    = dir / "mind-d.bin";
+    const fs::path staging = dir / "..page-staging";
+    publish_generation(file, "one");
+
+    // the stage's sync fails (every sync fails; the stage's is the first reached): refused before
+    // the commit, the committed generation as it was
+    {
+        sync_fault fault("");
+        CHECK(publish_refused(file, "two"));
+    }
+    { server_page_reader reader(file.string()); check_generation(file, "one"); }
+    check_no_leftovers(dir);
+
+    // the commit record's dir sync fails: refused, but the record keeps custody; the next reader completes it
+    {
+        sync_fault fault("..page-staging");
+        CHECK(publish_refused(file, "three"));
+        CHECK(fs::exists(staging / "mind-d.bin.commit"));
+    }
+    { server_page_reader reader(file.string()); check_generation(file, "three"); }
+    check_no_leftovers(dir);
+
+    // the destination's sync fails after the files moved: refused, the record kept until a sync succeeds
+    {
+        sync_fault fault(dir.filename().string());
+        CHECK(publish_refused(file, "four"));
+        CHECK(fs::exists(staging / "mind-d.bin.commit"));
+        bool reader_refused = false;
+        try {
+            server_page_reader reader(file.string());
+        } catch (const server_page_error &) {
+            reader_refused = true;
+        }
+        CHECK(reader_refused && fs::exists(staging / "mind-d.bin.commit"));
+    }
+    { server_page_reader reader(file.string()); check_generation(file, "four"); }
+    check_no_leftovers(dir);
+}
+
+// every publication after the first renames onto existing page files: each must replace them
+static void test_repeated_publication_replaces_every_file(const fs::path & dir) {
+    const fs::path file = dir / "mind-e.bin";
+    for (const char * tag : { "one", "two", "three", "four" }) {
+        publish_generation(file, tag);
+        { server_page_reader reader(file.string()); check_generation(file, tag); }
+        check_no_leftovers(dir);
+    }
+}
+
 static void test_spill_writes_a_page_restore_reads(const fs::path & dir) {
     // a sequence state as llama_state_seq_get_data writes it: [io magic][seq id][state]
     auto page = std::make_shared<server_page>();
@@ -260,6 +336,8 @@ int main() {
     fs::create_directories(dir);
     test_a_failed_publication_keeps_the_committed_generation(dir);
     test_an_interrupted_publication_restores_whole(dir);
+    test_a_failed_dir_sync_never_reports_or_loses_a_generation(dir);
+    test_repeated_publication_replaces_every_file(dir);
     test_spill_writes_a_page_restore_reads(dir);
     fs::remove_all(dir);
 

@@ -215,17 +215,29 @@ static bool sync_file(const fs::path & path) {
 #endif
 }
 
-// Makes a dir's entries (a rename into it) durable. Windows has no handle for this; NTFS journals them.
+static std::function<bool(const std::string &)> & sync_dir_fault() {
+    static std::function<bool(const std::string &)> fault;
+    return fault;
+}
+
+void server_page_files_inject_sync_fault(std::function<bool(const std::string & dir)> fault) {
+    sync_dir_fault() = std::move(fault);
+}
+
+// Makes a dir's entries (a rename into it) durable, or throws: a rename not proven durable is never
+// reported as published. Windows has no handle for this; NTFS journals the entries.
 static void sync_dir(const fs::path & dir) {
+    bool ok = !(sync_dir_fault() && sync_dir_fault()(dir.string()));
 #if !defined(_WIN32)
-    const int fd = open(dir.c_str(), O_RDONLY);
-    if (fd >= 0) {
-        fsync(fd);
-        close(fd);
+    if (ok) {
+        const int fd = open(dir.c_str(), O_RDONLY);
+        ok = fd >= 0 && fsync(fd) == 0;
+        ok = (fd < 0 || close(fd) == 0) && ok;
     }
-#else
-    (void) dir;
 #endif
+    if (!ok) {
+        throw server_page_error(ERROR_TYPE_SERVER, "a page directory could not be synced: " + dir.string());
+    }
 }
 
 static fs::path staging_dir(const fs::path & file) {
@@ -270,7 +282,6 @@ static void write_commit_record(const fs::path & file, const fs::path & stage, c
     if (!sync_file(tmp) || (fs::rename(tmp, commit_record(file), ec), ec)) {
         throw server_page_error(ERROR_TYPE_SERVER, "the page's commit record could not be placed: " + commit_record(file).string());
     }
-    sync_dir(staging_dir(file));
 }
 
 // Moves a committed generation over the page's files, removes the files it lacks, then its stage and
@@ -290,10 +301,16 @@ static void roll_forward(const fs::path & file, const fs::path & stage, const st
             throw server_page_error(ERROR_TYPE_SERVER, "an older page file could not be removed: " + file.string() + s + ": " + ec.message());
         }
     }
-    sync_dir(file.parent_path());
+    sync_dir(file.parent_path()); // throws, keeping the record: the moved names are not yet durable
     fs::remove_all(stage, ec);
     fs::remove(commit_record(file), ec);
-    sync_dir(staging_dir(file));
+    try {
+        sync_dir(staging_dir(file));
+    } catch (const server_page_error & err) {
+        // the generation is durable; a record whose removal is lost names a stage already moved,
+        // and the next reader's roll_forward of it changes nothing
+        SRV_WRN("%s\n", err.what());
+    }
 }
 
 // Removes every stage no commit record names and no live publication owns: what a crash before a
@@ -399,7 +416,8 @@ size_t server_page_publish(const std::string & filepath, const std::vector<serve
 
     std::unique_lock<std::shared_mutex> lock(pubs.commit);
     write_commit_record(file, stage, owner.id, suffixes);
-    owner.committed = true;
+    owner.committed = true; // the record names the stage: from here a failure leaves it to the next reader
+    sync_dir(staging_dir(file));
     roll_forward(file, stage, suffixes);
     return n_written;
 }
