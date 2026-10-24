@@ -3816,6 +3816,26 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
 common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                const struct common_chat_templates_inputs & inputs) {
     GGML_ASSERT(tmpls != nullptr);
+    if (inputs.use_jinja && !inputs.tail_tools.empty()) {
+        // The prompt is what the head tools alone render; everything that reads the model's
+        // output (format, parser, grammar, triggers, stops) is built over head + tail, so a
+        // verb declared later in the conversation is a real tool call, not text.
+        common_chat_templates_inputs head = inputs;
+        head.tail_tools.clear();
+        common_chat_templates_inputs callable = head;
+        for (const auto & tool : inputs.tail_tools) {
+            const bool in_head = std::any_of(callable.tools.begin(), callable.tools.end(),
+                                             [&](const common_chat_tool & held) { return held.name == tool.name; });
+            if (!in_head) {
+                callable.tools.push_back(tool);
+            }
+        }
+        auto rendered = common_chat_templates_apply_jinja(tmpls, head);
+        auto params   = common_chat_templates_apply_jinja(tmpls, callable);
+        params.prompt            = std::move(rendered.prompt);
+        params.generation_prompt = std::move(rendered.generation_prompt);
+        return params;
+    }
     return inputs.use_jinja ? common_chat_templates_apply_jinja(tmpls, inputs) :
                               common_chat_templates_apply_legacy(tmpls, inputs);
 }

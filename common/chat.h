@@ -255,6 +255,10 @@ struct common_chat_templates_inputs {
     bool                                  use_jinja              = true;
     // Parameters below only supported when use_jinja is true
     std::vector<common_chat_tool>         tools;
+    // Callable but not in the head: the parser and the lazy grammar accept these, the template
+    // never renders them. The caller declares each one later in the conversation, so loading a
+    // verb leaves the rendered prefix (and the KV cached for it) byte-identical.
+    std::vector<common_chat_tool>         tail_tools;
     common_chat_tool_choice               tool_choice         = COMMON_CHAT_TOOL_CHOICE_AUTO;
     bool                                  parallel_tool_calls = false;
     common_reasoning_format               reasoning_format    = COMMON_REASONING_FORMAT_NONE; // TODO: refactor this to "bool enable_thinking"

@@ -1279,6 +1279,7 @@ json oaicompat_chat_params_parse(
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
+    inputs.tail_tools             = common_chat_tools_parse_oaicompat(json_value(body, "tail_tools", json()));
     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
@@ -1310,7 +1311,7 @@ json oaicompat_chat_params_parse(
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
     }
     inputs.enable_thinking = opt.enable_thinking;
-    if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+    if ((!inputs.tools.empty() || !inputs.tail_tools.empty()) && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
         if (body.contains("grammar")) {
             throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
         }
