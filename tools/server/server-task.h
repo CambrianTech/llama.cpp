@@ -60,6 +60,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_PAGE_IN,    // named page -> slot
     SERVER_TASK_TYPE_PAGE_SPILL, // hands a page to the HTTP thread, which writes it to disk
     SERVER_TASK_TYPE_PAGE_DROP,  // frees a page
+    SERVER_TASK_TYPE_RECONFIGURE, // Continuum fork: new context geometry, same model (server-reconfigure.h)
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,
@@ -264,6 +265,10 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_LEARN
     learn_request learn;
+
+    // used by SERVER_TASK_TYPE_RECONFIGURE: the request body, parsed on the task thread against the
+    // geometry it then has (server_reconfigure_request::parse)
+    json reconfigure;
 
     server_task() = default;
 

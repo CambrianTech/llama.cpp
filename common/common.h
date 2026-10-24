@@ -931,6 +931,15 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    // Continuum fork: frees the context and builds one from `params` (n_ctx, n_parallel, KV types)
+    // on the SAME model: its weights, mmap and adapters stay loaded. Returns nullptr when the new
+    // context cannot be created; the result then holds no context and the caller may call it
+    // again with the old geometry.
+    llama_context * reinit_context(common_params & params);
+
+    // Continuum fork: frees the context only; the model and adapters stay (reinit_context builds the next)
+    void free_context();
+
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
@@ -966,6 +975,10 @@ struct common_threadpools {
     common_threadpools & operator=(const common_threadpools &) = delete;
 
     void init(llama_context * ctx, const common_params & params);
+
+    // Continuum fork: hands the pools init() made to another context of the same process (a
+    // context rebuilt with a new geometry keeps its CPU threads)
+    void attach(llama_context * ctx) const;
 
 private:
     ggml_threadpool * threadpool       = nullptr;

@@ -484,6 +484,8 @@ struct server_metrics {
 
     // Continuum fork: RAM pages and the checkpoint byte budget
     uint64_t n_page_out             = 0;
+    uint64_t n_reconfigure          = 0; // Continuum fork: /reconfigure runs (server-reconfigure.h)
+    uint64_t n_reconfigure_failed   = 0;
     uint64_t n_page_in              = 0;
     uint64_t n_page_failed          = 0; // page_out, page_in or spill refused or failed
     uint64_t n_ckpt_evicted_budget  = 0; // checkpoints dropped to keep within --ctx-checkpoints-bytes

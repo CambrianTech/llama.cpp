@@ -2069,11 +2069,14 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if (n_stream_cur != n_stream) {
+    // Continuum fork: one sequence's cells all land in that sequence's stream, so its state
+    // reads into a cache split into any number of streams (a server whose slot count changed,
+    // or a unified cache from a split one). The whole cache (seq_id == -1) keeps its layout.
+    if (n_stream_cur != n_stream && seq_id == -1) {
         throw std::runtime_error("n_stream mismatch");
     }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    for (uint32_t s = 0; s < n_stream_cur; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
