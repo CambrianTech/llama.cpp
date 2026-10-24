@@ -621,6 +621,8 @@ struct common_params {
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    uint64_t ctx_checkpoints_bytes = 0;  // checkpoint byte budget across all slots; 0 = the count above governs
+    uint64_t page_ram_bytes        = 0;  // ceiling of the named host-RAM page store; 0 = no ceiling
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";

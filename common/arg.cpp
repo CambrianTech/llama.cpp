@@ -330,6 +330,18 @@ static std::string get_all_kv_cache_types() {
     return msg.str();
 }
 
+// an exact byte count: the caller passes a measured number, so no unit suffixes are guessed
+static uint64_t parse_byte_count(const std::string & value, const char * flag) {
+    if (value.empty() || value.size() > 20 || value.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::invalid_argument(std::string(flag) + " takes an unsigned byte count, got: " + value);
+    }
+    try {
+        return std::stoull(value);
+    } catch (const std::exception &) {
+        throw std::invalid_argument(std::string(flag) + " is out of range: " + value);
+    }
+}
+
 static bool parse_bool_value(const std::string & value) {
     if (is_truthy(value)) {
         return true;
@@ -1691,6 +1703,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_ctx_checkpoints = value;
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--ctx-checkpoints-bytes"}, "BYTES",
+        "byte budget for the context checkpoints of all slots together, in place of the per-slot count "
+        "(default: 0 = use --ctx-checkpoints); when a new checkpoint would exceed it, the slot holding the "
+        "most checkpoint bytes drops its oldest checkpoint after its first, so each slot keeps its head and its newest",
+        [](common_params & params, const std::string & value) {
+            params.ctx_checkpoints_bytes = parse_byte_count(value, "--ctx-checkpoints-bytes");
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_BYTES").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--page-ram-bytes"}, "BYTES",
+        "ceiling of the host-RAM page store that /slots page_out fills (default: 0 = no ceiling); "
+        "a page_out that would exceed it is refused, so the caller spills a page to disk first",
+        [](common_params & params, const std::string & value) {
+            params.page_ram_bytes = parse_byte_count(value, "--page-ram-bytes");
+        }
+    ).set_env("LLAMA_ARG_PAGE_RAM_BYTES").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),

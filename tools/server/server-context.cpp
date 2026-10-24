@@ -2,6 +2,8 @@
 #include "server-context.h"
 #include "../../src/llama-ext.h"
 #include "server-train.h"
+#include "server-checkpoints.h"
+#include "server-pages.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -30,22 +32,6 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
-
-// Continuum fork: an adapter file's revision (size, mtime in ns since the epoch; (0, 0) when it
-// cannot be read), stored in a saved slot's `.lora` sidecar so a restore refuses a page computed
-// under different weights at the same path.
-static std::pair<uint64_t, int64_t> lora_file_revision(const std::string & path) {
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(path, ec);
-    if (ec) {
-        return {0, 0};
-    }
-    const auto mtime = std::filesystem::last_write_time(path, ec);
-    if (ec) {
-        return {0, 0};
-    }
-    return {(uint64_t) size, (int64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(mtime.time_since_epoch()).count()};
-}
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -938,6 +924,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // Continuum fork: named slot states in host RAM (/slots page_out, page_in, spill, page_drop)
+    server_page_store page_store;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -960,6 +949,12 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // a page names adapters by pointer, and the model's adapters are freed with it
+        if (page_store.n_pages() > 0) {
+            SRV_WRN("dropping %zu RAM pages (%zu bytes) with the model: spill them before sleep to keep them\n",
+                    page_store.n_pages(), page_store.n_bytes());
+            page_store = server_page_store{};
+        }
         spec.reset();
         spec_init.reset();
 
@@ -1352,7 +1347,12 @@ private:
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
-        if (params_base.n_ctx_checkpoints > 0) {
+        page_store.limit_bytes = params_base.page_ram_bytes;
+
+        if (params_base.n_ctx_checkpoints > 0 && params_base.ctx_checkpoints_bytes > 0) {
+            SRV_INF("context checkpoints enabled, budget = %llu bytes across all slots, min spacing = %d\n",
+                    (unsigned long long) params_base.ctx_checkpoints_bytes, params_base.checkpoint_min_step);
+        } else if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
         } else {
@@ -2472,7 +2472,34 @@ private:
             ++it;
         }
 
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+        // Continuum fork: a byte budget across all slots replaces the per-slot count when set
+        if (params_base.ctx_checkpoints_bytes > 0) {
+            const size_t incoming =
+                llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) +
+                (ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) : 0);
+            std::vector<server_checkpoint_list *> lists;
+            size_t own = 0;
+            for (auto & s : slots) {
+                if (&s == &slot) {
+                    own = lists.size();
+                }
+                lists.push_back(&s.prompt.checkpoints);
+            }
+            const bool fits = server_checkpoints_fit(lists, own, params_base.ctx_checkpoints_bytes, incoming,
+                [&](size_t i, const common_prompt_checkpoint & c) {
+                    metrics.n_ckpt_evicted_budget++;
+                    SLT_WRN(slots[i], "checkpoint budget: erasing context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB) for slot %d's new one\n",
+                            c.pos_min, c.pos_max, c.n_tokens, (float) c.size() / 1024 / 1024, slot.id);
+                });
+            if (!fits) {
+                metrics.n_ckpt_skipped_budget++;
+                SLT_WRN(slot, "checkpoint budget: a checkpoint of %.3f MiB alone exceeds --ctx-checkpoints-bytes %llu, not taken\n",
+                        (float) incoming / 1024 / 1024, (unsigned long long) params_base.ctx_checkpoints_bytes);
+                return;
+            }
+        }
+
+        while (params_base.ctx_checkpoints_bytes == 0 && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
 
@@ -2500,6 +2527,103 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+    }
+
+    // Continuum fork: one PAGE_* task on the task thread. Throws server_page_error: a failed
+    // page_out leaves the slot and the store as they were; a failed page_in leaves the page in
+    // the store and the slot empty, never half-restored.
+    std::unique_ptr<server_task_result_page> page_task(const server_task & task, server_slot * slot) {
+        const int64_t t_start = ggml_time_us();
+        const std::string & name = task.slot_action.page;
+
+        auto res = std::make_unique<server_task_result_page>();
+        res->id      = task.id;
+        res->id_slot = task.slot_action.id_slot;
+        res->page    = name;
+
+        server_page_ptr page;
+        switch (task.type) {
+            case SERVER_TASK_TYPE_PAGE_OUT:
+                {
+                    res->action = "page_out";
+                    if (slot->prompt.tokens.size() == 0) {
+                        throw server_page_error(ERROR_TYPE_INVALID_REQUEST, "the slot holds no sequence to page out");
+                    }
+                    const auto [n_tgt, n_dft] = server_page_state_size(ctx_tgt, ctx_dft, slot->id);
+                    page_store.admit(name, n_tgt + n_dft + server_checkpoints_bytes(slot->prompt.checkpoints));
+                    page = server_page_capture(ctx_tgt, ctx_dft, spec.get(), slot->id);
+                    page->prompt = std::move(slot->prompt);
+                    page->lora   = slot->lora;
+                    slot->prompt_clear();
+                    res->gen = page_store.put(name, page);
+                    metrics.n_page_out++;
+                } break;
+            case SERVER_TASK_TYPE_PAGE_IN:
+                {
+                    res->action = "page_in";
+                    page = page_store.find(name);
+                    if (!page) {
+                        throw server_page_error(ERROR_TYPE_NOT_FOUND, "no RAM page named '" + name + "'");
+                    }
+                    if (page->prompt.tokens.size() > (size_t) slot->n_ctx) {
+                        throw server_page_error(ERROR_TYPE_INVALID_REQUEST, "the page does not fit the slot context");
+                    }
+                    slot->prompt_clear();
+                    try {
+                        server_page_restore(*page, ctx_tgt, ctx_dft, spec.get(), slot->id);
+                    } catch (...) {
+                        slot->prompt_clear();
+                        throw;
+                    }
+                    // the page leaves the store; its buffers are copied only while a spill still reads them
+                    const bool sole = page.use_count() == 2; // the store's reference and this one
+                    slot->prompt = sole ? std::move(page->prompt) : page->prompt.clone();
+                    slot->lora   = page->lora;
+                    res->gen     = page->gen;
+                    page_store.erase(name, page->gen);
+                    metrics.n_page_in++;
+                } break;
+            case SERVER_TASK_TYPE_PAGE_SPILL:
+                {
+                    res->action = "spill";
+                    page = page_store.find(name);
+                    if (!page) {
+                        throw server_page_error(ERROR_TYPE_NOT_FOUND, "no RAM page named '" + name + "'");
+                    }
+                    res->gen     = page->gen;
+                    res->spilled = page;
+                } break;
+            case SERVER_TASK_TYPE_PAGE_DROP:
+                {
+                    res->action = "page_drop";
+                    page = page_store.find(name);
+                    if (!page) {
+                        throw server_page_error(ERROR_TYPE_NOT_FOUND, "no RAM page named '" + name + "'");
+                    }
+                    if (page_store.erase(name, task.slot_action.page_gen) == 0) {
+                        throw server_page_error(ERROR_TYPE_INVALID_REQUEST, "the page under this name was replaced; nothing dropped");
+                    }
+                    res->gen = page->gen;
+                } break;
+            default:
+                GGML_ABORT("not a page task");
+        }
+
+        // a page_in moved its prompt into the slot; report what the slot now holds
+        const server_prompt & held = task.type == SERVER_TASK_TYPE_PAGE_IN ? slot->prompt : page->prompt;
+        res->n_tokens            = held.tokens.size();
+        res->n_checkpoints       = held.checkpoints.size();
+        res->n_bytes_checkpoints = server_checkpoints_bytes(held.checkpoints);
+        res->n_bytes_draft       = page->data.drft.size();
+        res->n_bytes             = page->data.size() + page->spec.size() + res->n_bytes_checkpoints;
+        res->store_bytes         = page_store.n_bytes();
+        res->store_pages         = page_store.n_pages();
+        res->t_ms                = (ggml_time_us() - t_start) / 1000.0;
+
+        SRV_INF("%s '%s' slot %d: %zu tokens, %zu bytes (%zu draft, %zu in %zu checkpoints) in %.3f ms; store %zu bytes in %zu pages\n",
+                res->action.c_str(), name.c_str(), res->id_slot, res->n_tokens, res->n_bytes, res->n_bytes_draft,
+                res->n_bytes_checkpoints, res->n_checkpoints, res->t_ms, res->store_bytes, res->store_pages);
+        return res;
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -2645,6 +2769,11 @@ private:
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
                     res->metrics             = metrics;
+                    res->page_store_bytes    = page_store.n_bytes();
+                    res->page_store_pages    = page_store.n_pages();
+                    for (const server_slot & slot : slots) {
+                        res->ctx_checkpoint_bytes += server_checkpoints_bytes(slot.prompt.checkpoints);
+                    }
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -2729,39 +2858,26 @@ private:
                             ++i;
                         }
                     }
-                    auto write_checkpoints = [&](auto && put) {
-                        const uint32_t magic   = 0x434B5054u; // 'CKPT'
-                        const uint32_t version = 1;
-                        const uint32_t n_ckpt  = (uint32_t) kept_checkpoints.size();
-                        put(&magic, sizeof(magic)); put(&version, sizeof(version)); put(&n_ckpt, sizeof(n_ckpt));
-                        for (const auto * kept : kept_checkpoints) {
-                            const auto & c = *kept;
-                            const int64_t  n_tokens = c.n_tokens;
-                            const int32_t  pos_min  = c.pos_min;
-                            const int32_t  pos_max  = c.pos_max;
-                            const uint64_t sz_tgt   = c.data_tgt.size();
-                            const uint64_t sz_dft   = c.data_dft.size();
-                            const uint64_t sz_spec  = c.data_spec.size();
-                            put(&n_tokens, sizeof(n_tokens)); put(&pos_min, sizeof(pos_min)); put(&pos_max, sizeof(pos_max));
-                            put(&sz_tgt, sizeof(sz_tgt)); put(&sz_dft, sizeof(sz_dft)); put(&sz_spec, sizeof(sz_spec));
-                            put(c.data_tgt.data(), c.data_tgt.size());
-                            put(c.data_dft.data(), c.data_dft.size());
-                            put(c.data_spec.data(), c.data_spec.size());
+                    // Continuum fork: the draft (MTP) state rides in a `.dft` sidecar, so a restored
+                    // page drafts warm; a server without a draft context writes none.
+                    // The quote counts the draft bytes without copying them.
+                    std::vector<uint8_t> draft_state;
+                    std::vector<uint8_t> draft_spec;
+                    const size_t n_draft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+                    if (ctx_dft) {
+                        common_speculative_get_state(spec.get(), slot->id, draft_spec);
+                    }
+                    if (ctx_dft && !task.slot_action.size_only) {
+                        draft_state.resize(n_draft);
+                        if (llama_state_seq_get_data_ext(ctx_dft, draft_state.data(), n_draft, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_draft) {
+                            send_error(task, "Unable to read the draft state", ERROR_TYPE_SERVER);
+                            break;
                         }
-                    };
-                    auto write_adapters = [&](auto && put) {
-                        const uint32_t magic   = 0x4C4F5241u; // 'LORA'
-                        const uint32_t version = 2;
-                        const uint32_t n_lora  = (uint32_t) slot->lora.size();
-                        put(&magic, sizeof(magic)); put(&version, sizeof(version)); put(&n_lora, sizeof(n_lora));
-                        for (const auto & l : slot->lora) {
-                            const uint32_t n_path = (uint32_t) l.path.size();
-                            const auto     rev    = lora_file_revision(l.path);
-                            put(&n_path, sizeof(n_path));
-                            put(l.path.data(), n_path);
-                            put(&l.scale, sizeof(l.scale));
-                            put(&rev.first, sizeof(rev.first)); put(&rev.second, sizeof(rev.second));
-                        }
+                    }
+                    auto write_checkpoints = [&](const server_page_put & put) { server_page_write_checkpoints(kept_checkpoints, put); };
+                    auto write_adapters    = [&](const server_page_put & put) { server_page_write_adapters(slot->lora, put); };
+                    auto write_draft       = [&](const server_page_put & put) {
+                        server_page_write_draft(draft_state.empty() ? nullptr : draft_state.data(), n_draft, draft_spec, put);
                     };
                     if (task.slot_action.size_only || task.slot_action.has_byte_ceiling) {
                         size_t projected_bytes = llama_state_seq_file_size(
@@ -2781,6 +2897,9 @@ private:
                         };
                         write_checkpoints(count);
                         write_adapters(count);
+                        if (ctx_dft) {
+                            write_draft(count);
+                        }
                         if (size_overflow) {
                             send_error(task, "Slot file size overflow", ERROR_TYPE_SERVER);
                             break;
@@ -2823,6 +2942,17 @@ private:
                         if (!out) {
                             SLT_WRN(*slot, "adapter sidecar could not be written: %s (this page will not restore)\n", filepath.c_str());
                         }
+                    }
+                    if (ctx_dft) {
+                        std::ofstream out(filepath + ".dft", std::ios::binary | std::ios::trunc);
+                        write_draft([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
+                        if (!out) {
+                            SLT_WRN(*slot, "draft sidecar could not be written: %s (the restore will draft cold)\n", filepath.c_str());
+                        }
+                    } else {
+                        // a draft state saved under this name by an earlier server is not this page's
+                        std::error_code ec;
+                        std::filesystem::remove(filepath + ".dft", ec);
                     }
 
                     const int64_t t_end = ggml_time_us();
@@ -2985,6 +3115,23 @@ private:
                                 SLT_WRN(*slot, "no usable checkpoint sidecar (%s): the restore is cold — the next divergence re-prefills from the head\n", ckpt_path.c_str());
                             }
                         }
+                        // Continuum fork: the draft (MTP) state from the `.dft` sidecar, so drafting
+                        // resumes warm. A page saved before the sidecar existed drafts cold, as it did.
+                        if (ctx_dft) {
+                            std::vector<uint8_t> draft_state;
+                            std::vector<uint8_t> draft_spec;
+                            std::string why;
+                            const std::string dft_path = filepath + ".dft";
+                            if (!server_page_read_draft(dft_path, draft_state, draft_spec, why)) {
+                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                                SLT_WRN(*slot, "draft sidecar %s (%s): the draft starts cold\n", why.c_str(), dft_path.c_str());
+                            } else if (llama_state_seq_set_data_ext(ctx_dft, draft_state.data(), draft_state.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) != draft_state.size()) {
+                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                                SLT_WRN(*slot, "draft sidecar did not fit the draft context (%s): the draft starts cold\n", dft_path.c_str());
+                            } else {
+                                common_speculative_set_state(spec.get(), slot->id, draft_spec);
+                            }
+                        }
                         if (progress && progress->cancel_requested.load(std::memory_order_relaxed)) {
                             throw std::runtime_error("Restore operation cancelled");
                         }
@@ -3035,6 +3182,32 @@ private:
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_PAGE_OUT:
+            case SERVER_TASK_TYPE_PAGE_IN:
+            case SERVER_TASK_TYPE_PAGE_SPILL:
+            case SERVER_TASK_TYPE_PAGE_DROP:
+                {
+                    // Continuum fork: named host-RAM pages (server-pages.h). page_out and page_in
+                    // mutate the slot's KV, so they defer while it is processing, as restore does.
+                    const bool on_slot = task.type == SERVER_TASK_TYPE_PAGE_OUT || task.type == SERVER_TASK_TYPE_PAGE_IN;
+                    server_slot * slot = on_slot ? get_slot_by_id(task.slot_action.id_slot) : nullptr;
+                    if (on_slot && slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (on_slot && slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    try {
+                        auto res = page_task(task, slot);
+                        queue_results.send(std::move(res));
+                    } catch (const server_page_error & err) {
+                        metrics.n_page_failed += task.type == SERVER_TASK_TYPE_PAGE_DROP ? 0 : 1;
+                        send_error(task, err.what(), err.type);
+                    }
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
@@ -3195,6 +3368,7 @@ private:
                     if (prompt_cache) {
                         prompt_cache->evict_lora(ptr);
                     }
+                    page_store.evict_lora(ptr);
                     // the context may still hold it from the last batch; clear before freeing.
                     // Only ctx_tgt ever receives adapters (common_set_adapter_lora in
                     // update_slots); the draft/MTP context never does.
@@ -5213,6 +5387,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
         { "slot_save_size_version",      1 },
+        { "slot_page_version",           1 }, // Continuum fork: /slots page_out, page_in, spill, page_drop
         { "expert_container_custody_version", 1 },
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
@@ -5388,7 +5563,9 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
+        const std::string action_name = req.get_param("action");
+        const bool ram_only = action_name == "page_out" || action_name == "page_in" || action_name == "page_drop";
+        if (params.slot_save_path.empty() && !ram_only) {
             res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
@@ -5405,6 +5582,9 @@ void server_routes::init_routes() {
 
         std::string action = req.get_param("action");
 
+        if (action == "page_out" || action == "page_in" || action == "spill" || action == "page_drop") {
+            return handle_slots_page(req, id_slot, action);
+        }
         if (action == "save" || action == "save-size") {
             return handle_slots_save(req, id_slot, action == "save-size");
         }
@@ -6290,6 +6470,115 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_save_load*>(result.get()) != nullptr);
     res->ok(result->to_json());
+    return res;
+}
+
+// Continuum fork: the RAM page verbs (server-pages.h).
+//   POST /slots/{id}?action=page_out&page=<name>   slot -> RAM page; the slot is freed
+//   POST /slots/{id}?action=page_in&page=<name>    RAM page -> slot; the page leaves the store
+//   POST /slots/{id}?action=spill&page=<name>      body {"filename": f, "drop": bool}: RAM page -> f (+.ckpt .lora .dft)
+//   POST /slots/{id}?action=page_drop&page=<name>  frees the page
+// {id} is not used by spill and page_drop. The page name may also come as "page" in the body.
+std::unique_ptr<server_res_generator> server_routes::handle_slots_page(const server_http_req & req, int id_slot, const std::string & action) {
+    auto res = create_response();
+    json request_data = json::object();
+    if (!req.body.empty()) {
+        try {
+            request_data = json::parse(req.body);
+        } catch (const std::exception &) {
+            res->error(format_error_response("The body must be JSON", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+    }
+    std::string page = req.get_param("page");
+    if (page.empty() && request_data.contains("page") && request_data.at("page").is_string()) {
+        page = request_data.at("page").get<std::string>();
+    }
+    if (!server_page_name_valid(page)) {
+        res->error(format_error_response("A page name is 1-255 bytes without control characters", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const bool on_slot = action == "page_out" || action == "page_in";
+    if (on_slot && (id_slot < 0 || id_slot >= params.n_parallel)) {
+        res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    std::string filename;
+    bool drop = false;
+    if (action == "spill") {
+        filename = request_data.value("filename", std::string());
+        if (!fs_validate_filename(filename)) {
+            res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (request_data.contains("drop") && !request_data.at("drop").is_boolean()) {
+            res->error(format_error_response("drop must be a boolean", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        drop = request_data.value("drop", false);
+    }
+
+    // a reader posts once, so the spill's drop gets its own
+    server_response_reader rd_drop(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
+    auto run = [&](server_response_reader & rd, server_task_type type, uint64_t gen) -> server_task_result_ptr {
+        server_task task(type);
+        task.id = rd.get_new_id();
+        // bound to its slot, so a deferred page_out/page_in is serviced when that slot releases
+        task.id_slot = on_slot ? id_slot : -1;
+        task.slot_action.id_slot  = id_slot;
+        task.slot_action.page     = page;
+        task.slot_action.page_gen = gen;
+        rd.post_task(std::move(task));
+        return rd.next(req.should_stop);
+    };
+
+    const server_task_type type =
+        action == "page_out" ? SERVER_TASK_TYPE_PAGE_OUT :
+        action == "page_in"  ? SERVER_TASK_TYPE_PAGE_IN  :
+        action == "spill"    ? SERVER_TASK_TYPE_PAGE_SPILL : SERVER_TASK_TYPE_PAGE_DROP;
+    auto result = run(res->rd, type, 0);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    auto * page_res = dynamic_cast<server_task_result_page *>(result.get());
+    GGML_ASSERT(page_res != nullptr);
+
+    if (action == "spill") {
+        // the disk write runs here, on bytes already in RAM, so the engine never waits on it
+        const int64_t t_start = ggml_time_us();
+        try {
+            page_res->n_written = server_page_spill(*page_res->spilled, params.slot_save_path + filename);
+        } catch (const server_page_error & err) {
+            res->error(format_error_response(err.what(), err.type));
+            return res;
+        }
+        page_res->filename = filename;
+        page_res->t_ms     = (ggml_time_us() - t_start) / 1000.0;
+        const uint64_t gen = page_res->gen;
+        page_res->spilled.reset();
+        if (drop) {
+            // drops this generation only: a page_out under the same name since then is kept
+            auto dropped = run(rd_drop, SERVER_TASK_TYPE_PAGE_DROP, gen);
+            if (!dropped) {
+                GGML_ASSERT(req.should_stop());
+                return res;
+            }
+            if (dropped->is_error()) {
+                res->error(dropped->to_json());
+                return res;
+            }
+            auto * d = dynamic_cast<server_task_result_page *>(dropped.get());
+            page_res->store_bytes = d->store_bytes;
+            page_res->store_pages = d->store_pages;
+        }
+    }
+
+    res->ok(page_res->to_json());
     return res;
 }
 
