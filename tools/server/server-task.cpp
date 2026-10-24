@@ -1719,6 +1719,7 @@ json server_task_result_page::to_json() {
         { "n_tokens",            n_tokens },
         { "n_bytes",             n_bytes },
         { "n_bytes_draft",       n_bytes_draft },
+        { "n_bytes_spec",        n_bytes_spec },
         { "n_checkpoints",       n_checkpoints },
         { "n_bytes_checkpoints", n_bytes_checkpoints },
         { "store_bytes",         store_bytes },

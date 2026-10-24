@@ -3,6 +3,7 @@
 #include "../../src/llama-ext.h"
 #include "server-train.h"
 #include "server-checkpoints.h"
+#include "server-page-files.h"
 #include "server-pages.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -953,7 +954,7 @@ private:
         if (page_store.n_pages() > 0) {
             SRV_WRN("dropping %zu RAM pages (%zu bytes) with the model: spill them before sleep to keep them\n",
                     page_store.n_pages(), page_store.n_bytes());
-            page_store = server_page_store{};
+            page_store.clear();
         }
         spec.reset();
         spec_init.reset();
@@ -2556,13 +2557,14 @@ private:
                     if (slot->prompt.tokens.size() == 0) {
                         throw server_page_error(ERROR_TYPE_INVALID_REQUEST, "the slot holds no sequence to page out");
                     }
-                    const auto [n_tgt, n_dft] = server_page_state_size(ctx_tgt, ctx_dft, slot->id);
-                    page_store.admit(name, n_tgt + n_dft + server_checkpoints_bytes(slot->prompt.checkpoints));
-                    page = server_page_capture(ctx_tgt, ctx_dft, spec.get(), slot->id);
-                    page->prompt = std::move(slot->prompt);
-                    page->lora   = slot->lora;
+                    // refused before anything is copied, on the count the store charges
+                    auto shape = server_page_measure(ctx_tgt, ctx_dft, spec.get(), slot->id);
+                    page_store.admit(name, shape.n_bytes(server_checkpoints_bytes(slot->prompt.checkpoints)));
+                    page = server_page_capture(ctx_tgt, ctx_dft, slot->id, std::move(shape));
+                    page->lora = slot->lora;
+                    // the slot's prompt moves only into a stored page; the slot is freed after
+                    res->gen = page_store.put(name, page, &slot->prompt);
                     slot->prompt_clear();
-                    res->gen = page_store.put(name, page);
                     metrics.n_page_out++;
                 } break;
             case SERVER_TASK_TYPE_PAGE_IN:
@@ -2607,7 +2609,7 @@ private:
                     if (!page) {
                         throw server_page_error(ERROR_TYPE_NOT_FOUND, "no RAM page named '" + name + "'");
                     }
-                    if (page_store.erase(name, task.slot_action.page_gen) == 0) {
+                    if (!page_store.erase(name, task.slot_action.page_gen)) {
                         throw server_page_error(ERROR_TYPE_INVALID_REQUEST, "the page under this name was replaced; nothing dropped");
                     }
                     res->gen = page->gen;
@@ -2622,13 +2624,15 @@ private:
         res->n_checkpoints       = held.checkpoints.size();
         res->n_bytes_checkpoints = server_checkpoints_bytes(held.checkpoints);
         res->n_bytes_draft       = page->data.drft.size();
-        res->n_bytes             = page->data.size() + page->spec.size() + res->n_bytes_checkpoints;
+        res->n_bytes_spec        = page->spec.size();
+        res->n_bytes             = page->charge.n;
+        page.reset(); // the store's count below includes this page only while another owner holds it
         res->store_bytes         = page_store.n_bytes();
         res->store_pages         = page_store.n_pages();
         res->t_ms                = (ggml_time_us() - t_start) / 1000.0;
 
-        SRV_INF("%s '%s' slot %d: %zu tokens, %zu bytes (%zu draft, %zu in %zu checkpoints) in %.3f ms; store %zu bytes in %zu pages\n",
-                res->action.c_str(), name.c_str(), res->id_slot, res->n_tokens, res->n_bytes, res->n_bytes_draft,
+        SRV_INF("%s '%s' slot %d: %zu tokens, %zu bytes (%zu draft, %zu speculative, %zu in %zu checkpoints) in %.3f ms; store %zu bytes in %zu pages\n",
+                res->action.c_str(), name.c_str(), res->id_slot, res->n_tokens, res->n_bytes, res->n_bytes_draft, res->n_bytes_spec,
                 res->n_bytes_checkpoints, res->n_checkpoints, res->t_ms, res->store_bytes, res->store_pages);
         return res;
     }
@@ -2950,38 +2954,25 @@ private:
                             break;
                         }
                     }
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
-                        break;
-                    }
-                    // Companion serialization is shared with the pre-write size quote.
-                    {
-                        std::ofstream out(filepath + ".ckpt", std::ios::binary | std::ios::trunc);
-                        write_checkpoints([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
-                        if (!out) {
-                            SLT_WRN(*slot, "checkpoint sidecar could not be written: %s (the restore will be cold)\n", filepath.c_str());
-                        }
-                    }
-                    {
-                        std::ofstream out(filepath + ".lora", std::ios::binary | std::ios::trunc);
-                        write_adapters([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
-                        if (!out) {
-                            SLT_WRN(*slot, "adapter sidecar could not be written: %s (this page will not restore)\n", filepath.c_str());
-                        }
-                    }
+                    // one generation, published whole: a failed save leaves the page that was there
+                    size_t nwrite = 0;
+                    std::vector<server_page_file> files = {
+                        { "", [&](const std::string & path) {
+                            nwrite = llama_state_seq_save_file(ctx_tgt, path.c_str(), slot->id,
+                                reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                            return nwrite;
+                        } },
+                        server_page_sidecar(".ckpt", write_checkpoints),
+                        server_page_sidecar(".lora", write_adapters),
+                    };
                     if (ctx_dft) {
-                        std::ofstream out(filepath + ".dft", std::ios::binary | std::ios::trunc);
-                        write_draft([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
-                        if (!out) {
-                            SLT_WRN(*slot, "draft sidecar could not be written: %s (the restore will draft cold)\n", filepath.c_str());
-                        }
-                    } else {
-                        // a draft state saved under this name by an earlier server is not this page's
-                        std::error_code ec;
-                        std::filesystem::remove(filepath + ".dft", ec);
+                        files.push_back(server_page_sidecar(".dft", write_draft)); // without one, an older `.dft` is removed
+                    }
+                    try {
+                        server_page_publish(filepath, files);
+                    } catch (const server_page_error & err) {
+                        send_error(task, std::string("Unable to save slot: ") + err.what(), err.type);
+                        break;
                     }
 
                     const int64_t t_end = ggml_time_us();
@@ -3027,6 +3018,8 @@ private:
 
                     size_t nread = 0;
                     try {
+                        // Continuum fork: only a committed generation is read, and it stays one while it is
+                        const server_page_reader committed(filepath);
                         // Continuum fork: the adapters the state was computed under (see SLOT_SAVE), read
                         // FIRST so a page whose identity is unknown or foreign never touches the KV. A
                         // page without them cannot be reused safely (its KV may belong to other adapters),
