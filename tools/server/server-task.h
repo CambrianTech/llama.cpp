@@ -636,6 +636,7 @@ struct server_task_result_page : server_task_result {
     size_t n_tokens            = 0;
     size_t n_bytes             = 0; // the page: target + draft state + speculative state + checkpoints
     size_t n_bytes_draft       = 0;
+    size_t n_bytes_spec        = 0; // the speculative tail state
     size_t n_checkpoints       = 0;
     size_t n_bytes_checkpoints = 0;
     double t_ms                = 0.0;

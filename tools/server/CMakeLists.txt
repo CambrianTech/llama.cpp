@@ -18,6 +18,8 @@ add_library(${TARGET} STATIC
     server-context.h
     server-pages.cpp
     server-pages.h
+    server-page-files.cpp
+    server-page-files.h
     server-checkpoints.cpp
     server-checkpoints.h
     server-stream.cpp
