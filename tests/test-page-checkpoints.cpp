@@ -6,7 +6,13 @@
 // 35-40k prompt, so a restored slot had nothing under the point where its next prompt diverged
 // (about 11k). The page must keep, within the same budget, checkpoints just under the slot's last
 // raw common prefix.
+//
+// The byte budget's eviction (server_checkpoint_victim, server_checkpoints_fit) dropped each
+// slot's oldest checkpoint after its first: exactly the ones under the last divergence. It now
+// gives up what the page subset gives up first, so a slot keeps its head, the newest at or below
+// its last raw common prefix and its newest longest.
 
+#include "server-checkpoints.h"
 #include "server-common.h"
 
 #include <cstdio>
@@ -60,6 +66,48 @@ int main() {
     // keep 0: the oldest only. An empty list: nothing.
     CHECK(select_page_checkpoints(pos, 0, 11000).size() == 1);
     CHECK(select_page_checkpoints({}, 4, 11000).empty());
+
+    // Eviction gives up what the subset gives up first: never the head, never the two newest at
+    // or below the divergence, never the newest; with no divergence known, the oldest after the
+    // head, as before.
+    {
+        auto list_of = [&](size_t bytes) {
+            server_checkpoint_list list;
+            for (int64_t p : pos) {
+                auto & c = list.emplace_back();
+                c.n_tokens = p;
+                c.data_tgt.resize(bytes);
+            }
+            return list;
+        };
+        const auto list = list_of(1);
+        const size_t victim = server_checkpoint_victim(list, 11000);
+        const auto keep = select_page_checkpoints(pos, (int32_t) n - 2, 11000);
+        CHECK(keep.size() == n - 1);
+        for (size_t i : keep) {
+            CHECK(i != victim);
+        }
+        CHECK(victim != 0 && victim != n - 1);
+        CHECK(!(pos[victim] <= 11000 && pos[victim] + 2 * 1576 > 11000)); // not one of the two under the break
+        CHECK(server_checkpoint_victim(list, -1) == 1);                   // unknown divergence: oldest after the head
+
+        // The budget across slots: the fuller list drops its victims until the new one fits, and
+        // the checkpoints just under its divergence survive.
+        auto a = list_of(10);
+        auto b = list_of(1);
+        std::vector<server_checkpoint_list *> lists = { &a, &b };
+        const uint64_t budget = server_checkpoints_bytes(a) + server_checkpoints_bytes(b) - 25;
+        size_t evicted = 0;
+        CHECK(server_checkpoints_fit(lists, { 11000, -1 }, 1, budget, 10, [&](size_t i, const common_prompt_checkpoint &) { CHECK(i == 0); ++evicted; }));
+        CHECK(evicted == 4);
+        CHECK(a.front().n_tokens == pos[0] && a.back().n_tokens == pos[n - 1]);
+        size_t under = 0;
+        for (const auto & c : a) {
+            under += (c.n_tokens <= 11000 && c.n_tokens + 2 * 1576 > 11000) ? 1 : 0;
+        }
+        CHECK(under == 2);
+        CHECK(!server_checkpoints_fit(lists, { 11000, -1 }, 1, 5, 10, [&](size_t, const common_prompt_checkpoint &) { CHECK(false); }));
+    }
 
     std::printf("test-page-checkpoints: ok\n");
     return 0;

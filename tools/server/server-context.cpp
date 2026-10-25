@@ -2484,14 +2484,16 @@ private:
                 llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) +
                 (ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) : 0);
             std::vector<server_checkpoint_list *> lists;
+            std::vector<int32_t> raw_lcps;
             size_t own = 0;
             for (auto & s : slots) {
                 if (&s == &slot) {
                     own = lists.size();
                 }
                 lists.push_back(&s.prompt.checkpoints);
+                raw_lcps.push_back(s.resume_raw_lcp);
             }
-            const bool fits = server_checkpoints_fit(lists, own, params_base.ctx_checkpoints_bytes, incoming,
+            const bool fits = server_checkpoints_fit(lists, raw_lcps, own, params_base.ctx_checkpoints_bytes, incoming,
                 [&](size_t i, const common_prompt_checkpoint & c) {
                     metrics.n_ckpt_evicted_budget++;
                     SLT_WRN(slots[i], "checkpoint budget: erasing context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB) for slot %d's new one\n",
