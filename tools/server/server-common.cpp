@@ -9,6 +9,7 @@
 
 #include "server-common.h"
 
+#include <algorithm>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -1843,4 +1844,42 @@ server_tokens format_prompt_rerank(
     }
 
     return result;
+}
+
+std::vector<size_t> select_page_checkpoints(const std::vector<int64_t> & n_tokens, int32_t keep, int32_t raw_lcp) {
+    const size_t n = n_tokens.size();
+    std::vector<size_t> kept;
+    if (keep < 0) {
+        for (size_t i = 0; i < n; ++i) {
+            kept.push_back(i);
+        }
+        return kept;
+    }
+    std::vector<bool> take(n, false);
+    if (n > 0) {
+        take[0] = true;
+    }
+    size_t budget = (size_t) keep;
+    if (raw_lcp >= 0) {
+        size_t below = std::min<size_t>(2, budget / 2);
+        for (size_t i = n; i-- > 1 && below > 0;) {
+            if (n_tokens[i] <= raw_lcp && !take[i]) {
+                take[i] = true;
+                --below;
+                --budget;
+            }
+        }
+    }
+    for (size_t i = n; i-- > 1 && budget > 0;) {
+        if (!take[i]) {
+            take[i] = true;
+            --budget;
+        }
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (take[i]) {
+            kept.push_back(i);
+        }
+    }
+    return kept;
 }

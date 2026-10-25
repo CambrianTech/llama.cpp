@@ -232,6 +232,11 @@ struct server_slot {
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
+
+    // The raw common prefix (engine tokens) of this slot's prompt with its last request, before
+    // any checkpoint fallback, or -1 when unknown (no cache_prompt, a restored or erased slot).
+    // A saved page keeps checkpoints at or below it (select_page_checkpoints, Continuum fork).
+    int32_t resume_raw_lcp = -1;
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
@@ -2846,18 +2851,27 @@ private:
                     }
 
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    // The checkpoints this page carries: the oldest (the head of the first user
-                    // turn) and the newest `keep_newest_checkpoints`, in list order, or all of them
-                    // when the caller asked for no subset. The quote and the write share this list.
+                    // The checkpoints this page carries (select_page_checkpoints): the oldest (the
+                    // head of the first user turn), up to two just under where the slot's prompt last
+                    // diverged from a request (its raw common prefix), and the newest, at most
+                    // 1 + `keep_newest_checkpoints`, or all of them when the caller asked for no
+                    // subset. A restored page then resumes from under its last break, not from 0
+                    // (the M5 2026-10-25: "full re-prefill: no checkpoint passed the search").
+                    // The quote and the write share this list.
                     std::vector<const common_prompt_checkpoint *> kept_checkpoints;
                     {
-                        const auto & all  = slot->prompt.checkpoints;
-                        const int32_t keep = task.slot_action.keep_newest_checkpoints;
-                        const size_t  n    = all.size();
-                        size_t i = 0;
+                        const auto & all = slot->prompt.checkpoints;
+                        std::vector<int64_t> positions;
                         for (const auto & c : all) {
-                            if (keep < 0 || i == 0 || i + (size_t) keep >= n) {
+                            positions.push_back(c.n_tokens);
+                        }
+                        const auto kept = select_page_checkpoints(
+                            positions, task.slot_action.keep_newest_checkpoints, slot->resume_raw_lcp);
+                        size_t i = 0, k = 0;
+                        for (const auto & c : all) {
+                            if (k < kept.size() && kept[k] == i) {
                                 kept_checkpoints.push_back(&c);
+                                ++k;
                             }
                             ++i;
                         }
@@ -2973,6 +2987,8 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    // Its prompt is replaced or dropped: the last divergence no longer applies.
+                    slot->resume_raw_lcp = -1;
 
                     auto progress = task.slot_action.progress;
                     if (progress) {
@@ -3164,6 +3180,8 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    // Its prompt is replaced or dropped: the last divergence no longer applies.
+                    slot->resume_raw_lcp = -1;
 
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
@@ -3839,6 +3857,7 @@ private:
                         int n_past = 0;
                         // the raw common prefix with the slot's tokens, before any reuse adjustment (#56)
                         int resume_raw_lcp = -1;
+                        slot.resume_raw_lcp = -1; // unknown until this request computes it
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3900,6 +3919,7 @@ private:
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                 resume_raw_lcp = n_past;
+                                slot.resume_raw_lcp = n_past;
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {

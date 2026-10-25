@@ -620,3 +620,12 @@ struct server_pipe {
         return true;
     }
 };
+
+// The context checkpoints a saved page keeps (Continuum fork), as indices into the slot's
+// checkpoint list (positions in engine tokens, oldest first), in list order. `keep < 0` keeps
+// all. Otherwise the first checkpoint is always kept, and `keep` more: when the slot's last raw
+// common prefix with a request is known (`raw_lcp >= 0`), up to min(2, keep / 2) of them are the
+// newest checkpoints at or below it, so a restored page can resume from just under the point
+// where its prompt last diverged; the rest are the newest (the end of the prompt). A page keeps
+// at most 1 + keep checkpoints either way.
+std::vector<size_t> select_page_checkpoints(const std::vector<int64_t> & n_tokens, int32_t keep, int32_t raw_lcp);
