@@ -3816,7 +3816,11 @@ static common_chat_params common_chat_templates_apply_legacy(const struct common
 common_chat_params common_chat_templates_apply(const struct common_chat_templates *        tmpls,
                                                const struct common_chat_templates_inputs & inputs) {
     GGML_ASSERT(tmpls != nullptr);
-    if (inputs.use_jinja && !inputs.tail_tools.empty()) {
+    if (!inputs.use_jinja && !inputs.tail_tools.empty()) {
+        // The legacy renderer has no tools at all: a tail it cannot make callable is refused, never dropped.
+        throw std::invalid_argument("tail_tools require the jinja template path");
+    }
+    if (!inputs.tail_tools.empty()) {
         // The prompt is what the head tools alone render; everything that reads the model's
         // output (format, parser, grammar, triggers, stops) is built over head + tail, so a
         // verb declared later in the conversation is a real tool call, not text.

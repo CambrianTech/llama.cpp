@@ -7159,6 +7159,120 @@ static void test_tail_tools() {
     assert_equals(served.at("prompt").get<std::string>(), served_tail.at("prompt").get<std::string>());
     assert_contains(served_tail.at("grammar").get<std::string>(), "python");
     assert_equals(true, served_tail.at("parse_tool_calls").get<bool>());
+
+    // Each template family a node serves, with a populated and an EMPTY head: the prompt bytes
+    // are the head's alone; a tail verb's call streams (every prefix parses, the deltas add up to
+    // the final call, the lazy grammar accepts it); tool_choice "none" leaves it uncallable.
+    const auto calls_python = [](common_chat_templates * t, const common_chat_templates_inputs & in,
+                                 const std::string & text) {
+        try {
+            const auto msg = make_peg_parser(t, in).parse(text, false);
+            return std::any_of(msg.tool_calls.begin(), msg.tool_calls.end(),
+                               [](const common_chat_tool_call & c) { return c.name == "python"; });
+        } catch (const std::exception &) {
+            return false; // refused outright: also no call
+        }
+    };
+    struct family {
+        const char * path;
+        std::string  call;
+    };
+    const family families[] = {
+        // Qwen2.5 (enrico serves qwen2.5-coder-1.5b): JSON inside <tool_call>.
+        { "models/templates/Qwen-Qwen2.5-7B-Instruct.jinja",
+          "<tool_call>\n{\"name\": \"python\", \"arguments\": {\"code\": \"print(1)\"}}\n</tool_call>" },
+        // Qwen3.5 / Qwen3-coder: XML parameters inside <tool_call>.
+        { "models/templates/Qwen3.5-4B.jinja", call },
+    };
+    for (const auto & fam : families) {
+        for (const auto & head_tools : { std::vector<common_chat_tool>{ special_function_tool },
+                                         std::vector<common_chat_tool>{} }) {
+            LOG_DBG("%s: %s, head of %zu\n", __func__, fam.path, head_tools.size());
+            auto t = read_templates(fam.path);
+            common_chat_templates_inputs h;
+            h.messages         = { message_user };
+            h.tools            = head_tools;
+            h.enable_thinking  = false;
+            h.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+            common_chat_templates_inputs l = h;
+            l.tail_tools = { python_tool };
+
+            const auto hp = common_chat_templates_apply(t.get(), h);
+            const auto lp = common_chat_templates_apply(t.get(), l);
+            assert_equals(hp.prompt, lp.prompt);
+            assert_equals(hp.generation_prompt, lp.generation_prompt);
+            assert_not_contains(lp.prompt, python_tool.description);
+            assert_contains(lp.grammar, "python");
+            assert_equals(true, calls_python(t.get(), l, fam.call));
+            assert_equals(false, calls_python(t.get(), h, fam.call));
+
+            test_peg_parser(t.get(), [&](peg_test_case & tc) {
+                tc.params = l;
+                tc.input  = fam.call;
+                tc.expect = message_with_tool_calls("python", R"J({"code": "print(1)"})J");
+            }, false);
+
+            common_chat_templates_inputs hn = h;
+            hn.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+            common_chat_templates_inputs ln = l;
+            ln.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+            const auto hnp = common_chat_templates_apply(t.get(), hn);
+            const auto lnp = common_chat_templates_apply(t.get(), ln);
+            assert_equals(hnp.prompt, lnp.prompt);
+            assert_equals(hnp.grammar, lnp.grammar);
+            assert_not_contains(lnp.grammar, "python");
+            assert_equals(false, calls_python(t.get(), ln, fam.call));
+        }
+    }
+
+    // The request boundary treats a tail exactly like a head: tail-only on a non-Jinja server is
+    // refused (the legacy renderer cannot supply a callable verb), tail-only obeys the tools +
+    // stream format guard, tool_choice "none" asks for no tool-call parsing, and an empty head
+    // with a tail renders the no-tools prompt yet parses tool calls.
+    json tail_only = {{"messages", json::array({json{{"role", "user"}, {"content", "run it"}}})},
+                      {"tail_tools", common_chat_tools_to_json_oaicompat({ python_tool })}};
+    const auto refuses = [&](json req, const server_chat_params & o) {
+        try {
+            oaicompat_chat_params_parse(req, o, files);
+        } catch (const std::exception &) {
+            return true;
+        }
+        return false;
+    };
+    server_chat_params legacy{};
+    legacy.tmpls     = read_templates("models/templates/Qwen-Qwen2.5-7B-Instruct.jinja");
+    legacy.use_jinja = false;
+    assert_equals(true, refuses(tail_only, legacy));
+    bool legacy_dropped_tail = true;
+    try {
+        common_chat_templates_inputs legacy_in;
+        legacy_in.messages   = { message_user };
+        legacy_in.use_jinja  = false;
+        legacy_in.tail_tools = { python_tool };
+        common_chat_templates_apply(legacy.tmpls.get(), legacy_in);
+    } catch (const std::invalid_argument &) {
+        legacy_dropped_tail = false; // the library refuses it too, below the server
+    }
+    assert_equals(false, legacy_dropped_tail);
+
+    server_chat_params q25{};
+    q25.tmpls     = read_templates("models/templates/Qwen-Qwen2.5-7B-Instruct.jinja");
+    q25.use_jinja = true;
+    json streamed = tail_only;
+    streamed["stream"]   = true;
+    streamed["logprobs"] = true;
+    assert_equals(true, refuses(streamed, q25));
+
+    json none = tail_only;
+    none["tool_choice"] = "none";
+    const json served_none = oaicompat_chat_params_parse(none, q25, files);
+    assert_equals(false, served_none.value("parse_tool_calls", false));
+
+    json no_tools = {{"messages", tail_only.at("messages")}};
+    const json served_no_tools = oaicompat_chat_params_parse(no_tools, q25, files);
+    const json served_tail_only = oaicompat_chat_params_parse(tail_only, q25, files);
+    assert_equals(served_no_tools.at("prompt").get<std::string>(), served_tail_only.at("prompt").get<std::string>());
+    assert_equals(true, served_tail_only.at("parse_tool_calls").get<bool>());
 }
 
 static void test_reasoning_budget_tokens_per_request() {
