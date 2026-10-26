@@ -1152,13 +1152,15 @@ json oaicompat_chat_params_parse(
     json llama_params;
 
     auto tools = json_value(body, "tools", json());
-    auto has_tools = tools.is_array() && !tools.empty();
+    auto tail_tools = json_value(body, "tail_tools", json());
+    // A tail verb is callable like a head one, so every tools boundary below holds for it too.
+    auto has_tools = (tools.is_array() && !tools.empty()) || (tail_tools.is_array() && !tail_tools.empty());
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
 
     if (!opt.use_jinja) {
         if (has_tools) {
-            throw std::runtime_error("tools param requires --jinja flag");
+            throw std::runtime_error("tools and tail_tools params require --jinja flag");
         }
         if (tool_choice != "auto") {
             throw std::runtime_error("tool_choice param requires --jinja flag");
@@ -1279,6 +1281,7 @@ json oaicompat_chat_params_parse(
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
+    inputs.tail_tools             = common_chat_tools_parse_oaicompat(tail_tools);
     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
@@ -1310,7 +1313,7 @@ json oaicompat_chat_params_parse(
         inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
     }
     inputs.enable_thinking = opt.enable_thinking;
-    if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+    if ((!inputs.tools.empty() || !inputs.tail_tools.empty()) && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
         if (body.contains("grammar")) {
             throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
         }
