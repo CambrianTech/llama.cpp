@@ -156,6 +156,13 @@ llama_build_and_test(test-grad-leaf.cpp)
 # ggml-opt with per-step graphs (the llama training path) starts each optimizer period from zero accumulators
 llama_build_and_test(test-opt-dynamic-accum.cpp)
 
+# Continuum fork: the RAM page store's ceiling and the page files' whole-generation publication.
+# Built on every platform: it links only server-context, as llama-server does, and Windows is
+# where its durable-move adapter differs most.
+llama_build_and_test(test-server-pages.cpp)
+target_include_directories(test-server-pages PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(test-server-pages PRIVATE server-context)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)

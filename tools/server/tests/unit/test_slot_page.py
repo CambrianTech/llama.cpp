@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -136,6 +138,36 @@ def test_spill_writes_the_slot_save_format():
     assert page(1, "spill", "mind-a", {"filename": "../x.bin"}).status_code == 400
 
 
+def test_spill_publishes_whole_and_restore_cleans_a_crashed_one():
+    # what this catches: a spill that leaves a stage beside the page dir, or a restore that reads
+    # a generation a crashed publication left uncommitted (the committed page must be what restores,
+    # and the leftovers must go).
+    global server
+    server.start()
+    first = complete(PROMPT, 1)
+    out = page(1, "page_out", "mind-a")
+    assert out.status_code == 200
+    assert page(1, "spill", "mind-a", {"filename": "mind-a.bin", "drop": True}).status_code == 200
+    staging = Path(server.slot_save_path) / "..page-staging"
+    assert not staging.exists() or not any(staging.iterdir())
+
+    # a server that died between writing its files and committing them: its pid is gone
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    stage = staging / f"{dead.pid}-1"
+    stage.mkdir(parents=True)
+    for suffix in ("", ".ckpt", ".lora", ".dft"):
+        (stage / ("mind-a.bin" + suffix)).write_bytes(b"torn")
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "mind-a.bin"})
+    assert res.status_code == 200, res.body
+    assert res.body["n_restored"] == out.body["n_tokens"]
+    assert not stage.exists()
+    again = complete(PROMPT, 0)
+    assert again["timings"]["prompt_n"] == 1
+    assert again["content"] == first["content"]
+
+
 HYBRID = os.environ.get("LLAMA_SERVER_TEST_HYBRID_GGUF")
 
 
@@ -169,3 +201,51 @@ def test_checkpoints_stay_within_the_byte_budget_and_page_with_the_slot():
     complete("A different tale: " + long_prompt, 1)
     assert metric("ctx_checkpoint_bytes") <= budget
     assert metric("ctx_checkpoints_evicted_budget_total") > 0
+
+
+@pytest.mark.skipif(not HYBRID, reason="set LLAMA_SERVER_TEST_HYBRID_GGUF to a small hybrid (recurrent) GGUF with an MTP head")
+def test_page_with_draft_state_fits_its_ceiling_exactly():
+    # what this catches: a page_out admitted on a count that leaves out part of what the page holds
+    # (draft or speculative state), so the store passes --page-ram-bytes after a successful admission.
+    # At a ceiling of exactly the page's bytes it is stored; one byte less and it is refused, the slot kept.
+    global server
+
+    def mtp_server(ceiling):
+        global server
+        server = ServerPreset.tinyllama2()
+        server.slot_save_path = "./tmp"
+        server.temperature = 0.0
+        server.server_metrics = True
+        server.model_hf_repo = None
+        server.model_file = HYBRID
+        server.n_ctx = 4096
+        server.n_batch = 512
+        server.spec_type = "draft-mtp"
+        server.page_ram_bytes = ceiling
+        server.start()
+
+    mtp_server(None)
+    complete(PROMPT, 0)
+    out = page(0, "page_out", "mind-a")
+    assert out.status_code == 200, out.body
+    n_bytes = out.body["n_bytes"]
+    assert out.body["n_bytes_draft"] > 0  # the draft (MTP) state rides in the page
+    assert n_bytes == out.body["store_bytes"]
+    assert metric("page_store_bytes") == pytest.approx(n_bytes, rel=1e-5)  # the gauge prints 6 digits
+    server.stop()
+
+    mtp_server(n_bytes - 1)
+    first = complete(PROMPT, 0)
+    assert page(0, "page_out", "mind-a").status_code == 503
+    again = complete(PROMPT, 0)
+    # the refused page_out kept the slot's sequence: a hybrid resumes from its kept checkpoint
+    # (a cleared slot would evaluate the whole prompt)
+    assert again["timings"]["prompt_n"] < again["tokens_evaluated"]
+    assert again["content"] == first["content"]
+    server.stop()
+
+    mtp_server(n_bytes)
+    complete(PROMPT, 0)
+    out = page(0, "page_out", "mind-a")
+    assert out.status_code == 200, out.body
+    assert out.body["n_bytes"] == n_bytes == out.body["store_bytes"]
