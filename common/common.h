@@ -624,6 +624,8 @@ struct common_params {
     uint64_t ctx_checkpoints_bytes = 0;  // checkpoint byte budget across all slots; 0 = the count above governs
     uint64_t page_ram_bytes        = 0;  // ceiling of the named host-RAM page store; 0 = no ceiling
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_disk_dir;          // the prompt cache's disk tier, empty = none
+    int32_t cache_disk_mib      = 0;     // the disk tier's size limit in MiB, 0 = no limit
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

@@ -1348,6 +1348,10 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            if (!params_base.cache_disk_dir.empty() && !prompt_cache->set_disk(params_base.cache_disk_dir, params_base.cache_disk_mib)) {
+                SRV_ERR("%s", "the prompt cache disk tier could not be set up, refusing to start without it\n");
+                return false;
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }

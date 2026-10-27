@@ -738,6 +738,17 @@ struct server_prompt_cache_state {
     // the adapters the state was computed under; restored only into the same set
     lora_active_set lora;
 
+    // set while the state's bytes (its sequence state and its checkpoints' data) live in this
+    // file instead of RAM; its tokens and checkpoint positions stay in RAM, so a lookup still
+    // matches it without touching the disk
+    std::string spill_path;
+    size_t      spill_size = 0;
+
+    bool spilled() const {
+        return !spill_path.empty();
+    }
+
+    // bytes held in RAM: a spilled state holds none
     size_t size() const {
         size_t res = data.size();
 
@@ -763,9 +774,40 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // the disk tier: when set, a state evicted from RAM is written here instead of dropped, and
+    // a lookup that matches it reads it back; empty = no disk tier
+    std::string disk_dir;
+
+    // in bytes, 0 = no limit
+    size_t disk_limit = 0;
+
+    uint64_t spill_seq = 0;
+
+    ~server_prompt_cache();
+
+    // enable the disk tier in `dir` (created, and emptied of states a previous engine left)
+    bool set_disk(const std::string & dir, int32_t limit_mib);
+
+    // bytes held in RAM, by resident states only
     size_t size() const;
 
+    // bytes held on disk, by spilled states
+    size_t disk_size() const;
+
+    // tokens of the resident states (the RAM tier's token limit)
     size_t n_tokens() const;
+
+    // move the state's bytes to a file; false leaves it resident
+    bool spill(server_prompt_cache_state & state);
+
+    // read a spilled state's bytes back into RAM and remove its file
+    bool unspill(server_prompt_cache_state & state);
+
+    // remove a state, and its file if it has one
+    std::list<server_prompt_cache_state>::iterator erase(std::list<server_prompt_cache_state>::iterator it);
+
+    // make room in RAM: the oldest resident state goes to disk, or is dropped without a disk tier
+    bool evict_oldest_resident();
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_main, size_t state_size_drft);
 
