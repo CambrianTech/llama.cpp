@@ -2067,19 +2067,34 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
-    uint32_t n_stream_cur;
-    io.read(&n_stream_cur, sizeof(n_stream_cur));
-    if (n_stream_cur != n_stream) {
+    // the stream count of the context that WROTE the state
+    uint32_t n_stream_file;
+    io.read(&n_stream_file, sizeof(n_stream_file));
+
+    // A whole-cache state maps stream to stream, so the counts must agree. A single sequence
+    // lives in one stream whatever the count: its cells are restored into the stream this
+    // context gives the sequence, so a state saved at one parallel/unified layout loads into
+    // another (a relaunch that changes the slot count no longer drops every warm sequence).
+    if (seq_id == -1 && n_stream_file != n_stream) {
         throw std::runtime_error("n_stream mismatch");
     }
 
-    for (uint32_t s = 0; s < n_stream; ++s) {
+    bool restored = false;
+
+    for (uint32_t s = 0; s < n_stream_file; ++s) {
         uint32_t cell_count;
         io.read(&cell_count, sizeof(cell_count));
 
         if (cell_count == 0) {
             continue;
         }
+
+        if (seq_id != -1 && restored) {
+            // one sequence's cells were written from more than one stream: no single stream here can take them
+            seq_rm(seq_id, -1, -1);
+            throw std::runtime_error("sequence state spans more than one stream");
+        }
+        restored = true;
 
         const uint32_t strm = seq_id == -1 ? s : seq_to_stream[seq_id];
 

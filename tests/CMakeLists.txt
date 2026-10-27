@@ -311,6 +311,8 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 # Requires a model, uses same args pattern as test-thread-safety
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
+llama_build_and_test(test-state-restore-streams.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-state-restore-streams PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
