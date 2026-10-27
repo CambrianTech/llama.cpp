@@ -1710,6 +1710,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk"}, "DIR",
+        "a disk tier for the prompt cache: an entry evicted from --cache-ram is written here instead of dropped, "
+        "and read back when a prompt matches it (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_dir = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-mib"}, "N",
+        string_format("the prompt cache disk tier's size limit in MiB (default: %d, 0 - no limit)", params.cache_disk_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
