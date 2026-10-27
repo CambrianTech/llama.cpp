@@ -331,6 +331,16 @@ json oaicompat_chat_params_parse(
     std::vector<raw_buffer> & out_files,
     server_chat_render render = server_chat_render::serving);
 
+// Continuum fork: the token position where the first `n_view` chat `messages` end in a prompt the
+// template split into `spans` by `delims` (`n_tokens` long), so the server can checkpoint there.
+// Each message opens the span its role's delimiter starts, a run of tool replies opens one user span
+// when the template declares no tool delimiter, and the generation prompt may open one trailing
+// assistant span. When message `n_view` opens no span of its own, the position is the start of the
+// span it continues: never past the boundary. -1 with `refusal` set when the spans do not line up
+// with the messages one to one (a template this rule does not describe).
+int32_t view_end_position(const json & messages, int64_t n_view, const common_chat_msg_delimiters & delims,
+                          const common_chat_msg_spans & spans, size_t n_tokens, std::string & refusal);
+
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(
     const json & request,

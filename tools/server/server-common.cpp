@@ -745,6 +745,71 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
     return max_idx; // all tokens are equal
 }
 
+int32_t view_end_position(const json & messages, int64_t n_view, const common_chat_msg_delimiters & delims,
+                          const common_chat_msg_spans & spans, size_t n_tokens, std::string & refusal) {
+    if (!messages.is_array() || n_view <= 0 || n_view > (int64_t) messages.size()) {
+        refusal = "view_messages " + std::to_string(n_view) + " is not within the " +
+                  std::to_string(messages.is_array() ? messages.size() : 0) + " messages";
+        return -1;
+    }
+    auto declared = [&](common_chat_role role) {
+        for (const auto & d : delims.delimiters) {
+            if (d.role == role) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<common_chat_role> expected; // the span each message opens, in order
+    size_t n_before = 0;                    // spans opened by messages[0, n_view)
+    bool   continues = false;               // message n_view opens no span of its own
+    std::string previous;
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const std::string role = json_value(messages[i], "role", std::string());
+        common_chat_role span = COMMON_CHAT_ROLE_UNKNOWN;
+        if (role == "system") {
+            span = COMMON_CHAT_ROLE_SYSTEM;
+        } else if (role == "user") {
+            span = COMMON_CHAT_ROLE_USER;
+        } else if (role == "assistant") {
+            span = COMMON_CHAT_ROLE_ASSISTANT;
+        } else if (role == "tool") {
+            span = declared(COMMON_CHAT_ROLE_TOOL) ? COMMON_CHAT_ROLE_TOOL
+                 : previous == "tool"               ? COMMON_CHAT_ROLE_UNKNOWN
+                                                    : COMMON_CHAT_ROLE_USER;
+        } else {
+            refusal = "a message with role '" + role + "'";
+            return -1;
+        }
+        const bool opens = span != COMMON_CHAT_ROLE_UNKNOWN && declared(span);
+        if (i == (size_t) n_view) {
+            continues = !opens;
+        }
+        if (opens) {
+            expected.push_back(span);
+            n_before += i < (size_t) n_view;
+        }
+        previous = role;
+    }
+    const auto & got = spans.spans;
+    bool lined_up = got.size() == expected.size() || got.size() == expected.size() + 1;
+    for (size_t i = 0; lined_up && i < expected.size(); ++i) {
+        lined_up = got[i].role == expected[i];
+    }
+    if (!lined_up) {
+        refusal = std::to_string(got.size()) + " spans for " + std::to_string(expected.size()) + " span-opening messages";
+        return -1;
+    }
+    if (continues) {
+        if (n_before == 0) {
+            refusal = "the view ends inside a span no view message opened";
+            return -1;
+        }
+        return (int32_t) got[n_before - 1].pos;
+    }
+    return n_before < got.size() ? (int32_t) got[n_before].pos : (int32_t) n_tokens;
+}
+
 common_chat_msg_spans server_tokens::find_message_spans(const common_chat_msg_delimiters & delims) const {
     std::map<size_t, size_t> skips;
     for (const auto & it : map_idx_to_media) {

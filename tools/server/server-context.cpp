@@ -2715,18 +2715,40 @@ private:
                     GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
                     // The checkpoints this page carries: the oldest (the head of the first user
                     // turn) and the newest `keep_newest_checkpoints`, in list order, or all of them
-                    // when the caller asked for no subset. The quote and the write share this list.
+                    // when the caller asked for no subset. With `keep_view_checkpoints`, also the
+                    // newest at or before the last prompt's view end (where its next prompt
+                    // diverges) and those made for that prompt's end (a next prompt that resends it
+                    // whole); a slot that has run no prompt since a restore keeps them all. The quote
+                    // and the write share this list.
                     std::vector<const common_prompt_checkpoint *> kept_checkpoints;
                     {
                         const auto & all  = slot->prompt.checkpoints;
                         const int32_t keep = task.slot_action.keep_newest_checkpoints;
+                        const bool by_view = task.slot_action.keep_view_checkpoints;
+                        const int32_t view_end = slot->prompt.view_end;
+                        const int32_t end_from = slot->prompt.end_from;
+                        const bool keep_all = by_view ? end_from < 0 : keep < 0;
+                        const common_prompt_checkpoint * at_view_end = nullptr;
+                        for (const auto & c : all) {
+                            if (by_view && view_end >= 0 && c.n_tokens <= view_end) {
+                                at_view_end = &c;
+                            }
+                        }
                         const size_t  n    = all.size();
                         size_t i = 0;
+                        std::string kept_at;
                         for (const auto & c : all) {
-                            if (keep < 0 || i == 0 || i + (size_t) keep >= n) {
+                            const bool newest = keep > 0 && i + (size_t) keep >= n;
+                            const bool viewed = by_view && (&c == at_view_end || c.n_tokens >= end_from);
+                            if (keep_all || i == 0 || newest || viewed) {
                                 kept_checkpoints.push_back(&c);
+                                kept_at += (kept_at.empty() ? "" : ", ") + std::to_string(c.n_tokens);
                             }
                             ++i;
+                        }
+                        if (by_view && !task.slot_action.size_only) {
+                            SLT_INF(*slot, "page keeps %zu of %zu checkpoints at n_tokens = [%s] (view end = %d, prompt end from = %d)\n",
+                                    kept_checkpoints.size(), n, kept_at.c_str(), view_end, end_from);
                         }
                     }
                     auto write_checkpoints = [&](auto && put) {
@@ -4062,6 +4084,13 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
+                    // Continuum fork: the prompt's view end and where the checkpoints made for its
+                    // end begin (the farthest of the offsets below), which decide the checkpoints a
+                    // saved page keeps (SLOT_SAVE). They describe the prompt these tokens now hold,
+                    // so they travel with it (server_prompt).
+                    const auto view_end_pos = slot.task->params.view_end_pos;
+                    slot.prompt.view_end = view_end_pos;
+                    slot.prompt.end_from = std::max(0, slot.task->n_tokens() - std::min(n_batch, 4 + n_ubatch));
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
@@ -4099,6 +4128,12 @@ private:
                             }
                         }
 
+                        // Continuum fork: and always at the view end, where the caller's next prompt
+                        // diverges: a resume from there re-prefills only what is new
+                        if (do_checkpoint && slot.prompt.n_tokens() == view_end_pos) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -4133,6 +4168,7 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_view_end = n_tokens_start == view_end_pos;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -4150,7 +4186,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_view_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -4170,7 +4206,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_view_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
@@ -4919,6 +4955,16 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            // Continuum fork: where the caller's view ends, so the prompt is checkpointed there.
+            if (data.contains("view_messages") && data.contains("messages")) {
+                std::string refusal;
+                task.params.view_end_pos = view_end_position(data.at("messages"), json_value(data, "view_messages", (int64_t) -1),
+                                                             delimiters, task.params.message_spans, task.tokens.size(), refusal);
+                if (task.params.view_end_pos < 0) {
+                    SRV_WRN("view_messages = %s names no token position (%s): this prompt gets no checkpoint at its view end\n",
+                            data.at("view_messages").dump().c_str(), refusal.c_str());
+                }
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -6189,6 +6235,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
                 return res;
             }
             task.slot_action.keep_newest_checkpoints = (int32_t) keep.get<int64_t>();
+        }
+        if (request_data.contains("keep_view_checkpoints")) {
+            if (!request_data.at("keep_view_checkpoints").is_boolean()) {
+                res->error(format_error_response("keep_view_checkpoints must be a boolean", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            task.slot_action.keep_view_checkpoints = request_data.at("keep_view_checkpoints").get<bool>();
         }
         rd.post_task(std::move(task));
     }
