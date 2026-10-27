@@ -1752,6 +1752,51 @@ static void test_msg_token_delimiters_split() {
     }
 }
 
+// Continuum fork: view_messages maps to the token position where the caller's view ends, so the server
+// checkpoints there and a saved page keeps it. A run of tool replies renders as ONE user turn on a
+// template with no tool delimiter, so a view ending inside that run maps to the run's start (never
+// past the boundary), and a template whose spans do not line up with the messages maps nowhere.
+static void test_view_end_position() {
+    LOG_DBG("%s\n", __func__);
+    const common_chat_msg_delimiters delims = {
+        { { COMMON_CHAT_ROLE_USER,      "", { 10, 11 } },
+          { COMMON_CHAT_ROLE_ASSISTANT, "", { 10, 12 } } }
+    };
+    const llama_tokens tokens = {
+        500, 501,          // system (no system delimiter: no span)
+        10, 11, 100,       // <user> note                @2
+        10, 12, 200,       // <assistant> reply          @5
+        10, 11, 300, 301,  // <user> two tool replies    @8
+        10, 11, 400,       // <user> ask                 @12
+        10, 12,            // generation prompt          @15
+    };
+    const auto spans = delims.split(tokens);
+    const json messages = json::array({
+        { { "role", "system" },    { "content", "s" } },
+        { { "role", "user" },      { "content", "note" } },
+        { { "role", "assistant" }, { "content", "reply" } },
+        { { "role", "tool" },      { "content", "r1" } },
+        { { "role", "tool" },      { "content", "r2" } },
+        { { "role", "user" },      { "content", "ask" } },
+    });
+    std::string refusal;
+    assert_equals<int32_t>(8,  view_end_position(messages, 3, delims, spans, tokens.size(), refusal));
+    assert_equals<int32_t>(8,  view_end_position(messages, 4, delims, spans, tokens.size(), refusal)); // inside the run
+    assert_equals<int32_t>(12, view_end_position(messages, 5, delims, spans, tokens.size(), refusal));
+    assert_equals<int32_t>(15, view_end_position(messages, 6, delims, spans, tokens.size(), refusal)); // all of them
+    assert_equals<int32_t>(-1, view_end_position(messages, 0, delims, spans, tokens.size(), refusal));
+    assert_equals<int32_t>(-1, view_end_position(messages, 7, delims, spans, tokens.size(), refusal));
+    // a message the spans do not show (or a template the rule does not describe) maps nowhere
+    json extra = messages;
+    extra.push_back({ { "role", "user" }, { "content", "unrendered" } });
+    refusal.clear();
+    assert_equals<int32_t>(-1, view_end_position(extra, 3, delims, spans, tokens.size(), refusal));
+    assert_equals(false, refusal.empty());
+    // no generation-prompt span: the end of the prompt
+    const llama_tokens closed(tokens.begin(), tokens.end() - 2);
+    assert_equals<int32_t>((int32_t) closed.size(), view_end_position(messages, 6, delims, delims.split(closed), closed.size(), refusal));
+}
+
 static void test_tools_oaicompat_json_conversion() {
     LOG_DBG("%s\n", __func__);
     std::vector<common_chat_tool> tools{
@@ -7687,6 +7732,7 @@ int main(int argc, char ** argv) {
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
+        test_view_end_position();
         test_tools_oaicompat_json_conversion();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();

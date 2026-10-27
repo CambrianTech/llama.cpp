@@ -151,6 +151,11 @@ struct task_params {
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
 
+    // Continuum fork: the token position where the request's view ends (`view_messages`): the
+    // append-only part of the prompt the caller's next request sends again unchanged. The prompt
+    // is checkpointed exactly there and a saved page keeps that checkpoint. -1 = not given.
+    int32_t view_end_pos = -1;
+
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
@@ -236,6 +241,11 @@ struct server_task {
         // next prompt diverges, and an append-only prompt diverges near its end or at the
         // head of its first user turn, so the middle of the list is bytes nobody reads.
         int32_t keep_newest_checkpoints = -1;
+        // Continuum fork: also keep the newest checkpoint at or before the end of the slot's last
+        // view (server_prompt::view_end) and those made for its last prompt's end
+        // (server_prompt::end_from). A slot that has run no prompt since a restore keeps every
+        // checkpoint it holds, which is already a page's subset.
+        bool keep_view_checkpoints = false;
         std::shared_ptr<server_restore_progress> progress;
     };
     slot_action slot_action;
@@ -667,9 +677,17 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // Continuum fork: where the last prompt processed into these tokens put its view end, and the
+    // first position of the checkpoints made for its end (-1 = unknown), for the checkpoint subset
+    // a saved page keeps.
+    int32_t view_end = -1;
+    int32_t end_from = -1;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        view_end = -1;
+        end_from = -1;
     }
 
     int n_tokens() const {
@@ -680,6 +698,8 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            view_end,
+            end_from,
         };
     }
 };
