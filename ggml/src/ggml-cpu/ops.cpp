@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <vector>
 #include <cmath>
 
 // ggml_compute_forward_dup
@@ -472,6 +473,10 @@ static void ggml_compute_forward_dup_bytes(
     }
 }
 
+// A quantized source dequantizes one block at a time into an F32, F16 or BF16 destination; F16 and
+// BF16 convert each block from a scratch row. A training graph that walks a quantized cache reads it
+// as F16 (llm_graph_context::build_attn_mha), which aborted the CPU backend before F16 was a
+// destination here (continuum card c11da2f6: every CPU training run, in its first step).
 static void ggml_compute_forward_dup_from_q(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -486,6 +491,10 @@ static void ggml_compute_forward_dup_from_q(
 
     size_t qk = ggml_blck_size(type);
     const int64_t nr = ggml_nelements(src1) / qk;
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16);
+    // one block's floats, for a destination that is not F32
+    std::vector<float> block(dst->type == GGML_TYPE_F32 ? 0 : qk);
 
     // destination must be contiguous in the first dimension
     GGML_ASSERT(nb10 == ggml_type_size(dst->type));
@@ -517,9 +526,21 @@ static void ggml_compute_forward_dup_from_q(
         const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
         const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
 
-        dequantize_row_q(
-                (const void *) ((char *) src0->data + x_offset),
-                     (float *) ((char *)  dst->data + dst_offset), qk);
+        const void * src_block = (const void *) ((char *) src0->data + x_offset);
+        char       * dst_block = (char *) dst->data + dst_offset;
+        switch (dst->type) {
+            case GGML_TYPE_F32:
+                dequantize_row_q(src_block, (float *) dst_block, qk);
+                break;
+            case GGML_TYPE_F16:
+                dequantize_row_q(src_block, block.data(), qk);
+                ggml_cpu_fp32_to_fp16(block.data(), (ggml_fp16_t *) dst_block, qk);
+                break;
+            default: // BF16, asserted above
+                dequantize_row_q(src_block, block.data(), qk);
+                ggml_cpu_fp32_to_bf16(block.data(), (ggml_bf16_t *) dst_block, qk);
+                break;
+        }
     }
 }
 
@@ -564,7 +585,8 @@ void ggml_compute_forward_dup(
             } break;
         default:
             {
-                if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F32) {
+                if (ggml_is_quantized(src0->type) &&
+                    (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_BF16)) {
                     ggml_compute_forward_dup_from_q(params, dst);
                     break;
                 }
