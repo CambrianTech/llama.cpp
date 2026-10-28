@@ -6020,7 +6020,7 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->post_lora_adapters_fresh = [this](const server_http_req & req) {
+    this->post_lora_adapters_fresh = [this](const server_http_req & req) -> server_http_res_ptr {
         auto res = create_response();
         const json body = json::parse(req.body);
         const auto path = confine_out(params.train_dir, json_value(body, "name", std::string()));
