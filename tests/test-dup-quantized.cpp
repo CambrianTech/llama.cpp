@@ -9,7 +9,7 @@
 // BF16 copies equal the F32 dequantization converted, element for element.
 
 #include "ggml.h"
-#include "ggml-cpu.h"
+#include "ggml-backend.h"
 
 #include <cmath>
 #include <cstdio>
@@ -41,6 +41,12 @@ static int check(const char * what, ggml_tensor * f32, ggml_tensor * other) {
 }
 
 int main() {
+    ggml_backend_load_all();
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (backend == nullptr) {
+        fprintf(stderr, "CPU backend unavailable\n");
+        return 1;
+    }
     ggml_init_params ip = { 64 * 1024 * 1024, nullptr, false };
     ggml_context * ctx = ggml_init(ip);
 
@@ -64,8 +70,10 @@ int main() {
     for (ggml_tensor * t : outs) {
         ggml_build_forward_expand(gf, t);
     }
-    if (ggml_graph_compute_with_ctx(ctx, gf, 2) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "graph compute failed\n");
+        ggml_backend_free(backend);
+        ggml_free(ctx);
         return 1;
     }
 
@@ -75,6 +83,7 @@ int main() {
     bad += check("permuted q8_0 -> f16", outs[3], outs[4]);
     bad += check("permuted q8_0 -> bf16", outs[3], outs[5]);
 
+    ggml_backend_free(backend);
     ggml_free(ctx);
     if (bad > 0) {
         return 1;
