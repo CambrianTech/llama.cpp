@@ -218,6 +218,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.post_lora_adapters_load     = models_routes->proxy_post;
+        routes.post_lora_adapters_fresh    = models_routes->proxy_post;
+        routes.post_lora_adapters_save     = models_routes->proxy_post;
         routes.post_lora_adapters_unload   = models_routes->proxy_post;
         routes.post_learn                  = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
@@ -273,6 +275,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
     ctx_http.post("/lora-adapters/load",       ex_wrapper(routes.post_lora_adapters_load));
+    ctx_http.post("/lora-adapters/fresh",      ex_wrapper(routes.post_lora_adapters_fresh));
+    ctx_http.post("/lora-adapters/save",       ex_wrapper(routes.post_lora_adapters_save));
     ctx_http.post("/lora-adapters/unload",     ex_wrapper(routes.post_lora_adapters_unload));
     ctx_http.post("/learn",                    ex_wrapper(routes.post_learn));
     ctx_http.get ("/train",                    ex_wrapper(routes.get_train));

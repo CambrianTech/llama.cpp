@@ -2,6 +2,7 @@
 #include "server-context.h"
 #include "../../src/llama-ext.h"
 #include "server-train.h"
+#include "server-adapter-file.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -31,6 +32,7 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <sstream>
 
 // Continuum fork: an adapter file's revision (size, mtime in ns since the epoch; (0, 0) when it
 // cannot be read), stored in a saved slot's `.lora` sidecar so a restore refuses a page computed
@@ -3102,6 +3104,29 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SAVE_LORA:
+                {
+                    const auto & loras = params_base.lora_adapters;
+                    const int32_t id = task.save_lora;
+                    if (id < 0 || (size_t) id >= loras.size() || loras[id].ptr == nullptr) {
+                        send_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    // Same queue as learn and unload: the snapshot cannot observe a
+                    // partial optimizer update or an adapter freed by another request.
+                    const auto error = server_publish_adapter(task.load_lora_path, [&](const std::string & temporary) {
+                        return llama_adapter_lora_save(loras[id].ptr, temporary.c_str()) == 0;
+                    });
+                    if (!error.empty()) {
+                        send_error(task, error, ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    auto res = std::make_unique<server_task_result_lora_change>();
+                    res->id = task.id;
+                    res->lora_id = id;
+                    res->path = task.load_lora_path;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_LOAD_LORA:
                 {
                     // Read from disk off this loop by the HTTP handler; appending it here,
@@ -5966,6 +5991,76 @@ void server_routes::init_routes() {
         }
         res->ok(r);
         return res;
+    };
+
+    this->post_lora_adapters_save = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        const auto path = confine_out(params.train_dir, json_value(body, "name", std::string()));
+        if (params.train_dir.empty() || path.empty() || !body.contains("id") || !body.at("id").is_number_integer() ||
+            body.at("id").get<double>() < 0 || body.at("id").get<double>() > INT32_MAX) {
+            res->error(format_error_response("save requires an integer id and a bare .gguf name under --train-dir", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        auto & rd = res->rd;
+        server_task task(SERVER_TASK_TYPE_SAVE_LORA);
+        task.id = rd.get_new_id();
+        task.save_lora = body.at("id").get<int32_t>();
+        task.load_lora_path = path;
+        rd.post_task(std::move(task));
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            return res; // queued snapshot remains owned by the loop after disconnect
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+        } else {
+            res->ok(result->to_json());
+        }
+        return res;
+    };
+
+    this->post_lora_adapters_fresh = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        const auto path = confine_out(params.train_dir, json_value(body, "name", std::string()));
+        if (params.train_dir.empty() || path.empty() || ctx_server.model_tgt == nullptr) {
+            res->error(format_error_response("fresh requires a loaded model and a bare .gguf name under --train-dir", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const double rank = body.value("rank", 8.0);
+        const double alpha = body.value("alpha", 16.0);
+        const double top = body.value("top_layers", 0.0);
+        const double seed = body.value("seed", 42.0);
+        if (!std::isfinite(rank) || rank < 1 || rank > 256 || std::floor(rank) != rank ||
+            !std::isfinite(alpha) || alpha <= 0 || alpha > std::numeric_limits<float>::max() ||
+            !std::isfinite(top) || top < 0 || top > llama_model_n_layer(ctx_server.model_tgt) || std::floor(top) != top ||
+            !std::isfinite(seed) || seed < 0 || seed > UINT32_MAX || std::floor(seed) != seed) {
+            res->error(format_error_response("invalid rank, alpha, top_layers or seed", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        std::vector<std::string> targets;
+        std::stringstream parts(body.value("targets", std::string("attn_q,attn_v")));
+        std::string target;
+        while (std::getline(parts, target, ',')) {
+            if (!target.empty()) {
+                targets.push_back(target);
+            }
+        }
+        if (targets.empty()) {
+            res->error(format_error_response("targets must name at least one module", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const auto error = server_publish_adapter(path, [&](const std::string & temporary) {
+            return common_lora_write_fresh(ctx_server.model_tgt, temporary, (int32_t) rank, (float) alpha,
+                                           targets, (uint32_t) seed, (int32_t) top);
+        });
+        if (!error.empty()) {
+            res->error(format_error_response(error, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        // Reuse load's ownership transfer and dormant scale-zero installation.
+        return post_lora_adapters_load(req);
     };
 
     this->post_lora_adapters_load = [this](const server_http_req & req) {
