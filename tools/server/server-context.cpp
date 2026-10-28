@@ -2492,7 +2492,14 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // Continuum fork: a draft whose memory rolls back by trimming (plain attention KV, e.g. the
+        // MTP head) has no state a checkpoint must hold: on restore, slot.mem.seq_rm trims its live KV
+        // to the checkpoint. PARTIAL_ONLY returned that whole KV (~2 KB/token here, 246 MB at 118k)
+        // in EVERY checkpoint, 79% of each one, up to n_ctx_checkpoints copies per slot in RAM. A
+        // saved page carries the draft KV once instead (the `.dft` sidecar).
+        if (ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2771,6 +2778,21 @@ private:
                             put(c.data_spec.data(), c.data_spec.size());
                         }
                     };
+                    // The draft context's KV for this sequence (the MTP head), once per page: checkpoints no
+                    // longer copy it (see create_checkpoint). Header: magic, version, n_tokens it covers.
+                    // The quote counts its size; only the write copies it out.
+                    std::vector<uint8_t> draft_state;
+                    const size_t draft_size = ctx_dft != nullptr
+                        ? llama_state_seq_get_size_ext(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+                    auto write_draft = [&](auto && put) {
+                        const uint32_t magic    = 0x44524654u; // 'DRFT'
+                        const uint32_t version  = 1;
+                        const uint64_t n_tokens = slot->prompt.tokens.size();
+                        const uint64_t n_state  = draft_size;
+                        put(&magic, sizeof(magic)); put(&version, sizeof(version));
+                        put(&n_tokens, sizeof(n_tokens)); put(&n_state, sizeof(n_state));
+                        put(draft_state.data(), draft_size); // the quote only counts; the write fills it first
+                    };
                     auto write_adapters = [&](auto && put) {
                         const uint32_t magic   = 0x4C4F5241u; // 'LORA'
                         const uint32_t version = 2;
@@ -2803,6 +2825,7 @@ private:
                         };
                         write_checkpoints(count);
                         write_adapters(count);
+                        write_draft(count);
                         if (size_overflow) {
                             send_error(task, "Slot file size overflow", ERROR_TYPE_SERVER);
                             break;
@@ -2837,6 +2860,22 @@ private:
                         write_checkpoints([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
                         if (!out) {
                             SLT_WRN(*slot, "checkpoint sidecar could not be written: %s (the restore will be cold)\n", filepath.c_str());
+                        }
+                    }
+                    if (ctx_dft != nullptr) {
+                        // a sidecar that is not this page's draft is removed, never left stale
+                        const std::string dft_path = filepath + ".dft";
+                        draft_state.resize(draft_size);
+                        bool ok = llama_state_seq_get_data_ext(ctx_dft, draft_state.data(), draft_size, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) == draft_size;
+                        if (ok) {
+                            std::ofstream out(dft_path, std::ios::binary | std::ios::trunc);
+                            write_draft([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
+                            ok = (bool) out;
+                        }
+                        draft_state = {};
+                        if (!ok) {
+                            std::remove(dft_path.c_str());
+                            SLT_WRN(*slot, "draft sidecar could not be written: %s (the restore drafts cold)\n", dft_path.c_str());
                         }
                     }
                     {
@@ -2953,6 +2992,28 @@ private:
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
                         slot->lora = std::move(page_lora);
+                        // The draft's KV comes back with the page (see SLOT_SAVE). Without a matching
+                        // sidecar the draft sequence is cleared, never left holding the previous
+                        // occupant's KV at these positions: it then drafts cold, the target still verifies.
+                        if (ctx_dft != nullptr) {
+                            bool ok = false;
+                            std::ifstream in(filepath + ".dft", std::ios::binary);
+                            uint32_t magic = 0, version = 0; uint64_t n_tokens = 0, n_state = 0;
+                            in.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+                            in.read(reinterpret_cast<char *>(&version), sizeof(version));
+                            in.read(reinterpret_cast<char *>(&n_tokens), sizeof(n_tokens));
+                            in.read(reinterpret_cast<char *>(&n_state), sizeof(n_state));
+                            if (in && magic == 0x44524654u && version == 1 && n_tokens == slot->prompt.tokens.size() && n_state > 0) {
+                                std::vector<uint8_t> state(n_state);
+                                in.read(reinterpret_cast<char *>(state.data()), n_state);
+                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                                ok = in && llama_state_seq_set_data_ext(ctx_dft, state.data(), n_state, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) == n_state;
+                            }
+                            if (!ok) {
+                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                                SLT_WRN(*slot, "no usable draft sidecar for %s: the draft starts cold\n", filepath.c_str());
+                            }
+                        }
                         // Continuum fork: bring the context checkpoints back with the state (see
                         // SLOT_SAVE). Any defect in the sidecar leaves the slot exactly as a
                         // pre-fork restore left it — valid tokens + state, no checkpoints.
