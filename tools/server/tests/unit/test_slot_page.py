@@ -204,6 +204,40 @@ def test_checkpoints_stay_within_the_byte_budget_and_page_with_the_slot():
 
 
 @pytest.mark.skipif(not HYBRID, reason="set LLAMA_SERVER_TEST_HYBRID_GGUF to a small hybrid (recurrent) GGUF with an MTP head")
+@pytest.mark.skipif(not HYBRID, reason="set LLAMA_SERVER_TEST_HYBRID_GGUF to a small hybrid GGUF with an MTP head")
+def test_a_malformed_or_torn_draft_sidecar_restores_the_page_with_a_cold_draft():
+    # what this catches (Codex/Cormac on #79): a restore that trusts the `.dft` header's sizes, and
+    # allocates what a torn or hostile header claims, or loads a sidecar shorter than it says. The
+    # page itself must still restore whole; only the draft starts cold, and the target's output is
+    # unchanged because it verifies every drafted token.
+    global server
+    server = ServerPreset.tinyllama2()
+    server.slot_save_path = "./tmp"
+    server.temperature = 0.0
+    server.model_hf_repo = None
+    server.model_file = HYBRID
+    server.n_ctx = 4096
+    server.n_batch = 512
+    server.spec_type = "draft-mtp"
+    server.start()
+    first = complete(PROMPT, 0)
+    saved = server.make_request("POST", "/slots/0?action=save", data={"filename": "mind-a.bin"})
+    assert saved.status_code == 200, saved.body
+    dft = Path(server.slot_save_path) / "mind-a.bin.dft"
+    whole = dft.read_bytes()
+    assert len(whole) > 24  # magic, version, two sizes, then the state
+    huge = (1 << 60).to_bytes(8, "little")
+    for bad in (whole[:8] + huge + whole[16:],   # a header claiming an exabyte of draft state
+                whole[: len(whole) // 2]):         # a sidecar torn mid-write
+        dft.write_bytes(bad)
+        res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "mind-a.bin"})
+        assert res.status_code == 200, res.body
+        assert res.body["n_restored"] == saved.body["n_saved"]
+        again = complete(PROMPT, 0)
+        assert again["timings"]["prompt_n"] == 1
+        assert again["content"] == first["content"]
+
+
 def test_page_with_draft_state_fits_its_ceiling_exactly():
     # what this catches: a page_out admitted on a count that leaves out part of what the page holds
     # (draft or speculative state), so the store passes --page-ram-bytes after a successful admission.
