@@ -59,6 +59,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,
+    SERVER_TASK_TYPE_SAVE_LORA,
     SERVER_TASK_TYPE_UNLOAD_LORA,
     SERVER_TASK_TYPE_LEARN,
 };
@@ -260,6 +261,8 @@ struct server_task {
     // server loop; the loop only appends it (dormant, scale 0) to the adapter list
     llama_adapter_lora * load_lora = nullptr;
     std::string          load_lora_path;
+    // SAVE_LORA runs between decode/learn steps; path is confined by the route.
+    int32_t save_lora = -1;
 
     // used by SERVER_TASK_TYPE_UNLOAD_LORA: the adapter id to retire
     int32_t unload_lora = -1;
