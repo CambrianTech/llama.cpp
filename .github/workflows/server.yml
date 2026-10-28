@@ -96,6 +96,28 @@ jobs:
       - name: Prefill scheduling test
         run: ctest --test-dir build -C Release -R ^test-server-prefill$ --output-on-failure --no-tests=error
 
+      - name: Dream adapter creation and snapshot parity
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture=$(mktemp -d)
+          curl --fail --location --retry 3 --max-time 90 \
+            https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf \
+            -o "$fixture/model.gguf"
+          mkdir "$fixture/train"
+          build/bin/llama-server -m "$fixture/model.gguf" --port 58199 \
+            -np 1 -c 512 -b 512 -ub 512 -ngl 0 -t 2 --train-dir "$fixture/train" \
+            > "$fixture/server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" || true; cat "$fixture/server.log"' EXIT
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:58199/health > /dev/null; then break; fi
+            kill -0 "$server_pid"
+            sleep 1
+          done
+          python3 tools/server/tests/dream-adapter-routes.py http://127.0.0.1:58199
+
       - name: Python setup
         id: setup_python
         uses: actions/setup-python@v6
