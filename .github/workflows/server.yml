@@ -116,7 +116,7 @@ jobs:
             kill -0 "$server_pid"
             sleep 1
           done
-          python3 tools/server/tests/dream-adapter-routes.py http://127.0.0.1:58199
+          python3 tools/server/tests/dream-adapter-routes.py http://127.0.0.1:58199 "$fixture/train"
 
       - name: Python setup
         id: setup_python
