@@ -107,7 +107,7 @@ jobs:
             -o "$fixture/model.gguf"
           mkdir "$fixture/train"
           build/bin/llama-server -m "$fixture/model.gguf" --port 58199 \
-            -np 1 -c 512 -b 512 -ub 512 -ngl 0 -t 2 --train-dir "$fixture/train" \
+            -np 1 -c 512 -b 512 -ub 512 -ngl 0 --no-repack -t 2 --train-dir "$fixture/train" \
             > "$fixture/server.log" 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" || true; cat "$fixture/server.log"' EXIT
