@@ -492,6 +492,13 @@ struct server_metrics {
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<uint64_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // Continuum fork: RAM pages and the checkpoint byte budget
+    uint64_t n_page_out             = 0;
+    uint64_t n_page_in              = 0;
+    uint64_t n_page_failed          = 0; // page_out, page_in or spill refused or failed
+    uint64_t n_ckpt_evicted_budget  = 0; // checkpoints dropped to keep within --ctx-checkpoints-bytes
+    uint64_t n_ckpt_skipped_budget  = 0; // checkpoints not taken: one alone exceeds the budget
+
     void init() {
         t_start = ggml_time_us();
     }

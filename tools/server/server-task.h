@@ -56,6 +56,10 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_PAGE_OUT,   // Continuum fork: slot -> named host-RAM page (server-pages.h)
+    SERVER_TASK_TYPE_PAGE_IN,    // named page -> slot
+    SERVER_TASK_TYPE_PAGE_SPILL, // hands a page to the HTTP thread, which writes it to disk
+    SERVER_TASK_TYPE_PAGE_DROP,  // frees a page
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,
@@ -247,6 +251,10 @@ struct server_task {
         // checkpoint it holds, which is already a page's subset.
         bool keep_view_checkpoints = false;
         std::shared_ptr<server_restore_progress> progress;
+        // Continuum fork: the RAM page a PAGE_* task names, and for PAGE_DROP the generation it
+        // drops (0 = whichever page holds the name), so a spill's drop never frees a newer page
+        std::string page;
+        uint64_t    page_gen = 0;
     };
     slot_action slot_action;
 
@@ -588,6 +596,9 @@ struct server_task_result_metrics : server_task_result {
     // these are immediate stats, not accumulated (server_metrics is cumulative)
     int n_processing_slots = 0;
     int n_tasks_deferred = 0;
+    size_t page_store_bytes     = 0; // Continuum fork: the host-RAM page store
+    size_t page_store_pages     = 0;
+    size_t ctx_checkpoint_bytes = 0; // every slot's context checkpoints
 
     server_metrics metrics;
 
@@ -620,6 +631,33 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_tokens;
     size_t n_bytes;
     double t_ms;
+
+    virtual json to_json() override;
+};
+
+struct server_page;
+
+// Continuum fork: the outcome of a PAGE_* task, with the store's totals after it
+struct server_task_result_page : server_task_result {
+    std::string action;
+    std::string page;
+    uint64_t gen = 0;
+
+    size_t n_tokens            = 0;
+    size_t n_bytes             = 0; // the page: target + draft state + speculative state + checkpoints
+    size_t n_bytes_draft       = 0;
+    size_t n_bytes_spec        = 0; // the speculative tail state
+    size_t n_checkpoints       = 0;
+    size_t n_bytes_checkpoints = 0;
+    double t_ms                = 0.0;
+
+    size_t store_bytes = 0;
+    size_t store_pages = 0;
+
+    // PAGE_SPILL: the page the HTTP thread writes; shared, so the task thread never waits on disk
+    std::shared_ptr<const server_page> spilled;
+    std::string filename;
+    size_t n_written = 0;
 
     virtual json to_json() override;
 };

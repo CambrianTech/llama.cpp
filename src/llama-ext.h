@@ -130,3 +130,19 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+//
+// sequence state pages (Continuum fork)
+//
+
+// Writes a sequence-state file (the llama_state_seq_save_file format) from bytes that
+// llama_state_seq_get_data_ext returned with LLAMA_STATE_SEQ_FLAGS_NONE, without a context:
+// a page held in host RAM spills to disk off the engine thread, and llama_state_seq_load_file
+// reads it back. Returns the bytes written, or 0 when the bytes are not a sequence state or
+// the write fails.
+LLAMA_API size_t llama_state_seq_save_file_from_data(
+        const char        * filepath,
+        const uint8_t     * data,
+        size_t              size,
+        const llama_token * tokens,
+        size_t              n_token_count);

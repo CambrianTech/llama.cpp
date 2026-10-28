@@ -1591,6 +1591,26 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "page_out_total",
+            "Slot states paged out to the host-RAM page store",
+            (double) metrics.n_page_out
+        }, {
+            "page_in_total",
+            "Pages restored from the host-RAM page store into a slot",
+            (double) metrics.n_page_in
+        }, {
+            "page_failed_total",
+            "page_out, page_in or spill operations refused or failed",
+            (double) metrics.n_page_failed
+        }, {
+            "ctx_checkpoints_evicted_budget_total",
+            "Context checkpoints dropped to keep within --ctx-checkpoints-bytes",
+            (double) metrics.n_ckpt_evicted_budget
+        }, {
+            "ctx_checkpoints_skipped_budget_total",
+            "Context checkpoints not taken because one alone exceeds --ctx-checkpoints-bytes",
+            (double) metrics.n_ckpt_skipped_budget
         },
     };
 
@@ -1615,6 +1635,18 @@ std::string server_task_result_metrics::to_metrics() {
             "n_busy_slots_per_decode",
             "Average number of busy slots per llama_decode() call",
             (double) metrics.n_busy_slots / std::max((double) metrics.n_decode, 1.0)
+        }, {
+            "page_store_bytes",
+            "Bytes held by the host-RAM page store",
+            (double) page_store_bytes
+        }, {
+            "page_store_pages",
+            "Pages held by the host-RAM page store",
+            (double) page_store_pages
+        }, {
+            "ctx_checkpoint_bytes",
+            "Bytes held by every slot's context checkpoints",
+            (double) ctx_checkpoint_bytes
         },
     };
 
@@ -1673,6 +1705,34 @@ json server_task_result_slot_save_load::to_json() {
             { "restore_ms", t_ms }
         }},
     };
+}
+
+//
+// server_task_result_page
+//
+json server_task_result_page::to_json() {
+    json res = {
+        { "id_slot",             id_slot },
+        { "action",              action },
+        { "page",                page },
+        { "gen",                 gen },
+        { "n_tokens",            n_tokens },
+        { "n_bytes",             n_bytes },
+        { "n_bytes_draft",       n_bytes_draft },
+        { "n_bytes_spec",        n_bytes_spec },
+        { "n_checkpoints",       n_checkpoints },
+        { "n_bytes_checkpoints", n_bytes_checkpoints },
+        { "store_bytes",         store_bytes },
+        { "store_pages",         store_pages },
+        { "timings", {
+            { "ms", t_ms }
+        }},
+    };
+    if (!filename.empty()) {
+        res["filename"]  = filename;
+        res["n_written"] = n_written;
+    }
+    return res;
 }
 
 //
