@@ -9,6 +9,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-prefill.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -3285,6 +3286,7 @@ private:
     // time-fair interleave: after a prefill step, generating slots are owed decode-only time equal to that step
     int64_t t_decode_owed_us = 0;
     int32_t n_batch_gen      = 0; // batch size before prompt tokens are added
+    server_prefill_order prefill_order;
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
@@ -3641,7 +3643,12 @@ private:
         if (!decode_owed && (params_base.cont_batching || batch.size() == 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            std::vector<server_slot *> prompt_slots;
+            for (const size_t index : prefill_order.order(slots.size(), params_base.kv_unified)) {
+                prompt_slots.push_back(&slots[index]);
+            }
+            iterate(prompt_slots, [&](server_slot & slot) {
+                const auto batch_before = batch.size();
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
@@ -4217,6 +4224,7 @@ private:
                     }
                 }
 
+                prefill_order.served(size_t(&slot - slots.data()), batch_before, batch.size());
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
