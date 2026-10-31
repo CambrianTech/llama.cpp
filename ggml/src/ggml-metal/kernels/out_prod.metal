@@ -155,3 +155,66 @@ template [[host_name("kernel_out_prod_q3_K")]] kernel out_prod_t kernel_out_prod
 template [[host_name("kernel_out_prod_q4_K")]] kernel out_prod_t kernel_out_prod<float,  block_q4_K, QK_NL, dequantize_q4_K>;
 template [[host_name("kernel_out_prod_q5_K")]] kernel out_prod_t kernel_out_prod<float,  block_q5_K, QK_NL, dequantize_q5_K>;
 template [[host_name("kernel_out_prod_q6_K")]] kernel out_prod_t kernel_out_prod<float,  block_q6_K, QK_NL, dequantize_q6_K>;
+
+// MUL_MAT_ID_BACK: dst[:, i, t] = sum_r as[:, r, ids[i, t]] * grad[r, i, t], the activations'
+// gradient of mul_mat_id through its frozen experts (a LoRA on attention trains on a MoE base).
+// One threadgroup per routed slot (i, t); each thread owns columns of the slot's row and walks the
+// expert's rows, so every dst element has one writer and no expert is copied or transposed in
+// device memory. nl == 0 reads F32/F16/BF16 element by element; nl > 0 dequantizes 16
+// consecutive elements of a row in registers (ne00 % 16 == 0), as kernel_out_prod does.
+template<typename T0, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread float4x4 &)>
+kernel void kernel_mul_mat_id_back(
+        constant ggml_metal_kargs_mul_mat_id_back & args,
+        device const char * src0,
+        device const char * grad,
+        device const char * ids,
+        device       char * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiitg[[thread_index_in_threadgroup]],
+        ushort3 ntg  [[threads_per_threadgroup]]) {
+    const int32_t i = tgpig.x;
+    const int32_t t = tgpig.y;
+    const int32_t e = *((device const int32_t *) (ids + i*args.nbi0 + t*args.nbi1));
+
+    device const char * as_e = src0 + e*args.nb02;
+    device const char * g    = grad + i*args.nbg1 + t*args.nbg2;
+    device       char * d    = dst  + i*args.nb1  + t*args.nb2;
+
+    if (nl == 0) {
+        for (int32_t c = tiitg; c < args.ne00; c += ntg.x) {
+            float acc = 0.0f;
+            for (int32_t r = 0; r < args.ne01; ++r) {
+                acc += (float) ((device const T0 *) (as_e + r*args.nb01))[c] * *((device const float *) (g + r*args.nbg0));
+            }
+            ((device float *) d)[c] = acc;
+        }
+    } else {
+        for (int32_t ind = tiitg; ind < args.ne00/16; ind += ntg.x) {
+            float4x4 acc = float4x4(0.0f);
+            for (int32_t r = 0; r < args.ne01; ++r) {
+                float4x4 w;
+                dequantize_func(((device const block_q *) (as_e + r*args.nb01)) + ind/nl, ind%nl, w);
+                acc += w * *((device const float *) (g + r*args.nbg0));
+            }
+            ((device float4x4 *) d)[ind] = acc;
+        }
+    }
+}
+
+typedef decltype(kernel_mul_mat_id_back<float, float4x4, 0, dequantize_f32>) mul_mat_id_back_t;
+
+template [[host_name("kernel_mul_mat_id_back_f32")]]  kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  float4x4,   0,     dequantize_f32>;
+template [[host_name("kernel_mul_mat_id_back_f16")]]  kernel mul_mat_id_back_t kernel_mul_mat_id_back<half,   float4x4,   0,     dequantize_f32>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_mul_mat_id_back_bf16")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<bfloat, float4x4,   0,     dequantize_f32>;
+#endif
+template [[host_name("kernel_mul_mat_id_back_q4_0")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  block_q4_0, 2,     dequantize_q4_0>;
+template [[host_name("kernel_mul_mat_id_back_q4_1")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  block_q4_1, 2,     dequantize_q4_1>;
+template [[host_name("kernel_mul_mat_id_back_q5_0")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  block_q5_0, 2,     dequantize_q5_0>;
+template [[host_name("kernel_mul_mat_id_back_q5_1")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  block_q5_1, 2,     dequantize_q5_1>;
+template [[host_name("kernel_mul_mat_id_back_q8_0")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  block_q8_0, 2,     dequantize_q8_0>;
+template [[host_name("kernel_mul_mat_id_back_q2_K")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  block_q2_K, QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_mul_mat_id_back_q3_K")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  block_q3_K, QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_mul_mat_id_back_q4_K")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  block_q4_K, QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mat_id_back_q5_K")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  block_q5_K, QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_mul_mat_id_back_q6_K")]] kernel mul_mat_id_back_t kernel_mul_mat_id_back<float,  block_q6_K, QK_NL, dequantize_q6_K>;

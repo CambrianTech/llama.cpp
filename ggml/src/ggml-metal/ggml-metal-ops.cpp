@@ -304,6 +304,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_out_prod(ctx, idx);
             } break;
+        case GGML_OP_MUL_MAT_ID_BACK:
+            {
+                n_fuse = ggml_metal_op_mul_mat_id_back(ctx, idx);
+            } break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             {
                 n_fuse = ggml_metal_op_cross_entropy_loss(ctx, idx);
@@ -3984,6 +3988,8 @@ static void ggml_metal_encode_add(ggml_metal_op_t ctx, const ggml_tensor * op) {
 // dispatch, reading the weight in place in its own block order. Batched and broadcast
 // operands follow the CPU backend: dst and src1 share dims 2-3, and src0 is broadcast over
 // them (dst per src0 = ne2/ne02, ne3/ne03).
+static bool ggml_metal_frozen_weight_readable(const ggml_tensor * w);
+
 bool ggml_metal_op_out_prod_supported(const ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -3994,11 +4000,18 @@ bool ggml_metal_op_out_prod_supported(const ggml_tensor * op) {
         op->ne[2] % src0->ne[2] != 0 || op->ne[3] % src0->ne[3] != 0) {
         return false;
     }
-    switch (src0->type) {
+    return ggml_metal_frozen_weight_readable(src0);
+}
+
+// A frozen weight the training kernels (kernel_out_prod, kernel_mul_mat_id_back) read in its
+// own layout: element by element for float types, else 16 consecutive elements of a row
+// dequantized from whole blocks.
+static bool ggml_metal_frozen_weight_readable(const ggml_tensor * w) {
+    switch (w->type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
-            return src0->nb[0] == ggml_type_size(src0->type); // read element by element, any width
+            return w->nb[0] == ggml_type_size(w->type); // read element by element, any width
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -4009,11 +4022,62 @@ bool ggml_metal_op_out_prod_supported(const ggml_tensor * op) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
-            // dequantized 16 consecutive elements at a time, from whole blocks of a row
-            return ggml_is_contiguous_rows(src0) && src0->ne[0] % 16 == 0;
+            return ggml_is_contiguous_rows(w) && w->ne[0] % 16 == 0;
         default:
             return false;
     }
+}
+
+bool ggml_metal_op_mul_mat_id_back_supported(const ggml_tensor * op) {
+    const ggml_tensor * as   = op->src[0];
+    const ggml_tensor * grad = op->src[1];
+    const ggml_tensor * ids  = op->src[2];
+    return op->src[3] == NULL && // the gather's pointer table is not read here
+        op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+        grad->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 &&
+        ggml_metal_frozen_weight_readable(as);
+}
+
+int ggml_metal_op_mul_mat_id_back(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * as   = op->src[0];
+    const ggml_tensor * grad = op->src[1];
+    const ggml_tensor * ids  = op->src[2];
+
+    GGML_ASSERT(ggml_metal_op_mul_mat_id_back_supported(op));
+
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mat_id_back(lib, op);
+
+    ggml_metal_kargs_mul_mat_id_back args = {
+        /*.ne00 =*/ (int32_t) as->ne[0],
+        /*.ne01 =*/ (int32_t) as->ne[1],
+        /*.nb01 =*/ as->nb[1],
+        /*.nb02 =*/ as->nb[2],
+        /*.nbi0 =*/ ids->nb[0],
+        /*.nbi1 =*/ ids->nb[1],
+        /*.nbg0 =*/ grad->nb[0],
+        /*.nbg1 =*/ grad->nb[1],
+        /*.nbg2 =*/ grad->nb[2],
+        /*.nb1  =*/ op->nb[1],
+        /*.nb2  =*/ op->nb[2],
+    };
+
+    const int32_t per_thread = ggml_is_quantized(as->type) ? as->ne[0]/16 : as->ne[0];
+    const int nth = std::max(1, std::min<int>(per_thread, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)));
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(as),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(grad), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(ids),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   4);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ids->ne[0], ids->ne[1], 1, nth, 1, 1);
+
+    return 1;
 }
 
 int ggml_metal_op_out_prod(ggml_metal_op_t ctx, int idx) {
