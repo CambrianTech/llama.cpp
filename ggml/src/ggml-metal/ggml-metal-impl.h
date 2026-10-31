@@ -498,6 +498,20 @@ typedef struct {
 } ggml_metal_kargs_out_prod;
 
 typedef struct {
+    int32_t  ne00; // expert cols
+    int32_t  ne01; // expert rows
+    uint64_t nb01;
+    uint64_t nb02; // one expert
+    uint64_t nbi0; // ids: slot, token
+    uint64_t nbi1;
+    uint64_t nbg0; // grad: row, slot, token
+    uint64_t nbg1;
+    uint64_t nbg2;
+    uint64_t nb1;  // dst: slot, token
+    uint64_t nb2;
+} ggml_metal_kargs_mul_mat_id_back;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;

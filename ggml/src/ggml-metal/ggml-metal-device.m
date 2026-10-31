@@ -1512,6 +1512,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             // matmul (see ggml_metal_op_out_prod). 2D, src1 F32 with contiguous rows, src0 F32
             // or a type with a kernel_cpy_<type>_f32.
             return ggml_metal_op_out_prod_supported(op) && ggml_metal_device_get_props(dev)->has_simdgroup_mm;
+        case GGML_OP_MUL_MAT_ID_BACK:
+            // the activations' gradient through frozen experts (kernels/out_prod.metal)
+            return ggml_metal_op_mul_mat_id_back_supported(op) &&
+                (op->src[0]->type != GGML_TYPE_BF16 || ggml_metal_device_get_props(dev)->has_bfloat);
         case GGML_OP_SILU_BACK:
             return (op->src[0]->type == GGML_TYPE_F32) &&
                 (op->src[1]->type == GGML_TYPE_F32) &&
