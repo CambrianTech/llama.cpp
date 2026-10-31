@@ -1022,6 +1022,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT",
     "MUL_MAT_ID",
     "OUT_PROD",
+    "MUL_MAT_ID_BACK",
 
     "SCALE",
     "SET",
@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1138,6 +1139,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X*Y",
     "X[i]*Y",
     "X*Y",
+    "X[i]^T*dY",
 
     "x*v",
     "y-\\>view(x)",
@@ -1217,7 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3374,6 +3376,31 @@ struct ggml_tensor * ggml_mul_mat_id_gather(
     return result;
 }
 
+// ggml_mul_mat_id_back
+
+struct ggml_tensor * ggml_mul_mat_id_back(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * grad,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(!ggml_is_transposed(as));
+    GGML_ASSERT(as->ne[3] == 1);
+    GGML_ASSERT(grad->type == GGML_TYPE_F32 && grad->ne[3] == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(grad->ne[0] == as->ne[1]);  // one gradient value per expert row
+    GGML_ASSERT(grad->ne[1] == ids->ne[0]); // per routed slot
+    GGML_ASSERT(grad->ne[2] == ids->ne[1]); // per token
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, as->ne[0], ids->ne[0], ids->ne[1]);
+
+    result->op     = GGML_OP_MUL_MAT_ID_BACK;
+    result->src[0] = as;
+    result->src[1] = grad;
+    result->src[2] = ids;
+
+    return result;
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
@@ -3940,12 +3967,17 @@ struct ggml_tensor * ggml_get_rows_back(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b,
         struct ggml_tensor  * c) {
-    GGML_ASSERT(ggml_is_matrix(a) && ggml_is_vector(b) && b->type == GGML_TYPE_I32);
-    GGML_ASSERT(ggml_is_matrix(c) && (a->ne[0] == c->ne[0]));
+    // The inverse of ggml_get_rows, batch for batch: `a` is the gradient of its result
+    // [ne0, n_idx, ne2, ne3], `b` the indices [n_idx, ne2, ne3], `c` the gathered source
+    // [ne0, n_rows, ne2, ne3]; each index's row of `a` adds into its row of the result. A MoE
+    // gathers its router weights per token this way ([1, n_expert, n_tokens] by [n_used, n_tokens]).
+    GGML_ASSERT(b->type == GGML_TYPE_I32 && b->ne[3] == 1);
+    GGML_ASSERT(a->ne[0] == c->ne[0] && a->ne[1] >= b->ne[0]); // index k reads gradient row k
+    GGML_ASSERT(a->ne[2] == b->ne[1] && a->ne[3] == b->ne[2]);
+    GGML_ASSERT(c->ne[2] == b->ne[1] && c->ne[3] == b->ne[2]);
 
     // TODO: implement non F32 return
-    //struct ggml_tensor * result = ggml_new_tensor_2d(ctx, a->type, a->ne[0], b->ne[0]);
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1]);
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1], c->ne[2], c->ne[3]);
 
     result->op     = GGML_OP_GET_ROWS_BACK;
     result->src[0] = a;
@@ -7049,6 +7081,7 @@ bool ggml_node_has_backward(const struct ggml_tensor * tensor) {
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_RMS_NORM:
         case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
         case GGML_OP_SCALE:
         case GGML_OP_SET:
         case GGML_OP_CPY:
@@ -7300,6 +7333,22 @@ static void ggml_compute_backward(
                             src0,               // [n,m,q1,r1]
                             ggml_transpose(ctx, // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
+            }
+        } break;
+        case GGML_OP_MUL_MAT_ID: {
+            // dst[:, i, t] = as[:, :, ids[i, t]]^T b[:, i % n_b, t]. The experts are held fixed
+            // (a frozen, usually quantized base): only the activations' gradient is formed, so a
+            // LoRA on attention gets its whole gradient through every later expert FFN.
+            GGML_ASSERT(!src0_needs_grads && "a gradient for MUL_MAT_ID's experts is not implemented: they are trained frozen");
+            // no graph builds the pointer-table gather (ggml_mul_mat_id_gather) for training;
+            // its backward is designed when one does, never computed from the plain layout
+            GGML_ASSERT(tensor->src[3] == NULL && "MUL_MAT_ID's backward through the pointer-table gather is not implemented");
+            if (src1_needs_grads) {
+                struct ggml_tensor * back = ggml_mul_mat_id_back(ctx, src0, grad, tensor->src[2]);
+                if (src1->ne[1] != back->ne[1]) {
+                    back = ggml_repeat_back(ctx, back, src1); // slot i read row i % n_b: sum them back
+                }
+                ggml_add_or_set(ctx, cgraph, isrc1, back);
             }
         } break;
         case GGML_OP_SCALE: {
@@ -7886,6 +7935,13 @@ void ggml_build_backward_expand(
             case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
             case GGML_OP_ROPE:          // positions not differentiable
                 ignore_src[1] = true;
+                break;
+
+            // the routing (I32 ids) and the gather's expert pointer table (I64) are not
+            // differentiable; the experts and the activations are
+            case GGML_OP_MUL_MAT_ID:
+                ignore_src[2] = true;
+                ignore_src[3] = true;
                 break;
 
             default:

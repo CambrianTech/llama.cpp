@@ -4469,6 +4469,108 @@ static void ggml_compute_forward_out_prod_converted_f32(
     }
 }
 
+// ggml_compute_forward_mul_mat_id_back
+//
+// dst[:, i, t] = sum_r as[:, r, ids[i, t]] * grad[r, i, t]: the activations' gradient of
+// mul_mat_id through its experts, held fixed. Task 0 groups the routed (slot, token) pairs by
+// expert with a counting sort (count, prefix sum, fill: one entry per pair, Fable on fork #82);
+// then each task takes whole experts, dequantizes one in tiles of
+// GGML_OUT_PROD_KT rows ONCE, and adds each tile row, scaled by its gradient, into every slot
+// routed to that expert. A slot has exactly one expert, so each dst row has one writer.
+void ggml_compute_forward_mul_mat_id_back(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * as   = dst->src[0];
+    const ggml_tensor * grad = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t cols     = as->ne[0];
+    const int64_t rows     = as->ne[1];
+    const int64_t n_expert = as->ne[2];
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_tok    = ids->ne[1];
+    const int64_t n_slots  = n_used*n_tok;
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->nb[0] == sizeof(float));
+    GGML_ASSERT(grad->nb[0] == sizeof(float));
+    GGML_ASSERT(as->nb[0] == ggml_type_size(as->type)); // expert rows are contiguous
+
+    ggml_to_float_t const to_float = ggml_get_type_traits(as->type)->to_float;
+    GGML_ASSERT(as->type == GGML_TYPE_F32 || to_float != NULL);
+
+    char *    wdata  = (char *) params->wdata;
+    int64_t * offset = (int64_t *) wdata;                    // [n_expert + 1]: expert e's pairs
+    int32_t * routed = (int32_t *) (offset + n_expert + 1);  // [n_slots] of (i, t), by expert
+    float *   tiles  = (float *) GGML_PAD((uintptr_t) (routed + n_slots*2), CACHE_LINE_SIZE);
+
+    const auto expert_of = [&](int64_t i, int64_t t) {
+        const int32_t e = *(const int32_t *) ((const char *) ids->data + i*ids->nb[0] + t*ids->nb[1]);
+        GGML_ASSERT(e >= 0 && e < n_expert);
+        return e;
+    };
+
+    if (ith == 0) {
+        memset(dst->data, 0, ggml_nbytes(dst));
+        memset(offset, 0, (n_expert + 1)*sizeof(int64_t));
+        for (int64_t t = 0; t < n_tok; ++t) {
+            for (int64_t i = 0; i < n_used; ++i) {
+                offset[expert_of(i, t) + 1]++;
+            }
+        }
+        for (int64_t e = 0; e < n_expert; ++e) {
+            offset[e + 1] += offset[e];
+        }
+        // fill: offset[e] advances to the end of e's range, which is where e + 1 begins
+        for (int64_t t = 0; t < n_tok; ++t) {
+            for (int64_t i = 0; i < n_used; ++i) {
+                int32_t * pair = routed + 2*offset[expert_of(i, t)]++;
+                pair[0] = (int32_t) i;
+                pair[1] = (int32_t) t;
+            }
+        }
+        // shift back: offset[e] is again the start of e's range
+        for (int64_t e = n_expert; e > 0; --e) {
+            offset[e] = offset[e - 1];
+        }
+        offset[0] = 0;
+    }
+    ggml_barrier(params->threadpool);
+
+    const int64_t KT = GGML_OUT_PROD_KT;
+    float * wt = tiles + ith*KT*cols; // [KT][cols]
+
+    for (int64_t e = ith; e < n_expert; e += nth) {
+        const int64_t n_routed = offset[e + 1] - offset[e];
+        if (n_routed == 0) {
+            continue;
+        }
+        const int32_t * pairs = routed + 2*offset[e];
+        for (int64_t k0 = 0; k0 < rows; k0 += KT) {
+            const int64_t kt = std::min(KT, rows - k0);
+            for (int64_t r = 0; r < kt; ++r) {
+                const char * row = (const char *) as->data + (k0 + r)*as->nb[1] + e*as->nb[2];
+                if (as->type == GGML_TYPE_F32) {
+                    memcpy(wt + r*cols, row, cols*sizeof(float));
+                } else {
+                    to_float(row, wt + r*cols, cols);
+                }
+            }
+            for (int64_t s = 0; s < n_routed; ++s) {
+                const int64_t i = pairs[2*s + 0];
+                const int64_t t = pairs[2*s + 1];
+                float * d = (float *) ((char *) dst->data + i*dst->nb[1] + t*dst->nb[2]);
+                const char * g = (const char *) grad->data + i*grad->nb[1] + t*grad->nb[2];
+                for (int64_t r = 0; r < kt; ++r) {
+                    ggml_vec_mad_f32((int) cols, d, wt + r*cols, *(const float *) (g + (k0 + r)*grad->nb[0]));
+                }
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_out_prod(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -5204,18 +5306,22 @@ static void ggml_compute_forward_get_rows_back_f32(
     memset(dst->data, 0, ggml_nbytes(dst));
 
     const int nc = src0->ne[0];
-    const int nr = ggml_nelements(src1);
 
     GGML_ASSERT( dst->ne[0] == nc);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
 
-    for (int i = 0; i < nr; ++i) {
-        const int r = ((int32_t *) src1->data)[i];
+    // batch for batch (ggml_get_rows_back): index k of batch (i2, i3) adds its gradient row
+    // into that batch's row r of dst
+    for (int64_t i3 = 0; i3 < src1->ne[2]; ++i3) {
+        for (int64_t i2 = 0; i2 < src1->ne[1]; ++i2) {
+            for (int64_t k = 0; k < src1->ne[0]; ++k) {
+                const int32_t r = *(const int32_t *) ((const char *) src1->data + k*src1->nb[0] + i2*src1->nb[1] + i3*src1->nb[2]);
+                GGML_ASSERT(r >= 0 && r < dst->ne[1]);
 
-        ggml_vec_add_f32(nc,
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *)  dst->data + r*dst->nb[1]),
-                (float *) ((char *) src0->data + i*src0->nb[1]));
+                float * d = (float *) ((char *) dst->data + r*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+                ggml_vec_add_f32(nc, d, d, (const float *) ((const char *) src0->data + k*src0->nb[1] + i2*src0->nb[2] + i3*src0->nb[3]));
+            }
+        }
     }
 }
 

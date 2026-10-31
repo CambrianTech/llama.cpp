@@ -2340,6 +2340,67 @@ struct test_get_rows : public test_case {
     }
 };
 
+// GET_ROWS's gradient on batched rows (a MoE gathers its router weights per token: [1, n_expert,
+// n_tokens] by [n_used, n_tokens]), checked by finite differences. Every row of every batch is
+// gathered (r >= m) and the output is weighted by a fixed random tensor: the suite's metric,
+// (a-b)/(a+b) averaged, is NaN on any element whose gradient is 0 on both sides, and a NaN mean
+// never exceeds the threshold, so a row nothing gathers would pass the case whatever the kernel did.
+struct test_get_rows_grad : public test_case {
+    const int n; // cols
+    const int m; // rows
+    const int r; // rows to get, >= m
+    const int be1; // batches
+
+    std::string vars() override {
+        return VARS_TO_STR4(n, m, r, be1);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GET_ROWS";
+    }
+
+    test_get_rows_grad(int n = 1, int m = 6, int r = 9, int be1 = 7) : n(n), m(m), r(r), be1(be1) {
+        GGML_ASSERT(r >= m);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, m, be1);
+        ggml_set_name(in, "in");
+        ggml_set_param(in);
+
+        ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r, be1);
+        ggml_set_name(rows, "rows");
+
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, r, be1);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_get_rows(ctx, in, rows), w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                for (int b = 0; b < be1; b++) {
+                    std::vector<int32_t> data(r);
+                    for (int k = 0; k < r; k++) {
+                        data[k] = k % m; // every row at least once
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), b*t->nb[1], r*sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -4981,6 +5042,106 @@ struct test_mul_mat_id : public test_case {
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// The activations' gradient of mul_mat_id through fixed experts (GGML_OP_MUL_MAT_ID_BACK),
+// checked by finite differences. The output is weighted by a fixed random tensor before the
+// suite's SUM loss: under a bare SUM every upstream gradient value is 1, so a kernel that reads
+// the wrong gradient row passes. F32 experts only: a quantized expert's forward rounds b to its
+// vec_dot type, so the finite differences are not exact (test_mul_mat_id_back compares those).
+struct test_mul_mat_id_grad : public test_case {
+    const int n_mats;
+    const int n_used;
+    const bool b; // broadcast b matrix
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_mats, n_used, b, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID";
+    }
+
+    test_mul_mat_id_grad(int n_mats = 4, int n_used = 2, bool b = false, int64_t m = 40, int64_t n = 3, int64_t k = 6)
+        : n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+        ggml_set_param(b);
+
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n_used, n);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_mul_mat_id(ctx, as, b, ids), w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// GGML_OP_MUL_MAT_ID_BACK: the activations' gradient of mul_mat_id through fixed (frozen,
+// quantized) experts, compared across backends
+struct test_mul_mat_id_back : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int64_t m; // expert rows
+    const int64_t n; // tokens
+    const int64_t k; // expert cols
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, n_mats, n_used, m, n, k);
+    }
+
+    test_mul_mat_id_back(ggml_type type_a = GGML_TYPE_F32, int n_mats = 8, int n_used = 2, int64_t m = 32, int64_t n = 16, int64_t k = 64)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * grad = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n_used, n);
+        ggml_set_name(grad, "grad");
+
+        ggml_tensor * out = ggml_mul_mat_id_back(ctx, as, grad, ids);
         ggml_set_name(out, "out");
 
         return out;
@@ -8950,6 +9111,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
+    // batched (a MoE's router weights: [1, n_expert, n_tokens] gathered by [n_used, n_tokens])
+    test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 16, 4, 7, false));
+    test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 8, 16, 4, 3, true));
+    test_cases.emplace_back(new test_get_rows_grad(1, 6, 9, 7));
+    test_cases.emplace_back(new test_get_rows_grad(3, 8, 8, 5));
+
+    // MoE training: the activations' gradient through fixed experts. A small F32 mul_mat_id
+    // grad-checks it by finite differences (per-slot and broadcast b); MUL_MAT_ID_BACK itself is
+    // compared across backends for the expert types a resident base is served in
+    for (bool bcast : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_id_grad(4, 2, bcast, 40, 3, 6)); // m > GGML_OUT_PROD_KT: two row tiles
+        test_cases.emplace_back(new test_mul_mat_id_grad(8, 3, bcast, 70, 5, 9));
+    }
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_mul_mat_id_back(type_a, 8, 2, 32, 16, 256));
+        test_cases.emplace_back(new test_mul_mat_id_back(type_a, 16, 4, 64, 33, 512));
+    }
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
     for (ggml_type type : all_types) {
         for (bool v : {false, true}) {

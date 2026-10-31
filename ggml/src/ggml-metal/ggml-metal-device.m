@@ -1490,7 +1490,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->src[0]->nb[0] == sizeof(float) && op->src[4]->nb[0] == sizeof(float) &&
                    (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_F16);
         case GGML_OP_GET_ROWS_BACK:
+            // kernel_get_rows_back walks one flat index list over dst's rows: the 2-D form only;
+            // a batched one ([1, n_expert, n_tokens], a MoE's router weights) runs where it is
+            // implemented
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
+                   ggml_is_vector(op->src[1]) && op->ne[2] == 1 && op->ne[3] == 1 &&
                    ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
