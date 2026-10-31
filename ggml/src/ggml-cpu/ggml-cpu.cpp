@@ -428,7 +428,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-pointer table,
     // docs/serving/MOE-GATHER-MULMATID.md) is not implemented on CPU — reject so the
     // scheduler falls back rather than compute a wrong contiguous-stride result.
-    if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != NULL) {
+    if ((op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_MUL_MAT_ID_BACK) && op->src[3] != NULL) {
         return false;
     }
 
@@ -473,6 +473,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
+        case GGML_OP_MUL_MAT_ID_BACK:
+            return (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL) &&
+                src1->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32;
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 ||
                     ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && src1->ne[2] % src0->ne[2] == 0 && src1->ne[3] % src0->ne[3] == 0)) &&

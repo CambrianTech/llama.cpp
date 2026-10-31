@@ -513,6 +513,7 @@ extern "C" {
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
         GGML_OP_OUT_PROD,
+        GGML_OP_MUL_MAT_ID_BACK, // MUL_MAT_ID's gradient w.r.t. its activations (src1), through frozen experts
 
         GGML_OP_SCALE,
         GGML_OP_SET,
@@ -1465,6 +1466,25 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids,
             struct ggml_tensor  * expert_ptrs);
+
+    // The gradient of ggml_mul_mat_id(as, b, ids) with respect to b, through the experts held
+    // fixed (frozen, possibly quantized): the MoE half of training a LoRA on attention, whose
+    // gradient reaches earlier layers through every later expert FFN.
+    //
+    //   as:   [cols, rows, n_expert]       the forward's experts (F32, F16 or quantized)
+    //   grad: [rows, n_expert_used, n_tok] F32, the gradient of the forward's result
+    //   ids:  [n_expert_used, n_tok]       I32, the forward's routing
+    //   result: [cols, n_expert_used, n_tok] F32, one row per routed slot
+    //
+    //   result[:, i, t] = sum_r as[:, r, ids[i, t]] * grad[r, i, t]
+    //
+    // A forward whose b broadcast over the slots (b->ne[1] < n_expert_used) sums the slots back
+    // with ggml_repeat_back, so every slot row has exactly one writer.
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_back(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * grad,
+            struct ggml_tensor  * ids);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

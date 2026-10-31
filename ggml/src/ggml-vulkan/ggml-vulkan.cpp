@@ -18275,7 +18275,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
             }
         case GGML_OP_GET_ROWS_BACK:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32;
+            // the shader walks one flat index list: the 2-D form only (a batched one, a MoE's
+            // router weights, runs where it is implemented), as CUDA's supports_op says
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->ne[2] == 1 && op->ne[3] == 1;
         case GGML_OP_SET_ROWS:
             {
                 if ((op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) ||

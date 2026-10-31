@@ -49,6 +49,7 @@ void ggml_compute_forward_rms_norm_back(const struct ggml_compute_params * param
 void ggml_compute_forward_group_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_out_prod(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_mul_mat_id_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_scale(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_set(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_cpy(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -95,6 +96,14 @@ void ggml_compute_forward_flash_attn_back(const struct ggml_compute_params * par
 #define GGML_OUT_PROD_KT 32
 static inline int64_t ggml_out_prod_cpu_wsize(int64_t ne0) {
     return GGML_OUT_PROD_KT*ne0 + GGML_OUT_PROD_BN*GGML_OUT_PROD_KT;
+}
+
+// ggml_compute_forward_mul_mat_id_back's work buffer, in bytes: the routing grouped by expert
+// (a count per expert, then up to every (slot, token) pair per expert, as the forward's
+// mul_mat_id groups them), and each task's dequantized tile of GGML_OUT_PROD_KT expert rows.
+static inline size_t ggml_mul_mat_id_back_cpu_wsize(int64_t cols, int64_t n_expert, int64_t n_slots, int n_tasks) {
+    return (size_t) n_expert*sizeof(int64_t) + (size_t) n_expert*n_slots*2*sizeof(int32_t) +
+           (size_t) n_tasks*GGML_OUT_PROD_KT*cols*sizeof(float) + 2*CACHE_LINE_SIZE;
 }
 // FLASH_ATTN_BACK's blocks: BR query rows (pass 1) and BC KV positions (pass 2) share one conversion of
 // each K and V row. Its per-thread scratch, in floats; the work-size planner reserves this per task.
