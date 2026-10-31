@@ -428,7 +428,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     // [MOE-GATHER #23] pointer-table MUL_MAT_ID (src[3] = expert base-pointer table,
     // docs/serving/MOE-GATHER-MULMATID.md) is not implemented on CPU — reject so the
     // scheduler falls back rather than compute a wrong contiguous-stride result.
-    if ((op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_MUL_MAT_ID_BACK) && op->src[3] != NULL) {
+    if (op->op == GGML_OP_MUL_MAT_ID && op->src[3] != NULL) {
         return false;
     }
 

@@ -4473,7 +4473,8 @@ static void ggml_compute_forward_out_prod_converted_f32(
 //
 // dst[:, i, t] = sum_r as[:, r, ids[i, t]] * grad[r, i, t]: the activations' gradient of
 // mul_mat_id through its experts, held fixed. Task 0 groups the routed (slot, token) pairs by
-// expert, as the forward does; then each task takes whole experts, dequantizes one in tiles of
+// expert with a counting sort (count, prefix sum, fill: one entry per pair, Fable on fork #82);
+// then each task takes whole experts, dequantizes one in tiles of
 // GGML_OUT_PROD_KT rows ONCE, and adds each tile row, scaled by its gradient, into every slot
 // routed to that expert. A slot has exactly one expert, so each dst row has one writer.
 void ggml_compute_forward_mul_mat_id_back(
@@ -4501,23 +4502,40 @@ void ggml_compute_forward_mul_mat_id_back(
     GGML_ASSERT(as->type == GGML_TYPE_F32 || to_float != NULL);
 
     char *    wdata  = (char *) params->wdata;
-    int64_t * counts = (int64_t *) wdata;                    // [n_expert]
-    int32_t * routed = (int32_t *) (counts + n_expert);      // [n_expert][n_slots] of (i, t)
-    float *   tiles  = (float *) GGML_PAD((uintptr_t) (routed + n_expert*n_slots*2), CACHE_LINE_SIZE);
+    int64_t * offset = (int64_t *) wdata;                    // [n_expert + 1]: expert e's pairs
+    int32_t * routed = (int32_t *) (offset + n_expert + 1);  // [n_slots] of (i, t), by expert
+    float *   tiles  = (float *) GGML_PAD((uintptr_t) (routed + n_slots*2), CACHE_LINE_SIZE);
+
+    const auto expert_of = [&](int64_t i, int64_t t) {
+        const int32_t e = *(const int32_t *) ((const char *) ids->data + i*ids->nb[0] + t*ids->nb[1]);
+        GGML_ASSERT(e >= 0 && e < n_expert);
+        return e;
+    };
 
     if (ith == 0) {
         memset(dst->data, 0, ggml_nbytes(dst));
-        memset(counts, 0, n_expert*sizeof(int64_t));
+        memset(offset, 0, (n_expert + 1)*sizeof(int64_t));
         for (int64_t t = 0; t < n_tok; ++t) {
             for (int64_t i = 0; i < n_used; ++i) {
-                const int32_t e = *(const int32_t *) ((const char *) ids->data + i*ids->nb[0] + t*ids->nb[1]);
-                GGML_ASSERT(e >= 0 && e < n_expert);
-                int32_t * pair = routed + (e*n_slots + counts[e])*2;
-                pair[0] = (int32_t) i;
-                pair[1] = (int32_t) t;
-                counts[e]++;
+                offset[expert_of(i, t) + 1]++;
             }
         }
+        for (int64_t e = 0; e < n_expert; ++e) {
+            offset[e + 1] += offset[e];
+        }
+        // fill: offset[e] advances to the end of e's range, which is where e + 1 begins
+        for (int64_t t = 0; t < n_tok; ++t) {
+            for (int64_t i = 0; i < n_used; ++i) {
+                int32_t * pair = routed + 2*offset[expert_of(i, t)]++;
+                pair[0] = (int32_t) i;
+                pair[1] = (int32_t) t;
+            }
+        }
+        // shift back: offset[e] is again the start of e's range
+        for (int64_t e = n_expert; e > 0; --e) {
+            offset[e] = offset[e - 1];
+        }
+        offset[0] = 0;
     }
     ggml_barrier(params->threadpool);
 
@@ -4525,11 +4543,11 @@ void ggml_compute_forward_mul_mat_id_back(
     float * wt = tiles + ith*KT*cols; // [KT][cols]
 
     for (int64_t e = ith; e < n_expert; e += nth) {
-        const int64_t n_routed = counts[e];
+        const int64_t n_routed = offset[e + 1] - offset[e];
         if (n_routed == 0) {
             continue;
         }
-        const int32_t * pairs = routed + e*n_slots*2;
+        const int32_t * pairs = routed + 2*offset[e];
         for (int64_t k0 = 0; k0 < rows; k0 += KT) {
             const int64_t kt = std::min(KT, rows - k0);
             for (int64_t r = 0; r < kt; ++r) {

@@ -7340,9 +7340,11 @@ static void ggml_compute_backward(
             // (a frozen, usually quantized base): only the activations' gradient is formed, so a
             // LoRA on attention gets its whole gradient through every later expert FFN.
             GGML_ASSERT(!src0_needs_grads && "a gradient for MUL_MAT_ID's experts is not implemented: they are trained frozen");
+            // no graph builds the pointer-table gather (ggml_mul_mat_id_gather) for training;
+            // its backward is designed when one does, never computed from the plain layout
+            GGML_ASSERT(tensor->src[3] == NULL && "MUL_MAT_ID's backward through the pointer-table gather is not implemented");
             if (src1_needs_grads) {
                 struct ggml_tensor * back = ggml_mul_mat_id_back(ctx, src0, grad, tensor->src[2]);
-                back->src[3] = tensor->src[3]; // the gather's expert pointers, when the forward had them
                 if (src1->ne[1] != back->ne[1]) {
                     back = ggml_repeat_back(ctx, back, src1); // slot i read row i % n_b: sum them back
                 }
