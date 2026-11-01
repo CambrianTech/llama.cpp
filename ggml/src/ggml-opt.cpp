@@ -545,7 +545,8 @@ static int64_t ggml_opt_output_rows(ggml_opt_context_t opt_ctx) {
     return n;
 }
 
-static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
+// false (with refusal set) when the loss's gradient cannot pass through the graph
+static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
 
@@ -731,12 +732,25 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_FORWARD) {
-            return;
+            return true;
         }
     } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_FORWARD) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
-        return;
+        return true;
+    }
+
+    // Refused by the op's name before anything is built: ggml_build_backward_expand aborts on such a
+    // graph, and the M5's serving engine went down with it (the 35B-A3B's first /train met the MoE
+    // router's CLAMP, 2026-11-01).
+    {
+        const char * why = nullptr;
+        if (const ggml_tensor * node = ggml_graph_backward_refusal(opt_ctx->gf, &why)) {
+            opt_ctx->refusal = std::string("the training graph has no backward through ") + ggml_op_desc(node)
+                + " (node \"" + node->name + "\"): " + why;
+            GGML_LOG_ERROR("%s: %s\n", __func__, opt_ctx->refusal.c_str());
+            return false;
+        }
     }
 
     if (!opt_ctx->accumulators_created) {
@@ -801,7 +815,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     if (opt_ctx->buf_static) {
         if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD) {
-            return;
+            return true;
         }
     } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_GRAD) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
@@ -854,6 +868,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
+    return true;
 }
 
 ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
@@ -887,7 +902,11 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->gf = ggml_new_graph_custom(result->ctx_compute, GGML_DEFAULT_GRAPH_SIZE, /*grads =*/ true); // Forward pass.
     ggml_build_forward_expand(result->gf, result->outputs);
 
-    ggml_opt_build(result);
+    // static graphs are built here, where no request can be refused: a graph without a backward
+    // stays the caller's abort, with its reason
+    if (!ggml_opt_build(result)) {
+        GGML_ABORT("%s", result->refusal.c_str());
+    }
 
     return result;
 }
@@ -1547,7 +1566,9 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
 
     if (!opt_ctx->static_graphs) {
-        ggml_opt_build(opt_ctx);
+        if (!ggml_opt_build(opt_ctx)) {
+            return false;
+        }
 
         // Graphs built per step keep their gradient accumulators in ctx_static across graphs,
         // and the reset above found no graph to reset (gb_grad is rebuilt every step). Without
