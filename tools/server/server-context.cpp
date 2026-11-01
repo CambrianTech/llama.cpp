@@ -29,6 +29,8 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <set>
+#include <random>
 #include <utility>
 #include <fstream>
 
@@ -905,6 +907,26 @@ private:
     float   learn_lr      = 1e-4f;
     // each shadow's committed optimizer steps on this server (a snapshot records where she was)
     std::map<const llama_adapter_lora *, int64_t> learn_steps;
+    // This engine's identity for this run: minted at start, reported in /props and on every learn
+    // receipt, so a receipt from before a restart is never mistaken for this run's.
+    const std::string engine_incarnation = mint_engine_incarnation();
+    // Committed learn steps by the task that owns them (the lost-reply binding): a learn naming an
+    // execution already here is answered with its receipt and steps nothing. An entry stays until
+    // the core acknowledges it (POST /learn/receipts/ack).
+    std::map<std::string, learn_outcome> learn_receipts;
+    // /learn executions deferred behind a busy slot: in flight, not yet committed or refused
+    std::set<std::string> learn_pending;
+    // A backstop on unacknowledged receipts, not a tuned rate: the core acknowledges each receipt as
+    // it adopts it, so the table holds only steps whose adoption is in flight; at the bound, new
+    // learns are refused (receipts_full) rather than receipts dropped. ~200 bytes each.
+    static constexpr size_t LEARN_RECEIPTS_MAX = 4096;
+
+    static std::string mint_engine_incarnation() {
+        std::random_device rd;
+        char buf[33];
+        snprintf(buf, sizeof(buf), "%08x%08x%08x%08x", rd(), rd(), rd(), rd());
+        return buf;
+    }
     // LEARNING BARELY TOUCHES THE FLOW: while any other slot is working, learning may take at most
     // LEARN_DUTY of the loop's time (the step after a learn of t ms waits t*(1/LEARN_DUTY - 1) ms);
     // with every other slot idle it runs at once. Back to back, learns took the 4B's other slot from
@@ -2069,6 +2091,55 @@ private:
     // completion's own learn before its slot is released): the slot's stable set plus the shadow on
     // the reply's labelled rows, then the slot back to its whole served prompt.
     learn_outcome learn_on_slot(server_slot & slot, const learn_request & L, int64_t t0) {
+        // The lost-reply binding: every step names the task that owns it, the engine it was
+        // dispatched to, the shadow generation (its adapter load id: never reused, so an unload and
+        // restore is a new generation), the committed step it builds on and the input it learns.
+        if (L.execution.empty() || L.input.empty()) {
+            learn_outcome out;
+            out.failure = "learn needs \"execution\" (the id of the task that owns this step) and \"input\" (the revision it learns)";
+            return out;
+        }
+        if (L.engine != engine_incarnation) {
+            learn_outcome out;
+            out.failure = "stale_engine: dispatched to engine " + L.engine + ", this is " + engine_incarnation;
+            return out;
+        }
+        // A committed execution is answered from its receipt only when the request is the same
+        // step: the same generation, base and input. Anything else under that name is refused, never
+        // handed an unrelated success.
+        if (const auto it = learn_receipts.find(L.execution); it != learn_receipts.end()) {
+            const learn_outcome & r = it->second;
+            if (r.generation != L.lora_id || r.base_step != L.base_step || r.input != L.input) {
+                learn_outcome out;
+                out.failure = "execution_rebound: execution " + L.execution + " committed a different step (generation "
+                    + std::to_string(r.generation) + ", base " + std::to_string(r.base_step) + ")";
+                return out;
+            }
+            learn_outcome out = r;
+            out.replayed = true;
+            return out;
+        }
+        // The fence: a step builds on exactly the committed step the caller saw, of a generation that
+        // is still loaded. A delayed duplicate (its receipt already acknowledged and gone), or a
+        // redispatch racing the original under a new execution id, finds the shadow past its base and
+        // is refused: at most one step commits per (generation, step), with no tombstones kept. A
+        // request bound to a retired generation finds no loaded adapter and is refused below.
+        if (L.lora_id >= 0 && (size_t) L.lora_id < params_base.lora_adapters.size() && params_base.lora_adapters[L.lora_id].ptr) {
+            const auto at = learn_steps.find(params_base.lora_adapters[L.lora_id].ptr);
+            const int64_t current = at == learn_steps.end() ? 0 : at->second;
+            if (L.base_step != current) {
+                learn_outcome out;
+                out.failure = "stale_base_step: the shadow is at committed step " + std::to_string(current)
+                    + ", the step was dispatched on " + std::to_string(L.base_step);
+                out.step = current;
+                return out;
+            }
+        }
+        if (learn_receipts.size() >= LEARN_RECEIPTS_MAX) {
+            learn_outcome out;
+            out.failure = "receipts_full: acknowledge adopted receipts (POST /learn/receipts/ack) before learning more";
+            return out;
+        }
         for (const auto & other : slots) {
             if (other.id != slot.id && other.is_processing() && t0 < learn_next_us) {
                 learn_outcome out;
@@ -2079,6 +2150,15 @@ private:
             }
         }
         auto out = learn_on_slot_admitted(slot, L, t0);
+        out.execution          = L.execution;
+        out.engine_incarnation = engine_incarnation;
+        out.generation         = L.lora_id;
+        out.base_step          = L.base_step;
+        out.input              = L.input;
+        if (out.ok) {
+            out.shadow = params_base.lora_adapters[L.lora_id].path;
+            learn_receipts.emplace(L.execution, out);
+        }
         const int64_t finished = ggml_time_us();
         learn_next_us = finished + (int64_t) ((finished - t0) * (1.0/LEARN_DUTY - 1.0));
         return out;
@@ -3137,6 +3217,9 @@ private:
                     llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
                     la.prompt_prefix = buf;
                     params_base.lora_adapters.push_back(la);
+                    if (task.load_lora_step > 0) {
+                        learn_steps[la.ptr] = task.load_lora_step; // a restored generation resumes its fence at its snapshot's step
+                    }
                     SRV_INF("loaded lora adapter id=%zu path=%s (dormant)\n", params_base.lora_adapters.size() - 1, la.path.c_str());
                     auto res = std::make_unique<server_task_result_lora_change>();
                     res->id      = task.id;
@@ -3163,10 +3246,44 @@ private:
                     }
                     if (slot->is_processing()) {
                         // her slot is serving: learn between its turns, never during one
+                        if (!L.execution.empty()) {
+                            learn_pending.insert(L.execution);
+                        }
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    learn_pending.erase(L.execution);
                     res->outcome = learn_on_slot(*slot, L, t0);
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_LEARN_RECEIPT:
+                {
+                    // What became of one execution, from the loop that owns the receipts: committed
+                    // (its receipt), pending (deferred, not yet run), or unknown. Unknown is NOT proof
+                    // it never committed: acknowledgement deletes receipts. Redispatch rests on the
+                    // fence (stale_base_step / a retired generation), never on this absence.
+                    const std::string & execution = task.learn_executions.at(0);
+                    auto res = std::make_unique<server_task_result_json>();
+                    res->id = task.id;
+                    res->body = { { "execution", execution }, { "engine_incarnation", engine_incarnation } };
+                    if (const auto it = learn_receipts.find(execution); it != learn_receipts.end()) {
+                        res->body["state"]   = "committed";
+                        res->body["receipt"] = it->second.to_json();
+                    } else {
+                        res->body["state"] = learn_pending.count(execution) ? "pending" : "unknown";
+                    }
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_LEARN_RECEIPTS_ACK:
+                {
+                    // The core adopted these steps: their receipts may go.
+                    size_t released = 0;
+                    for (const auto & execution : task.learn_executions) {
+                        released += learn_receipts.erase(execution);
+                    }
+                    auto res = std::make_unique<server_task_result_json>();
+                    res->id   = task.id;
+                    res->body = { { "released", released }, { "outstanding", learn_receipts.size() } };
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SNAPSHOT_LORA:
@@ -4826,6 +4943,7 @@ server_context_meta server_context::get_meta() const {
 
     return server_context_meta {
         /* build_info             */ std::string(llama_build_info()),
+        /* engine_incarnation     */ impl->engine_incarnation,
         /* model_name             */ impl->model_name,
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
@@ -5326,6 +5444,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "bos_token",                   meta.bos_token_str },
         { "eos_token",                   meta.eos_token_str },
         { "build_info",                  meta.build_info },
+        { "engine_incarnation",          meta.engine_incarnation },
         { "is_sleeping",                 is_sleeping },
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
     };
@@ -6033,6 +6152,7 @@ void server_routes::init_routes() {
             task.id             = rd.get_new_id();
             task.load_lora      = adapter;
             task.load_lora_path = path;
+            task.load_lora_step = std::max<int64_t>(0, json_value(body, "step", (int64_t) 0));
             rd.post_task(std::move(task));
         }
         auto result = rd.next(req.should_stop);
@@ -6068,6 +6188,10 @@ void server_routes::init_routes() {
         task.learn.n_prefix = json_value(body, "n_prefix", 0);
         task.learn.lora_id  = json_value(body, "lora_id",  -1);
         task.learn.lr       = json_value(body, "lr",       1e-4f);
+        task.learn.execution = json_value(body, "execution", std::string());
+        task.learn.base_step = json_value(body, "base_step", (int64_t) -1);
+        task.learn.engine    = json_value(body, "engine", std::string());
+        task.learn.input     = json_value(body, "input", std::string());
         if (body.contains("messages")) {
             // the conversation she was served, its last message her reply (or the correction). The
             // served prompt is every earlier message through the SAME parser and template arguments
@@ -6152,6 +6276,48 @@ void server_routes::init_routes() {
         }
         res->ok(result->to_json());
         return res;
+    };
+
+    // the lost-reply binding's read and its release: one execution's state, and receipts the core adopted
+    auto learn_receipts_task = [this](const server_http_req & req, server_task_type type, std::vector<std::string> executions) {
+        auto res = create_response();
+        auto & rd = res->rd;
+        {
+            server_task task(type);
+            task.id               = rd.get_new_id();
+            task.learn_executions = std::move(executions);
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+    this->post_learn_receipt = [this, learn_receipts_task](const server_http_req & req) {
+        const json body = json::parse(req.body);
+        const std::string execution = json_value(body, "execution", std::string());
+        if (execution.empty()) {
+            auto res = create_response();
+            res->error(format_error_response("\"execution\" (the task id a learn named) is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return learn_receipts_task(req, SERVER_TASK_TYPE_LEARN_RECEIPT, { execution });
+    };
+    this->post_learn_receipts_ack = [this, learn_receipts_task](const server_http_req & req) {
+        const json body = json::parse(req.body);
+        if (!body.contains("executions") || !body.at("executions").is_array()) {
+            auto res = create_response();
+            res->error(format_error_response("\"executions\" (the adopted task ids) is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        return learn_receipts_task(req, SERVER_TASK_TYPE_LEARN_RECEIPTS_ACK, body.at("executions").get<std::vector<std::string>>());
     };
 
     this->post_lora_adapters_snapshot = [this](const server_http_req & req) {

@@ -1727,8 +1727,21 @@ json server_task_result_lora_change::to_json() {
 
 json learn_outcome::to_json() const {
     json res = { { "success", ok }, { "loss", loss }, { "n_labels", n_labels }, { "t_ms", t_ms } };
-    if (ok) {
-        res["step"] = step;
+    if (step > 0) {
+        res["step"] = step; // the shadow's committed step: after this step, or (refused stale) where it stands
+    }
+    if (!execution.empty()) {
+        res["execution"]          = execution;
+        res["engine_incarnation"] = engine_incarnation;
+        res["generation"]         = generation;
+        res["base_step"]          = base_step;
+        res["input"]              = input;
+    }
+    if (!shadow.empty()) {
+        res["shadow"] = shadow;
+    }
+    if (replayed) {
+        res["replayed"] = true;
     }
     if (deferred) {
         res["deferred"] = true;

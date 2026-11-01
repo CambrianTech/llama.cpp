@@ -15,6 +15,7 @@ struct server_context_impl; // private implementation
 
 struct server_context_meta {
     std::string build_info;
+    std::string engine_incarnation;
     std::string model_name;
     std::set<std::string> model_aliases;
     std::set<std::string> model_tags;
@@ -170,6 +171,8 @@ struct server_routes {
     server_http_context::handler_t post_lora_adapters_load;
     server_http_context::handler_t post_lora_adapters_unload;
     server_http_context::handler_t post_lora_adapters_snapshot;
+    server_http_context::handler_t post_learn_receipt;
+    server_http_context::handler_t post_learn_receipts_ack;
     server_http_context::handler_t post_learn;
     server_http_context::handler_t get_train;
     server_http_context::handler_t post_train;

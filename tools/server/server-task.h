@@ -61,6 +61,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_LOAD_LORA,
     SERVER_TASK_TYPE_UNLOAD_LORA,
     SERVER_TASK_TYPE_SNAPSHOT_LORA,
+    SERVER_TASK_TYPE_LEARN_RECEIPT,
+    SERVER_TASK_TYPE_LEARN_RECEIPTS_ACK,
     SERVER_TASK_TYPE_LEARN,
 };
 
@@ -92,6 +94,10 @@ struct learn_request {
     std::vector<llama_token> prompt;            // the served prompt, when known: her slot must hold exactly it
     int32_t                  lora_id  = -1;     // the trainable adapter (the shadow), loaded dormant
     float                    lr       = 1e-4f;
+    std::string              execution;         // the task that owns this step: its receipt's key (required)
+    int64_t                  base_step = -1;    // the shadow's committed step this step builds on (required): the fence
+    std::string              engine;            // the engine incarnation the caller dispatched to (required)
+    std::string              input;             // the input revision it learns (the experience id and cursor; required)
 };
 
 struct learn_outcome {
@@ -104,6 +110,15 @@ struct learn_outcome {
     double      t_ms     = 0.0;
     // the shadow's committed optimizer steps after this one (0 when it did not step)
     int64_t     step     = 0;
+    // the step's identity: the task that owns it, the engine incarnation that ran it, the shadow
+    // file it changed; replayed = this execution had already committed and nothing stepped now
+    std::string execution;
+    std::string engine_incarnation;
+    std::string shadow;
+    int32_t     generation = -1;   // the shadow generation: its adapter load id, never reused
+    int64_t     base_step  = -1;   // the committed step this step built on
+    std::string input;             // the input revision it learned
+    bool        replayed = false;
     json to_json() const;
 };
 
@@ -263,9 +278,13 @@ struct server_task {
     // server loop; the loop only appends it (dormant, scale 0) to the adapter list
     llama_adapter_lora * load_lora = nullptr;
     std::string          load_lora_path;
+    int64_t              load_lora_step = 0; // a restored generation's committed step (its snapshot's), seeding its fence
 
     // used by SERVER_TASK_TYPE_UNLOAD_LORA: the adapter id to retire
     int32_t unload_lora = -1;
+
+    // used by SERVER_TASK_TYPE_LEARN_RECEIPT (one id) and SERVER_TASK_TYPE_LEARN_RECEIPTS_ACK (many)
+    std::vector<std::string> learn_executions;
 
     // used by SERVER_TASK_TYPE_SNAPSHOT_LORA: the adapter id to write, and where (confined to --train-dir)
     int32_t     snapshot_lora = -1;
@@ -683,6 +702,12 @@ struct server_task_result_lora_snapshot : server_task_result {
     virtual json to_json() override {
         return { { "success", true }, { "id", lora_id }, { "path", path }, { "bytes", bytes }, { "steps", steps } };
     }
+};
+
+// A receipt lookup or acknowledgement, answered by the loop that owns the receipts.
+struct server_task_result_json : server_task_result {
+    json body;
+    virtual json to_json() override { return body; }
 };
 
 struct server_task_result_learn : server_task_result {
