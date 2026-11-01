@@ -80,7 +80,12 @@ bool llama_context::opt_fa_back_native() const {
 }
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
-    GGML_ASSERT(!opt_ctx);
+    // a serving context already configured for its first shadow: another mind's shadow is a switch
+    if (lopt_params.adapter != nullptr && !opt_minds.empty()) {
+        opt_select(lopt_params.adapter, lopt_params);
+        return;
+    }
+    GGML_ASSERT(!opt_configured());
     // The training window lives on this context, not the shared model (a serving context may
     // be running on the same weights).
     opt_n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
@@ -132,6 +137,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.optimizer       = lopt_params.optimizer_type;
     opt_ctx = ggml_opt_init(opt_params);
     ggml_opt_set_alloc_budget(opt_ctx, opt_memory_budget);
+    opt_params_base = opt_params;
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
@@ -151,6 +157,7 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
         GGML_ASSERT(n_params > 0 && "the param filter selected none of the adapter's tensors");
         // the trained adapter is the shadow: labelled rows only, never a serving row
         opt_shadow = lopt_params.adapter;
+        opt_minds.emplace(lopt_params.adapter, opt_ctx);
         LLAMA_LOG_INFO("%s: LoRA-only training: %lld adapter tensors trainable, base frozen\n", __func__, (long long) n_params);
         return;
     }
@@ -176,6 +183,63 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
         }
     }
+}
+
+// Another mind's shadow on a configured serving context. Only the active shadow's tensors are
+// parameters, so a graph never carries a parameter the active optimizer was not built with; each
+// shadow keeps its own optimizer (moments, accumulators), so a switch back resumes where it was.
+void llama_context::opt_select(const llama_adapter_lora * adapter, struct llama_opt_params lopt_params) {
+    if (adapter == opt_shadow) {
+        return;
+    }
+    const auto attached = loras->find(const_cast<llama_adapter_lora *>(adapter));
+    GGML_ASSERT(attached != loras->end() && attached->second != 0.0f && "the LoRA to train must be attached with a non-zero scale");
+    if (opt_shadow != nullptr) {
+        for (const auto & [name, ab] : opt_shadow->ab_map) {
+            ab.a->flags &= ~GGML_TENSOR_FLAG_PARAM;
+            ab.b->flags &= ~GGML_TENSOR_FLAG_PARAM;
+        }
+    }
+    int64_t n_params = 0;
+    for (const auto & [name, ab] : adapter->ab_map) {
+        GGML_ASSERT(ab.a->type == GGML_TYPE_F32 && ab.b->type == GGML_TYPE_F32 && "a trainable LoRA holds F32 A/B tensors");
+        n_params += llama_set_param(ab.a, lopt_params.param_filter, lopt_params.param_filter_ud);
+        n_params += llama_set_param(ab.b, lopt_params.param_filter, lopt_params.param_filter_ud);
+    }
+    GGML_ASSERT(n_params > 0 && "the param filter selected none of the adapter's tensors");
+    const auto mind = opt_minds.find(adapter);
+    if (mind != opt_minds.end()) {
+        opt_ctx = mind->second;
+    } else {
+        ggml_opt_params params = opt_params_base;
+        params.get_opt_pars    = lopt_params.get_opt_pars;
+        params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
+        params.optimizer       = lopt_params.optimizer_type;
+        opt_ctx = ggml_opt_init(params);
+        ggml_opt_set_alloc_budget(opt_ctx, opt_memory_budget);
+        opt_minds.emplace(adapter, opt_ctx);
+        LLAMA_LOG_INFO("%s: a new shadow's optimizer: %lld adapter tensors trainable (%zu shadows)\n", __func__,
+                (long long) n_params, opt_minds.size());
+    }
+    opt_shadow = adapter;
+}
+
+bool llama_context::opt_release(const llama_adapter_lora * adapter) {
+    const auto mind = opt_minds.find(adapter);
+    if (mind == opt_minds.end()) {
+        return false;
+    }
+    if (adapter == opt_shadow) {
+        for (const auto & [name, ab] : adapter->ab_map) {
+            ab.a->flags &= ~GGML_TENSOR_FLAG_PARAM;
+            ab.b->flags &= ~GGML_TENSOR_FLAG_PARAM;
+        }
+        opt_shadow = nullptr;
+        opt_ctx    = nullptr;
+    }
+    ggml_opt_free(mind->second);
+    opt_minds.erase(mind);
+    return true;
 }
 
 // THE WALK (Fable's design, continuum 2026-10-06; objective 2026-10-14): one pass over a window
@@ -753,6 +817,10 @@ void llama_opt_init(struct llama_context * ctx, struct llama_model * model, stru
     ctx->opt_alloc_failed.store(false);
     ctx->opt_failure.clear();
     ctx->opt_init(model, lopt_params);
+}
+
+bool llama_opt_release(struct llama_context * ctx, const struct llama_adapter_lora * adapter) {
+    return ctx->opt_release(adapter);
 }
 
 void llama_opt_stop(struct llama_context * ctx, bool stop) {

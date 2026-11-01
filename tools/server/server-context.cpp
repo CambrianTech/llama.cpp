@@ -900,9 +900,8 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
-    // LEARNING IN THE SERVING CONTEXT (SERVER_TASK_TYPE_LEARN): the shadow adapter llama_opt_init was
-    // given (one per server run for now), and the learning rate its next step reads
-    int32_t learn_lora_id = -1;
+    // LEARNING IN THE SERVING CONTEXT (SERVER_TASK_TYPE_LEARN): the learning rate the next step reads
+    // (each mind's shadow has its own optimizer in the context: llama_opt_init selects it)
     float   learn_lr      = 1e-4f;
     // LEARNING BARELY TOUCHES THE FLOW: while any other slot is working, learning may take at most
     // LEARN_DUTY of the loop's time (the step after a learn of t ms waits t*(1/LEARN_DUTY - 1) ms);
@@ -2099,9 +2098,6 @@ private:
         if (L.lora_id < 0 || (size_t) L.lora_id >= loras.size() || loras[L.lora_id].ptr == nullptr) {
             return refused("no loaded adapter " + std::to_string(L.lora_id) + " to train (POST /lora-adapters/load it first)");
         }
-        if (learn_lora_id >= 0 && learn_lora_id != L.lora_id) {
-            return refused("this server trains adapter " + std::to_string(learn_lora_id) + "; one shadow per server run");
-        }
         const int32_t n0 = L.n_prefix - 1; // the last prompt token is re-decoded with the reply's first token as its label
         if (n0 < 0 || L.n_prefix > slot.prompt.n_tokens() || L.reply.empty()) {
             return refused("slot " + std::to_string(slot.id) + " holds " + std::to_string(slot.prompt.n_tokens())
@@ -2149,7 +2145,9 @@ private:
         set[L.lora_id].scale = 1.0f;
         common_set_adapter_lora(ctx_tgt, set);
         learn_lr = L.lr;
-        if (learn_lora_id < 0) {
+        {
+            // her shadow is the trained one: its own optimizer, created the first time she learns
+            // and kept (moments and all) while other minds' shadows train in between
             llama_opt_params lopt{};
             lopt.param_filter    = llama_opt_param_filter_all;
             lopt.get_opt_pars    = learn_opt_pars;
@@ -2157,7 +2155,6 @@ private:
             lopt.optimizer_type  = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
             lopt.adapter         = loras[L.lora_id].ptr;
             llama_opt_init(ctx_tgt, model_tgt, lopt);
-            learn_lora_id = L.lora_id;
         }
         // drop what follows n0 (attention) and put her recurrent state back at n0
         if (cp != nullptr) {
@@ -3177,12 +3174,6 @@ private:
                         send_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (id == learn_lora_id) {
-                        // Optimizer moments and opt_shadow still reference this adapter's tensors.
-                        send_error(task, "LoRA adapter " + std::to_string(id) +
-                                   " is bound to the learning optimizer; unload requires optimizer teardown", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
                     llama_adapter_lora * ptr = loras[id].ptr;
                     if (loras[id].scale != 0.0f) {
                         send_error(task, "LoRA adapter " + std::to_string(id) + " is active by default (scale " +
@@ -3201,6 +3192,9 @@ private:
                     if (ptr == nullptr) {
                         break;
                     }
+                    // a shadow that learned holds an optimizer referencing its tensors: release it
+                    // first (its moments go; a snapshot is the durable form of what it learned)
+                    llama_opt_release(ctx_tgt, ptr);
                     // An idle slot that last ran with it keeps KV computed WITH the adapter;
                     // once the adapter is gone its list would read as the base's, so that
                     // cache must not be reused.
