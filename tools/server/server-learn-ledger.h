@@ -15,7 +15,8 @@
 //  - a retry or a duplicate never adds budget: every step naming the id debits the same account;
 //  - every reservation, a free (uncontended) one included, is live custody until settled;
 //  - a reservation is cancelled (its whole cost released) only before its step started; a
-//    started step settles with its measured time and committed steps, after quiescence;
+//    started step settles with its measured time and committed steps, after quiescence; it
+//    starts once, and only a started step settles;
 //  - a step that could never fit its grant's whole period is refused as such;
 //  - a step whose grant was revoked or expired after admission does not start (typed refusal);
 //  - arithmetic is checked: clocks live in an explicit domain, periods and costs are bounded, and
@@ -44,6 +45,8 @@ enum class server_learn_refusal {
     never_fits,       // the step costs more than the grant's whole period allows
     budget_exhausted, // the period's share is spent: retry_after_ms says when it renews
     started,          // cancel after the step started: it must settle with its measured time
+    not_started,      // finish before start: a step that never started has nothing measured to settle
+    already_started,  // start again: one reservation authorizes one execution
     unknown_reservation,
 };
 
@@ -149,6 +152,9 @@ public:
         if (r == reservations.end()) {
             return server_learn_refusal::unknown_reservation;
         }
+        if (r->second.started) {
+            return server_learn_refusal::already_started;
+        }
         const auto a = accounts.find(r->second.grant);
         if (a == accounts.end() || a->second.revoked || now_us >= a->second.grant.expires_at_us) {
             return server_learn_refusal::unknown_grant;
@@ -175,14 +181,20 @@ public:
         return settle(id, 0, 0, now_us, /*cancel =*/ true);
     }
 
-    // Debited time and committed steps of a live grant's current period (0 for an unknown grant).
-    int64_t used_us(const std::string & grant, int64_t now_us) {
+    // Debited time of a grant's current period, observed without changing anything: a clock
+    // outside the domain is refused, and an unknown grant reads 0.
+    server_learn_refusal used_us(const std::string & grant, int64_t now_us, int64_t & out) const {
+        if (!in_clock(now_us)) {
+            return server_learn_refusal::invalid;
+        }
         const auto it = accounts.find(grant);
         if (it == accounts.end()) {
-            return 0;
+            out = 0;
+            return server_learn_refusal::none;
         }
-        roll(it->second, now_us);
-        return it->second.used_us;
+        const account & a = it->second;
+        out = now_us >= a.period_start_us + a.grant.period_ms * 1000 ? 0 : a.used_us;
+        return server_learn_refusal::none;
     }
 
     int64_t committed_steps(const std::string & grant) const {
@@ -236,6 +248,9 @@ private:
         }
         if (cancel && r->second.started) {
             return server_learn_refusal::started;
+        }
+        if (!cancel && !r->second.started) {
+            return server_learn_refusal::not_started;
         }
         const auto a = accounts.find(r->second.grant);
         if (a != accounts.end()) {
