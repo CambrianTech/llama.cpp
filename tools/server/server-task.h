@@ -97,6 +97,7 @@ struct learn_request {
     std::string              execution;         // the task that owns this step: its receipt's key (required)
     int64_t                  base_step = -1;    // the shadow's committed step this step builds on (required): the fence
     std::string              engine;            // the engine incarnation the caller dispatched to (required)
+    std::string              input;             // the input revision it learns (the experience id and cursor; required)
 };
 
 struct learn_outcome {
@@ -114,6 +115,9 @@ struct learn_outcome {
     std::string execution;
     std::string engine_incarnation;
     std::string shadow;
+    int32_t     generation = -1;   // the shadow generation: its adapter load id, never reused
+    int64_t     base_step  = -1;   // the committed step this step built on
+    std::string input;             // the input revision it learned
     bool        replayed = false;
     json to_json() const;
 };

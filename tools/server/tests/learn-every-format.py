@@ -21,7 +21,7 @@ def fenced(lora, **extra):
     # one step's identity and fence: a fresh execution, the shadow's committed step it builds on,
     # the engine it is dispatched to. A retry of a deferred step re-sends this same dict.
     step = dict(reply="Topeka is the capital of Kansas.", lora_id=lora, lr=0.001, execution=str(uuid.uuid4()),
-                base_step=_steps.get(lora, 0), engine=ENGINE)
+                base_step=_steps.get(lora, 0), engine=ENGINE, input=f"experience-{uuid.uuid4()}")
     step.update(extra)  # a test may pin a stale base or engine
     return step
 def landed(lora, outcome):
@@ -90,14 +90,30 @@ if "--receipts" in sys.argv:
     assert not stale_engine["success"] and stale_engine["failure"].startswith("stale_engine"), stale_engine
     unnamed = {k: v for k, v in fenced(sid).items() if k != "execution"}
     assert "execution" in json.loads(raw("/completion", turn(unnamed)))["learn"]["failure"]
+    # the same execution re-sent with any bound field changed is refused, never an unrelated success
+    for change in ({"input": "another-experience"}, {"base_step": first_step["base_step"] + 7}, {"lora_id": sid + 1000}):
+        rebound = json.loads(raw("/completion", turn(dict(first_step, **change))))["learn"]
+        assert not rebound["success"] and rebound["failure"].startswith("execution_rebound"), (change, rebound)
     ack = json.loads(raw("/learn/receipts/ack", {"executions": [first_step["execution"]]}))
     assert ack["released"] == 1 and ack["outstanding"] == 0, ack
     # its receipt is gone: the delayed duplicate is refused by the shadow's step, not run again
     late = json.loads(raw("/completion", turn(first_step)))["learn"]
     assert not late["success"] and late["failure"].startswith("stale_base_step"), late
     nxt = landed(sid, json.loads(raw("/completion", turn(fenced(sid))))["learn"])
-    assert nxt["success"] and nxt["step"] == 2, nxt
-    print(json.dumps({"first": first, "replay": replay, "stale_base": stale_base["failure"], "late_duplicate": late["failure"], "next": nxt["step"]}))
+    assert nxt["success"] and nxt["step"] == 2 and nxt["generation"] == sid, nxt
+    # unload and restore: a new generation (a new load id); a delayed request of the old generation,
+    # its receipt acknowledged, is refused and steps nothing
+    old_gen_step = fenced(sid)
+    raw("/learn/receipts/ack", {"executions": [nxt["execution"]]})
+    raw("/lora-adapters/unload", {"id": sid})
+    restored = json.loads(raw("/lora-adapters/load", {"name": "shadow-05.gguf", "step": 2}))["id"]
+    assert restored != sid, (restored, sid)
+    stale_gen = json.loads(raw("/completion", turn(old_gen_step)))["learn"]
+    assert not stale_gen["success"] and "no loaded adapter" in stale_gen["failure"], stale_gen
+    resumed = landed(restored, json.loads(raw("/completion", turn(dict(fenced(restored), base_step=2))))["learn"])
+    assert resumed["success"] and resumed["step"] == 3 and resumed["generation"] == restored, resumed
+    print(json.dumps({"first": first, "replay": replay, "stale_base": stale_base["failure"], "late_duplicate": late["failure"],
+                      "next": nxt["step"], "stale_generation": stale_gen["failure"], "resumed": resumed["step"]}))
     sys.exit(0)
 
 # Two minds on one serving context: each shadow keeps its own optimizer while the other learns in
@@ -137,7 +153,7 @@ if "--template-replies" in sys.argv:
         raw("/v1/chat/completions", request)
         step = fenced(sid)
         experience = dict(request, messages=messages + [reply], lora_id=sid, lr=step["lr"],
-                          execution=step["execution"], base_step=step["base_step"], engine=ENGINE)
+                          execution=step["execution"], base_step=step["base_step"], engine=ENGINE, input=step["input"])
         expect_refusal = bool(reply.get("reasoning_content")) and "--expect-reasoning-refusal" in sys.argv
         try:
             outcome = json.loads(raw("/learn", experience))
@@ -159,7 +175,8 @@ if "--template-replies" in sys.argv:
         print(json.dumps({"template_reply": "tool_calls" if "tool_calls" in reply else "reasoning" if reply.get("reasoning_content") else "text", "outcome": outcome}))
     try:
         raw("/learn", {"messages": messages + [{"role": "assistant", "content": ""}], "id_slot": 0, "lora_id": sid,
-                       "execution": str(uuid.uuid4()), "base_step": _steps.get(sid, 0), "engine": ENGINE})
+                       "execution": str(uuid.uuid4()), "base_step": _steps.get(sid, 0), "engine": ENGINE,
+                       "input": f"experience-{uuid.uuid4()}"})
         raise AssertionError("empty assistant reply was accepted")
     except urllib.error.HTTPError as error:
         assert error.code == 400, error
