@@ -903,6 +903,8 @@ private:
     // LEARNING IN THE SERVING CONTEXT (SERVER_TASK_TYPE_LEARN): the learning rate the next step reads
     // (each mind's shadow has its own optimizer in the context: llama_opt_init selects it)
     float   learn_lr      = 1e-4f;
+    // each shadow's committed optimizer steps on this server (a snapshot records where she was)
+    std::map<const llama_adapter_lora *, int64_t> learn_steps;
     // LEARNING BARELY TOUCHES THE FLOW: while any other slot is working, learning may take at most
     // LEARN_DUTY of the loop's time (the step after a learn of t ms waits t*(1/LEARN_DUTY - 1) ms);
     // with every other slot idle it runs at once. Back to back, learns took the 4B's other slot from
@@ -2207,6 +2209,7 @@ private:
         slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & c) { return c.n_tokens > n_keep; });
         learn_outcome out;
         out.ok       = ok;
+        out.step     = ok ? ++learn_steps[loras[L.lora_id].ptr] : 0;
         out.failure  = ok ? "" : llama_opt_failure(ctx_tgt);
         out.loss     = loss;
         out.n_labels = (int32_t) toks.size() - 1;
@@ -3166,6 +3169,44 @@ private:
                     res->outcome = learn_on_slot(*slot, L, t0);
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SNAPSHOT_LORA:
+                {
+                    // Between steps on the loop, so the file is one whole step's weights, never a
+                    // half-applied update. Written beside its name and renamed into place, and
+                    // never over an existing file: a snapshot is immutable.
+                    auto & loras = params_base.lora_adapters;
+                    const int32_t id = task.snapshot_lora;
+                    if (id < 0 || (size_t) id >= loras.size() || loras[id].ptr == nullptr) {
+                        send_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    std::error_code ec;
+                    if (std::filesystem::exists(task.snapshot_path, ec)) {
+                        send_error(task, "a snapshot is immutable: " + task.snapshot_path + " already exists", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    const std::string partial = task.snapshot_path + ".partial";
+                    if (llama_adapter_lora_save(loras[id].ptr, partial.c_str()) != 0) {
+                        std::filesystem::remove(partial, ec);
+                        send_error(task, "could not write the snapshot of adapter " + std::to_string(id), ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    std::filesystem::rename(partial, task.snapshot_path, ec);
+                    if (ec) {
+                        std::filesystem::remove(partial, ec);
+                        send_error(task, "could not place the snapshot at " + task.snapshot_path, ERROR_TYPE_SERVER);
+                        break;
+                    }
+                    auto res = std::make_unique<server_task_result_lora_snapshot>();
+                    res->id      = task.id;
+                    res->lora_id = id;
+                    res->path    = task.snapshot_path;
+                    res->bytes   = (int64_t) std::filesystem::file_size(task.snapshot_path, ec);
+                    const auto steps = learn_steps.find(loras[id].ptr);
+                    res->steps   = steps == learn_steps.end() ? 0 : steps->second;
+                    SRV_INF("snapshot of lora adapter id=%d at %lld steps: %s\n", id, (long long) res->steps, res->path.c_str());
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_UNLOAD_LORA:
                 {
                     auto & loras = params_base.lora_adapters;
@@ -3195,6 +3236,7 @@ private:
                     // a shadow that learned holds an optimizer referencing its tensors: release it
                     // first (its moments go; a snapshot is the durable form of what it learned)
                     llama_opt_release(ctx_tgt, ptr);
+                    learn_steps.erase(ptr);
                     // An idle slot that last ran with it keeps KV computed WITH the adapter;
                     // once the adapter is gone its list would read as the base's, so that
                     // cache must not be reused.
@@ -6099,6 +6141,37 @@ void server_routes::init_routes() {
         auto & rd = res->rd;
         task.id = rd.get_new_id();
         rd.post_task(std::move(task));
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_lora_adapters_snapshot = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+        const std::string name = json_value(body, "name", std::string());
+        const std::string path = confine_out(params.train_dir, name);
+        if (!body.contains("id") || !body.at("id").is_number_integer() || params.train_dir.empty() || path.empty()) {
+            res->error(format_error_response("\"id\" (an integer adapter id) and \"name\" (a bare file name ending in .gguf "
+                                             "inside the server's --train-dir) are required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_SNAPSHOT_LORA);
+            task.id            = rd.get_new_id();
+            task.snapshot_lora = body.at("id").get<int32_t>();
+            task.snapshot_path = path;
+            rd.post_task(std::move(task));
+        }
         auto result = rd.next(req.should_stop);
         if (!result) {
             GGML_ASSERT(req.should_stop());
