@@ -27,15 +27,33 @@ if "--shadow-retirement" in sys.argv:
     turn = {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0, "learn": learn}
     first = json.loads(raw("/completion", turn))
     assert first["learn"]["success"], first
-    try:
-        raw("/lora-adapters/unload", {"id": sid})
-        raise AssertionError("optimizer-bound shadow was unloaded")
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode()
-        assert error.code == 400 and "bound to the learning optimizer" in detail, (error.code, detail)
+    # a shadow that learned unloads too: its optimizer is released first (its moments go)
+    bound = json.loads(raw("/lora-adapters/unload", {"id": sid}))
+    assert bound["success"] and bound["retired"] and bound["id"] == sid, bound
+    sid = json.loads(raw("/lora-adapters/load", {"name": "shadow-05.gguf"}))["id"]
+    learn["lora_id"] = sid
     following = json.loads(raw("/completion", turn))
     assert following["learn"]["success"], following
-    print(json.dumps({"unbound_retired": retired, "bound_retirement_refused": sid, "next_learn": following["learn"]}))
+    print(json.dumps({"unbound_retired": retired, "bound_retired": bound, "next_learn": following["learn"]}))
+    sys.exit(0)
+
+# Two minds on one serving context: each shadow keeps its own optimizer while the other learns in
+# between (needs shadow-05.gguf and a copy of it, shadow-06.gguf, in --train-dir).
+if "--two-minds" in sys.argv:
+    other = json.loads(raw("/lora-adapters/load", {"name": "shadow-06.gguf"}))["id"]
+    steps = []
+    for lora in [sid, other, sid, other]:
+        turn = {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0,
+                "learn": dict(learn, lora_id=lora)}
+        out = json.loads(raw("/completion", turn))
+        assert out["learn"]["success"], out
+        steps.append((lora, out["learn"]["loss"]))
+    # the two shadows start from the same file, so they are independent only if their trajectories
+    # match: the other mind's first step is untouched by this one's step, and each second step
+    # continues its own optimizer (a shared optimizer or shared weights would split them)
+    assert abs(steps[0][1] - steps[1][1]) < 1e-6 and abs(steps[2][1] - steps[3][1]) < 1e-6, steps
+    assert steps[2][1] < steps[0][1], steps
+    print(json.dumps({"steps": steps}))
     sys.exit(0)
 
 # Isolated template/label regression; never run this shadow-adapter fixture on a persona lane.
