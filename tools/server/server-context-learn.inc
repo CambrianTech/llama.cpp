@@ -37,9 +37,6 @@
         if (L.lora_id < 0 || (size_t) L.lora_id >= loras.size() || loras[L.lora_id].ptr == nullptr) {
             return refused("no loaded adapter " + std::to_string(L.lora_id) + " to train (POST /lora-adapters/load it first)");
         }
-        if (learn_lora_id >= 0 && learn_lora_id != L.lora_id) {
-            return refused("this server trains adapter " + std::to_string(learn_lora_id) + "; one shadow per server run");
-        }
         const int32_t n0 = L.n_prefix - 1; // the last prompt token is re-decoded with the reply's first token as its label
         if (n0 < 0 || L.n_prefix > slot.prompt.n_tokens() || L.reply.empty()) {
             return refused("slot " + std::to_string(slot.id) + " holds " + std::to_string(slot.prompt.n_tokens())
@@ -87,15 +84,21 @@
         set[L.lora_id].scale = 1.0f;
         common_set_adapter_lora(ctx_tgt, set);
         learn_lr = L.lr;
-        if (learn_lora_id < 0) {
+        {
+            // her shadow is the trained one: its own optimizer, created the first time she learns
+            // and kept (moments and all) while other minds' shadows train in between
             llama_opt_params lopt{};
             lopt.param_filter    = llama_opt_param_filter_all;
             lopt.get_opt_pars    = learn_opt_pars;
             lopt.get_opt_pars_ud = &learn_lr;
             lopt.optimizer_type  = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
             lopt.adapter         = loras[L.lora_id].ptr;
-            llama_opt_init(ctx_tgt, model_tgt, lopt);
-            learn_lora_id = L.lora_id;
+            if (!llama_opt_init(ctx_tgt, model_tgt, lopt)) {
+                // refused before anything was trained or decoded: her own adapter set again, her
+                // slot untouched, and the server keeps serving
+                common_set_adapter_lora(ctx_tgt, slot.lora);
+                return refused("adapter " + std::to_string(L.lora_id) + " cannot be trained: " + llama_opt_failure(ctx_tgt));
+            }
         }
         // drop what follows n0 (attention) and put her recurrent state back at n0
         if (cp != nullptr) {
@@ -107,7 +110,7 @@
             served_tokens.data() + n0, (int32_t) served_tokens.size() - n0, result);
         common_set_adapter_lora(ctx_tgt, slot.lora);
         learning = std::unique_ptr<pending_learn>(new pending_learn{ &slot, cp, std::move(set), result,
-            toks[0], L.n_prefix, (int32_t) toks.size() - 1, t0 });
+            toks[0], L.n_prefix, (int32_t) toks.size() - 1, loras[L.lora_id].ptr, t0 });
         learning->began = begun;
         if (!begun) {
             learning->finished = false;
