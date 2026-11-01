@@ -546,7 +546,8 @@ task_params eval_llama_cmpl_schema(
         f->eval(ctx, data);
     }
 
-    // learn a reply on this request's slot before it is released: {"reply": text, "lora_id", "lr"};
+    // learn a reply on this request's slot before it is released: {"reply": text, "lora_id", "lr",
+    // "execution", "base_step", "engine"} (the step's identity and fence, required);
     // the reply is learned as the tokens the model would generate after this prompt (its text, then
     // the end of the turn)
     if (data.contains("learn")) {
@@ -557,6 +558,9 @@ task_params eval_llama_cmpl_schema(
         learn_request L;
         L.lora_id = json_value(l, "lora_id", -1);
         L.lr      = json_value(l, "lr", 1e-4f);
+        L.execution = json_value(l, "execution", std::string());
+        L.base_step = json_value(l, "base_step", (int64_t) -1);
+        L.engine    = json_value(l, "engine", std::string());
         L.reply   = common_tokenize(vocab, l.at("reply").get<std::string>(), false, true);
         L.reply.push_back(llama_vocab_eot(vocab) != LLAMA_TOKEN_NULL ? llama_vocab_eot(vocab) : llama_vocab_eos(vocab));
         params.learn = std::move(L);
