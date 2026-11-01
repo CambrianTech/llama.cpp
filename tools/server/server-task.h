@@ -60,6 +60,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,
     SERVER_TASK_TYPE_UNLOAD_LORA,
+    SERVER_TASK_TYPE_SNAPSHOT_LORA,
     SERVER_TASK_TYPE_LEARN,
 };
 
@@ -101,6 +102,8 @@ struct learn_outcome {
     double      loss     = 0.0;
     int32_t     n_labels = 0;
     double      t_ms     = 0.0;
+    // the shadow's committed optimizer steps after this one (0 when it did not step)
+    int64_t     step     = 0;
     json to_json() const;
 };
 
@@ -263,6 +266,10 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_UNLOAD_LORA: the adapter id to retire
     int32_t unload_lora = -1;
+
+    // used by SERVER_TASK_TYPE_SNAPSHOT_LORA: the adapter id to write, and where (confined to --train-dir)
+    int32_t     snapshot_lora = -1;
+    std::string snapshot_path;
 
     // used by SERVER_TASK_TYPE_LEARN
     learn_request learn;
@@ -665,6 +672,17 @@ struct server_task_result_lora_change : server_task_result {
     std::string path;
     bool        loaded  = true;
     virtual json to_json() override;
+};
+
+// A shadow written to an immutable file between steps: what she had learned at `steps`.
+struct server_task_result_lora_snapshot : server_task_result {
+    int32_t     lora_id = -1;
+    std::string path;
+    int64_t     bytes   = 0;
+    int64_t     steps   = 0;
+    virtual json to_json() override {
+        return { { "success", true }, { "id", lora_id }, { "path", path }, { "bytes", bytes }, { "steps", steps } };
+    }
 };
 
 struct server_task_result_learn : server_task_result {
