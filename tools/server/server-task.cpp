@@ -1733,6 +1733,9 @@ json learn_outcome::to_json() const {
     if (!execution.empty()) {
         res["execution"]          = execution;
         res["engine_incarnation"] = engine_incarnation;
+        res["generation"]         = generation;
+        res["base_step"]          = base_step;
+        res["input"]              = input;
     }
     if (!shadow.empty()) {
         res["shadow"] = shadow;

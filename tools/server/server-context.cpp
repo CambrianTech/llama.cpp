@@ -2091,27 +2091,39 @@ private:
     // completion's own learn before its slot is released): the slot's stable set plus the shadow on
     // the reply's labelled rows, then the slot back to its whole served prompt.
     learn_outcome learn_on_slot(server_slot & slot, const learn_request & L, int64_t t0) {
-        // the lost-reply binding: every step names the task that owns it, and a step already
-        // committed under that name is answered from its receipt, never stepped twice
-        if (L.execution.empty()) {
+        // The lost-reply binding: every step names the task that owns it, the engine it was
+        // dispatched to, the shadow generation (its adapter load id: never reused, so an unload and
+        // restore is a new generation), the committed step it builds on and the input it learns.
+        if (L.execution.empty() || L.input.empty()) {
             learn_outcome out;
-            out.failure = "learn needs \"execution\": the id of the task that owns this step (its receipt's key)";
+            out.failure = "learn needs \"execution\" (the id of the task that owns this step) and \"input\" (the revision it learns)";
             return out;
         }
-        if (const auto it = learn_receipts.find(L.execution); it != learn_receipts.end()) {
-            learn_outcome out = it->second;
-            out.replayed = true;
-            return out;
-        }
-        // The fence: a step builds on exactly the shadow generation and committed step the caller
-        // saw, on this engine. A delayed duplicate (its receipt already acknowledged and gone), or a
-        // redispatch racing the original under a new execution id, finds the shadow past its base and
-        // is refused: at most one step commits per (shadow generation, step), with no tombstones kept.
         if (L.engine != engine_incarnation) {
             learn_outcome out;
             out.failure = "stale_engine: dispatched to engine " + L.engine + ", this is " + engine_incarnation;
             return out;
         }
+        // A committed execution is answered from its receipt only when the request is the same
+        // step: the same generation, base and input. Anything else under that name is refused, never
+        // handed an unrelated success.
+        if (const auto it = learn_receipts.find(L.execution); it != learn_receipts.end()) {
+            const learn_outcome & r = it->second;
+            if (r.generation != L.lora_id || r.base_step != L.base_step || r.input != L.input) {
+                learn_outcome out;
+                out.failure = "execution_rebound: execution " + L.execution + " committed a different step (generation "
+                    + std::to_string(r.generation) + ", base " + std::to_string(r.base_step) + ")";
+                return out;
+            }
+            learn_outcome out = r;
+            out.replayed = true;
+            return out;
+        }
+        // The fence: a step builds on exactly the committed step the caller saw, of a generation that
+        // is still loaded. A delayed duplicate (its receipt already acknowledged and gone), or a
+        // redispatch racing the original under a new execution id, finds the shadow past its base and
+        // is refused: at most one step commits per (generation, step), with no tombstones kept. A
+        // request bound to a retired generation finds no loaded adapter and is refused below.
         if (L.lora_id >= 0 && (size_t) L.lora_id < params_base.lora_adapters.size() && params_base.lora_adapters[L.lora_id].ptr) {
             const auto at = learn_steps.find(params_base.lora_adapters[L.lora_id].ptr);
             const int64_t current = at == learn_steps.end() ? 0 : at->second;
@@ -2140,6 +2152,9 @@ private:
         auto out = learn_on_slot_admitted(slot, L, t0);
         out.execution          = L.execution;
         out.engine_incarnation = engine_incarnation;
+        out.generation         = L.lora_id;
+        out.base_step          = L.base_step;
+        out.input              = L.input;
         if (out.ok) {
             out.shadow = params_base.lora_adapters[L.lora_id].path;
             learn_receipts.emplace(L.execution, out);
@@ -3244,7 +3259,9 @@ private:
             case SERVER_TASK_TYPE_LEARN_RECEIPT:
                 {
                     // What became of one execution, from the loop that owns the receipts: committed
-                    // (its receipt), pending (deferred, not yet run), or neither in THIS incarnation.
+                    // (its receipt), pending (deferred, not yet run), or unknown. Unknown is NOT proof
+                    // it never committed: acknowledgement deletes receipts. Redispatch rests on the
+                    // fence (stale_base_step / a retired generation), never on this absence.
                     const std::string & execution = task.learn_executions.at(0);
                     auto res = std::make_unique<server_task_result_json>();
                     res->id = task.id;
@@ -6174,6 +6191,7 @@ void server_routes::init_routes() {
         task.learn.execution = json_value(body, "execution", std::string());
         task.learn.base_step = json_value(body, "base_step", (int64_t) -1);
         task.learn.engine    = json_value(body, "engine", std::string());
+        task.learn.input     = json_value(body, "input", std::string());
         if (body.contains("messages")) {
             // the conversation she was served, its last message her reply (or the correction). The
             // served prompt is every earlier message through the SAME parser and template arguments
