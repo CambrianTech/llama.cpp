@@ -17,8 +17,11 @@
 //  - a reservation is cancelled (its whole cost released) only before its step started; a
 //    started step settles with its measured time and committed steps, after quiescence;
 //  - a step that could never fit its grant's whole period is refused as such;
-//  - arithmetic is checked: an out-of-range field is a typed refusal, never an overflow.
+//  - a step whose grant was revoked or expired after admission does not start (typed refusal);
+//  - arithmetic is checked: clocks live in an explicit domain, periods and costs are bounded, and
+//    accumulated time and steps are checked before they change: a typed refusal, never a wrap.
 
+#include <climits>
 #include <cstdint>
 #include <iterator>
 #include <map>
@@ -56,13 +59,19 @@ public:
     // product and sum below stays in range (1 day of ms x 1e6 ppm, and 1 day of us).
     static constexpr int64_t kMaxPeriodMs = 86400000;
     static constexpr int64_t kMaxCostUs   = 86400000000;
+    // The accepted engine clock domain (us since the engine's epoch): with periods <= 1 day, every
+    // sum of a clock value and a period stays below INT64_MAX. The core translates its own expiry
+    // into this clock; a wall-clock time interpreted as engine time is its bug, not this ledger's.
+    static constexpr int64_t kMaxClockUs = int64_t(1) << 62;
+    // One settlement commits at most this many optimizer steps.
+    static constexpr int64_t kMaxStepsPerSettle = int64_t(1) << 20;
 
     explicit server_learn_ledger(std::string engine) : engine(std::move(engine)) {}
 
     // The authority registers (or re-confirms) a grant.
     server_learn_refusal register_grant(const server_learn_grant & g, int64_t now_us) {
-        if (g.id.empty() || g.period_ms <= 0 || g.period_ms > kMaxPeriodMs || g.share_ppm < 1 || g.share_ppm > 1000000 ||
-                g.expires_at_us <= now_us) {
+        if (!in_clock(now_us) || g.id.empty() || g.period_ms <= 0 || g.period_ms > kMaxPeriodMs || g.share_ppm < 1 ||
+                g.share_ppm > 1000000 || g.expires_at_us <= now_us || !in_clock(g.expires_at_us)) {
             return server_learn_refusal::invalid;
         }
         if (g.engine != engine) {
@@ -85,6 +94,9 @@ public:
 
     // The authority ends a grant. Its account goes once its last reservation settles.
     void revoke(const std::string & id, int64_t now_us) {
+        if (!in_clock(now_us)) {
+            return;
+        }
         const auto it = accounts.find(id);
         if (it != accounts.end()) {
             it->second.revoked = true;
@@ -97,7 +109,7 @@ public:
     // without a debit but is still a live reservation.
     server_learn_admission admit(const std::string & grant, int64_t est_us, int64_t now_us, bool contended) {
         server_learn_admission out;
-        if (est_us < 0 || est_us > kMaxCostUs) {
+        if (est_us < 0 || est_us > kMaxCostUs || !in_clock(now_us)) {
             out.refusal = server_learn_refusal::invalid;
             return out;
         }
@@ -126,20 +138,30 @@ public:
         return out;
     }
 
-    // The step began executing: from here it settles only with its measured time.
-    bool start(uint64_t id) {
+    // The step begins executing: from here it settles only with its measured time. Refused when its
+    // grant was revoked or expired after admission (unknown_grant): the reservation stays held, so
+    // the caller cancels it (it never ran) and nothing is erased silently.
+    server_learn_refusal start(uint64_t id, int64_t now_us) {
+        if (!in_clock(now_us)) {
+            return server_learn_refusal::invalid;
+        }
         const auto r = reservations.find(id);
         if (r == reservations.end()) {
-            return false;
+            return server_learn_refusal::unknown_reservation;
+        }
+        const auto a = accounts.find(r->second.grant);
+        if (a == accounts.end() || a->second.revoked || now_us >= a->second.grant.expires_at_us) {
+            return server_learn_refusal::unknown_grant;
         }
         r->second.started = true;
-        return true;
+        return server_learn_refusal::none;
     }
 
     // The step quiesced after measured_us with committed_steps optimizer steps: debit the measured
     // time (when it was admitted contended) and release the rest of its reservation.
     server_learn_refusal finish(uint64_t id, int64_t measured_us, int64_t committed_steps, int64_t now_us) {
-        if (measured_us < 0 || measured_us > kMaxCostUs || committed_steps < 0) {
+        if (measured_us < 0 || measured_us > kMaxCostUs || committed_steps < 0 || committed_steps > kMaxStepsPerSettle ||
+                !in_clock(now_us)) {
             return server_learn_refusal::invalid;
         }
         return settle(id, measured_us, committed_steps, now_us, /*cancel =*/ false);
@@ -147,6 +169,9 @@ public:
 
     // The step never ran: its whole reservation returns. Refused once it started.
     server_learn_refusal cancel(uint64_t id, int64_t now_us) {
+        if (!in_clock(now_us)) {
+            return server_learn_refusal::invalid;
+        }
         return settle(id, 0, 0, now_us, /*cancel =*/ true);
     }
 
@@ -186,6 +211,10 @@ private:
         bool        started;
     };
 
+    static bool in_clock(int64_t t) {
+        return t >= 0 && t <= kMaxClockUs;
+    }
+
     // share_ppm of period_ms, in us: in range by kMaxPeriodMs x 1e6 (8.64e13)
     static int64_t budget_us(const server_learn_grant & g) {
         return g.period_ms * g.share_ppm / 1000;
@@ -210,12 +239,15 @@ private:
         }
         const auto a = accounts.find(r->second.grant);
         if (a != accounts.end()) {
+            roll(a->second, now_us);
+            const int64_t debit = r->second.contended ? measured_us : 0;
+            // checked before anything changes: a sum past INT64_MAX is refused, never wrapped
+            if (a->second.used_us > INT64_MAX - debit || a->second.steps > INT64_MAX - committed) {
+                return server_learn_refusal::invalid;
+            }
             a->second.reserved_us -= r->second.cost_us;
             a->second.outstanding -= 1;
-            roll(a->second, now_us);
-            if (r->second.contended) {
-                a->second.used_us += measured_us;
-            }
+            a->second.used_us += debit;
             a->second.steps += committed;
         }
         reservations.erase(r);

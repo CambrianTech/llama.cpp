@@ -3,6 +3,7 @@
 // free reservations as live custody, cancel only before start, checked ranges, bounded accounts.
 #include "../tools/server/server-learn-ledger.h"
 
+#include <climits>
 #include <cstdlib>
 #include <iostream>
 
@@ -45,7 +46,7 @@ int main() {
     require(a2.refusal == R::budget_exhausted && a2.retry_after_ms == 999, "reserved time counts against the share");
 
     // started: it settles with what it measured, never cancels
-    require(ledger.start(a1.reservation), "start");
+    require(ledger.start(a1.reservation, 1000) == R::none, "start");
     require(ledger.cancel(a1.reservation, 30000) == R::started, "a started step cannot be cancelled");
     require(ledger.finish(a1.reservation, 30000, 1, 40000) == R::none, "it settles after quiescence");
     require(ledger.used_us("grant-1", 40000) == 30000 && ledger.committed_steps("grant-1") == 1, "debit and steps measured");
@@ -68,17 +69,42 @@ int main() {
     ledger.revoke("grant-1", 46000);
     require(ledger.n_accounts() == 1, "a live free reservation keeps its account through revocation");
     require(ledger.admit("grant-1", 1, 47000, true).refusal == R::unknown_grant, "a revoked grant admits nothing new");
-    require(ledger.start(free_step.reservation) && ledger.finish(free_step.reservation, 500000, 1, 3 * 1000000) == R::none,
-            "the outstanding step settles long after");
+    require(ledger.start(free_step.reservation, 46500) == R::unknown_grant, "a revoked grant's reservation does not start");
+    require(ledger.cancel(free_step.reservation, 3 * 1000000) == R::none, "it never ran: cancelled, custody released");
     require(ledger.n_accounts() == 0, "then the revoked account goes");
+
+    // admitted, then the grant expires before the step starts: refused, cancellable
+    require(ledger.register_grant({ "brief", "engine-a", 1000, 100000, 3500000 }, 3000000) == R::none, "a brief grant");
+    const auto late = ledger.admit("brief", 1000, 3100000, true);
+    require(late.refusal == R::none, "admitted before expiry");
+    require(ledger.start(late.reservation, 3600000) == R::unknown_grant, "expired before start: refused");
+    require(ledger.cancel(late.reservation, 3600000) == R::none, "and cancelled, never erased silently");
+
+    // a started step still settles after its grant ends
+    require(ledger.register_grant({ "ending", "engine-a", 1000, 100000, 3900000 }, 3700000) == R::none, "an ending grant");
+    const auto running = ledger.admit("ending", 1000, 3700000, true);
+    require(ledger.start(running.reservation, 3700000) == R::none, "started while live");
+    require(ledger.finish(running.reservation, 1000, 1, 4000000) == R::none, "settles after the grant expired");
+
+    // the clock domain and the per-settle step bound are explicit, checked refusals
+    require(ledger.admit("grant-x", 1, -1, true).refusal == R::invalid, "a negative clock");
+    require(ledger.admit("grant-x", 1, server_learn_ledger::kMaxClockUs + 1, true).refusal == R::invalid, "a clock past the domain");
+    require(ledger.register_grant({ "far", "engine-a", 1000, 100000, server_learn_ledger::kMaxClockUs + 1 }, 4000000) == R::invalid,
+            "an expiry past the domain");
+    require(ledger.register_grant({ "steps", "engine-a", 1000, 100000, day_us }, 4000000) == R::none, "steps grant");
+    const auto big = ledger.admit("steps", 1, 4000000, true);
+    require(ledger.start(big.reservation, 4000000) == R::none, "start");
+    require(ledger.finish(big.reservation, 1, INT64_MAX, 4000001) == R::invalid, "INT64_MAX steps in one settle is refused, not wrapped");
+    require(ledger.finish(big.reservation, 1, 1, 4000001) == R::none, "a valid settle still lands");
 
     // bounded without idleness eviction: an expired grant with nothing outstanding goes at the
     // next registration, and a live idle one stays (its terms cannot be reset)
-    require(ledger.register_grant({ "short", "engine-a", 1000, 100000, 2000000 }, 1000000) == R::none, "short grant");
-    require(ledger.register_grant({ "idle", "engine-a", 1000, 100000, day_us }, 1000000) == R::none, "idle grant");
-    require(ledger.register_grant({ "next", "engine-a", 1000, 100000, day_us }, 5000000) == R::none, "a later registration");
-    require(ledger.n_accounts() == 2, "the expired grant is gone, the idle live one stays");
-    require(ledger.register_grant({ "idle", "engine-a", 1000, 500000, day_us }, 9000000) == R::grant_mismatch,
+    server_learn_ledger fresh("engine-a");
+    require(fresh.register_grant({ "short", "engine-a", 1000, 100000, 2000000 }, 1000000) == R::none, "short grant");
+    require(fresh.register_grant({ "idle", "engine-a", 1000, 100000, day_us }, 1000000) == R::none, "idle grant");
+    require(fresh.register_grant({ "next", "engine-a", 1000, 100000, day_us }, 5000000) == R::none, "a later registration");
+    require(fresh.n_accounts() == 2, "the expired grant is gone, the idle live one stays");
+    require(fresh.register_grant({ "idle", "engine-a", 1000, 500000, day_us }, 9000000) == R::grant_mismatch,
             "an idle live grant keeps its terms");
 
     std::cout << "test-server-learn-ledger: OK\n";
