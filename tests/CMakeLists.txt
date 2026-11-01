@@ -6,6 +6,12 @@ target_compile_features(test-server-prefill PRIVATE cxx_std_17)
 add_test(NAME test-server-prefill COMMAND test-server-prefill)
 set_tests_properties(test-server-prefill PROPERTIES LABELS "main")
 
+# Model-free learning-budget validator: the ledger every learning step debits.
+add_executable(test-server-learn-ledger test-server-learn-ledger.cpp)
+target_compile_features(test-server-learn-ledger PRIVATE cxx_std_17)
+add_test(NAME test-server-learn-ledger COMMAND test-server-learn-ledger)
+set_tests_properties(test-server-learn-ledger PROPERTIES LABELS "main")
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
