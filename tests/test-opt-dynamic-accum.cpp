@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
@@ -374,11 +375,67 @@ static void run_label_projection(bool projected) {
     ggml_backend_sched_free(sched);
     ggml_backend_free(cpu);
 }
+// what this catches: a training graph the loss's gradient cannot pass through (here an in-place
+// clamp, a view with no backward) must refuse ggml_opt_alloc by the op's name, not abort: the
+// abort took the M5's serving engine down on the 35B-A3B's first /train (2026-11-01). The same
+// context then trains a graph it can differentiate.
+static void run_refuses_graph_without_backward() {
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    CHECK(cpu != nullptr);
+    ggml_backend_t backends[] = { cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+
+    ggml_init_params sp = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx_static = ggml_init(sp);
+    ggml_tensor * w = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
+    ggml_set_param(w);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, cpu);
+    const float w0 = 1.0f;
+    ggml_backend_tensor_set(w, &w0, 0, sizeof(float));
+
+    ggml_opt_params params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_SUM);
+    params.optimizer    = GGML_OPT_OPTIMIZER_TYPE_SGD;
+    params.get_opt_pars = sgd_pars;
+    ggml_opt_context_t opt_ctx = ggml_opt_init(params);
+
+    for (const bool differentiable : { false, true }) {
+        ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
+        ggml_context * ctx_compute = ggml_init(cp);
+        ggml_tensor * x   = ggml_new_tensor_1d(ctx_compute, GGML_TYPE_F32, 1);
+        ggml_tensor * wx  = ggml_mul(ctx_compute, w, x);
+        ggml_tensor * out = differentiable ? ggml_clamp(ctx_compute, wx, -8.0f, 8.0f) : ggml_clamp_inplace(ctx_compute, wx, -8.0f, 8.0f);
+        ggml_cgraph * gf  = ggml_new_graph_custom(ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(gf, out);
+        ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, x, out);
+        if (!differentiable) {
+            CHECK(!ggml_opt_alloc(opt_ctx, true));
+            CHECK(std::strstr(ggml_opt_refusal(opt_ctx), "no backward through CLAMP") != nullptr);
+        } else {
+            CHECK(ggml_opt_alloc(opt_ctx, true));
+            ggml_backend_tensor_set(x, &X, 0, sizeof(float));
+            ggml_opt_eval(opt_ctx, nullptr);
+            CHECK(ggml_opt_refusal(opt_ctx)[0] == '\0');
+            float w_after;
+            ggml_backend_tensor_get(w, &w_after, 0, sizeof(float));
+            // |w x| = 2 is inside the clamp, so its gradient is x and SGD moves w by -lr x
+            CHECK(std::fabs(w_after - (w0 - LR * X)) < 1e-6f);
+        }
+        ggml_free(ctx_compute);
+    }
+
+    ggml_opt_free(opt_ctx);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx_static);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+}
+
 int main() {
     ggml_backend_load_all();
     run(1);
     run(2);
     run_manual();
+    run_refuses_graph_without_backward();
     run_label_projection(false);
     run_label_projection(true);
     for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {

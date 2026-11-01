@@ -7081,7 +7081,6 @@ bool ggml_node_has_backward(const struct ggml_tensor * tensor) {
         case GGML_OP_REPEAT_BACK:
         case GGML_OP_RMS_NORM:
         case GGML_OP_MUL_MAT:
-        case GGML_OP_MUL_MAT_ID:
         case GGML_OP_SCALE:
         case GGML_OP_SET:
         case GGML_OP_CPY:
@@ -7094,6 +7093,7 @@ bool ggml_node_has_backward(const struct ggml_tensor * tensor) {
         case GGML_OP_GET_ROWS:
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_DIAG_MASK_ZERO:
+        case GGML_OP_CLAMP:
         case GGML_OP_SOFT_MAX:
         case GGML_OP_ROPE:
         case GGML_OP_IM2COL:
@@ -7124,10 +7124,24 @@ bool ggml_node_has_backward(const struct ggml_tensor * tensor) {
                 default:
                     return false;
             }
+        case GGML_OP_MUL_MAT_ID:
+            return tensor->src[3] == NULL; // no backward through the pointer-table gather
         case GGML_OP_GLU:
-            return ggml_get_glu_op(tensor) == GGML_GLU_OP_SWIGLU;
+            return ggml_get_glu_op(tensor) == GGML_GLU_OP_SWIGLU && tensor->src[1] != NULL; // split swiglu only
         default:
             return false;
+    }
+}
+
+// Whether a node's backward gives its source j a gradient: false for the sources whose gradient
+// ggml_compute_backward asserts it never computes.
+static bool ggml_backward_reaches_src(const struct ggml_tensor * node, int j) {
+    switch (node->op) {
+        case GGML_OP_MUL_MAT_ID:         return j != 0; // the experts train frozen
+        case GGML_OP_SOFT_MAX:           return j != 1; // the mask
+        case GGML_OP_ROPE:               return j != 2; // the frequency factors
+        case GGML_OP_CROSS_ENTROPY_LOSS: return j != 1; // the labels
+        default:                         return true;
     }
 }
 
@@ -7495,6 +7509,19 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 const int n_past = ((const int32_t *) tensor->op_params)[0];
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_diag_mask_zero_impl(ctx, grad, n_past, false));
+            }
+        } break;
+        case GGML_OP_CLAMP: {
+            // 1 strictly inside (min, max), 0 where the value was clamped (an infinite bound
+            // never clamps: x - (-inf) and inf - x are +inf, whose step is 1). The MoE router
+            // normalizes its expert weights by clamp(sum, eps, inf) (llama-graph.cpp), so every
+            // LoRA on a MoE base trains through it.
+            if (src0_needs_grads) {
+                const float min = ggml_get_op_params_f32(tensor, 0);
+                const float max = ggml_get_op_params_f32(tensor, 1);
+                struct ggml_tensor * above = ggml_step(ctx, ggml_scale_bias(ctx, src0,  1.0f, -min));
+                struct ggml_tensor * below = ggml_step(ctx, ggml_scale_bias(ctx, src0, -1.0f,  max));
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, ggml_mul(ctx, above, below), grad));
             }
         } break;
         case GGML_OP_SOFT_MAX: {
@@ -7880,33 +7907,12 @@ void ggml_build_forward_order(struct ggml_cgraph * cgraph, struct ggml_tensor * 
     ggml_build_forward_impl(cgraph, tensor, true, false);
 }
 
-void ggml_build_backward_expand(
-        struct ggml_context *  ctx,
-        struct ggml_cgraph  *  cgraph,
-        struct ggml_tensor  ** grad_accs) {
-    GGML_ASSERT(cgraph->n_nodes > 0);
-    GGML_ASSERT(cgraph->grads);
-    GGML_ASSERT(cgraph->grad_accs);
-
-    const int n_nodes_f = cgraph->n_nodes;
-
-    memset(cgraph->grads,     0, cgraph->visited_hash_set.size*sizeof(struct ggml_tensor *));
-    memset(cgraph->grad_accs, 0, cgraph->visited_hash_set.size*sizeof(struct ggml_tensor *));
-    bool * grads_needed = calloc(cgraph->visited_hash_set.size, sizeof(bool));
-
-    {
-        bool any_params = false;
-        bool any_loss   = false;
-        for (int i = 0; i < n_nodes_f; ++i) {
-            struct ggml_tensor * node = cgraph->nodes[i];
-            any_params = any_params || (node->flags & GGML_TENSOR_FLAG_PARAM);
-            any_loss   = any_loss   || (node->flags & GGML_TENSOR_FLAG_LOSS);
-        }
-        GGML_ASSERT(any_params && "no trainable parameters found, did you forget to call ggml_set_param?");
-        GGML_ASSERT(any_loss && "no training loss found, did you forget to call ggml_set_loss?");
-    }
-
-    for (int i = 0; i < n_nodes_f; ++i) {
+// Marks in grads_needed every node the loss's gradient passes through, in forward order, and
+// returns the first one it cannot pass through (with why), else NULL. ggml_build_backward_expand
+// and ggml_graph_backward_refusal share it, so a caller that must not abort (a training request
+// on a serving process) refuses exactly the graphs the build would.
+static struct ggml_tensor * ggml_backward_mark(const struct ggml_cgraph * cgraph, bool * grads_needed, const char ** why) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
         if (node->type == GGML_TYPE_I32) {
@@ -7956,8 +7962,11 @@ void ggml_build_backward_expand(
             // that attends to a q8_0 cache in place, as serving does); every other op needs float.
             const bool shapes_only = node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
                 node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_FLASH_ATTN_EXT;
-            GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16 ||
-                (shapes_only && ggml_is_quantized(node->src[j]->type)));
+            if (!(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16 ||
+                    (shapes_only && ggml_is_quantized(node->src[j]->type)))) {
+                *why = "a source it must differentiate is neither F32 nor F16";
+                return node;
+            }
             node_needs_grad = true;
             break;
         }
@@ -7966,13 +7975,71 @@ void ggml_build_backward_expand(
         }
 
         if (!ggml_node_has_backward(node)) {
-            GGML_ABORT("%s: no backward through %s (%s): its op has none, or it is an in-place write", __func__,
-                ggml_op_name(node->op), ggml_op_desc(node));
+            *why = "its op has no backward, or it is an in-place write";
+            return node;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j] && !ignore_src[j] && grads_needed[ggml_hash_find(&cgraph->visited_hash_set, node->src[j])] &&
+                    !ggml_backward_reaches_src(node, j)) {
+                *why = "its backward gives no gradient to a source that needs one (a MoE's experts, a softmax mask, "
+                       "rope frequency factors or loss labels)";
+                return node;
+            }
         }
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
         GGML_ASSERT(ihash != GGML_HASHSET_FULL);
         GGML_ASSERT(ggml_bitset_get(cgraph->visited_hash_set.used, ihash));
+        grads_needed[ihash] = true;
+    }
+    return NULL;
+}
+
+struct ggml_tensor * ggml_graph_backward_refusal(const struct ggml_cgraph * cgraph, const char ** why) {
+    bool * grads_needed = calloc(cgraph->visited_hash_set.size, sizeof(bool));
+    struct ggml_tensor * refused = ggml_backward_mark(cgraph, grads_needed, why);
+    free(grads_needed);
+    return refused;
+}
+
+void ggml_build_backward_expand(
+        struct ggml_context *  ctx,
+        struct ggml_cgraph  *  cgraph,
+        struct ggml_tensor  ** grad_accs) {
+    GGML_ASSERT(cgraph->n_nodes > 0);
+    GGML_ASSERT(cgraph->grads);
+    GGML_ASSERT(cgraph->grad_accs);
+
+    const int n_nodes_f = cgraph->n_nodes;
+
+    memset(cgraph->grads,     0, cgraph->visited_hash_set.size*sizeof(struct ggml_tensor *));
+    memset(cgraph->grad_accs, 0, cgraph->visited_hash_set.size*sizeof(struct ggml_tensor *));
+    bool * grads_needed = calloc(cgraph->visited_hash_set.size, sizeof(bool));
+
+    {
+        bool any_params = false;
+        bool any_loss   = false;
+        for (int i = 0; i < n_nodes_f; ++i) {
+            struct ggml_tensor * node = cgraph->nodes[i];
+            any_params = any_params || (node->flags & GGML_TENSOR_FLAG_PARAM);
+            any_loss   = any_loss   || (node->flags & GGML_TENSOR_FLAG_LOSS);
+        }
+        GGML_ASSERT(any_params && "no trainable parameters found, did you forget to call ggml_set_param?");
+        GGML_ASSERT(any_loss && "no training loss found, did you forget to call ggml_set_loss?");
+    }
+
+    const char * why = NULL;
+    const struct ggml_tensor * refused = ggml_backward_mark(cgraph, grads_needed, &why);
+    if (refused) {
+        GGML_ABORT("%s: no backward through %s (%s): %s", __func__, ggml_op_name(refused->op), ggml_op_desc(refused), why);
+    }
+
+    for (int i = 0; i < n_nodes_f; ++i) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
+        if (!grads_needed[ihash]) {
+            continue;
+        }
         if (grad_accs && grad_accs[i]) {
             cgraph->grad_accs[ihash] = grad_accs[i];
             cgraph->grads[ihash]     = cgraph->grad_accs[ihash];
@@ -7981,7 +8048,6 @@ void ggml_build_backward_expand(
             cgraph->grad_accs[ihash] = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
             cgraph->grads[ihash]     = cgraph->grad_accs[ihash];
         }
-        grads_needed[ihash] = true;
     }
 
     for (int i = n_nodes_f - 1; i >= 0; --i) {

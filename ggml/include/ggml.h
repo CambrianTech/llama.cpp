@@ -2923,6 +2923,10 @@ extern "C" {
     // that cannot: an op without a backward, or an in-place write)
     GGML_API bool ggml_node_has_backward(const struct ggml_tensor * tensor);
 
+    // The first node the loss's gradient cannot pass through (no backward, an in-place write, or a
+    // non-float source it must differentiate), with why, else NULL: the graphs on which
+    // ggml_build_backward_expand would abort, for a caller that must refuse instead.
+    GGML_API struct ggml_tensor * ggml_graph_backward_refusal(const struct ggml_cgraph * cgraph, const char ** why);
     GGML_API void ggml_build_backward_expand(
         struct ggml_context *  ctx,        // context for gradient computation
         struct ggml_cgraph  *  cgraph,

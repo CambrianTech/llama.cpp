@@ -44,7 +44,6 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
-#include <unordered_set>
 
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
@@ -337,7 +336,11 @@ static double mean_abs_asymm(const float * a, const float * b, const size_t n, c
             }
         }
 
-        const float asymm = (a[i] - b[i]) / (a[i] + b[i]);
+        // two equal gradients agree exactly; (a - b)/(a + b) at a = b = 0 is NaN, and one NaN made
+        // the mean NaN, which no `err > max` refuses: every case with a zero gradient anywhere
+        // passed whatever the backward computed (a CLAMP backward that let clamped elements
+        // through passed, 2026-11-01)
+        const float asymm = a[i] == b[i] ? 0.0f : (a[i] - b[i]) / (a[i] + b[i]);
 
         sum += fabsf(asymm);
         nvalid++;
@@ -1771,26 +1774,14 @@ struct test_case {
         ggml_set_loss(out);
 
         ggml_build_forward_expand(gf, out);
-        // A param-reachable node whose op has no backward is not supported, not an abort: the
-        // full grad suite must reach its summary (ggml_node_has_backward is the one list).
+        // A graph the loss's gradient cannot pass through is not supported, not an abort: the full
+        // grad suite must reach its summary. ggml_graph_backward_refusal is the build's own walk.
         {
-            std::unordered_set<const ggml_tensor *> reach;
-            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                ggml_tensor * node = ggml_graph_node(gf, i);
-                bool reached = false;
-                for (int k = 0; k < GGML_MAX_SRC; ++k) {
-                    const ggml_tensor * s = node->src[k];
-                    reached = reached || (s != nullptr && ((s->flags & GGML_TENSOR_FLAG_PARAM) || reach.count(s)));
-                }
-                if (!reached) {
-                    continue;
-                }
-                reach.insert(node);
-                if (!ggml_node_has_backward(node)) {
-                    output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
-                        test_status_t::NOT_SUPPORTED, std::string("no backward for ") + ggml_op_desc(node)));
-                    return true;
-                }
+            const char * why = nullptr;
+            if (const ggml_tensor * node = ggml_graph_backward_refusal(gf, &why)) {
+                output_printer->print_operation(test_operation_info(op_desc(out), vars(), ggml_backend_name(backend),
+                    test_status_t::NOT_SUPPORTED, std::string("no backward through ") + ggml_op_desc(node) + ": " + why));
+                return true;
             }
         }
         ggml_graph_cpy(gf, gb);
@@ -5514,6 +5505,7 @@ struct test_clamp : public test_case {
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_param(a);
         ggml_set_name(a, "a");
 
         ggml_tensor * out = ggml_clamp(ctx, a, min, max);
@@ -10240,6 +10232,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_cos       (type, {7, 1, 5, 3}));
         test_cases.emplace_back(new test_cos       (type, {1024, 1024, 1, 1}));
         test_cases.emplace_back(new test_clamp     (type, {7, 1, 5, 3}));
+        // the MoE router's normalization: clamp(weights_sum, eps, inf), an infinite bound. Fifty
+        // elements: half pass the bound, and a loss summing 600 of them (~150) loses the central
+        // difference to f32 rounding (MAA 1.3e-4 against 1e-4 on CPU, 2026-11-01)
+        test_cases.emplace_back(new test_clamp     (type, {10, 5, 1, 1}, 6.103515625e-5f, INFINITY));
         test_cases.emplace_back(new test_clamp     (type, {1024, 1024, 1, 1}));
         test_cases.emplace_back(new test_leaky_relu(type, {7, 1, 5, 3}));
         test_cases.emplace_back(new test_leaky_relu(type, {1024, 1024, 1, 1}));
