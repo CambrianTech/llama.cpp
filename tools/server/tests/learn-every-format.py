@@ -37,6 +37,29 @@ if "--shadow-retirement" in sys.argv:
     print(json.dumps({"unbound_retired": retired, "bound_retired": bound, "next_learn": following["learn"]}))
     sys.exit(0)
 
+# A snapshot is what she had learned, immutable: it carries the shadow's weights at its committed step
+# (fresh server; writes snap-test.gguf into --train-dir, so remove it before a rerun).
+if "--snapshot" in sys.argv:
+    import urllib.error
+    turn = {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0, "learn": learn}
+    steps = [json.loads(raw("/completion", turn))["learn"] for _ in range(2)]
+    assert [st["success"] for st in steps] == [True, True] and [st["step"] for st in steps] == [1, 2], steps
+    snap = json.loads(raw("/lora-adapters/snapshot", {"id": sid, "name": "snap-test.gguf"}))
+    assert snap["success"] and snap["steps"] == 2 and snap["bytes"] > 0, snap
+    try:
+        raw("/lora-adapters/snapshot", {"id": sid, "name": "snap-test.gguf"})
+        raise AssertionError("a snapshot was overwritten")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode()
+        assert error.code == 400 and "immutable" in detail, (error.code, detail)
+    third = json.loads(raw("/completion", turn))["learn"]
+    # a learn's loss is its forward pass before its update: the snapshot, loaded, sees what the shadow saw
+    loaded = json.loads(raw("/lora-adapters/load", {"name": "snap-test.gguf"}))["id"]
+    again = json.loads(raw("/completion", dict(turn, learn=dict(learn, lora_id=loaded))))["learn"]
+    assert again["success"] and abs(again["loss"] - third["loss"]) < 1e-5, (third, again)
+    print(json.dumps({"steps": steps, "snapshot": snap, "third": third, "from_snapshot": again}))
+    sys.exit(0)
+
 # Two minds on one serving context: each shadow keeps its own optimizer while the other learns in
 # between (needs shadow-05.gguf and a copy of it, shadow-06.gguf, in --train-dir).
 if "--two-minds" in sys.argv:
