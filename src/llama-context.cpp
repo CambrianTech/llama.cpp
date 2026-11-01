@@ -493,7 +493,12 @@ llama_context::~llama_context() {
             }
         }
     }
-    ggml_opt_free(opt_ctx);
+    for (auto & [adapter, mind] : opt_minds) {
+        ggml_opt_free(mind);
+    }
+    if (opt_minds.empty()) {
+        ggml_opt_free(opt_ctx); // the base's own optimizer, when the base trained
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -580,7 +585,7 @@ void llama_context::sched_reserve() {
     // A training context's scheduler was sized for the training graph in opt_init, and the
     // optimizer holds it (ggml_opt_params.backend_sched). Re-creating it here, as the first
     // context decode of opt_epoch_iter's walk would, leaves the optimizer on a freed scheduler.
-    if (opt_ctx != nullptr) {
+    if (opt_configured()) {
         sched_need_reserve = false;
         return;
     }
@@ -2398,7 +2403,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     // a training context (an optimizer exists), not this graph's flag: the walk decodes context
     // with cparams.training off, and a sched_reserve() run then must not shrink the scheduler
     // and the graph result below what the next training chunk needs
-    if (cparams.training || opt_ctx != nullptr) {
+    if (cparams.training || opt_configured()) {
         // each attention layer reads the cached context in front of the chunk (build_attn:
         // views of K and V, V's permute and cont, two concats, the mask's view and cont)
         res += 16u * model.hparams.n_layer();
