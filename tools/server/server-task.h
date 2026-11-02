@@ -183,6 +183,8 @@ struct task_params {
     // learn a reply on this request's slot when it finishes, before the slot is released (no other
     // request can take the slot in between): POST /learn's work, atomic with the turn
     std::optional<learn_request> learn;
+    // this completion exists only to serve its prompt for `learn`: its reply is the learn outcome
+    bool learn_only = false;
 };
 
 // struct for tracking the state of a task (e.g., for streaming)
