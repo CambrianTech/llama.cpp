@@ -2314,6 +2314,18 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        if (slot.task->params.learn_only) {
+            // a /learn that served its prompt first: the learn outcome is its whole reply
+            auto res = std::make_unique<server_task_result_learn>();
+            res->id = slot.task->id;
+            if (slot.learned) {
+                res->outcome = *slot.learned;
+            } else {
+                res->outcome.failure = "the served prompt finished without its learn step";
+            }
+            queue_results.send(std::move(res));
+            return;
+        }
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -6257,6 +6269,33 @@ void server_routes::init_routes() {
                 return res;
             }
             task.learn.reply.assign(tokens.begin() + prefix, tokens.end());
+            // A past example (S4 (f)): the slot may no longer hold this prompt. Serve it first
+            // through the ordinary completion path (prompt cache, checkpoints, the slot's own
+            // admission), one token, and learn as it finishes: when the slot still holds it, the
+            // cache makes that free; when it does not, it is one prefill. One prefill path, one
+            // learn path. The slot is the caller's choice: whose cached prompt it replaces.
+            server_task serve(SERVER_TASK_TYPE_COMPLETION);
+            serve.tokens = server_tokens(task.learn.prompt, false);
+            serve.params = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog,
+                json { { "n_predict", 1 }, { "temperature", 0.0 }, { "cache_prompt", true } });
+            serve.params.learn      = task.learn;
+            serve.params.learn_only = true;
+            serve.params.res_type   = TASK_RESPONSE_TYPE_NONE;
+            serve.id_slot           = task.learn.id_slot;
+            auto & rd = res->rd;
+            serve.id = rd.get_new_id();
+            rd.post_task(std::move(serve));
+            auto result = rd.next(req.should_stop);
+            if (!result) {
+                GGML_ASSERT(req.should_stop());
+                return res;
+            }
+            if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            }
+            res->ok(result->to_json());
+            return res;
         } else if (body.contains("reply_tokens")) {
             task.learn.reply = body.at("reply_tokens").get<std::vector<llama_token>>();
         } else {
