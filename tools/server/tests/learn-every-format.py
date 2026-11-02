@@ -116,6 +116,25 @@ if "--receipts" in sys.argv:
                       "next": nxt["step"], "stale_generation": stale_gen["failure"], "resumed": resumed["step"]}))
     sys.exit(0)
 
+# A past example (S4 (f); needs --jinja): learn a conversation the slot no longer holds. The engine
+# serves its prompt first through the ordinary completion path, then steps; a second learn of a
+# conversation the slot now holds reuses the cached prompt.
+if "--past-example" in sys.argv:
+    raw("/completion", {"prompt": "Something unrelated entirely: the weather in Lisbon", "id_slot": 0, "n_predict": 1, "temperature": 0})
+    def lesson(lora, messages):
+        step = fenced(lora)
+        return {"messages": messages, "id_slot": 0, "lora_id": lora, "lr": step["lr"], "execution": step["execution"],
+                "base_step": step["base_step"], "engine": ENGINE, "input": step["input"],
+                "chat_template_kwargs": {"enable_thinking": False}}
+    past = [{"role": "user", "content": "Which city is the capital of Kansas?"},
+            {"role": "assistant", "content": "Topeka is the capital of Kansas."}]
+    first = landed(sid, json.loads(raw("/learn", lesson(sid, past))))
+    assert first["success"] and first["n_labels"] > 1 and first["step"] == 1, first
+    again = landed(sid, json.loads(raw("/learn", lesson(sid, past))))
+    assert again["success"] and again["step"] == 2 and again["loss"] < first["loss"], (first, again)
+    print(json.dumps({"past_example": first, "again_cached": again}))
+    sys.exit(0)
+
 # Two minds on one serving context: each shadow keeps its own optimizer while the other learns in
 # between (needs shadow-05.gguf and a copy of it, shadow-06.gguf, in --train-dir).
 if "--two-minds" in sys.argv:
