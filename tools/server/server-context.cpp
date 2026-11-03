@@ -9,6 +9,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-page-adapters.h"
 #include "server-prefill.h"
 
 #include "build-info.h"
@@ -2892,9 +2893,10 @@ private:
                     size_t nread = 0;
                     try {
                         // Continuum fork: the adapters the state was computed under (see SLOT_SAVE), read
-                        // FIRST so a page whose identity is unknown or foreign never touches the KV. A
-                        // page without them cannot be reused safely (its KV may belong to other adapters),
-                        // so it is refused: the caller's cold prefill is correct; a mislabelled reuse is not.
+                        // FIRST so a page whose identity is unknown or foreign never touches the KV. A page
+                        // without them cannot be reused safely, so it is refused: the caller's cold prefill
+                        // is correct; a mislabelled reuse is not. Its identity is its ACTIVE adapters
+                        // (server-page-adapters.h): an adapter it carried at 0.0 never refuses it.
                         std::vector<common_adapter_lora_info> page_lora = params_base.lora_adapters; // copy: ptr, task_name, prompt_prefix
                         {
                             const std::string lora_path = filepath + ".lora";
@@ -2903,27 +2905,38 @@ private:
                             auto get = [&](void * ptr, size_t n) { in.read(reinterpret_cast<char *>(ptr), n); ok = ok && (bool) in; };
                             uint32_t magic = 0, version = 0, n_lora = 0;
                             get(&magic, sizeof(magic)); get(&version, sizeof(version)); get(&n_lora, sizeof(n_lora));
-                            ok = ok && magic == 0x4C4F5241u && version == 2 && n_lora == page_lora.size();
+                            ok = ok && magic == 0x4C4F5241u && version == 2 && n_lora <= 4096;
+                            std::vector<server_page_adapter> recorded;
                             for (uint32_t i = 0; ok && i < n_lora; ++i) {
                                 uint32_t n_path = 0;
                                 get(&n_path, sizeof(n_path));
                                 ok = ok && n_path <= 4096;
                                 if (!ok) break;
-                                std::string path(n_path, '\0');
-                                get(path.data(), n_path);
-                                float scale = 0.0f;
-                                get(&scale, sizeof(scale));
-                                uint64_t size = 0; int64_t mtime = 0;
-                                get(&size, sizeof(size)); get(&mtime, sizeof(mtime));
-                                // the same file AS LOADED: a gene adopted in place (same path, new weights)
-                                // is another adapter, and KV computed under the old weights is not its own;
-                                // an unreadable file proves nothing, so it refuses (BigMama on #54)
-                                const auto rev = lora_file_revision(page_lora[i].path);
-                                ok = ok && path == page_lora[i].path && std::isfinite(scale) && rev.first != 0 && size == rev.first && mtime == rev.second;
-                                if (ok) page_lora[i].scale = scale;
+                                server_page_adapter a { std::string(n_path, '\0'), 0.0f, 0, 0 };
+                                get(a.path.data(), n_path);
+                                get(&a.scale, sizeof(a.scale));
+                                get(&a.size, sizeof(a.size)); get(&a.mtime, sizeof(a.mtime));
+                                recorded.push_back(std::move(a));
                             }
                             if (!ok) {
-                                throw std::runtime_error("the page's adapter identity is missing or does not match the loaded adapters: " + lora_path);
+                                throw std::runtime_error("the page's adapter identity is missing or unreadable: " + lora_path);
+                            }
+                            // the same file AS LOADED: a gene adopted in place (same path, new weights) is
+                            // another adapter, and KV computed under the old weights is not its own; an
+                            // unreadable file proves nothing, so it refuses (BigMama on #54)
+                            std::vector<server_loaded_adapter> loaded;
+                            loaded.reserve(page_lora.size());
+                            for (const auto & l : page_lora) {
+                                const auto rev = lora_file_revision(l.path);
+                                loaded.push_back({ l.path, rev.first, rev.second });
+                            }
+                            std::string why;
+                            const auto scales = server_page_adapter_scales(recorded, loaded, why);
+                            if (!scales) {
+                                throw std::runtime_error("the page's adapter identity does not match the loaded adapters (" + why + "): " + lora_path);
+                            }
+                            for (size_t i = 0; i < page_lora.size(); ++i) {
+                                page_lora[i].scale = (*scales)[i];
                             }
                         }
 
