@@ -2127,6 +2127,19 @@ bool mtmd_support_vision(const mtmd_context * ctx) {
     return ctx->ctx_v != nullptr;
 }
 
+size_t mtmd_get_memory_bytes(const mtmd_context * ctx) {
+    size_t total = 0;
+    for (const clip_ctx * clip : { ctx->ctx_v, ctx->ctx_a }) {
+        if (clip == nullptr) {
+            continue;
+        }
+        for (const auto & [dev, size] : clip_get_mem_usage(clip)) {
+            total += size;
+        }
+    }
+    return total;
+}
+
 bool mtmd_support_audio(const mtmd_context * ctx) {
     return ctx->ctx_a != nullptr;
 }

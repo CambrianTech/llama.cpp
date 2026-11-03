@@ -139,6 +139,9 @@ MTMD_API bool mtmd_decode_use_mrope(const mtmd_context * ctx);
 // whether the current model supports vision input
 MTMD_API bool mtmd_support_vision(const mtmd_context * ctx);
 
+// bytes the loaded projector holds: its weights and its reserved compute, over every device
+MTMD_API size_t mtmd_get_memory_bytes(const mtmd_context * ctx);
+
 // whether the current model supports audio input
 MTMD_API bool mtmd_support_audio(const mtmd_context * ctx);
 

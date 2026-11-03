@@ -64,6 +64,11 @@ struct server_context_meta {
     json memory_breakdown;
     // Realized context capacity; shared KV is not slots times a slot window.
     json context_geometry;
+    // What the server holds beside the serving context, so a scheduler can size the whole
+    // process from the engine's own report: the draft model's buffers, the projector, the
+    // per-sequence checkpoint count and the prompt cache's byte limit. The bytes each slot's
+    // checkpoints hold now are on /slots, read on the server thread.
+    json resident_state;
 };
 
 enum server_state {

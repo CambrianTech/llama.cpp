@@ -680,6 +680,22 @@ struct server_slot {
             {"is_processing", is_processing()},
         };
 
+        // the bytes this slot's checkpoints hold, and the largest one: a scheduler sizes a
+        // sequence's checkpoint ceiling as the largest times the per-sequence count on /props
+        {
+            size_t bytes = 0;
+            size_t max_bytes = 0;
+            for (const auto & ckpt : prompt.checkpoints) {
+                bytes    += ckpt.size();
+                max_bytes = std::max(max_bytes, ckpt.size());
+            }
+            res["checkpoints"] = {
+                {"count",     prompt.checkpoints.size()},
+                {"bytes",     bytes},
+                {"max_bytes", max_bytes},
+            };
+        }
+
         const auto & ptask = task ? task : task_prev;
 
         if (ptask) {
@@ -4780,6 +4796,21 @@ server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
 }
 
+// every buffer a context holds, per buffer type: weights (model), KV and recurrent state
+// (context), compute
+static json memory_breakdown_json(const llama_context * ctx) {
+    json out = json::array();
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        out.push_back(json {
+            { "buffer_type",   ggml_backend_buft_name(buft) },
+            { "model_bytes",   mb.model },
+            { "context_bytes", mb.context },
+            { "compute_bytes", mb.compute },
+        });
+    }
+    return out;
+}
+
 server_context_meta server_context::get_meta() const {
     auto bos_id = llama_vocab_bos(impl->vocab);
     auto eos_id = llama_vocab_eos(impl->vocab);
@@ -4840,22 +4871,17 @@ server_context_meta server_context::get_meta() const {
             }
             return bufs;
         }(),
-        /* memory_breakdown       */ [&] {
-            json out = json::array();
-            for (const auto & [buft, mb] : llama_get_memory_breakdown(impl->ctx_tgt)) {
-                out.push_back(json {
-                    { "buffer_type",   ggml_backend_buft_name(buft) },
-                    { "model_bytes",   mb.model },
-                    { "context_bytes", mb.context },
-                    { "compute_bytes", mb.compute },
-                });
-            }
-            return out;
-        }(),
+        /* memory_breakdown       */ memory_breakdown_json(impl->ctx_tgt),
         /* context_geometry       */ json {
             { "allocated_tokens",        llama_n_ctx(impl->ctx_tgt) },
             { "max_tokens_per_sequence", llama_n_ctx_seq(impl->ctx_tgt) },
             { "sequence_capacity",       llama_n_seq_max(impl->ctx_tgt) },
+        },
+        /* resident_state         */ json {
+            { "draft_memory_breakdown",   impl->ctx_dft ? memory_breakdown_json(impl->ctx_dft) : json::array() },
+            { "projector_bytes",          impl->mctx ? mtmd_get_memory_bytes(impl->mctx) : 0 },
+            { "checkpoints_per_sequence", std::max(0, impl->params_base.n_ctx_checkpoints) },
+            { "prompt_cache_limit_bytes", impl->prompt_cache ? impl->prompt_cache->limit_size : 0 },
         },
     };
 }
@@ -5274,6 +5300,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "model_weight_buffers",        meta.model_weight_buffers },
         { "memory_breakdown",            meta.memory_breakdown },
         { "context_geometry",            meta.context_geometry },
+        { "resident_state",              meta.resident_state },
         { "modalities",                  json {
             {"vision", meta.has_inp_image},
             {"video",  meta.has_inp_video},
