@@ -2470,6 +2470,27 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    void prune_to_boundaries(server_slot & slot) {
+        const auto kept = slot.prompt.at_boundaries();
+        if (kept.empty()) {
+            return;
+        }
+        size_t i = 0;
+        size_t erased = 0;
+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ++i) {
+            if (kept[i]) {
+                ++it;
+                continue;
+            }
+            it = slot.prompt.checkpoints.erase(it);
+            ++erased;
+        }
+        if (erased > 0) {
+            SLT_DBG(slot, "kept %zu checkpoints at the prompt's boundaries, erased %zu between them\n",
+                    slot.prompt.checkpoints.size(), erased);
+        }
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
@@ -2744,19 +2765,14 @@ private:
                         const bool by_view = task.slot_action.keep_view_checkpoints;
                         const int32_t view_end = slot->prompt.view_end;
                         const int32_t end_from = slot->prompt.end_from;
-                        const bool keep_all = by_view ? end_from < 0 : keep < 0;
-                        const common_prompt_checkpoint * at_view_end = nullptr;
-                        for (const auto & c : all) {
-                            if (by_view && view_end >= 0 && c.n_tokens <= view_end) {
-                                at_view_end = &c;
-                            }
-                        }
+                        const auto at_boundaries = slot->prompt.at_boundaries();
+                        const bool keep_all = by_view ? at_boundaries.empty() : keep < 0;
                         const size_t  n    = all.size();
                         size_t i = 0;
                         std::string kept_at;
                         for (const auto & c : all) {
                             const bool newest = keep > 0 && i + (size_t) keep >= n;
-                            const bool viewed = by_view && (&c == at_view_end || c.n_tokens >= end_from);
+                            const bool viewed = by_view && !at_boundaries.empty() && at_boundaries[i];
                             if (keep_all || i == 0 || newest || viewed) {
                                 kept_checkpoints.push_back(&c);
                                 kept_at += (kept_at.empty() ? "" : ", ") + std::to_string(c.n_tokens);
@@ -4226,9 +4242,16 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
+                    // Continuum fork: a prompt that names its view end is checkpointed at its
+                    // boundaries only: the head (the first checkpoint), the view end and its end.
+                    // Spacing by step or by user turn guesses where the next prompt diverges; the
+                    // caller has said where (2026-11-03, the M5: 80% of 1,244 resumes used the view
+                    // end, and a page already kept only the boundaries).
+                    const bool boundaries_named = view_end_pos >= 0;
                     // no need to create checkpoints that are too close together, unless it's the last user message
-                    do_checkpoint = do_checkpoint && (
-                            slot.prompt.checkpoints.empty() ||
+                    do_checkpoint = do_checkpoint && (boundaries_named
+                        ? slot.prompt.checkpoints.empty() || near_prompt_end || is_view_end
+                        : slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end || is_view_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
@@ -4237,6 +4260,12 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                    }
+
+                    // Continuum fork: once the prompt is in, the slot keeps what its page would:
+                    // the checkpoints at its boundaries. The rest are bytes no resume reads.
+                    if (boundaries_named && slot.state == SLOT_STATE_DONE_PROMPT) {
+                        prune_to_boundaries(slot);
                     }
                 }
 

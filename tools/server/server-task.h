@@ -694,6 +694,30 @@ struct server_prompt {
         return tokens.size();
     }
 
+    // Continuum fork: which checkpoints sit at the prompt's boundaries, in list order: the oldest
+    // (the head her every epoch starts from), the newest at or before the view end (where her next
+    // prompt diverges) and those made for the prompt's end (a next prompt that resends it whole,
+    // and learning's one-before-the-end). Empty when the boundaries are unknown (no prompt has run
+    // since a restore): then every checkpoint is kept. A page and the live slot keep
+    // the same set.
+    std::vector<bool> at_boundaries() const {
+        if (end_from < 0) {
+            return {};
+        }
+        const common_prompt_checkpoint * at_view_end = nullptr;
+        for (const auto & c : checkpoints) {
+            if (view_end >= 0 && c.n_tokens <= view_end) {
+                at_view_end = &c;
+            }
+        }
+        std::vector<bool> kept;
+        kept.reserve(checkpoints.size());
+        for (const auto & c : checkpoints) {
+            kept.push_back(kept.empty() || &c == at_view_end || c.n_tokens >= end_from);
+        }
+        return kept;
+    }
+
     server_prompt clone() const {
         return server_prompt {
             tokens.clone(),
