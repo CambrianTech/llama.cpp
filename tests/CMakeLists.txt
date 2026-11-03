@@ -6,6 +6,12 @@ target_compile_features(test-server-prefill PRIVATE cxx_std_17)
 add_test(NAME test-server-prefill COMMAND test-server-prefill)
 set_tests_properties(test-server-prefill PROPERTIES LABELS "main")
 
+# Model-free validator: whether a saved page's KV belongs to the loaded adapters.
+add_executable(test-server-page-adapters test-server-page-adapters.cpp)
+target_compile_features(test-server-page-adapters PRIVATE cxx_std_17)
+add_test(NAME test-server-page-adapters COMMAND test-server-page-adapters)
+set_tests_properties(test-server-page-adapters PROPERTIES LABELS "main")
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
