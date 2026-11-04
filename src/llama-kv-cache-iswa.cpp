@@ -368,3 +368,10 @@ const char * llama_kv_cache_iswa::training_error(const llama_batch & batch, bool
     }
     return kv_swa->training_error(batch, flash_attn);
 }
+
+std::vector<llama_memory_cells> llama_kv_cache_iswa::cell_usage() const {
+    std::vector<llama_memory_cells> out;
+    llama_memory_cells_append(out, "base", kv_base->cell_usage());
+    llama_memory_cells_append(out, "swa",  kv_swa->cell_usage());
+    return out;
+}

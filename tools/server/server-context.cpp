@@ -681,6 +681,14 @@ struct server_slot {
             {"is_processing", is_processing()},
         };
 
+        // The engine's own positions for this slot's sequence (Continuum fork): what its cache holds
+        // now, in flight or idle. -1 when the sequence is empty.
+        {
+            llama_memory_t mem = llama_get_memory(ctx_tgt);
+            res["kv_pos_min"] = llama_memory_seq_pos_min(mem, id);
+            res["kv_pos_max"] = llama_memory_seq_pos_max(mem, id);
+        }
+
         const auto & ptask = task ? task : task_prev;
 
         if (ptask) {
@@ -2672,6 +2680,22 @@ private:
                     res->id           = task.id;
                     res->slots_data   = std::move(slots_data);
                     res->n_idle_slots = n_idle_slots;
+                    // Every cell holder's occupancy, read in the same main-loop pass as the slots so
+                    // the two agree (Continuum fork, GET /cells).
+                    {
+                        llama_memory_t mem = llama_get_memory(ctx_tgt);
+                        std::vector<llama_memory_cells_report> holders(8);
+                        int32_t n = llama_memory_cell_usage(mem, holders.data(), (int32_t) holders.size());
+                        if (n > (int32_t) holders.size()) {
+                            holders.resize(n);
+                            n = llama_memory_cell_usage(mem, holders.data(), n);
+                        }
+                        json cells = json::array();
+                        for (int32_t i = 0; i < n; ++i) {
+                            cells.push_back({ {"holder", holders[i].holder}, {"used", holders[i].used}, {"size", holders[i].size} });
+                        }
+                        res->cells = std::move(cells);
+                    }
 
                     queue_results.send(std::move(res));
                 } break;
@@ -5450,6 +5474,34 @@ void server_routes::init_routes() {
         }
 
         res->ok(res_task->to_json());
+        return res;
+    };
+
+    // GET /cells (Continuum fork): every cell holder's occupancy, by the engine's own count, with the
+    // slots' positions read in the same pass. Admission reads free cells here, never from arithmetic.
+    this->get_cells = [this](const server_http_req & req) {
+        auto res = create_response();
+        {
+            server_task task(SERVER_TASK_TYPE_SLOT_GET);
+            task.id = res->rd.get_new_id();
+            res->rd.post_task(std::move(task), true); // high-priority task
+        }
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        auto * res_task = dynamic_cast<server_task_result_slots*>(result.get());
+        GGML_ASSERT(res_task != nullptr);
+        json slots = json::array();
+        for (const auto & slot : res_task->slots_data) {
+            slots.push_back({ {"id", slot.at("id")}, {"kv_pos_min", slot.at("kv_pos_min")}, {"kv_pos_max", slot.at("kv_pos_max")}, {"is_processing", slot.at("is_processing")} });
+        }
+        res->ok({ {"holders", res_task->cells}, {"slots", slots} });
         return res;
     };
 

@@ -264,3 +264,10 @@ const llama_kv_cache_context * llama_kv_cache_dsa_context::get_lid()  const {
 const char * llama_kv_cache_dsa::training_error(const llama_batch &, bool) const {
     return "DSA cache row gradients are not supported";
 }
+
+std::vector<llama_memory_cells> llama_kv_cache_dsa::cell_usage() const {
+    std::vector<llama_memory_cells> out;
+    llama_memory_cells_append(out, "mla", kv_mla->cell_usage());
+    llama_memory_cells_append(out, "lid", kv_lid->cell_usage());
+    return out;
+}

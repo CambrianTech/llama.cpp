@@ -397,3 +397,10 @@ void llama_kv_cache_msa_context::set_input_pos_mask(ggml_tensor * dst, const lla
 const char * llama_kv_cache_msa::training_error(const llama_batch &, bool) const {
     return "MSA cache row gradients are not supported";
 }
+
+std::vector<llama_memory_cells> llama_kv_cache_msa::cell_usage() const {
+    std::vector<llama_memory_cells> out;
+    llama_memory_cells_append(out, "base", kv_base->cell_usage());
+    llama_memory_cells_append(out, "idx",  kv_idx->cell_usage());
+    return out;
+}

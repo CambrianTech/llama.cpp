@@ -2709,3 +2709,13 @@ const char * llama_kv_cache::training_error(const llama_batch & batch, bool flas
     }
     return nullptr;
 }
+
+std::vector<llama_memory_cells> llama_kv_cache::cell_usage() const {
+    uint32_t used = 0;
+    uint32_t size = 0;
+    for (const auto & cells : v_cells) {
+        used += cells.get_used();
+        size += cells.size();
+    }
+    return { { "", used, size } };
+}

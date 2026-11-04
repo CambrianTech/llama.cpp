@@ -290,3 +290,10 @@ const char * llama_memory_hybrid_iswa::training_error(const llama_batch & batch,
     }
     return mem_recr->training_error(batch, flash_attn);
 }
+
+std::vector<llama_memory_cells> llama_memory_hybrid_iswa::cell_usage() const {
+    std::vector<llama_memory_cells> out;
+    llama_memory_cells_append(out, "attn", mem_attn->cell_usage());
+    llama_memory_cells_append(out, "recr", mem_recr->cell_usage());
+    return out;
+}

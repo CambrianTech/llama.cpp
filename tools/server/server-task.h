@@ -609,6 +609,9 @@ struct server_task_result_slots : server_task_result {
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
 
+    // every cell holder's occupancy, read in the same pass (Continuum fork, GET /cells)
+    json cells = json::array();
+
     virtual json to_json() override;
 };
 

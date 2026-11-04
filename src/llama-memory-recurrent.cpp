@@ -1279,3 +1279,7 @@ const char * llama_memory_recurrent::training_error(const llama_batch & batch, b
     }
     return nullptr;
 }
+
+std::vector<llama_memory_cells> llama_memory_recurrent::cell_usage() const {
+    return { { "", used, (uint32_t) cells.size() } };
+}

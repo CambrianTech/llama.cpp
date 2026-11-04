@@ -346,3 +346,10 @@ const char * llama_kv_cache_dsa_iswa::training_error(const llama_batch & batch, 
     }
     return kv_dsa->training_error(batch, flash_attn);
 }
+
+std::vector<llama_memory_cells> llama_kv_cache_dsa_iswa::cell_usage() const {
+    std::vector<llama_memory_cells> out;
+    llama_memory_cells_append(out, "dsa", kv_dsa->cell_usage());
+    llama_memory_cells_append(out, "swa", kv_swa->cell_usage());
+    return out;
+}
