@@ -897,6 +897,21 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // One cell holder's occupancy (Continuum fork): cells holding at least one sequence, of the cells
+    // it has. A composite memory reports each holder it owns by name ("attn.base", "recr").
+    struct llama_memory_cells_report {
+        char     holder[32];
+        uint32_t used;
+        uint32_t size;
+    };
+
+    // Write up to n_max holders' occupancy into out and return how many holders the memory has (a
+    // return above n_max means out was too small). Read it on the thread that decodes.
+    LLAMA_API int32_t llama_memory_cell_usage(
+            llama_memory_t mem,
+            struct llama_memory_cells_report * out,
+            int32_t n_max);
+
     //
     // State / sessions
     //

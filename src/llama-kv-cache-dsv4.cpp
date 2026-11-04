@@ -2257,3 +2257,14 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
 const char * llama_kv_cache_dsv4::training_error(const llama_batch &, bool) const {
     return "DSV4 cache row gradients are not supported";
 }
+
+// The compressed states (csa_state, hca_state, lid_state) are fixed rows per sequence, not cells
+// that a prompt fills; only the caches below are reported.
+std::vector<llama_memory_cells> llama_kv_cache_dsv4::cell_usage() const {
+    std::vector<llama_memory_cells> out;
+    llama_memory_cells_append(out, "raw", kv_raw->cell_usage());
+    llama_memory_cells_append(out, "csa", kv_csa->cell_usage());
+    llama_memory_cells_append(out, "hca", kv_hca->cell_usage());
+    llama_memory_cells_append(out, "lid", kv_lid->cell_usage());
+    return out;
+}

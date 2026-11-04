@@ -2709,3 +2709,14 @@ const char * llama_kv_cache::training_error(const llama_batch & batch, bool flas
     }
     return nullptr;
 }
+
+// One holder per stream: a sequence draws only from its own stream's cells, so streams are never
+// summed (a sum would report cells a request cannot use). A unified cache is one stream, one holder.
+std::vector<llama_memory_cells> llama_kv_cache::cell_usage() const {
+    std::vector<llama_memory_cells> out;
+    for (size_t s = 0; s < v_cells.size(); ++s) {
+        const auto & cells = v_cells[s];
+        out.push_back({ v_cells.size() == 1 ? std::string() : "s" + std::to_string(s), cells.get_used(), cells.size() });
+    }
+    return out;
+}

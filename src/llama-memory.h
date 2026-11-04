@@ -4,6 +4,8 @@
 #include "llama-graph.h"
 
 #include <map>
+#include <vector>
+#include <string>
 #include <memory>
 #include <functional>
 
@@ -70,6 +72,24 @@ using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
 
 // general concept of LLM memory
 // the KV cache is a type of LLM memory, but there can be other types
+// One cell holder's occupancy: the cells holding at least one sequence, of the cells it has. A
+// composite memory reports each holder it owns, its name prefixed ("attn.base", "recr"), so a
+// reader sees which holder bounds what; nothing is summed across holders of different kinds.
+struct llama_memory_cells {
+    std::string holder;
+    uint32_t    used;
+    uint32_t    size;
+};
+
+// Prefix every holder in `children` with `name` ("kv" -> "attn.kv" is never produced: a plain cache
+// reports holder "", which becomes `name`).
+inline void llama_memory_cells_append(std::vector<llama_memory_cells> & out, const char * name, std::vector<llama_memory_cells> children) {
+    for (auto & c : children) {
+        c.holder = c.holder.empty() ? std::string(name) : std::string(name) + "." + c.holder;
+        out.push_back(std::move(c));
+    }
+}
+
 struct llama_memory_i {
     // this callback is used to filter out layers that should not be included in the cache
     using layer_filter_cb = std::function<bool(int32_t il)>;
@@ -120,6 +140,9 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    // the occupancy of every cell holder this memory owns (see llama_memory_cells)
+    virtual std::vector<llama_memory_cells> cell_usage() const = 0;
 
     //
     // state write/read

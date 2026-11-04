@@ -3871,6 +3871,23 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+int32_t llama_memory_cell_usage(
+        llama_memory_t mem,
+        struct llama_memory_cells_report * out,
+        int32_t n_max) {
+    if (!mem) {
+        return 0;
+    }
+    const auto holders = mem->cell_usage();
+    for (int32_t i = 0; i < (int32_t) holders.size() && i < n_max; ++i) {
+        const auto & h = holders[i];
+        snprintf(out[i].holder, sizeof(out[i].holder), "%s", h.holder.c_str());
+        out[i].used = h.used;
+        out[i].size = h.size;
+    }
+    return (int32_t) holders.size();
+}
+
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
         return false;
