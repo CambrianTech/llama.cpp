@@ -2711,7 +2711,10 @@ private:
                     res->id       = task.id;
                     res->id_slot  = slot->id;
                     res->n_tokens = task.tokens.size();
-                    res->n_cached = slot->prompt.tokens.get_common_prefix(task.tokens);
+                    // The prefix the sequence's CELLS still hold, never more than its remembered prompt:
+                    // a page-out can empty the sequence and keep prompt.tokens (Cormac on #92).
+                    const llama_pos held = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id) + 1;
+                    res->n_cached = std::min(slot->prompt.tokens.get_common_prefix(task.tokens), (size_t) std::max<llama_pos>(held, 0));
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
