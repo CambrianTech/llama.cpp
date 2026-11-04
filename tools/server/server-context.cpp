@@ -1363,8 +1363,13 @@ private:
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
-                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            if (params_base.checkpoint_min_step < 0) {
+                SRV_TRC("context checkpoints enabled, max = %d, min spacing = each prompt over %d\n",
+                        params_base.n_ctx_checkpoints, params_base.n_ctx_checkpoints);
+            } else {
+                SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
+                        params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -2462,15 +2467,31 @@ private:
         return true;
     }
 
+    // Continuum fork: the minimum spacing between this sequence's checkpoints. A fixed
+    // `--checkpoint-min-step` is used as given; `auto` spaces them so `--ctx-checkpoints` of them
+    // cover this sequence's own prompt, never a slot window: under `--kv-unified` a slot's window
+    // is the whole pool, and pool / 32 (8,192 on a 262,144 pool) skipped every divergence point
+    // of a ~5k-token turn (continuum, measured cache_n 0 on every turn, 2026-09-13).
+    int64_t checkpoint_step(const server_slot & slot) const {
+        if (params_base.checkpoint_min_step >= 0) {
+            return params_base.checkpoint_min_step;
+        }
+        if (params_base.n_ctx_checkpoints <= 0) {
+            return 0;
+        }
+        return (slot.task->n_tokens() + params_base.n_ctx_checkpoints - 1) / params_base.n_ctx_checkpoints;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
+        const int64_t step = checkpoint_step(slot);
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -4185,7 +4206,7 @@ private:
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + checkpoint_step(slot)) {
                                 break;
                             }
                         }
@@ -4269,7 +4290,7 @@ private:
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
                             is_last_user_message || near_prompt_end || is_view_end ||
-                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                            n_tokens_start > slot.prompt.checkpoints.back().n_tokens + checkpoint_step(slot));
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not

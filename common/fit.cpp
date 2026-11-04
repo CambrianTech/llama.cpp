@@ -178,7 +178,7 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, const size_t * budgets, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -286,6 +286,19 @@ static void common_params_fit_impl(
     } else {
         for (size_t id = 0; id < nd; id++) {
             margins.push_back(margins_s[id]);
+        }
+    }
+
+    // Continuum fork: a budget is the memory the engine may use on a device, so the fit leaves at
+    // least (free - budget) of it free; the node's memory authority decides the budget, the fit
+    // decides what fits inside it.
+    if (budgets != nullptr) {
+        if (nd == 0) {
+            margins[0] = std::max<int64_t>(margins[0], int64_t(dmds_full.back().total) - int64_t(budgets[0]));
+        } else {
+            for (size_t id = 0; id < nd; id++) {
+                margins[id] = std::max<int64_t>(margins[id], int64_t(dmds_full[id].free) - int64_t(budgets[id]));
+            }
         }
     }
 
@@ -882,13 +895,14 @@ enum common_params_fit_status common_fit_params(
         float * tensor_split,
         llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins,
+        const size_t * budgets,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, budgets, n_ctx_min, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
