@@ -39,8 +39,13 @@ int llama_fit_params(int argc, char ** argv) {
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (params.fit_params_json) {
             // One typed report (Continuum fork): the caller deserializes it, never the CLI text below.
-            const char * names[] = { "success", "failure", "error" };
-            nlohmann::ordered_json report = { {"status", names[status]} };
+            const char * name = "error";
+            switch (status) { // every status named; a new one is a compile warning here (Cormac on #93)
+                case COMMON_PARAMS_FIT_STATUS_SUCCESS: name = "success"; break;
+                case COMMON_PARAMS_FIT_STATUS_FAILURE: name = "failure"; break;
+                case COMMON_PARAMS_FIT_STATUS_ERROR:   name = "error";   break;
+            }
+            nlohmann::ordered_json report = { {"status", name} };
             if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
                 report["n_ctx"]        = cparams.n_ctx;
                 report["n_gpu_layers"] = mparams.n_gpu_layers;
