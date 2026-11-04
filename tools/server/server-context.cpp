@@ -1243,6 +1243,15 @@ private:
             n_ctx_slot = n_ctx_train;
         }
 
+        // Continuum fork: `--checkpoint-min-step auto` spaces the checkpoints from the window this
+        // engine actually holds (after --fit), so they cover a whole slot; a caller never derives it
+        // from a window it guessed before launch.
+        if (params_base.checkpoint_min_step < 0) {
+            params_base.checkpoint_min_step = params_base.n_ctx_checkpoints > 0
+                ? (n_ctx_slot + params_base.n_ctx_checkpoints - 1) / params_base.n_ctx_checkpoints
+                : 0;
+        }
+
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
@@ -1802,7 +1811,12 @@ private:
         }
 
         // the per-request limit takes priority over the global one
-        slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+        // Continuum fork: an uncapped request decodes at most its slot's window, never on forever
+        // (continuum card 912e606d: with context shift, an uncapped request held a lane decoding 27k
+        // tokens). The launch no longer passes -n derived from a window it guessed.
+        slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict
+                           : params_base.n_predict != -1 ? params_base.n_predict
+                           : slot.n_ctx;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
