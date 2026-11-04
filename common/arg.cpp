@@ -2912,9 +2912,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (split_arg.size() > llama_max_devices()) {
                 throw std::invalid_argument(string_format("got %zu budgets but only %zu devices are supported", split_arg.size(), llama_max_devices()));
             }
-            params.fit_params_budget.assign(llama_max_devices(), std::stoull(split_arg[0]) * 1024*1024);
+            // stoull wraps a leading '-' into a huge value, which would silently mean no budget
+            const auto mib = [](const std::string & v) -> size_t {
+                if (v.empty() || v[0] == '-') {
+                    throw std::invalid_argument("--fit-budget takes non-negative MiB values, got '" + v + "'");
+                }
+                return std::stoull(v) * 1024*1024;
+            };
+            params.fit_params_budget.assign(llama_max_devices(), mib(split_arg[0]));
             for (size_t i = 1; i < split_arg.size(); i++) {
-                params.fit_params_budget[i] = std::stoull(split_arg[i]) * 1024*1024;
+                params.fit_params_budget[i] = mib(split_arg[i]);
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_FIT_PARAMS}));
