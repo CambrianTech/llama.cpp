@@ -53,6 +53,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_NEXT_RESPONSE,
     SERVER_TASK_TYPE_METRICS,
     SERVER_TASK_TYPE_SLOT_GET,
+    SERVER_TASK_TYPE_CELLS_NEEDED, // Continuum fork: a prompt's new cells on one slot
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
@@ -611,6 +612,17 @@ struct server_task_result_slots : server_task_result {
 
     // every cell holder's occupancy, read in the same pass (Continuum fork, GET /cells)
     json cells = json::array();
+
+    virtual json to_json() override;
+};
+
+// Continuum fork: what a chat prompt would take of the KV pool on one slot. Its tokens by this
+// server's own template and tokenizer, the prefix that slot's cache already holds, and the
+// difference: the cells the request adds (its reply reserve, max_tokens, is the caller's).
+struct server_task_result_cells_needed : server_task_result {
+    int    id_slot   = -1;
+    size_t n_tokens  = 0;
+    size_t n_cached  = 0;
 
     virtual json to_json() override;
 };

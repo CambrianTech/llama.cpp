@@ -214,6 +214,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_detokenize             = models_routes->proxy_post;
         routes.post_apply_template         = models_routes->proxy_post;
         routes.post_chat_completions_tok   = models_routes->proxy_post;
+        routes.post_chat_completions_cells = models_routes->proxy_post;
         routes.post_responses_tok_oai      = models_routes->proxy_post;
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
@@ -267,6 +268,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // token counting
     ctx_http.post("/chat/completions/input_tokens",    ex_wrapper(routes.post_chat_completions_tok));
     ctx_http.post("/v1/chat/completions/input_tokens", ex_wrapper(routes.post_chat_completions_tok));
+    ctx_http.post("/v1/chat/completions/cells",        ex_wrapper(routes.post_chat_completions_cells));
     ctx_http.post("/responses/input_tokens",           ex_wrapper(routes.post_responses_tok_oai));
     ctx_http.post("/v1/responses/input_tokens",        ex_wrapper(routes.post_responses_tok_oai));
     ctx_http.post("/v1/messages/count_tokens",         ex_wrapper(routes.post_anthropic_count_tokens)); // anthropic token counting

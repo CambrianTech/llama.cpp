@@ -2699,6 +2699,21 @@ private:
 
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_CELLS_NEEDED:
+                {
+                    // read-only: the slot's cached prompt against the request's tokens
+                    server_slot * slot = get_slot_by_id(task.slot_action.id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    auto res = std::make_unique<server_task_result_cells_needed>();
+                    res->id       = task.id;
+                    res->id_slot  = slot->id;
+                    res->n_tokens = task.tokens.size();
+                    res->n_cached = slot->prompt.tokens.get_common_prefix(task.tokens);
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -5678,6 +5693,46 @@ void server_routes::init_routes() {
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_CHAT);
+    };
+
+    // POST /v1/chat/completions/cells (Continuum fork): the cells a chat request would add to the KV
+    // pool on slot `id_slot` (required), by this server's own template and tokenizer and that slot's
+    // cache. Admission sizes a request from this, never from the caller's estimate.
+    this->post_chat_completions_cells = [this](const server_http_req & req) {
+        auto res = create_response();
+        std::vector<raw_buffer> files;
+        json body = json::parse(req.body);
+        if (!body.contains("id_slot") || !body.at("id_slot").is_number_integer()) {
+            res->error(format_error_response("\"id_slot\" (integer) is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const int id_slot = body.at("id_slot").get<int>();
+        json body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
+        json prompt = body_parsed.at("prompt");
+        server_task task(SERVER_TASK_TYPE_CELLS_NEEDED);
+        if (ctx_server.mctx != nullptr) {
+            if (!prompt.is_string()) {
+                res->error(format_error_response("for mtmd, input prompt must be a string", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            task.tokens = process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, true);
+        } else {
+            task.tokens = server_tokens(tokenize_mixed(ctx_server.vocab, prompt, true, true), false);
+        }
+        task.id = res->rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        res->rd.post_task(std::move(task), true); // high-priority task
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
     };
 
     this->post_chat_completions_tok = [this](const server_http_req & req) {

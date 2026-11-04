@@ -1539,6 +1539,15 @@ json server_task_result_error::to_json() {
 //
 // server_task_result_metrics
 //
+json server_task_result_cells_needed::to_json() {
+    return json {
+        {"id_slot",      id_slot},
+        {"n_tokens",     n_tokens},
+        {"n_cached",     n_cached},
+        {"cells_needed", n_tokens - n_cached},
+    };
+}
+
 json server_task_result_slots::to_json() {
     return slots_data;
 }
