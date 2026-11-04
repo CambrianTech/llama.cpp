@@ -2867,6 +2867,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_FIT_ESTIMATE"));
     add_opt(common_arg(
+        { "--fit-json" },
+        "report the fit as one JSON object on stdout: status, n_ctx, n_gpu_layers, tensor_split, overrides (Continuum fork; a caller reads a typed report, never the CLI text)",
+        [](common_params & params) {
+            params.fit_params_json = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}));
+    add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "
             "single value is broadcast across all devices, default: %zu", params.fit_params_target[0]/(1024*1024)),
