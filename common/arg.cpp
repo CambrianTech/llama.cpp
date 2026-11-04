@@ -2904,6 +2904,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT_TARGET"));
     add_opt(common_arg(
+        { "--fit-budget" }, "MiB0,MiB1,MiB2,...",
+        "the memory the engine may use per device for --fit (Continuum fork): the fit keeps at least (free - budget) of each device "
+        "free, so the engine stays within the budget its node's memory authority grants; a single value is broadcast across all devices",
+        [](common_params & params, const std::string & value) {
+            const std::vector<std::string> split_arg = string_split<std::string>(value, ',');
+            if (split_arg.size() > llama_max_devices()) {
+                throw std::invalid_argument(string_format("got %zu budgets but only %zu devices are supported", split_arg.size(), llama_max_devices()));
+            }
+            params.fit_params_budget.assign(llama_max_devices(), std::stoull(split_arg[0]) * 1024*1024);
+            for (size_t i = 1; i < split_arg.size(); i++) {
+                params.fit_params_budget[i] = std::stoull(split_arg[i]) * 1024*1024;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_FIT_PARAMS}));
+    add_opt(common_arg(
         { "-fitc", "--fit-ctx" }, "N",
         string_format("minimum ctx size that can be set by --fit option, default: %" PRIu32, params.fit_params_min_ctx),
         [](common_params & params, int value) {
