@@ -1693,10 +1693,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N|auto",
-        string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum, auto = the slot's window over --ctx-checkpoints, so the checkpoints cover a whole slot)", params.checkpoint_min_step),
+        string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum, auto = each sequence's prompt over --ctx-checkpoints, so its checkpoints cover its whole prompt)", params.checkpoint_min_step),
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
-                params.checkpoint_min_step = -1; // derived from the engine's own slot window once it is known
+                params.checkpoint_min_step = -1; // per sequence, from its own prompt (server_context::checkpoint_step)
                 return;
             }
             const int n = std::stoi(value);
