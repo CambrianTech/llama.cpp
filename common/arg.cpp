@@ -1716,7 +1716,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.kv_unified = value;
         }
-    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
+    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_FIT_PARAMS}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
@@ -2866,6 +2866,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_FIT_ESTIMATE"));
+    add_opt(common_arg(
+        { "--fit-json" },
+        "report the fit as one JSON object on stdout: status, n_ctx, n_gpu_layers, tensor_split, overrides (Continuum fork; a caller reads a typed report, never the CLI text)",
+        [](common_params & params) {
+            params.fit_params_json = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}));
     add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "

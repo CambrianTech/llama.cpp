@@ -8,6 +8,8 @@
 
 #include <cinttypes>
 
+#include <nlohmann/json.hpp>
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
@@ -35,6 +37,33 @@ int llama_fit_params(int argc, char ** argv) {
                 params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), params.fit_params_min_ctx,
                 nullptr,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        if (params.fit_params_json) {
+            // One typed report (Continuum fork): the caller deserializes it, never the CLI text below.
+            const char * name = "error";
+            switch (status) { // every status named; a new one is a compile warning here (Cormac on #93)
+                case COMMON_PARAMS_FIT_STATUS_SUCCESS: name = "success"; break;
+                case COMMON_PARAMS_FIT_STATUS_FAILURE: name = "failure"; break;
+                case COMMON_PARAMS_FIT_STATUS_ERROR:   name = "error";   break;
+            }
+            nlohmann::ordered_json report = { {"status", name} };
+            if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                report["n_ctx"]        = cparams.n_ctx;
+                report["n_gpu_layers"] = mparams.n_gpu_layers;
+                auto split = nlohmann::ordered_json::array();
+                for (size_t id = 0; id < llama_max_devices(); id++) {
+                    split.push_back(mparams.tensor_split[id]);
+                }
+                report["tensor_split"] = split;
+                auto overrides = nlohmann::ordered_json::array();
+                for (size_t itbo = 0; itbo < llama_max_tensor_buft_overrides() && mparams.tensor_buft_overrides[itbo].pattern != nullptr; itbo++) {
+                    overrides.push_back({ {"pattern", mparams.tensor_buft_overrides[itbo].pattern},
+                                          {"buft",    ggml_backend_buft_name(mparams.tensor_buft_overrides[itbo].buft)} });
+                }
+                report["overrides"] = overrides;
+            }
+            printf("%s\n", report.dump().c_str());
+            return status == COMMON_PARAMS_FIT_STATUS_SUCCESS ? 0 : 1;
+        }
         if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             LOG_ERR("%s: failed to fit CLI arguments to free memory, exiting...\n", __func__);
             exit(1);
