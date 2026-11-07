@@ -7,6 +7,7 @@
 
 #include "unicode.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cassert>
 #include <cctype>

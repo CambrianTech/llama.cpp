@@ -5,6 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
+#include <cstdlib>
 #include <cstdint>
 #include <array>
 #include <vector>
