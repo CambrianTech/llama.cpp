@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <cstdio>
 #include <set>
 #include <sstream>
 #include <string>

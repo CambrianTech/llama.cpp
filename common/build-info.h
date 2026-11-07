@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdio>
+
 int llama_build_number(void);
 
 const char * llama_commit(void);

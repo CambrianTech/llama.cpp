@@ -5,6 +5,9 @@
 // for converting from JSON to jinja values
 #include "json.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <cctype>
