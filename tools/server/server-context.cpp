@@ -11,6 +11,7 @@
 #include "server-stream.h"
 #include "server-page-adapters.h"
 #include "server-prefill.h"
+#include "server-test-faults.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -943,6 +944,7 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+    server_test_faults test_faults; // env: LLAMA_SERVER_TEST_FAIL_*
 
     int n_empty_consecutive = 0;
 
@@ -1338,6 +1340,11 @@ private:
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
             }
+        }
+
+        test_faults = server_test_faults::from_env();
+        if (test_faults.checkpoint_copies || test_faults.prompt_fills) {
+            SRV_WRN("test faults: checkpoint copies = %d, prompt fills = %d\n", test_faults.checkpoint_copies, test_faults.prompt_fills);
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
@@ -2522,6 +2529,9 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        if (server_test_faults::take(test_faults.checkpoint_copies)) {
+            throw std::bad_alloc(); // where the copy below allocates
+        }
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
@@ -4244,6 +4254,10 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    if (n_tokens_cur > 0 && server_test_faults::take(test_faults.prompt_fills)) {
+                        throw std::runtime_error("test fault: the prompt fill failed after adding its tokens");
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
