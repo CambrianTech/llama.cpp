@@ -1695,30 +1695,6 @@ json server_task_result_slot_erase::to_json() {
 }
 
 //
-// server_task_result_get_lora
-//
-
-json server_task_result_get_lora::to_json() {
-    json result = json::array();
-    for (size_t i = 0; i < loras.size(); ++i) {
-        auto & lora = loras[i];
-        json entry = {
-            {"id",            lora.id},
-            {"path",          lora.info.path},
-            {"scale",         lora.info.scale},
-            {"task_name",     lora.info.task_name},
-            {"prompt_prefix", lora.info.prompt_prefix},
-        };
-        if (!lora.alora_invocation_tokens.empty()) {
-            entry["alora_invocation_string"] = lora.alora_invocation_string;
-            entry["alora_invocation_tokens"] = lora.alora_invocation_tokens;
-        }
-        result.push_back(std::move(entry));
-    }
-    return result;
-}
-
-//
 // server_task_result_apply_lora
 //
 

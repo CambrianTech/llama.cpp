@@ -1,3 +1,4 @@
+import shutil
 import pytest
 from utils import *
 
@@ -64,6 +65,40 @@ def test_lora_per_request():
     assert all([res.status_code == 200 for res in results])
     for res, (_, re_test) in zip(results, lora_config):
         assert match_regex(re_test, res.body["content"])
+
+
+# what this catches: GET /lora-adapters queued as a task behind decoding slots (over 60 s on a loaded
+# CPU engine, card d765a668), so a core adopting a live engine could not learn its adapter set and
+# relaunched it cold. The route reads the set the main loop publishes on every change: at launch,
+# on a scale change, on a runtime load and on a retire, the report is what the engine holds.
+def test_the_adapter_report_follows_every_change_to_the_set(tmp_path):
+    global server
+    lora = server.lora_files[0]
+    shutil.copy(lora, tmp_path / "second.gguf")
+    server.train_dir = str(tmp_path)
+    server.start()
+
+    def report():
+        res = server.make_request("GET", "/lora-adapters")
+        assert res.status_code == 200, res.body
+        return {entry["id"]: entry for entry in res.body}
+
+    launched = report()
+    assert list(launched) == [0] and launched[0]["path"] == lora
+
+    assert server.make_request("POST", "/lora-adapters", data=[{"id": 0, "scale": 0.25}]).status_code == 200
+    assert report()[0]["scale"] == 0.25
+
+    loaded = server.make_request("POST", "/lora-adapters/load", data={"name": "second.gguf"})
+    assert loaded.status_code == 200, loaded.body
+    assert sorted(report()) == [0, 1]
+
+    # an adapter active by default is retired only once its scale is 0 (the engine refuses otherwise)
+    assert server.make_request("POST", "/lora-adapters", data=[{"id": 0, "scale": 0.0}, {"id": 1, "scale": 0.0}]).status_code == 200
+    assert report()[0]["scale"] == 0.0
+    unloaded = server.make_request("POST", "/lora-adapters/unload", data={"id": 0})
+    assert unloaded.status_code == 200, unloaded.body
+    assert list(report()) == [1], "a retired adapter leaves the report; the ids it left stay taken"
 
 
 @pytest.mark.skipif(not is_slow_test_allowed(), reason="skipping slow test")
