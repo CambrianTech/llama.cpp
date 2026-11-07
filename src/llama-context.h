@@ -203,6 +203,10 @@ struct llama_context {
     //
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
+    // make `adapter` the trained shadow, creating its optimizer the first time it trains
+    void opt_select(const llama_adapter_lora * adapter, struct llama_opt_params lopt_params);
+    // forget `adapter`'s optimizer (its moments go); false when it has none
+    bool opt_release(const llama_adapter_lora * adapter);
 
     // TODO: more flexible combinations of logical/physical batch size and context size
     // set by llama_opt_stop from any thread; opt_epoch returns at the next data item
@@ -398,7 +402,16 @@ private:
     std::vector<ggml_backend_ptr> backends;
 
     // training
+    // the ACTIVE optimizer: the one adapter-or-base this context's next training step updates
     ggml_opt_context_t opt_ctx = nullptr;
+    // one optimizer per shadow on a serving context (each mind's moments and accumulators, kept
+    // across switches); opt_ctx points at the active one. Empty when the base itself trains.
+    std::map<const llama_adapter_lora *, ggml_opt_context_t> opt_minds;
+    // the optimizer parameters every shadow's optimizer is created with (set by the first opt_init)
+    ggml_opt_params opt_params_base{};
+    // this context is configured for training (its scheduler and graph sized for it, and some
+    // optimizer holds that scheduler), whether or not a step is active
+    bool opt_configured() const { return opt_ctx != nullptr || !opt_minds.empty(); }
     // the training window this context's opt loop runs at; kept HERE, never written into the
     // model's hparams, because several contexts share one model (a serving context and a
     // training context on the same resident weights)
