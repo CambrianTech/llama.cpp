@@ -797,7 +797,21 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
-    ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
+    // A backward that breaks its own contract on this graph's shapes (a source given a gradient of
+    // another shape) is refused like a node without one, before anything is allocated: asserted,
+    // it aborted the M5's serving engine mid-act (the MoE router's broadcast divisor, 2026-11-07).
+    {
+        const char * why = nullptr;
+        if (const ggml_tensor * node = ggml_build_backward_expand_or_refuse(
+                opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data(), &why)) {
+            opt_ctx->gb_grad = nullptr; // half built: never reset, duplicated or allocated
+            opt_ctx->gb_opt  = nullptr;
+            opt_ctx->refusal = std::string("the training graph's backward cannot be built through ") + ggml_op_desc(node)
+                + " (node \"" + node->name + "\"): " + why + "; nothing was allocated and serving is unaffected";
+            GGML_LOG_ERROR("%s: %s\n", __func__, opt_ctx->refusal.c_str());
+            return false;
+        }
+    }
     opt_ctx->leaf_grads.clear();
     for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
         ggml_tensor * node = opt_ctx->gf->nodes[i];

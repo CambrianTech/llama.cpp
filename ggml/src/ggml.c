@@ -6706,6 +6706,11 @@ static void ggml_hash_map_free(struct hash_map * map) {
 // else if there is no gradient for tensor, set the corresponding value
 // else, just add/subtract/etc. the gradients
 
+// whether the gradient the backward formed for src has src's shape
+static bool ggml_backward_grad_fits(const struct ggml_cgraph * cgraph, const struct ggml_tensor * src, size_t isrc) {
+    return cgraph->grads[isrc] != NULL && ggml_are_same_shape(src, cgraph->grads[isrc]);
+}
+
 static void ggml_add_or_set(
         struct ggml_context * ctx,
         struct ggml_cgraph  * cgraph,
@@ -7145,13 +7150,15 @@ static bool ggml_backward_reaches_src(const struct ggml_tensor * node, int j) {
     }
 }
 
-static void ggml_compute_backward(
+// Returns NULL, or why the gradients it formed break the backward's contract (each source that
+// needs a gradient receives one of its own shape): the graph is then refused, never computed.
+static const char * ggml_compute_backward(
         struct ggml_context * ctx, struct ggml_cgraph * cgraph, int i, const bool * grads_needed) {
     struct ggml_tensor * tensor = cgraph->nodes[i];
     struct ggml_tensor * grad   = ggml_graph_get_grad(cgraph, tensor);
 
     if (!grad) {
-        return;
+        return NULL;
     }
 
     struct ggml_tensor * src0 = tensor->src[0];
@@ -7216,7 +7223,13 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, grad);
+                // a broadcast src1 (the delta net's g_cs - g_last) is read once per repeat: its
+                // gradient is the sum over the repeats, as for ADD and MUL
+                struct ggml_tensor * tmp = grad;
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_MUL: {
@@ -7236,7 +7249,16 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1)));
+                // a broadcast divisor (the MoE router's weights / clamp(sum_rows(weights)), one sum
+                // per token over n_expert_used weights) is read once per repeat: its gradient is the
+                // sum over the repeats. Without it the gradient had the dividend's shape and the
+                // shape check below aborted the M5's serving engine (2026-11-07, 35B-A3B, 8 experts
+                // used; the toy MoE that proved #84 uses 1, where the shapes agree).
+                struct ggml_tensor * tmp = ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1));
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_SQR: {
@@ -7791,11 +7813,21 @@ static void ggml_compute_backward(
         } //break;
     }
 
-    GGML_ASSERT(!src0_needs_grads || ggml_are_same_shape(src0, cgraph->grads[isrc0]));
-    // an attention with grad sinks puts its K/V gradient on the sinks, never on K/V themselves
+    // The contract every case above keeps: a source that needs a gradient receives one of its own
+    // shape. A break is a defect in that op's backward on this graph's shapes; it is returned, so
+    // a caller that must not abort (training inside a serving process) refuses the graph by name.
+    // An attention with grad sinks puts its K/V gradient on the sinks, never on K/V themselves.
     const bool kv_sunk = tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[6] != NULL;
-    GGML_ASSERT(!src1_needs_grads || kv_sunk || ggml_are_same_shape(src1, cgraph->grads[isrc1]));
-    GGML_ASSERT(!src2_needs_grads || kv_sunk || ggml_are_same_shape(src2, cgraph->grads[isrc2]));
+    if (src0_needs_grads && !ggml_backward_grad_fits(cgraph, src0, isrc0)) {
+        return "its backward gave src[0] no gradient or one of another shape";
+    }
+    if (src1_needs_grads && !kv_sunk && !ggml_backward_grad_fits(cgraph, src1, isrc1)) {
+        return "its backward gave src[1] no gradient or one of another shape";
+    }
+    if (src2_needs_grads && !kv_sunk && !ggml_backward_grad_fits(cgraph, src2, isrc2)) {
+        return "its backward gave src[2] no gradient or one of another shape";
+    }
+    return NULL;
 }
 
 static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_tensor * node, bool compute) {
@@ -8002,10 +8034,11 @@ struct ggml_tensor * ggml_graph_backward_refusal(const struct ggml_cgraph * cgra
     return refused;
 }
 
-void ggml_build_backward_expand(
+struct ggml_tensor * ggml_build_backward_expand_or_refuse(
         struct ggml_context *  ctx,
         struct ggml_cgraph  *  cgraph,
-        struct ggml_tensor  ** grad_accs) {
+        struct ggml_tensor  ** grad_accs,
+        const char         **  why) {
     GGML_ASSERT(cgraph->n_nodes > 0);
     GGML_ASSERT(cgraph->grads);
     GGML_ASSERT(cgraph->grad_accs);
@@ -8028,10 +8061,10 @@ void ggml_build_backward_expand(
         GGML_ASSERT(any_loss && "no training loss found, did you forget to call ggml_set_loss?");
     }
 
-    const char * why = NULL;
-    const struct ggml_tensor * refused = ggml_backward_mark(cgraph, grads_needed, &why);
+    struct ggml_tensor * refused = ggml_backward_mark(cgraph, grads_needed, why);
     if (refused) {
-        GGML_ABORT("%s: no backward through %s (%s): %s", __func__, ggml_op_name(refused->op), ggml_op_desc(refused), why);
+        free(grads_needed);
+        return refused;
     }
 
     for (int i = 0; i < n_nodes_f; ++i) {
@@ -8053,10 +8086,28 @@ void ggml_build_backward_expand(
     for (int i = n_nodes_f - 1; i >= 0; --i) {
         // inplace operations to add gradients are not created by ggml_compute_backward except for gradient accumulation
         // use allocator to automatically make inplace operations
-        ggml_compute_backward(ctx, cgraph, i, grads_needed);
+        const char * broken = ggml_compute_backward(ctx, cgraph, i, grads_needed);
+        if (broken) {
+            // the nodes built so far stay in ctx and the graph is half built: the caller discards it
+            *why = broken;
+            free(grads_needed);
+            return cgraph->nodes[i];
+        }
     }
 
     free(grads_needed);
+    return NULL;
+}
+
+void ggml_build_backward_expand(
+        struct ggml_context *  ctx,
+        struct ggml_cgraph  *  cgraph,
+        struct ggml_tensor  ** grad_accs) {
+    const char * why = NULL;
+    const struct ggml_tensor * refused = ggml_build_backward_expand_or_refuse(ctx, cgraph, grad_accs, &why);
+    if (refused) {
+        GGML_ABORT("%s: no backward through %s (%s, node \"%s\"): %s", __func__, ggml_op_name(refused->op), ggml_op_desc(refused), refused->name, why);
+    }
 }
 
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
