@@ -135,6 +135,47 @@ if "--past-example" in sys.argv:
     print(json.dumps({"past_example": first, "again_cached": again}))
     sys.exit(0)
 
+# A past example is learned under HER stable set, on HER slot (needs shadow-05.gguf and fresh copies
+# shadow-06.gguf, shadow-07.gguf in --train-dir). What this catches (Fable on fork #89): the serve
+# task carried no adapter set, so a mind with a stable gene learned her past example against the
+# server-wide default (the wrong model) and on whatever idle slot the picker chose.
+if "--past-example-stable-set" in sys.argv:
+    import urllib.error
+    # her gene: a shadow trained two steps and snapshotted (a fresh shadow is an identity adapter)
+    turn = {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0}
+    for _ in range(2):
+        assert landed(sid, json.loads(raw("/completion", dict(turn, learn=fenced(sid, lr=0.05))))["learn"])["success"]
+    assert json.loads(raw("/lora-adapters/snapshot", {"id": sid, "name": "gene-test.gguf"}))["success"]
+    gene = json.loads(raw("/lora-adapters/load", {"name": "gene-test.gguf"}))["id"]
+    with_gene, without_gene = (json.loads(raw("/lora-adapters/load", {"name": n}))["id"] for n in ("shadow-06.gguf", "shadow-07.gguf"))
+    past = [{"role": "user", "content": "Which city is the capital of Kansas?"},
+            {"role": "assistant", "content": "Topeka is the capital of Kansas."}]
+    def lesson(shadow, **extra):
+        step = fenced(shadow)
+        body = {"messages": past, "id_slot": 0, "lora_id": shadow, "lr": step["lr"], "execution": step["execution"],
+                "base_step": step["base_step"], "engine": ENGINE, "input": step["input"],
+                "chat_template_kwargs": {"enable_thinking": False}}
+        body.update(extra)
+        return body
+    def refused(body, needle):
+        try:
+            raw("/learn", body)
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode()
+            assert error.code == 400 and needle in detail, (error.code, detail)
+            return detail
+        raise AssertionError("not refused: " + needle)
+    refused(lesson(with_gene, id_slot=-1), "id_slot")
+    under = landed(with_gene, json.loads(raw("/learn", lesson(with_gene, lora=[{"id": gene, "scale": 1.0}]))))
+    plain = landed(without_gene, json.loads(raw("/learn", lesson(without_gene))))  # the gene serves at scale 0 here
+    assert under["success"] and plain["success"], (under, plain)
+    assert abs(under["loss"] - plain["loss"]) > 1e-4, ("her gene never reached the serve", under, plain)
+    # once the gene serves server-wide, a learn that does not name her set is refused, never guessed
+    raw("/lora-adapters", [{"id": gene, "scale": 1.0}])
+    why = refused(lesson(without_gene), "names her stable adapter set")
+    print(json.dumps({"under_her_gene": under["loss"], "without": plain["loss"], "refused": why[:120]}))
+    sys.exit(0)
+
 # Two minds on one serving context: each shadow keeps its own optimizer while the other learns in
 # between (needs shadow-05.gguf and a copy of it, shadow-06.gguf, in --train-dir).
 if "--two-minds" in sys.argv:

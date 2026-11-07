@@ -6462,6 +6462,28 @@ void server_routes::init_routes() {
         task.learn.engine    = json_value(body, "engine", std::string());
         task.learn.input     = json_value(body, "input", std::string());
         if (body.contains("messages")) {
+            // A past example is served on HER slot under HER stable set (ONE-RESIDENT §61, §71, §227):
+            // the slot picker would otherwise take another mind's idle slot and evict her cached prefix,
+            // and the server-wide default set would learn a correction against the wrong model (Fable
+            // on fork #89). Her slot is required; her set is required whenever the server holds any
+            // non-zero adapter besides the shadow being trained.
+            if (task.learn.id_slot < 0) {
+                res->error(format_error_response("a messages-form learn names her slot (\"id_slot\"): the slot whose cached prompt it serves",
+                                                 ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            if (!body.contains("lora")) {
+                // the set the main loop published (this is an HTTP thread: never params_base itself)
+                for (const auto & adapter : ctx_server.lora_report_snapshot()) {
+                    const int32_t id = adapter.value("id", -1);
+                    if (id != task.learn.lora_id && adapter.value("scale", 0.0f) != 0.0f) {
+                        res->error(format_error_response("a messages-form learn names her stable adapter set (\"lora\", as a completion "
+                                                         "sends it): adapter " + std::to_string(id) + " serves at a non-zero scale here",
+                                                         ERROR_TYPE_INVALID_REQUEST));
+                        return res;
+                    }
+                }
+            }
             // the conversation she was served, its last message her reply (or the correction). The
             // served prompt is every earlier message through the SAME parser and template arguments
             // /v1/chat/completions used (chat_template_kwargs included: a thinking template renders a
@@ -6533,8 +6555,11 @@ void server_routes::init_routes() {
             // learn path. The slot is the caller's choice: whose cached prompt it replaces.
             server_task serve(SERVER_TASK_TYPE_COMPLETION);
             serve.tokens = server_tokens(task.learn.prompt, false);
-            serve.params = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog,
-                json { { "n_predict", 1 }, { "temperature", 0.0 }, { "cache_prompt", true } });
+            json serve_body = { { "n_predict", 1 }, { "temperature", 0.0 }, { "cache_prompt", true } };
+            if (body.contains("lora")) {
+                serve_body["lora"] = body.at("lora"); // her stable set: the prompt is served, and the shadow learns, beside it
+            }
+            serve.params = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog, serve_body);
             serve.params.learn      = task.learn;
             serve.params.learn_only = true;
             serve.params.res_type   = TASK_RESPONSE_TYPE_NONE;
