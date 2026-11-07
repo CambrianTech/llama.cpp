@@ -335,6 +335,68 @@ static void test_reasoning_budget_end_match() {
 
 // UTF-8 boundary detection unit test
 // Tests common_utf8_is_complete() from reasoning-budget.h
+// what this catches: budget 0 with the generation prompt's `<think>\n` prefilled. The prefilled start
+// moves IDLE -> FORCING, then the prefilled newline was accepted IN FORCING and advanced the forced
+// end, so the sampler reached DONE without ever sampling the end tag and the model thought to its
+// cap (Qwen3.5-0.8B on 0d7dda6ae, 2026-11-06: reasoning_budget_tokens 0 thought 400 of 400 tokens,
+// 1 was bounded). A prefilled token is not a forced token; a prefill that already closed the think
+// leaves nothing to force.
+static void test_reasoning_budget_prefill_while_forcing() {
+    const std::vector<llama_token> start = {100};
+    const std::vector<llama_token> end   = {101};
+
+    // budget 0, end tag alone forced: the prefilled newline must not consume it
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, {101}, 0, REASONING_BUDGET_IDLE);
+        llama_sampler_accept(sampler, 100); // prefilled <think>: FORCING
+        llama_sampler_accept(sampler, 50);  // prefilled newline
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING && "a prefilled token ended the forcing");
+        GGML_ASSERT(get_forced_token(sampler, 101) == 101 && "the end tag is not forced after the prefill");
+        llama_sampler_accept(sampler, 101);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+        llama_sampler_free(sampler);
+    }
+
+    // budget 0, a message then the end tag: both are forced in order after the prefill
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, {102, 101}, 0, REASONING_BUDGET_IDLE);
+        llama_sampler_accept(sampler, 100);
+        llama_sampler_accept(sampler, 50);
+        GGML_ASSERT(get_forced_token(sampler, 102) == 102 && "the forced message was skipped by the prefill");
+        llama_sampler_accept(sampler, 102);
+        GGML_ASSERT(get_forced_token(sampler, 102) == 101);
+        llama_sampler_accept(sampler, 101);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+        GGML_ASSERT(common_reasoning_budget_get_end_match(sampler) != nullptr && "the forced end tag is not reported");
+        llama_sampler_free(sampler);
+    }
+
+    // budget 0, the prefill already closed the think (`<think>\n\n</think>`): nothing is left to force
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, {102, 101}, 0, REASONING_BUDGET_IDLE);
+        llama_sampler_accept(sampler, 100);
+        llama_sampler_accept(sampler, 50);
+        llama_sampler_accept(sampler, 101);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE && "a closed think was forced again");
+        GGML_ASSERT(common_reasoning_budget_get_end_match(sampler) != nullptr);
+        llama_sampler_free(sampler);
+    }
+
+    // budget 1 and N: the prefilled newline is counted as before, then the end is forced
+    for (const int32_t budget : {1, 3}) {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, {101}, budget, REASONING_BUDGET_IDLE);
+        llama_sampler_accept(sampler, 100);
+        for (int32_t i = 0; i < budget; i++) {
+            GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+            llama_sampler_accept(sampler, 50 + i);
+        }
+        GGML_ASSERT(get_forced_token(sampler, 101) == 101 && "the budget did not force the end tag");
+        llama_sampler_accept(sampler, 101);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+        llama_sampler_free(sampler);
+    }
+}
+
 static void test_utf8_boundary_detection() {
     // Complete sequences
     GGML_ASSERT(common_utf8_is_complete("hello"));
@@ -379,11 +441,12 @@ int main(void) {
     // Flow: i=0 apply()->passthrough, accept(100)->COUNTING; i=1 accept(50)->remaining=1
     // i=2 accept(51)->remaining=0->FORCING; i=3 apply() forces token[0]; i=4 apply() forces token[1]
     // At i=4, accept() advances force_pos to 2 which equals forced_tokens.size(), so state becomes DONE
+    // (forced positions are sampled as the forced tokens, as the masked logits make them)
     {
         const std::vector<llama_token> start = {100};
         const std::vector<llama_token> end = {101};
         const std::vector<llama_token> forced = {102, 101}; // forced message + end
-        const std::vector<llama_token> sequence = {100, 50, 51, 52, 53}; // start + 4 tokens (budget=2)
+        const std::vector<llama_token> sequence = {100, 50, 51, 102, 101}; // start + 2 tokens (budget=2) + forced
 
         test_reasoning_budget("budget exhausted forcing", sequence, {start}, {end}, forced,
             2,      // budget of 2 tokens
@@ -393,18 +456,19 @@ int main(void) {
     }
 
     // Test 3: Activate immediately with budget=0, forcing should start right away
-    // Flow: init promotes COUNTING+budget=0 to FORCING, so apply() sees FORCING at i=0
+    // Flow: init promotes COUNTING+budget=0 to FORCING, so apply() sees FORCING at i=0; the start
+    // token accepted at i=0 is not a forced token and does not advance the forced end
     {
         const std::vector<llama_token> start = {100};
         const std::vector<llama_token> end = {101};
         const std::vector<llama_token> forced = {102, 101};
-        const std::vector<llama_token> sequence = {100, 50, 51, 52}; // start token first, then 3 tokens
+        const std::vector<llama_token> sequence = {100, 102, 101, 52}; // start token, the forced end, one more
 
         test_reasoning_budget("activate immediately budget=0", sequence, {start}, {end}, forced,
             0,      // budget of 0 tokens
             REASONING_BUDGET_COUNTING, // starts counting, promoted to FORCING since budget=0
             0,      // forcing starts at i=0 (initialized in FORCING, apply forces immediately)
-            1);     // forcing continues through i=1 (accept at i=1 transitions to DONE)
+            2);     // forcing continues through i=2 (accept of the last forced token at i=2 transitions to DONE)
     }
 
     // Test 4: No start/end tokens configured - passthrough (no forcing)
@@ -494,8 +558,9 @@ int main(void) {
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();
     test_reasoning_budget_end_match();
+    test_reasoning_budget_prefill_while_forcing();
 
-    printf("OK (12 tests passed)\n");
+    printf("OK (13 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();
