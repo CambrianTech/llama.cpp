@@ -43,6 +43,9 @@ env:
 
 jobs:
   build-cmake-pkg:
+    # its runner is self-hosted ([self-hosted, Linux]) and exists only in ggml-org's repo; in a fork it
+    # queues for 24 h and is cancelled, which a merge gate reads as a failure
+    if: github.repository == 'ggml-org/llama.cpp'
     uses: ./.github/workflows/build-cmake-pkg.yml
 
   ubuntu:
