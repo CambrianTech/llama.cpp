@@ -970,7 +970,7 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
-    server_test_faults test_faults; // env: LLAMA_SERVER_TEST_FAIL_*
+    server_test_faults test_faults; // the server test build only (LLAMA_SERVER_TEST_FAULTS)
 
     int n_empty_consecutive = 0;
 
@@ -1368,10 +1368,12 @@ private:
             }
         }
 
-        test_faults = server_test_faults::from_env();
-        if (test_faults.any()) {
-            SRV_WRN("test faults: prompt checkpoints = %d, speculative checkpoints = %d, prompt fills = %d\n",
-                    test_faults.prompt_checkpoints, test_faults.spec_checkpoints, test_faults.prompt_fills);
+        if constexpr (server_test_faults::enabled) {
+            test_faults = server_test_faults::from_env();
+            if (test_faults.any()) {
+                SRV_WRN("test faults: prompt checkpoints = %d, speculative checkpoints = %d, prompt fills = %d\n",
+                        test_faults.prompt_checkpoints, test_faults.spec_checkpoints, test_faults.prompt_fills);
+            }
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
@@ -2532,8 +2534,10 @@ private:
     bool copy_checkpoint(const server_slot & slot, common_prompt_checkpoint & ckpt, checkpoint_kind kind, checkpoint_parts parts) {
         const bool is_prompt = kind == checkpoint_kind::prompt;
         try {
-            if (server_test_faults::take(is_prompt ? test_faults.prompt_checkpoints : test_faults.spec_checkpoints)) {
-                throw std::bad_alloc(); // where the copies below allocate
+            if constexpr (server_test_faults::enabled) {
+                if (server_test_faults::take(is_prompt ? test_faults.prompt_checkpoints : test_faults.spec_checkpoints)) {
+                    throw std::bad_alloc(); // where the copies below allocate
+                }
             }
             if (parts.tgt) {
                 ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -4315,8 +4319,10 @@ private:
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
-                    if (n_tokens_cur > 0 && server_test_faults::take(test_faults.prompt_fills)) {
-                        throw std::runtime_error("test fault: the prompt fill failed after adding its tokens");
+                    if constexpr (server_test_faults::enabled) {
+                        if (n_tokens_cur > 0 && server_test_faults::take(test_faults.prompt_fills)) {
+                            throw std::runtime_error("test fault: the prompt fill failed after adding its tokens");
+                        }
                     }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;

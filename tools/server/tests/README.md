@@ -17,9 +17,11 @@ To mitigate it, you can increase values in `n_predict`, `kv_size`.
 
 ```shell
 cd ../../..
-cmake -B build
+cmake -B build -DLLAMA_SERVER_TEST_FAULTS=ON
 cmake --build build --target llama-server
 ```
+
+`LLAMA_SERVER_TEST_FAULTS` compiles in the faults `unit/test_failed_fill.py` injects; without it those tests skip. Never set it for a build that serves.
 
 2. Start the test: `./tests.sh`
 
