@@ -1,3 +1,5 @@
+import os
+import tempfile
 import pytest
 from utils import *
 
@@ -73,3 +75,53 @@ def test_a_failed_fill_leaves_the_batch_and_its_prompt_clean(monkeypatch):
     assert retry.status_code == 200, retry.body
     assert retry.body["timings"]["cache_n"] == 0
     assert retry.body["content"] == good.body["content"]
+
+
+def speculative_server() -> ServerProcess:
+    # a recurrent model: its memory cannot drop a rejected draft's tail, so every verified draft
+    # is protected by a speculative checkpoint of the target's state
+    preset = ServerProcess()
+    preset.model_hf_repo = "mradermacher/mamba-130m-hf-GGUF"
+    preset.model_hf_file = "mamba-130m-hf.Q4_K_M.gguf"
+    preset.model_alias = "mamba-130m"
+    preset.n_slots = 1
+    preset.n_ctx = 2048
+    preset.temperature = 0.0
+    preset.spec_type = "ngram-simple"
+    preset.spec_draft_n_max = 8
+    fd, preset.log_path = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+    return preset
+
+
+def generate_repetitive():
+    return server.make_request("POST", "/completion", data={
+        # a period longer than the 12-token n-gram, so ngram-simple drafts from the history
+        "prompt": "the quick brown fox jumps over the lazy dog and then runs into the deep dark forest, " * 5 + "the quick",
+        "n_predict": 48,
+        "temperature": 0.0,
+        "return_tokens": True,
+    })
+
+
+# what this catches: the speculative checkpoint taken before a draft is verified allocates the
+# same kind of state copy; a std::bad_alloc there released a generating slot mid-reply. Refused,
+# the draft is dropped and the step decodes without it, so the reply is unchanged.
+def test_a_refused_speculative_checkpoint_drops_the_draft_not_the_reply(monkeypatch):
+    global server
+    server = speculative_server()
+    server.start()
+    clean = generate_repetitive()
+    assert clean.status_code == 200, clean.body
+    assert clean.body["timings"]["draft_n"] > 0 # it drafted, so speculative checkpoints were taken
+    server.stop()
+
+    server = speculative_server()
+    monkeypatch.setenv("LLAMA_SERVER_TEST_FAIL_SPEC_CHECKPOINTS", "1")
+    server.start()
+    faulted = generate_repetitive()
+    assert faulted.status_code == 200, faulted.body
+    assert faulted.body["tokens"] == clean.body["tokens"]
+    with open(server.log_path) as log:
+        assert "speculative checkpoint refused" in log.read()
+    assert server.make_request("GET", "/health").status_code == 200

@@ -1369,8 +1369,9 @@ private:
         }
 
         test_faults = server_test_faults::from_env();
-        if (test_faults.checkpoint_copies || test_faults.prompt_fills) {
-            SRV_WRN("test faults: checkpoint copies = %d, prompt fills = %d\n", test_faults.checkpoint_copies, test_faults.prompt_fills);
+        if (test_faults.any()) {
+            SRV_WRN("test faults: prompt checkpoints = %d, speculative checkpoints = %d, prompt fills = %d\n",
+                    test_faults.prompt_checkpoints, test_faults.spec_checkpoints, test_faults.prompt_fills);
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
@@ -2515,6 +2516,44 @@ private:
         return (slot.task->n_tokens() + params_base.n_ctx_checkpoints - 1) / params_base.n_ctx_checkpoints;
     }
 
+    enum class checkpoint_kind { prompt, speculative };
+
+    // which parts of a sequence's state a checkpoint copies
+    struct checkpoint_parts {
+        bool tgt;
+        bool dft;
+        bool spec; // the speculative implementation's own state
+    };
+
+    // Continuum fork: the one place a checkpoint's state copy is allocated. A copy that cannot be
+    // allocated is refused, not a slot failure: the checkpoint is cleared, false is returned and
+    // the caller goes on without it (a restore from a prompt checkpoint is cold; a draft that a
+    // speculative checkpoint would protect is dropped, and the step decodes without it).
+    bool copy_checkpoint(const server_slot & slot, common_prompt_checkpoint & ckpt, checkpoint_kind kind, checkpoint_parts parts) {
+        const bool is_prompt = kind == checkpoint_kind::prompt;
+        try {
+            if (server_test_faults::take(is_prompt ? test_faults.prompt_checkpoints : test_faults.spec_checkpoints)) {
+                throw std::bad_alloc(); // where the copies below allocate
+            }
+            if (parts.tgt) {
+                ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+            if (parts.dft) {
+                ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+            if (parts.spec) {
+                common_speculative_get_state(spec.get(), slot.id, ckpt.data_spec);
+            }
+            return true;
+        } catch (const std::bad_alloc &) {
+            SLT_WRN(slot, "%s checkpoint refused: its state copy could not be allocated (n_tokens = %" PRId64 "), %s\n",
+                    is_prompt ? "context" : "speculative", ckpt.n_tokens,
+                    is_prompt ? "a restore from here will be cold" : "the draft is dropped");
+            ckpt.clear();
+            return false;
+        }
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2556,17 +2595,8 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        // a copy that cannot be allocated only makes a later restore from here cold
-        try {
-            if (server_test_faults::take(test_faults.checkpoint_copies)) {
-                throw std::bad_alloc(); // where the copy below allocates
-            }
-            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            // stash the draft's speculative state with the checkpoint
-            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
-        } catch (const std::bad_alloc &) {
-            SLT_WRN(slot, "context checkpoint refused: its copy could not be allocated (n_tokens = %" PRId64 "), a restore from here will be cold\n", cur.n_tokens);
+        // with the draft's speculative state stashed beside it
+        if (!copy_checkpoint(slot, cur, checkpoint_kind::prompt, { /* tgt */ true, /* dft */ true, /* spec */ true })) {
             return;
         }
 
@@ -3666,8 +3696,8 @@ private:
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
-                        if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        if (use_ckpt_dft && !copy_checkpoint(slot, slot.spec_ckpt, checkpoint_kind::speculative, { false, true, false })) {
+                            return; // no draft this step
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -3699,8 +3729,6 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
-            slot.stats.n_draft_tokens += draft.size();
-
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
@@ -3722,24 +3750,18 @@ private:
                 const bool use_ckpt_dft =
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
-                if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
-
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
-
+                if ((use_ckpt_tgt || use_ckpt_dft) &&
+                    !copy_checkpoint(slot, ckpt, checkpoint_kind::speculative, { use_ckpt_tgt, use_ckpt_dft, false })) {
+                    draft.clear(); // a draft that could not be rolled back is not verified
+                } else if (use_ckpt_tgt) {
                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
                             (float) ckpt.size() / 1024 / 1024,
                             (float) ckpt.data_dft.size() / 1024 / 1024);
                 }
-
-                if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                }
             }
+
+            slot.stats.n_draft_tokens += draft.size();
         });
 
         // update the batch with the sampled/drafted tokens
