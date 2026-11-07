@@ -430,12 +430,97 @@ static void run_refuses_graph_without_backward() {
     ggml_backend_free(cpu);
 }
 
+// what this catches: the MoE router's normalization, weights / clamp(sum_rows(weights), eps, inf)
+// (llama-graph.cpp build_moe_ffn), with more than one expert used: the divisor is broadcast over
+// the experts, and DIV's backward gave it a gradient of the dividend's shape. The build asserted
+// on it and aborted the M5's serving engine during a /train on the 35B-A3B (8 experts used,
+// 2026-11-07); the toy MoE in test-llama-archs uses 1, where the two shapes agree. Here w is the
+// router's two weights for one token, the loss is w0 / (w0 + w1), and one SGD step must move w by
+// -lr * (w1, -w0) / (w0 + w1)^2: the dividend's path and the broadcast divisor's, summed.
+static void run_trains_through_broadcast_divisor() {
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    CHECK(cpu != nullptr);
+    ggml_backend_t backends[] = { cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+
+    ggml_init_params sp = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx_static = ggml_init(sp);
+    ggml_tensor * w = ggml_new_tensor_2d(ctx_static, GGML_TYPE_F32, 2, 1); // [n_expert_used, n_tokens]
+    ggml_set_param(w);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, cpu);
+    const float w0[2] = { 1.0f, 3.0f };
+    ggml_backend_tensor_set(w, w0, 0, sizeof(w0));
+
+    ggml_opt_params params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_SUM);
+    params.optimizer    = GGML_OPT_OPTIMIZER_TYPE_SGD;
+    params.get_opt_pars = sgd_pars;
+    ggml_opt_context_t opt_ctx = ggml_opt_init(params);
+
+    ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
+    ggml_context * ctx_compute = ggml_init(cp);
+    ggml_tensor * pick = ggml_new_tensor_2d(ctx_compute, GGML_TYPE_F32, 2, 1); // which normalized weight is the loss
+    ggml_tensor * sum  = ggml_clamp(ctx_compute, ggml_sum_rows(ctx_compute, w), 6.103515625e-5f, INFINITY); // [1, n_tokens]
+    ggml_tensor * out  = ggml_mul(ctx_compute, ggml_div(ctx_compute, w, sum), pick);
+    ggml_cgraph * gf   = ggml_new_graph_custom(ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
+    ggml_build_forward_expand(gf, out);
+    ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, pick, out);
+    CHECK(ggml_opt_alloc(opt_ctx, true));
+    CHECK(ggml_opt_refusal(opt_ctx)[0] == '\0');
+    const float pick0[2] = { 1.0f, 0.0f };
+    ggml_backend_tensor_set(pick, pick0, 0, sizeof(pick0));
+    ggml_opt_eval(opt_ctx, nullptr);
+    CHECK(ggml_opt_refusal(opt_ctx)[0] == '\0');
+    float w_after[2];
+    ggml_backend_tensor_get(w, w_after, 0, sizeof(w_after));
+    const float s2 = (w0[0] + w0[1]) * (w0[0] + w0[1]);
+    CHECK(std::fabs(w_after[0] - (w0[0] - LR * ( w0[1] / s2))) < 1e-6f);
+    CHECK(std::fabs(w_after[1] - (w0[1] - LR * (-w0[0] / s2))) < 1e-6f);
+
+    ggml_free(ctx_compute);
+    ggml_opt_free(opt_ctx);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx_static);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+}
+
+// what this catches: a backward that gives a source a gradient of another shape must be returned
+// by ggml_build_backward_expand_or_refuse, naming the node, never asserted: the assert is what took
+// the serving process down. The break is made here by a gradient accumulator of the wrong shape
+// (w has 1 element, its accumulator 2), so the test needs no op with a broken backward.
+static void run_refuses_misshaped_gradient() {
+    ggml_init_params cp = { 64 * ggml_tensor_overhead() + 2 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
+    ggml_context * ctx = ggml_init(cp);
+    ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_param(w);
+    ggml_tensor * x   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_tensor * out = ggml_mul(ctx, w, x);
+    ggml_set_name(out, "w_times_x");
+    ggml_set_loss(out);
+    ggml_cgraph * gb = ggml_new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, true);
+    ggml_build_forward_expand(gb, out);
+
+    ggml_tensor * grad_accs[GGML_DEFAULT_GRAPH_SIZE] = { nullptr };
+    for (int i = 0; i < ggml_graph_n_nodes(gb); ++i) {
+        if (ggml_graph_node(gb, i) == w) {
+            grad_accs[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2);
+        }
+    }
+    const char * why = nullptr;
+    const ggml_tensor * refused = ggml_build_backward_expand_or_refuse(ctx, gb, grad_accs, &why);
+    CHECK(refused == out);
+    CHECK(why != nullptr && std::strstr(why, "src[0]") != nullptr);
+    ggml_free(ctx);
+}
+
 int main() {
     ggml_backend_load_all();
     run(1);
     run(2);
     run_manual();
     run_refuses_graph_without_backward();
+    run_trains_through_broadcast_divisor();
+    run_refuses_misshaped_gradient();
     run_label_projection(false);
     run_label_projection(true);
     for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
