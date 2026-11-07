@@ -4,6 +4,8 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 
+#include <cerrno>
+#include <cstring>
 #include <map>
 #include <cassert>
 #include <mutex>
