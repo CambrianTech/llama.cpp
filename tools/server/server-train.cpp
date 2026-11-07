@@ -1066,7 +1066,10 @@ void server_trainer::run(json req, examples_data ex) {
     llama_opt_set_memory_budget(ctx, budget == 0 ? 0 : std::max<size_t>(1, budget > context_bytes ? budget - context_bytes : 1));
     // the exact walk's host memory per window: refused by name over the caller's cap
     llama_opt_set_walk_host_budget(ctx, (size_t) req.value("walk_host_budget_mib", (int64_t) 0) << 20);
-    llama_opt_init(ctx, model, lopt);
+    if (!llama_opt_init(ctx, model, lopt)) {
+        fail(std::string("the adapter cannot be trained: ") + llama_opt_failure(ctx));
+        return;
+    }
     llama_opt_set_step_callback(ctx, &server_trainer::before_window, this);
     {
         // from here an epoch can run: a cancel reaches this context directly

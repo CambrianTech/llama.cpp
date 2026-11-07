@@ -202,9 +202,11 @@ struct llama_context {
     // training
     //
 
-    void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
+    bool opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
+    // why `adapter` cannot train on this context, or nullptr; checked before anything is changed
+    const char * opt_untrainable(const llama_adapter_lora * adapter, const struct llama_opt_params & lopt_params) const;
     // make `adapter` the trained shadow, creating its optimizer the first time it trains
-    void opt_select(const llama_adapter_lora * adapter, struct llama_opt_params lopt_params);
+    bool opt_select(const llama_adapter_lora * adapter, struct llama_opt_params lopt_params);
     // forget `adapter`'s optimizer (its moments go); false when it has none
     bool opt_release(const llama_adapter_lora * adapter);
 
