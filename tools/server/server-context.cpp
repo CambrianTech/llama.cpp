@@ -2253,7 +2253,13 @@ private:
             lopt.get_opt_pars_ud = &learn_lr;
             lopt.optimizer_type  = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
             lopt.adapter         = loras[L.lora_id].ptr;
-            llama_opt_init(ctx_tgt, model_tgt, lopt);
+            if (!llama_opt_init(ctx_tgt, model_tgt, lopt)) {
+                // refused before anything was trained or decoded: her own adapter set again, her
+                // slot untouched, and the server keeps serving (an F16 adapter killed it at an
+                // assert: Fable on fork #85, 2026-11-07)
+                common_set_adapter_lora(ctx_tgt, slot.lora);
+                return refused("adapter " + std::to_string(L.lora_id) + " cannot be trained: " + llama_opt_failure(ctx_tgt));
+            }
         }
         // drop what follows n0 (attention) and put her recurrent state back at n0
         if (cp != nullptr) {

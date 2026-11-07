@@ -56,6 +56,25 @@ if "--two-minds" in sys.argv:
     print(json.dumps({"steps": steps}))
     sys.exit(0)
 
+# A learn naming an adapter that cannot train is refused by name, and serving survives it (needs
+# shadow-05.gguf and an F16 copy of it, shadow-f16.gguf, in --train-dir: make-f16-shadow.py writes
+# one). What this catches (Fable on fork #85, 2026-11-07): the F32 shadow learned, then a learn on
+# its F16 copy hit a GGML_ASSERT in opt_select and killed the serving process (exit 134).
+if "--non-f32-refused" in sys.argv:
+    f16 = json.loads(raw("/lora-adapters/load", {"name": "shadow-f16.gguf"}))["id"]
+    turn = lambda lora: {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0,
+                         "learn": dict(learn, lora_id=lora)}
+    first = json.loads(raw("/completion", turn(sid)))
+    assert first["learn"]["success"], first
+    refused = json.loads(raw("/completion", turn(f16)))
+    assert not refused["learn"]["success"] and "non-F32" in refused["learn"]["failure"], refused
+    with urllib.request.urlopen(U + "/health", timeout=30) as r:
+        assert json.load(r)["status"] == "ok", "the server still answers after the refusal"
+    again = json.loads(raw("/completion", turn(sid)))
+    assert again["learn"]["success"], again
+    print(json.dumps({"refused": refused["learn"]["failure"], "after": again["learn"]["loss"]}))
+    sys.exit(0)
+
 # Isolated template/label regression; never run this shadow-adapter fixture on a persona lane.
 # Add --expect-reasoning-refusal only for a known non-reasoning template; the exact refusal must match.
 if "--template-replies" in sys.argv:
