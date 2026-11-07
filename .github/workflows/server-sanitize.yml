@@ -79,6 +79,7 @@ jobs:
           cmake -B build \
             -DLLAMA_BUILD_BORINGSSL=ON \
             -DGGML_SCHED_NO_REALLOC=ON \
+            -DLLAMA_SERVER_TEST_FAULTS=ON \
             -DGGML_SANITIZE_ADDRESS=${{ matrix.sanitizer == 'ADDRESS' }} \
             -DGGML_SANITIZE_THREAD=${{ matrix.sanitizer == 'THREAD' }} \
             -DGGML_SANITIZE_UNDEFINED=${{ matrix.sanitizer == 'UNDEFINED' }} \
