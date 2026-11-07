@@ -135,6 +135,19 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
         {
             // track the end sequence within forced_tokens so it is also reported on DONE
             const int32_t match = ctx->end_matcher.advance(token);
+            if (match >= 0 && (ctx->force_pos >= ctx->forced_tokens.size() || token != ctx->forced_tokens[ctx->force_pos])) {
+                // the reasoning already ended (a prefilled `<think></think>`): nothing is left to force
+                ctx->state = REASONING_BUDGET_DONE;
+                ctx->end_match = match;
+                COM_TRC("%s", "deactivated (natural end while forcing)\n");
+                break;
+            }
+            if (ctx->force_pos >= ctx->forced_tokens.size() || token != ctx->forced_tokens[ctx->force_pos]) {
+                // only the forced token advances the forced end: a prefilled token accepted in
+                // FORCING (budget 0 with the generation prompt's `<think>\n`) is not a forced token,
+                // and consuming one reached DONE without ever sampling the end tag
+                break;
+            }
             ctx->force_pos++;
             if (ctx->force_pos >= ctx->forced_tokens.size()) {
                 ctx->state = REASONING_BUDGET_DONE;

@@ -4,6 +4,7 @@
 
 #include "ggml.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <climits>
 #include <stdexcept>
