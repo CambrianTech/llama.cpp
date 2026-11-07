@@ -2348,9 +2348,15 @@ private:
             cp->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
         ggml_opt_result_t result = ggml_opt_result_init();
+        const int64_t steps_before = llama_opt_steps(ctx_tgt);
         const bool ok = llama_opt_learn(ctx_tgt, slot.id, n0, toks.data(), labels.data(), (int32_t) toks.size(), result);
+        // COMMITTED is whether the optimizer stepped, not whether the call returned true: a learn whose
+        // restore failed after the step has moved her shadow, so it is counted and receipted, and a
+        // redispatch is answered from that receipt instead of training the same input twice (Fable
+        // on fork #88). Her slot is re-prefilled below either way.
+        const bool committed = llama_opt_steps(ctx_tgt) > steps_before;
         double loss = 0.0, unc = 0.0;
-        if (ok) {
+        if (committed) {
             ggml_opt_result_loss(result, &loss, &unc);
         }
         ggml_opt_result_free(result);
@@ -2393,9 +2399,13 @@ private:
         slot.prompt.tokens.keep_first(n_keep);
         slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & c) { return c.n_tokens > n_keep; });
         learn_outcome out;
-        out.ok       = ok;
-        out.step     = ok ? ++learn_steps[loras[L.lora_id].ptr] : 0;
-        out.failure  = ok ? "" : llama_opt_failure(ctx_tgt);
+        out.ok       = committed;
+        out.step     = committed ? ++learn_steps[loras[L.lora_id].ptr] : 0;
+        out.failure  = committed ? "" : llama_opt_failure(ctx_tgt);
+        if (committed && !ok) {
+            SRV_WRN("learn on slot %d committed its step, then failed after it (%s): the slot was re-prefilled\n", slot.id,
+                    llama_opt_failure(ctx_tgt));
+        }
         out.loss     = loss;
         out.n_labels = (int32_t) toks.size() - 1;
         out.t_ms     = (ggml_time_us() - t0) / 1000.0;

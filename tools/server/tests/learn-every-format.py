@@ -142,15 +142,15 @@ if "--two-minds" in sys.argv:
 if "--non-f32-refused" in sys.argv:
     f16 = json.loads(raw("/lora-adapters/load", {"name": "shadow-f16.gguf"}))["id"]
     turn = lambda lora: {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0,
-                         "learn": dict(learn, lora_id=lora)}
+                         "learn": fenced(lora)}
     first = json.loads(raw("/completion", turn(sid)))
-    assert first["learn"]["success"], first
+    assert landed(sid, first["learn"])["success"], first
     refused = json.loads(raw("/completion", turn(f16)))
     assert not refused["learn"]["success"] and "non-F32" in refused["learn"]["failure"], refused
     with urllib.request.urlopen(U + "/health", timeout=30) as r:
         assert json.load(r)["status"] == "ok", "the server still answers after the refusal"
     again = json.loads(raw("/completion", turn(sid)))
-    assert again["learn"]["success"], again
+    assert landed(sid, again["learn"])["success"], again
     print(json.dumps({"refused": refused["learn"]["failure"], "after": again["learn"]["loss"]}))
     sys.exit(0)
 

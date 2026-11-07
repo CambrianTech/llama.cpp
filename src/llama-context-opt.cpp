@@ -1015,6 +1015,12 @@ bool llama_context::opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_
     opt_outputs_internal  = false;
     opt_learn_labels      = 0;
     opt_learn_labels_done = 0;
+    // A batch that failed part-way through a period leaves its partial gradient in the accumulators:
+    // drop the period, so the next learn's step never applies this input's gradient under another
+    // input's receipt (Fable on fork #88). Steps already taken by earlier batches stand.
+    if (!ok && opt_ctx != nullptr) {
+        ggml_opt_discard_period(opt_ctx);
+    }
     // RESTORE: the reply's cells and the recurrent state decoded again under her stable set
     bool restored = attn == nullptr || attn->seq_rm(seq, n_cached, -1);
     if (recr != nullptr) {
@@ -1032,6 +1038,14 @@ bool llama_context::opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_
         return false;
     }
     return ok;
+}
+
+int64_t llama_context::opt_steps() const {
+    return opt_ctx != nullptr ? ggml_opt_steps(opt_ctx) : 0;
+}
+
+int64_t llama_opt_steps(struct llama_context * ctx) {
+    return ctx->opt_steps();
 }
 
 bool llama_opt_learn(

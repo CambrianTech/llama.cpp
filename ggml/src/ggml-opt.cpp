@@ -958,6 +958,16 @@ struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_
     return it == opt_ctx->leaf_grads.end() ? nullptr : it->second;
 }
 
+int64_t ggml_opt_steps(ggml_opt_context_t opt_ctx) {
+    return opt_ctx->iter - 1;
+}
+
+void ggml_opt_discard_period(ggml_opt_context_t opt_ctx) {
+    // the next ggml_opt_alloc zeroes the accumulators when a period starts fresh at opt_i 0
+    opt_ctx->period_fresh = true;
+    opt_ctx->opt_i        = 0;
+}
+
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
     opt_ctx->checkpoint_ready = false;
     if (optimizer) {

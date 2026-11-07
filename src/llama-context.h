@@ -209,6 +209,8 @@ struct llama_context {
     bool opt_select(const llama_adapter_lora * adapter, struct llama_opt_params lopt_params);
     // forget `adapter`'s optimizer (its moments go); false when it has none
     bool opt_release(const llama_adapter_lora * adapter);
+    // the active shadow's committed optimizer steps (0 before llama_opt_init)
+    int64_t opt_steps() const;
 
     // TODO: more flexible combinations of logical/physical batch size and context size
     // set by llama_opt_stop from any thread; opt_epoch returns at the next data item

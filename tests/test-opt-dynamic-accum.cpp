@@ -513,11 +513,81 @@ static void run_refuses_misshaped_gradient() {
     ggml_free(ctx);
 }
 
+// what this catches (Fable on fork #88): a learn whose reply spans batches failing part-way through
+// a period left that batch's partial gradient in the accumulators, and the next learn's step applied
+// it under another input's receipt. ggml_opt_discard_period drops the period. With a period of two
+// graphs on loss = sum(w * x) (gradient x per graph): one graph, a discard, then one graph is the
+// first half of a NEW period, so nothing steps; the next graph ends it and moves w by exactly
+// -lr * 2x, as from an untouched optimizer. Without the discard the second graph already ends the
+// period. ggml_opt_steps counts the committed steps the caller fences on.
+static void run_discarded_period() {
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_t backends[] = { cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+
+    ggml_init_params sp = { 8 * ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx_static = ggml_init(sp);
+    ggml_tensor * w = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
+    ggml_set_param(w);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, cpu);
+    const float w0 = 1.0f;
+    ggml_backend_tensor_set(w, &w0, 0, sizeof(float));
+
+    ggml_opt_params params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_SUM);
+    params.optimizer    = GGML_OPT_OPTIMIZER_TYPE_SGD;
+    params.get_opt_pars = sgd_pars;
+    params.opt_period   = 2;
+    ggml_opt_context_t opt_ctx = ggml_opt_init(params);
+    ggml_opt_result_t  result  = ggml_opt_result_init();
+    CHECK(ggml_opt_steps(opt_ctx) == 0);
+
+    auto eval = [&]() {
+        ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
+        ggml_context * ctx_compute = ggml_init(cp);
+        ggml_tensor * x   = ggml_new_tensor_1d(ctx_compute, GGML_TYPE_F32, 1);
+        ggml_tensor * out = ggml_mul(ctx_compute, w, x);
+        ggml_cgraph * gf  = ggml_new_graph_custom(ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
+        ggml_build_forward_expand(gf, out);
+        ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, x, out);
+        CHECK(ggml_opt_alloc(opt_ctx, true));
+        ggml_backend_tensor_set(x, &X, 0, sizeof(float));
+        ggml_opt_eval(opt_ctx, result);
+        ggml_free(ctx_compute);
+    };
+    auto w_now = [&]() {
+        float v;
+        ggml_backend_tensor_get(w, &v, 0, sizeof(float));
+        return v;
+    };
+
+    eval();                           // the failed learn's first graph: half a period, a gradient
+    ggml_opt_discard_period(opt_ctx); // its next graph failed: the period is dropped
+    eval();                           // the next learn's first graph: half of a fresh period
+    if (std::fabs(w_now() - w0) > 1e-7f || ggml_opt_steps(opt_ctx) != 0) {
+        fprintf(stderr, "a discarded period still counted: w %f (from %f), %lld steps\n", w_now(), w0, (long long) ggml_opt_steps(opt_ctx));
+        exit(1);
+    }
+    eval();                           // ends the fresh period: its two graphs, never three
+    if (std::fabs(w_now() - (w0 - LR * 2 * X)) > 1e-6f || ggml_opt_steps(opt_ctx) != 1) {
+        fprintf(stderr, "after a discarded period w moved to %f, expected %f\n", w_now(), w0 - LR * 2 * X);
+        exit(1);
+    }
+
+    ggml_opt_result_free(result);
+    ggml_opt_free(opt_ctx);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx_static);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+}
+
 int main() {
     ggml_backend_load_all();
     run(1);
     run(2);
     run_manual();
+    run_discarded_period();
     run_refuses_graph_without_backward();
     run_trains_through_broadcast_divisor();
     run_refuses_misshaped_gradient();

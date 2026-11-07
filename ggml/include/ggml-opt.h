@@ -153,6 +153,14 @@ extern "C" {
     // set gradients to zero, initialize loss, and optionally reset the optimizer
     GGML_API void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer);
 
+    // The optimizer steps taken (the iteration the next step uses, minus one): read before and after
+    // a call that may step, so a caller knows whether the weights moved even when the call failed.
+    GGML_API int64_t ggml_opt_steps(ggml_opt_context_t opt_ctx);
+    // Abandons the period in progress: the gradients accumulated since the last step are dropped (the
+    // next backward starts a fresh period from zero), so a failure part-way through a period never
+    // carries its partial gradient into the next step. The optimizer's moments and iteration stay.
+    GGML_API void ggml_opt_discard_period(ggml_opt_context_t opt_ctx);
+
     GGML_API bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx); // whether the graphs are allocated_statically
 
     // get underlying tensors that store data

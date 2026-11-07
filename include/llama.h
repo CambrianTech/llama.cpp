@@ -1860,6 +1860,11 @@ extern "C" {
     // A reply within one batch is one exact step; a longer one steps per batch, its gradient
     // stopped at each batch boundary. false: refused or failed by name (llama_opt_failure),
     // with the sequence restored.
+    // The optimizer steps the active shadow's optimizer has committed (0 before llama_opt_init). Read
+    // before and after llama_opt_learn: a learn whose optimizer stepped committed an update even when
+    // it returned false (its restore failed), so the caller's fence and receipt follow this count.
+    LLAMA_API int64_t llama_opt_steps(struct llama_context * lctx);
+
     LLAMA_API bool llama_opt_learn(
             struct llama_context * lctx,
             llama_seq_id           seq,
