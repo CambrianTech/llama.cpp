@@ -1785,7 +1785,17 @@ struct test_case {
             }
         }
         ggml_graph_cpy(gf, gb);
-        ggml_build_backward_expand(ctx.get(), gb, nullptr);
+        // past the walk, a refused build is the op's backward breaking its own contract on these
+        // shapes (a source given a gradient of another shape): a failure, not "not supported"
+        {
+            const char * why = nullptr;
+            if (const ggml_tensor * node = ggml_build_backward_expand_or_refuse(ctx.get(), gb, nullptr, &why)) {
+                test_operation_info info(op_desc(out), vars(), ggml_backend_name(backend));
+                info.set_error("backward", std::string(ggml_op_desc(node)) + ": " + why);
+                output_printer->print_operation(info);
+                return false;
+            }
+        }
         if (expect.size() != 1 || expect[0] != 0.0f) {
             GGML_ASSERT(ggml_graph_n_nodes(gb) > ggml_graph_n_nodes(gf));
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
@@ -3260,8 +3270,10 @@ struct test_bin_bcast : public test_case {
             ggml_set_name(b[i], (std::string("b") + std::to_string(i)).c_str());
         }
 
-        // The backward pass supports broadcasting only for GGML_ADD:
-        const bool grad_supported = op == ggml_add && ggml_are_same_shape(a, b[0]) && nf == 1 && !perm1;
+        // every binary op's backward sums a broadcast src1's gradient over its repeats (the MoE
+        // router divides n_expert_used weights by one sum per token: ne {1, n, ...} nr {k, 1, ...})
+        const bool grad_supported = (op == ggml_add || op == ggml_sub || op == ggml_mul || op == ggml_div) &&
+            nf == 1 && !perm1 && !src_overlap;
         if (grad_supported) {
             ggml_set_param(a);
             ggml_set_param(b[0]);

@@ -2927,6 +2927,16 @@ extern "C" {
     // non-float source it must differentiate), with why, else NULL: the graphs on which
     // ggml_build_backward_expand would abort, for a caller that must refuse instead.
     GGML_API struct ggml_tensor * ggml_graph_backward_refusal(const struct ggml_cgraph * cgraph, const char ** why);
+    // Builds the backward into cgraph, or returns the first node it cannot build (with why, which
+    // must be non-NULL), else NULL: a node ggml_graph_backward_refusal names, or one whose backward
+    // gave a source no gradient or one of another shape. A refused graph is half built: discard it.
+    // For a caller that must refuse instead of aborting (training inside a serving process).
+    GGML_API struct ggml_tensor * ggml_build_backward_expand_or_refuse(
+        struct ggml_context *  ctx,        // context for gradient computation
+        struct ggml_cgraph  *  cgraph,
+        struct ggml_tensor  ** grad_accs,
+        const char         **  why);
+    // ggml_build_backward_expand_or_refuse that aborts on a refusal, naming the node and why
     GGML_API void ggml_build_backward_expand(
         struct ggml_context *  ctx,        // context for gradient computation
         struct ggml_cgraph  *  cgraph,
