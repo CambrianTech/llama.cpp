@@ -773,6 +773,23 @@ int main(int argc, char ** argv) {
             }
         }
         const auto generation_prefix = seq_state(ctx, 0);
+        // What this catches: revoked authority must stop NEW gradients without abandoning KV
+        // restoration or freeing optimizer custody. A drain is not proof the reply was learned.
+        GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0,
+            tokens.data() + r0, WINDOW - r0, nullptr));
+        GGML_ASSERT(llama_opt_learn_needs_gradient(ctx));
+        GGML_ASSERT(llama_opt_learn_drain(ctx));
+        GGML_ASSERT(llama_opt_learn_drain(ctx));
+        GGML_ASSERT(!llama_opt_learn_needs_gradient(ctx));
+        llama_opt_learn_status drained;
+        do { drained = llama_opt_learn_step(ctx); } while (drained == LLAMA_OPT_LEARN_MORE);
+        GGML_ASSERT(drained == LLAMA_OPT_LEARN_DONE);
+        GGML_ASSERT(!llama_opt_learn_drain(ctx));
+        GGML_ASSERT(adapter_params(adapter) == before);
+        GGML_ASSERT(seq_state(ctx, 0) == want_her);
+        GGML_ASSERT(seq_state(ctx, 1) == neighbour_before);
+        GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
+
         // What this catches: yielding with training flags still installed, losing accumulated
         // labels between chunks, or restoring the neighbour instead of the learning sequence.
         // Real neighbour inference runs at every yield; learning still covers the entire reply.

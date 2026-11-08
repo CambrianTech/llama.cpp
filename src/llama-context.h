@@ -248,6 +248,8 @@ struct llama_context {
     bool opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens,
             const llama_token * labels, int32_t n, const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result);
     llama_opt_learn_status opt_learn_step();
+    bool opt_learn_drain();
+    bool opt_learn_needs_gradient() const;
 
     bool opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens, const llama_token * labels, int32_t n,
             ggml_opt_result_t result);

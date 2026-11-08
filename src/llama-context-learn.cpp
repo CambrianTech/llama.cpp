@@ -95,6 +95,20 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
     return true;
 }
 
+// Revocation ends gradient admission, not sequence custody. The next step follows the
+// existing stable-restoration path; no optimizer, KV, or completed update is discarded.
+bool llama_context::opt_learn_drain() {
+    if (!opt_reply) { return false; }
+    if (!opt_reply->restoring && opt_reply->cursor < opt_reply->n_train) {
+        opt_reply->cursor = opt_reply->n_train;
+    }
+    return true;
+}
+
+bool llama_context::opt_learn_needs_gradient() const {
+    return opt_reply && !opt_reply->restoring && opt_reply->cursor < opt_reply->n_train;
+}
+
 // One existing decode chunk, then return to the caller. The served window and the
 // gradient's label denominator remain whole; chunking changes scheduling, not examples.
 llama_opt_learn_status llama_context::opt_learn_step() {
@@ -181,6 +195,8 @@ bool llama_opt_learn_begin(llama_context * ctx, llama_seq_id seq, llama_pos pref
 }
 
 llama_opt_learn_status llama_opt_learn_step(llama_context * ctx) { return ctx->opt_learn_step(); }
+bool llama_opt_learn_drain(llama_context * ctx) { return ctx->opt_learn_drain(); }
+bool llama_opt_learn_needs_gradient(const llama_context * ctx) { return ctx->opt_learn_needs_gradient(); }
 
 bool llama_opt_learn(
         struct llama_context * ctx,

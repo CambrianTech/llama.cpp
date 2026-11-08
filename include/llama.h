@@ -1876,6 +1876,13 @@ extern "C" {
             const llama_token * tokens, const llama_token * labels, int32_t n,
             const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result);
     LLAMA_API enum llama_opt_learn_status llama_opt_learn_step(struct llama_context * ctx);
+    // Stop admitting gradient chunks, but keep custody until step drains the original served
+    // tail. Already committed optimizer steps remain committed. Call only between steps.
+    // Returns false when no reply is active; repeated drain requests are harmless.
+    LLAMA_API bool llama_opt_learn_drain(struct llama_context * ctx);
+    // True only while a further gradient chunk remains; restoration never needs a new grant.
+    LLAMA_API bool llama_opt_learn_needs_gradient(const struct llama_context * ctx);
+
 
     LLAMA_API bool llama_opt_learn(
             struct llama_context * lctx,
