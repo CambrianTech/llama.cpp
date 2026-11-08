@@ -970,6 +970,13 @@ void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
     } else {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
+    // Dynamic graphs do not own the persistent accumulator map. A revoked partial
+    // manual period must not flow into the next reply; preserve Adam moments unless
+    // optimizer reset was explicitly requested above.
+    for (auto & entry : opt_ctx->param_grad_acc) { ggml_set_zero(entry.second); }
+    opt_ctx->period_fresh = true;
+    opt_ctx->opt_i = 0;
+
 }
 
 // Stable names describe parameter identity; pointer addresses are local to a graph.

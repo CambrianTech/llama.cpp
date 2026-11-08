@@ -94,7 +94,7 @@ static void run(int32_t opt_period) {
 // is SGD on (0.5 + 0.25 + 3 + 1) * x. Each graph's x is a GRAD leaf, whose gradient (the
 // weight times w, plus 3 w in the second) must read back after its eval; a following period
 // starts from zero.
-static void run_manual() {
+static void run_manual(bool abandon_first_chunk = false) {
     // by type, not ggml_backend_cpu_init: in a dynamically loaded backend build (CI) the CPU
     // backend is its own library
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -158,6 +158,12 @@ static void run_manual() {
             if (std::fabs(gx_val - dx) > 1e-5f) {
                 fprintf(stderr, "period %d graph %d: dL/dx %f, expected %f\n", period, k, gx_val, dx);
                 exit(1);
+            }
+            // What this catches: revoking a partial live reply clears only its accumulated
+            // gradients, and the next complete period must match a clean optimizer.
+            if (abandon_first_chunk && period == 0 && k == 0) {
+                ggml_opt_reset(opt_ctx, false);
+                expected_grad_w = 0.0f;
             }
             ggml_free(ctx_compute);
 
@@ -518,6 +524,7 @@ int main() {
     run(1);
     run(2);
     run_manual();
+    run_manual(true);
     run_refuses_graph_without_backward();
     run_trains_through_broadcast_divisor();
     run_refuses_misshaped_gradient();
