@@ -879,6 +879,10 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         ggml_graph_reset(opt_ctx->gb_opt);
+        // what one optimizer keeps resident between steps (gradient accumulators, AdamW moments):
+        // the per-mind memory cost a serving context carries for each shadow that learns
+        GGML_LOG_INFO("%s: optimizer static buffer %zu bytes (%zu params)\n", __func__,
+            opt_ctx->buf_static ? ggml_backend_buffer_get_size(opt_ctx->buf_static) : (size_t) 0, opt_ctx->param_m.size());
     }
 
     opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
