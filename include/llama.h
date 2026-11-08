@@ -1770,8 +1770,9 @@ extern "C" {
     LLAMA_API bool llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
     // A serving context trains one shadow per mind: llama_opt_init with another adapter makes it the
     // trained shadow, creating its optimizer the first time and keeping every shadow's moments across
-    // switches. llama_opt_release forgets one shadow's optimizer (before its adapter is unloaded);
-    // false when it had none.
+    // switches. llama_opt_release forgets one shadow's optimizer before its adapter is unloaded: true
+    // when no optimizer references the adapter any more (released, or it never had one); false,
+    // with llama_opt_failure saying why, when a live reply is training that shadow (unload must wait).
     LLAMA_API bool llama_opt_release(struct llama_context * lctx, const struct llama_adapter_lora * adapter);
     // Restore one shadow generation in place, preserving optimizer tensor identity. The caller
     // owns verified same-generation files/binding, stable adapter exclusion, and serialized queue
