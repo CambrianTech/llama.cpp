@@ -7293,16 +7293,17 @@ struct test_acc : public test_case {
     const std::array<int64_t, 4> ne_a;
     const std::array<int64_t, 4> ne_b;
     const int64_t stride_dim;
+    const size_t dst_offset;
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne_a, ne_b, stride_dim);
+        return VARS_TO_STR5(type, ne_a, ne_b, stride_dim, dst_offset);
     }
 
     test_acc(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {256, 17, 2, 3},
             std::array<int64_t, 4> ne_b = {256, 16, 2, 3},
-            uint64_t stride_dim = -1)
-        : type(type), ne_a(ne_a), ne_b(ne_b), stride_dim(stride_dim) {}
+            uint64_t stride_dim = -1, size_t dst_offset = 0)
+        : type(type), ne_a(ne_a), ne_b(ne_b), stride_dim(stride_dim), dst_offset(dst_offset) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne_a.data());
@@ -7331,7 +7332,9 @@ struct test_acc : public test_case {
 
         // When ne_b[0] < ne_a[0], a->nb[1] != b->nb[1], so the stride
         // parameters to ggml_acc don't match b's natural stride.
-        ggml_tensor * out = ggml_acc(ctx, a, b, a->nb[1], a->nb[2], a->nb[3], 0);
+        static const int permutations[6][3] = {{2,1,3}, {1,2,3}, {1,3,2}, {2,3,1}, {3,1,2}, {3,2,1}};
+        const int * axes = stride_dim >= 4 && stride_dim < 10 ? permutations[stride_dim - 4] : permutations[1];
+        ggml_tensor * out = ggml_acc(ctx, a, b, a->nb[axes[0]], a->nb[axes[1]], a->nb[axes[2]], dst_offset);
         ggml_set_name(out, "out");
 
         return out;
@@ -10539,6 +10542,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 1}));
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {9, 9, 1280, 1}));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
+    // Transposed V-cache view backward: destination strides are not dimension-ordered.
+    test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {8, 4, 3, 1}, {8, 3, 4, 1}, 4));
+    // Every destination-axis order, with holes and a nonzero offset inside each row.
+    const std::array<int64_t, 4> acc_shape = {8, 4, 3, 2};
+    const int acc_axes[6][3] = {{2,1,3}, {1,2,3}, {1,3,2}, {2,3,1}, {3,1,2}, {3,2,1}};
+    for (int p = 0; p < 6; ++p) {
+        test_cases.emplace_back(new test_acc(GGML_TYPE_F32, acc_shape,
+            {4, acc_shape[acc_axes[p][0]], acc_shape[acc_axes[p][1]], acc_shape[acc_axes[p][2]]}, p + 4, sizeof(float)));
+    }
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, -1));
     // rows wider than one threadgroup: dst = a must be copied whole before b is added (Metal's
