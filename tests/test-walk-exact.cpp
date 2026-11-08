@@ -504,6 +504,14 @@ int main(int argc, char ** argv) {
     const std::string init = "test-walk-exact." + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".init.gguf";
     GGML_ASSERT(common_lora_write_fresh(model, init, 8, 16, { "attn_q", "attn_v" }, 42));
 
+    // Fixture provisioning for the real server protocol tests, using the same adapter owner.
+    if (const char * shadow = getenv("WALK_WRITE_SHADOW")) {
+        GGML_ASSERT(std::rename(init.c_str(), shadow) == 0);
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
+
     // words in a fixed pseudo-random order: a window the model cannot already predict, so its
     // loss, and the gradient under test, is well above the kernels' batch-size noise
     static const char * words[] = { "room", "card", "claim", "review", "patch", "lease", "board", "turn",
@@ -727,6 +735,8 @@ int main(int argc, char ** argv) {
         decode_span(ctl, 0, tokens.data(), 0, r0);
         decode_span(ctl, 0, tokens.data() + r0, r0, WINDOW - r0);
         const std::vector<uint8_t> want_her = seq_state(ctl, 0);
+        decode_span(ctl, 1, neighbour + 200, 200, 1);
+        const auto want_neighbour_turn = seq_state(ctl, 1);
         llama_free(ctl);
 
         llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
@@ -763,7 +773,30 @@ int main(int argc, char ** argv) {
             }
         }
         const auto generation_prefix = seq_state(ctx, 0);
-        const bool learned = llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr);
+        // What this catches: yielding with training flags still installed, losing accumulated
+        // labels between chunks, or restoring the neighbour instead of the learning sequence.
+        // Real neighbour inference runs at every yield; learning still covers the entire reply.
+        GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
+        // A checkpoint may not publish an optimizer/cursor pair from half a live reply.
+        FILE * partial_state = tmpfile();
+        GGML_ASSERT(partial_state != nullptr);
+        GGML_ASSERT(!llama_opt_state_write(ctx, partial_state, "active-live-reply"));
+        fclose(partial_state);
+        llama_opt_learn_status progress;
+        int yielded = 0;
+        do {
+            progress = llama_opt_learn_step(ctx);
+            if (progress == LLAMA_OPT_LEARN_MORE) {
+                GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
+                decode_span(ctx, 1, neighbour + 200, 200, 1);
+                GGML_ASSERT(seq_state(ctx, 1) == want_neighbour_turn);
+                ++yielded;
+            }
+        } while (progress == LLAMA_OPT_LEARN_MORE);
+        GGML_ASSERT(yielded >= 1);
+        // Restore the fixture's original neighbour for its unchanged-custody assertions below.
+        GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
+        const bool learned = progress == LLAMA_OPT_LEARN_DONE;
         const std::vector<uint8_t> her_after = seq_state(ctx, 0);
         const std::vector<uint8_t> neighbour_after = seq_state(ctx, 1);
         if (learned && !streams) {

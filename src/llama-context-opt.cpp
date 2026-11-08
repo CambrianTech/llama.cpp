@@ -809,140 +809,6 @@ const char * llama_opt_failure(struct llama_context * ctx) {
     return ctx->opt_failure.c_str();
 }
 
-bool llama_context::opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens, const llama_token * labels,
-        int32_t n, ggml_opt_result_t result) {
-    if (opt_ctx == nullptr) {
-        opt_fail("llama_opt_learn needs llama_opt_init on this context first");
-        return false;
-    }
-    if (opt_shadow && opt_shadow->restore_quarantined) {
-        opt_fail("shadow generation restore is uncertain; restore a known-good generation before learning");
-        return false;
-    }
-    // each call answers for itself: a refusal before it does not refuse this one
-    opt_alloc_failed.store(false);
-    opt_stop_requested.store(false);
-    opt_failure.clear();
-    if (n <= 0 || n_cached < 0 || tokens == nullptr || labels == nullptr) {
-        opt_fail("llama_opt_learn: an empty reply, a negative served prefix, or no tokens / labels");
-        return false;
-    }
-    if ((int64_t) n_cached + n > (int64_t) cparams.n_ctx_seq) {
-        opt_fail("llama_opt_learn: the reply ends at " + std::to_string((int64_t) n_cached + n) + ", past the sequence's context of "
-            + std::to_string(cparams.n_ctx_seq) + " positions");
-        return false;
-    }
-    // the parts of the memory: a recurrent state cannot be cut back, attention cells can
-    llama_memory_recurrent * recr = nullptr;
-    llama_memory_i         * attn = memory.get();
-    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
-        recr = hybrid->get_mem_recr();
-        attn = hybrid->get_mem_attn();
-    } else if (auto * r = dynamic_cast<llama_memory_recurrent *>(memory.get())) {
-        recr = r;
-        attn = nullptr;
-    }
-    // refusals before anything is touched
-    const llama_pos held = memory->seq_pos_max(seq) + 1;
-    if (held < n_cached) {
-        opt_fail("llama_opt_learn: sequence " + std::to_string(seq) + " holds " + std::to_string(held)
-            + " positions, fewer than the " + std::to_string(n_cached) + " served before the reply");
-        return false;
-    }
-    if (recr != nullptr && recr->seq_pos_max(seq) + 1 != n_cached) {
-        opt_fail("llama_opt_learn: the recurrent state of sequence " + std::to_string(seq) + " ends at "
-            + std::to_string(recr->seq_pos_max(seq) + 1) + ", not at the served prefix " + std::to_string(n_cached)
-            + ": restore the served-prefix checkpoint first");
-        return false;
-    }
-    if (recr != nullptr && recr->rollback_pending(seq)) {
-        opt_fail("llama_opt_learn: sequence " + std::to_string(seq) + " has a pending recurrent rollback: finish or drop the draft first");
-        return false;
-    }
-    if (attn != nullptr && !attn->seq_rm(seq, n_cached, -1)) {
-        opt_fail("llama_opt_learn: could not drop sequence " + std::to_string(seq) + "'s cells past " + std::to_string(n_cached));
-        return false;
-    }
-    // her stable recurrent state at the served prefix, for the restore
-    std::vector<uint8_t> snap;
-    if (recr != nullptr) {
-        synchronize();
-        snap.resize(state_seq_get_size(seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-        GGML_ASSERT(state_seq_get_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap.size());
-    }
-    const uint32_t nb = n_batch();
-    llama_batch batch = llama_batch_init(nb, 0, 1);
-    // [c0, c0 + m) of the reply into the batch; with labels, the trainable layer sees those rows
-    auto fill = [&](int32_t c0, int32_t m, bool labelled) {
-        batch.n_tokens = m;
-        for (int32_t i = 0; i < m; ++i) {
-            batch.token   [i]    = tokens[c0 + i];
-            batch.pos     [i]    = n_cached + c0 + i;
-            batch.n_seq_id[i]    = 1;
-            batch.seq_id  [i][0] = seq;
-            batch.label   [i]    = labelled ? labels[c0 + i] : -1;
-            batch.logits  [i]    = labelled && labels[c0 + i] >= 0;
-        }
-        if (!labelled) {
-            batch.logits[m - 1] = true;
-        }
-    };
-    // train up to the last labelled row: rows after it cannot change the loss, and in one batch an
-    // unlabelled row after the run is refused (a run ends its sequence's rows); the restore below
-    // still decodes all n
-    int32_t n_train = n;
-    while (n_train > 0 && labels[n_train - 1] < 0) {
-        --n_train;
-    }
-    bool ok = true;
-    opt_result_active     = result;
-    opt_outputs_internal  = true;
-    opt_learn_labels      = 0;
-    opt_learn_labels_done = 0;
-    for (int32_t i = 0; i < n_train; ++i) {
-        opt_learn_labels += labels[i] >= 0;
-    }
-    for (int32_t c0 = 0; c0 < n_train && ok; c0 += (int32_t) nb) {
-        const int32_t m = std::min<int32_t>((int32_t) nb, n_train - c0);
-        fill(c0, m, true);
-        ok = decode(batch) == 0;
-        if (!ok && !opt_alloc_failed.load()) {
-            opt_fail("llama_opt_learn: the reply's training batch at " + std::to_string(n_cached + c0) + " failed to decode");
-        }
-    }
-    opt_result_active     = nullptr;
-    opt_outputs_internal  = false;
-    opt_learn_labels      = 0;
-    opt_learn_labels_done = 0;
-    // RESTORE: the reply's cells and the recurrent state decoded again under her stable set
-    bool restored = attn == nullptr || attn->seq_rm(seq, n_cached, -1);
-    if (recr != nullptr) {
-        synchronize();
-        restored = restored && state_seq_set_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap.size();
-    }
-    for (int32_t c0 = 0; c0 < n && restored; c0 += (int32_t) nb) {
-        const int32_t m = std::min<int32_t>((int32_t) nb, n - c0);
-        fill(c0, m, false);
-        restored = decode(batch) == 0;
-    }
-    llama_batch_free(batch);
-    if (!restored) {
-        opt_fail("llama_opt_learn: sequence " + std::to_string(seq) + " could not be restored after training: re-prefill it");
-        return false;
-    }
-    return ok;
-}
-
-bool llama_opt_learn(
-        struct llama_context * ctx,
-        llama_seq_id           seq,
-        llama_pos              n_cached,
-        const llama_token    * tokens,
-        const llama_token    * labels,
-        int32_t                n,
-        ggml_opt_result_t      result) {
-    return ctx->opt_learn(seq, n_cached, tokens, labels, n, result);
-}
 
 void llama_opt_epoch(
         struct llama_context    * ctx,
@@ -964,7 +830,7 @@ void llama_opt_epoch(
 bool llama_context::opt_prepare_restore(const llama_batch & retained) {
     opt_alloc_failed.store(false);
     opt_failure.clear();
-    if (!ggml_opt_can_prepare_restore(opt_ctx)) {
+    if (opt_reply || !ggml_opt_can_prepare_restore(opt_ctx)) {
         opt_fail("restore preparation requires a fresh optimizer; existing graph ownership was preserved");
         return false;
     }
@@ -1043,7 +909,7 @@ bool llama_opt_prepare_restore(llama_context * ctx, llama_batch retained) {
 
 bool llama_context::opt_state_restore(llama_adapter_lora * shadow,
         FILE * weights, FILE * optimizer, const char * binding) {
-    if (!shadow || opt_shadow != shadow || !opt_ctx) { return false; }
+    if (opt_reply || !shadow || opt_shadow != shadow || !opt_ctx) { return false; }
     // The serving set must exclude the shadow throughout restore, including its preparation.
     if (loras->count(shadow)) { return false; }
     std::unique_ptr<llama_adapter_lora_state, decltype(&llama_adapter_lora_state_free)> adapter_state(
@@ -1067,7 +933,7 @@ bool llama_opt_state_restore(llama_context * ctx, llama_adapter_lora * shadow,
 }
 
 bool llama_context::opt_state_write(FILE * optimizer, const char * binding) {
-    return opt_ctx && opt_shadow && !opt_shadow->restore_quarantined &&
+    return !opt_reply && opt_ctx && opt_shadow && !opt_shadow->restore_quarantined &&
         ggml_opt_state_write(opt_ctx, optimizer, binding);
 }
 
@@ -1076,7 +942,7 @@ bool llama_opt_state_write(llama_context * ctx, FILE * optimizer, const char * b
 }
 
 bool llama_context::opt_state_write_initial(FILE * optimizer, const char * binding) {
-    return opt_ctx && opt_shadow && !opt_shadow->restore_quarantined && !loras->count(const_cast<llama_adapter_lora *>(opt_shadow)) &&
+    return !opt_reply && opt_ctx && opt_shadow && !opt_shadow->restore_quarantined && !loras->count(const_cast<llama_adapter_lora *>(opt_shadow)) &&
         ggml_opt_state_write_initial(opt_ctx, optimizer, binding);
 }
 
