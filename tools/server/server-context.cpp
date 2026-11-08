@@ -952,9 +952,8 @@ private:
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
-    // LEARNING IN THE SERVING CONTEXT (SERVER_TASK_TYPE_LEARN): the shadow adapter llama_opt_init was
-    // given (one per server run for now), and the learning rate its next step reads
-    int32_t learn_lora_id = -1;
+    // LEARNING IN THE SERVING CONTEXT (SERVER_TASK_TYPE_LEARN): the learning rate the next step reads
+    // (each mind's shadow has its own optimizer in the context: llama_opt_init selects it)
     float   learn_lr      = 1e-4f;
     // LEARNING BARELY TOUCHES THE FLOW: while any other slot is working, learning may take at most
     // LEARN_DUTY of the loop's time (the step after a learn of t ms waits t*(1/LEARN_DUTY - 1) ms);
@@ -975,6 +974,8 @@ private:
         ggml_opt_result_t result;
         llama_token last_prompt;
         int32_t prefix, n_labels;
+        // the shadow this learn trains: held by the optimizer from begin through restoration
+        const llama_adapter_lora * shadow = nullptr;
         int64_t started;
         int64_t compute_us = 0;
         bool separate_request = false;
@@ -3216,12 +3217,6 @@ private:
                         send_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (id == learn_lora_id) {
-                        // Optimizer moments and opt_shadow still reference this adapter's tensors.
-                        send_error(task, "LoRA adapter " + std::to_string(id) +
-                                   " is bound to the learning optimizer; unload requires optimizer teardown", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
                     llama_adapter_lora * ptr = loras[id].ptr;
                     if (loras[id].scale != 0.0f) {
                         send_error(task, "LoRA adapter " + std::to_string(id) + " is active by default (scale " +
@@ -3240,6 +3235,17 @@ private:
                     if (ptr == nullptr) {
                         break;
                     }
+                    // the shadow a learn is training stays bound from begin through restoration (its
+                    // optimizer and accumulators reference its tensors between chunks), whether or not
+                    // any slot's stable set names it
+                    if (learning && learning->shadow == ptr) {
+                        send_error(task, "LoRA adapter " + std::to_string(id) + " is the shadow a learn is training on slot " +
+                                   std::to_string(learning->slot->id) + "; retry when its restoration finishes", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
+                    // a shadow that learned holds an optimizer referencing its tensors: release it
+                    // first (its moments go; a snapshot is the durable form of what it learned)
+                    llama_opt_release(ctx_tgt, ptr);
                     // An idle slot that last ran with it keeps KV computed WITH the adapter;
                     // once the adapter is gone its list would read as the base's, so that
                     // cache must not be reused.

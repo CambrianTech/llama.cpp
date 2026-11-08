@@ -1764,7 +1764,15 @@ extern "C" {
         uint32_t walk_horizon;
     };
 
-    LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
+    // false, with nothing changed and llama_opt_failure saying why, when the adapter to train cannot
+    // train: not attached at a non-zero scale, an A/B tensor that is not F32, or none of its tensors
+    // selected by the filter. A serving context refuses the learn instead of aborting.
+    LLAMA_API bool llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
+    // A serving context trains one shadow per mind: llama_opt_init with another adapter makes it the
+    // trained shadow, creating its optimizer the first time and keeping every shadow's moments across
+    // switches. llama_opt_release forgets one shadow's optimizer (before its adapter is unloaded);
+    // false when it had none.
+    LLAMA_API bool llama_opt_release(struct llama_context * lctx, const struct llama_adapter_lora * adapter);
     // Restore one shadow generation in place, preserving optimizer tensor identity. The caller
     // owns verified same-generation files/binding, stable adapter exclusion, and serialized queue
     // custody. Both payloads are prepared before mutation. An interrupted apply quarantines the
