@@ -2,7 +2,7 @@
 
 static __global__ void acc_f32(const float * x, const float * y, float * dst, const int64_t ne,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
-        const int64_t s11, const int64_t s12, const int64_t s13, const int64_t offset) {
+        const int64_t s11, const int64_t s12, const int64_t s13, const int64_t offset, const int3 order) {
     const int64_t i = blockDim.x * blockIdx.x + threadIdx.x;
 
     if (i >= ne) {
@@ -12,12 +12,17 @@ static __global__ void acc_f32(const float * x, const float * y, float * dst, co
     int64_t src1_idx = i - offset;
 
     int64_t tmp = src1_idx;
-    const int64_t i13 = tmp / s13;
-    tmp -= i13 * s13;
-    const int64_t i12 = tmp / s12;
-    tmp -= i12 * s12;
-    const int64_t i11 = tmp / s11;
-    tmp -= i11 * s11;
+    // A view can permute destination strides (the transposed V-cache backward does).
+    // Decode physical offsets largest-stride first, then index y in its logical order.
+    const int64_t strides[] = {s11, s12, s13};
+    int64_t coords[3];
+    coords[order.x] = tmp / strides[order.x];
+    tmp -= coords[order.x] * strides[order.x];
+    coords[order.y] = tmp / strides[order.y];
+    tmp -= coords[order.y] * strides[order.y];
+    coords[order.z] = tmp / strides[order.z];
+    tmp -= coords[order.z] * strides[order.z];
+    const int64_t i11 = coords[0], i12 = coords[1], i13 = coords[2];
     const int64_t i10 = tmp;
 
     float val = x[i];
@@ -31,7 +36,17 @@ static void acc_f32_cuda(const float * x, const float * y, float * dst, const in
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
         const int64_t s1, const int64_t s2, const int64_t s3, const int64_t offset, cudaStream_t stream) {
     const int num_blocks = (n_elements + CUDA_ACC_BLOCK_SIZE - 1) / CUDA_ACC_BLOCK_SIZE;
-    acc_f32<<<num_blocks, CUDA_ACC_BLOCK_SIZE, 0, stream>>>(x, y, dst, n_elements, ne10, ne11, ne12, ne13, s1, s2, s3, offset);
+    const int64_t strides[] = {s1, s2, s3};
+    int axes[] = {2, 1, 0};
+    for (int a = 0; a < 2; ++a) {
+        for (int b = a + 1; b < 3; ++b) {
+            if (strides[axes[a]] < strides[axes[b]]) {
+                const int tmp = axes[a]; axes[a] = axes[b]; axes[b] = tmp;
+            }
+        }
+    }
+    const int3 order = make_int3(axes[0], axes[1], axes[2]);
+    acc_f32<<<num_blocks, CUDA_ACC_BLOCK_SIZE, 0, stream>>>(x, y, dst, n_elements, ne10, ne11, ne12, ne13, s1, s2, s3, offset, order);
 }
 
 void ggml_cuda_op_acc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

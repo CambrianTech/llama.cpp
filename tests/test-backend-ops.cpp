@@ -7331,7 +7331,9 @@ struct test_acc : public test_case {
 
         // When ne_b[0] < ne_a[0], a->nb[1] != b->nb[1], so the stride
         // parameters to ggml_acc don't match b's natural stride.
-        ggml_tensor * out = ggml_acc(ctx, a, b, a->nb[1], a->nb[2], a->nb[3], 0);
+        ggml_tensor * out = stride_dim == 4
+            ? ggml_acc(ctx, a, b, a->nb[2], a->nb[1], a->nb[3], 0)
+            : ggml_acc(ctx, a, b, a->nb[1], a->nb[2], a->nb[3], 0);
         ggml_set_name(out, "out");
 
         return out;
@@ -10539,6 +10541,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {64, 64, 320, 1}));
     test_cases.emplace_back(new test_group_norm_mul_add(GGML_TYPE_F32, {9, 9, 1280, 1}));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
+    // Transposed V-cache view backward: destination strides are not dimension-ordered.
+    test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {8, 4, 3, 1}, {8, 3, 4, 1}, 4));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {256, 16, 2, 3}, -1));
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 2, 3}, {128, 16, 2, 3}, -1));
     // rows wider than one threadgroup: dst = a must be copied whole before b is added (Metal's
