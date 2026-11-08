@@ -37,7 +37,12 @@
         for (const auto & a : learn_ledger.snapshot()) {
             out["grants"].push_back({{"id", a.grant.id}, {"period_ms", a.grant.period_ms},
                 {"share_ppm", a.grant.share_ppm}, {"expires_at_us", a.grant.expires_at_us},
-                {"revoked", a.revoked}, {"outstanding", a.outstanding}});
+                {"revoked", a.revoked}, {"outstanding", a.outstanding},
+                {"committed_steps", learn_ledger.committed_steps(a.grant.id)}});
+            int64_t used = 0;
+            if (learn_ledger.used_us(a.grant.id, now, used) == server_learn_refusal::none) {
+                out["grants"].back()["used_us"] = used;
+            }
         }
         result->receipt = std::move(out);
         queue_results.send(std::move(result));
@@ -55,15 +60,35 @@
             return out;
         }
         // Validate authority before touching adapters, optimizer, or sequence state.
-        auto probe = learn_ledger.admit(L.grant, 0, t0, false);
+        // This zero-estimate obligation remains live until the served tail is restored.
+        // Its measured setup/restoration time is charged even if authority ends meanwhile.
+        auto probe = learn_ledger.admit(L.grant, 0, t0, true);
         if (probe.refusal != server_learn_refusal::none) {
             learn_outcome out;
             out.refusal = learn_refusal_name(probe.refusal);
             out.failure = "learning requires a live registered authority grant";
             return out;
         }
-        learn_ledger.cancel(probe.reservation, t0);
-        return learn_on_slot_admitted(slot, L, t0);
+        const auto started = learn_ledger.start(probe.reservation, t0);
+        if (started != server_learn_refusal::none) {
+            learn_ledger.cancel(probe.reservation, t0);
+            learn_outcome out;
+            out.refusal = learn_refusal_name(started);
+            out.failure = "learning authority ended before sequence custody began";
+            return out;
+        }
+        auto out = learn_on_slot_admitted(slot, L, t0);
+        const auto setup_us = ggml_time_us() - t0;
+        if (learning) {
+            learning->restoration_reservation = probe.reservation;
+            learning->restoration_us = setup_us;
+            learning->compute_us += setup_us;
+            learning->max_chunk_us = setup_us;
+        } else {
+            const auto settled = learn_ledger.finish(probe.reservation, setup_us, 0, ggml_time_us());
+            if (settled != server_learn_refusal::none) { out.refusal = learn_refusal_name(settled); }
+        }
+        return out;
     }
 
     learn_outcome learn_on_slot_admitted(server_slot & slot, const learn_request & L, int64_t t0) {
@@ -209,6 +234,8 @@
             const auto chunk_finished = ggml_time_us();
             const auto elapsed = chunk_finished - chunk_started;
             pending.compute_us += elapsed;
+            pending.max_chunk_us = std::max(pending.max_chunk_us, elapsed);
+            if (!reservation) { pending.restoration_us += elapsed; }
             if (reservation) {
                 learn_chunk_us[pending.lora_id] = std::max(learn_chunk_us[pending.lora_id], elapsed);
                 const auto settled = learn_ledger.finish(reservation, elapsed,
@@ -257,7 +284,18 @@
         out.failure  = pending.failure;
         out.loss     = pending.drained ? 0.0 : loss;
         out.n_labels = pending.drained ? 0 : pending.n_labels;
-        pending.compute_us += ggml_time_us() - restore_started;
+        const auto cleanup_us = ggml_time_us() - restore_started;
+        pending.compute_us += cleanup_us;
+        pending.restoration_us += cleanup_us;
+        pending.max_chunk_us = std::max(pending.max_chunk_us, cleanup_us);
+        const auto settled = learn_ledger.finish(pending.restoration_reservation, pending.restoration_us, 0, ggml_time_us());
+        if (settled != server_learn_refusal::none) {
+            out.ok = false;
+            out.refusal = learn_refusal_name(settled);
+            out.failure = "restoration custody settlement refused";
+        }
+        out.max_chunk_ms = pending.max_chunk_us / 1000.0;
+        out.restoration_ms = pending.restoration_us / 1000.0;
         out.t_ms     = pending.compute_us / 1000.0;
         SRV_INF("learned on slot %d: %d labels from position %d, loss %.4f, %.1f ms%s\n", slot.id, out.n_labels, n0, loss,
                 out.t_ms, ok ? "" : (" (failed: " + out.failure + ")").c_str());

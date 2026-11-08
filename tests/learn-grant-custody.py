@@ -29,10 +29,26 @@ with concurrent.futures.ThreadPoolExecutor() as pool:
   if call('/slots')[0]['is_learning']:break
   time.sleep(.005)
  else:raise AssertionError('not learning')
- print('revoke',call('/learn/grants/revoke',{'id':g['id']}),flush=True)
+ revoked=call('/learn/grants/revoke',{'id':g['id']})
+ print('revoke',revoked,flush=True)
+ retained=next(x for x in revoked['grants'] if x['id']==g['id'])
+ assert retained['revoked'] and retained['outstanding']>0
  result=future.result();print('revoked result',result,flush=True)
  assert not result['success'] and result['refusal']=='unknown_grant' and result['n_labels']==0
  assert not call('/slots')[0]['is_learning']
+ assert result['restoration_ms']>0 and result['max_chunk_ms']>0
+ assert not any(x['id']==g['id'] for x in call('/learn/grants')['grants'])
 g['id']='authority-next';assert call('/learn/grants',g)['refusal']=='none'
 result=learn(g['id'],'Topeka is the capital of Kansas.');assert result['success'];print('next learned',result,flush=True)
-print('PASS registered authority, stale/unknown refusals, mid-reply revoke drains and next learning succeeds')
+account=next(x for x in call('/learn/grants')['grants'] if x['id']==g['id'])
+assert account['outstanding']==0 and account['committed_steps']==1 and account['used_us']>0
+# Revoked accumulation must not contaminate the next complete update or its moments.
+b=call('/lora-adapters/load',{'name':'shadow-06.gguf'})['id']
+old_a=a; a=b
+control=learn(g['id'],'Topeka is the capital of Kansas.')
+assert abs(control['loss']-result['loss'])<1e-6,(control,result)
+a=old_a; second=learn(g['id'],'Topeka is the capital of Kansas.')
+a=b; control_second=learn(g['id'],'Topeka is the capital of Kansas.')
+assert abs(second['loss']-control_second['loss'])<1e-6,(second,control_second)
+print('PASS revoke custody, measured restoration debit, and clean optimizer trajectory',flush=True)
+

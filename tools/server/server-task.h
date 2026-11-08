@@ -104,6 +104,8 @@ struct learn_outcome {
     double      loss     = 0.0;
     int32_t     n_labels = 0;
     double      t_ms     = 0.0;
+    double      max_chunk_ms = 0.0;
+    double      restoration_ms = 0.0;
     json to_json() const;
 };
 

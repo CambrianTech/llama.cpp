@@ -1711,7 +1711,7 @@ json server_task_result_lora_change::to_json() {
 }
 
 json learn_outcome::to_json() const {
-    json res = { { "success", ok }, { "refusal", refusal }, { "loss", loss }, { "n_labels", n_labels }, { "t_ms", t_ms } };
+    json res = { { "success", ok }, { "refusal", refusal }, { "loss", loss }, { "n_labels", n_labels }, { "t_ms", t_ms }, { "max_chunk_ms", max_chunk_ms }, { "restoration_ms", restoration_ms } };
     if (deferred) {
         res["deferred"] = true;
         res["retry_after_ms"] = retry_after_ms;

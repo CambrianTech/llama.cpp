@@ -993,6 +993,9 @@ private:
         int32_t lora_id = -1;
         std::string refusal = "none";
         bool drained = false;
+        uint64_t restoration_reservation = 0;
+        int64_t restoration_us = 0;
+        int64_t max_chunk_us = 0;
         std::optional<bool> finished;
         std::string failure;
         ~pending_learn() { ggml_opt_result_free(result); }
