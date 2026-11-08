@@ -263,13 +263,15 @@ bool llama_context::opt_select(const llama_adapter_lora * adapter, struct llama_
 }
 
 bool llama_context::opt_release(const llama_adapter_lora * adapter) {
-    // a live reply holds the active optimizer and its accumulators between chunks, through restoration
-    if (opt_reply) {
-        opt_failure = "a live reply owns this context's optimizer until its restoration finishes";
-        return false;
-    }
     const auto mind = opt_minds.find(adapter);
     if (mind == opt_minds.end()) {
+        return true; // no optimizer references it: nothing to release
+    }
+    // a live reply holds the ACTIVE shadow's optimizer and accumulators between chunks, through
+    // restoration; an idle mind's optimizer is its own buffers only (ggml_opt_free touches no shared
+    // scheduler), so it can be released while another mind learns
+    if (opt_reply && adapter == opt_shadow) {
+        opt_failure = "a live reply is training this shadow until its restoration finishes";
         return false;
     }
     if (adapter == opt_shadow) {

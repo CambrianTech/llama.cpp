@@ -3245,7 +3245,11 @@ private:
                     }
                     // a shadow that learned holds an optimizer referencing its tensors: release it
                     // first (its moments go; a snapshot is the durable form of what it learned)
-                    llama_opt_release(ctx_tgt, ptr);
+                    if (!llama_opt_release(ctx_tgt, ptr)) {
+                        send_error(task, "LoRA adapter " + std::to_string(id) + " cannot be unloaded yet: " + llama_opt_failure(ctx_tgt),
+                                   ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
                     // An idle slot that last ran with it keeps KV computed WITH the adapter;
                     // once the adapter is gone its list would read as the base's, so that
                     // cache must not be reused.
