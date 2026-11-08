@@ -12,6 +12,12 @@ target_compile_features(test-server-page-adapters PRIVATE cxx_std_17)
 add_test(NAME test-server-page-adapters COMMAND test-server-page-adapters)
 set_tests_properties(test-server-page-adapters PROPERTIES LABELS "main")
 
+# Model-free learning-budget validator: the ledger every learning step debits.
+add_executable(test-server-learn-ledger test-server-learn-ledger.cpp)
+target_compile_features(test-server-learn-ledger PRIVATE cxx_std_17)
+add_test(NAME test-server-learn-ledger COMMAND test-server-learn-ledger)
+set_tests_properties(test-server-learn-ledger PROPERTIES LABELS "main")
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
