@@ -1,4 +1,49 @@
 // Methods of server_context_impl; one owner for completion and /learn custody.
+    static const char * learn_refusal_name(server_learn_refusal r) {
+        switch (r) {
+#define LEARN_REFUSAL(x) case server_learn_refusal::x: return #x
+            LEARN_REFUSAL(none); LEARN_REFUSAL(invalid); LEARN_REFUSAL(stale_engine);
+            LEARN_REFUSAL(grant_mismatch); LEARN_REFUSAL(unknown_grant); LEARN_REFUSAL(never_fits);
+            LEARN_REFUSAL(budget_exhausted); LEARN_REFUSAL(started); LEARN_REFUSAL(not_started);
+            LEARN_REFUSAL(already_started); LEARN_REFUSAL(unknown_reservation);
+#undef LEARN_REFUSAL
+        }
+        return "invalid";
+    }
+
+    void process_learn_grants(const server_task & task) {
+        const auto now = ggml_time_us();
+        auto result = std::make_unique<server_task_result_learn_grants>();
+        result->id = task.id;
+        json out = {{"engine", learn_engine}, {"clock_us", now}, {"refusal", "none"}};
+        const auto & body = task.learn_grants;
+        const auto op = body.value("op", std::string());
+        if (op == "register") {
+            const auto duration = body.value("expires_in_ms", int64_t(0));
+            server_learn_grant g{body.value("id", std::string()), body.value("engine", std::string()),
+                body.value("period_ms", int64_t(0)), body.value("share_ppm", int64_t(0)), 0};
+            auto refusal = server_learn_refusal::invalid;
+            if (duration > 0 && duration <= server_learn_ledger::kMaxPeriodMs &&
+                    now <= server_learn_ledger::kMaxClockUs - duration * 1000) {
+                g.expires_at_us = now + duration * 1000;
+                refusal = learn_ledger.register_grant(g, now);
+            }
+            out["refusal"] = learn_refusal_name(refusal);
+        } else if (op == "revoke") {
+            learn_ledger.revoke(body.value("id", std::string()), now);
+            out["revoked"] = true; // idempotent: this id can admit no new work
+        }
+        out["grants"] = json::array();
+        for (const auto & a : learn_ledger.snapshot()) {
+            out["grants"].push_back({{"id", a.grant.id}, {"period_ms", a.grant.period_ms},
+                {"share_ppm", a.grant.share_ppm}, {"expires_at_us", a.grant.expires_at_us},
+                {"revoked", a.revoked}, {"outstanding", a.outstanding}});
+        }
+        result->receipt = std::move(out);
+        queue_results.send(std::move(result));
+    }
+
+
     // One reply learned on `slot`, which holds the served prompt (POST /learn between its turns, or a
     // completion's own learn before its slot is released): the slot's stable set plus the shadow on
     // the reply's labelled rows, then the slot back to its whole served prompt.
@@ -9,15 +54,15 @@
             out.failure = "the lane optimizer is restoring an admitted reply; retain this experience for retry";
             return out;
         }
-        for (const auto & other : slots) {
-            if (other.id != slot.id && other.is_processing() && t0 < learn_next_us) {
-                learn_outcome out;
-                out.deferred = true;
-                out.retry_after_ms = (learn_next_us - t0 + 999) / 1000;
-                out.failure = "learning deferred while another slot is busy; retain replayable input context and learning inputs for retry";
-                return out;
-            }
+        // Validate authority before touching adapters, optimizer, or sequence state.
+        auto probe = learn_ledger.admit(L.grant, 0, t0, false);
+        if (probe.refusal != server_learn_refusal::none) {
+            learn_outcome out;
+            out.refusal = learn_refusal_name(probe.refusal);
+            out.failure = "learning requires a live registered authority grant";
+            return out;
         }
+        learn_ledger.cancel(probe.reservation, t0);
         return learn_on_slot_admitted(slot, L, t0);
     }
 
@@ -112,6 +157,8 @@
         learning = std::unique_ptr<pending_learn>(new pending_learn{ &slot, cp, std::move(set), result,
             toks[0], L.n_prefix, (int32_t) toks.size() - 1, loras[L.lora_id].ptr, t0 });
         learning->began = begun;
+        learning->grant = L.grant;
+        learning->lora_id = L.lora_id;
         if (!begun) {
             learning->finished = false;
             learning->failure = llama_opt_failure(ctx_tgt);
@@ -127,13 +174,55 @@
         auto & slot = *pending.slot;
         if (!pending.finished) {
             const auto chunk_started = ggml_time_us();
+            uint64_t reservation = 0;
+            if (llama_opt_learn_needs_gradient(ctx_tgt)) {
+                bool contended = false;
+                for (const auto & other : slots) {
+                    contended |= other.id != slot.id && other.is_processing();
+                }
+                const auto measured = learn_chunk_us.find(pending.lora_id);
+                if (contended && measured == learn_chunk_us.end()) {
+                    pending.refusal = "pending_calibration";
+                    pending.failure = "no measured chunk cost for this shadow under contention";
+                    pending.drained = true;
+                    llama_opt_learn_drain(ctx_tgt);
+                } else {
+                    auto admission = learn_ledger.admit(pending.grant,
+                        measured == learn_chunk_us.end() ? 0 : measured->second, chunk_started, contended);
+                    if (admission.refusal == server_learn_refusal::budget_exhausted) { return; }
+                    if (admission.refusal == server_learn_refusal::none) {
+                        admission.refusal = learn_ledger.start(admission.reservation, chunk_started);
+                        if (admission.refusal == server_learn_refusal::none) { reservation = admission.reservation; }
+                        else { learn_ledger.cancel(admission.reservation, chunk_started); }
+                    }
+                    if (admission.refusal != server_learn_refusal::none) {
+                        pending.refusal = learn_refusal_name(admission.refusal);
+                        pending.failure = "authority refused the next gradient chunk; stable tail restored";
+                        pending.drained = true;
+                        llama_opt_learn_drain(ctx_tgt);
+                    }
+                }
+            }
             common_set_adapter_lora(ctx_tgt, pending.adapters);
             const auto status = llama_opt_learn_step(ctx_tgt);
             common_set_adapter_lora(ctx_tgt, slot.lora);
-            pending.compute_us += ggml_time_us() - chunk_started;
+            const auto chunk_finished = ggml_time_us();
+            const auto elapsed = chunk_finished - chunk_started;
+            pending.compute_us += elapsed;
+            if (reservation) {
+                learn_chunk_us[pending.lora_id] = std::max(learn_chunk_us[pending.lora_id], elapsed);
+                const auto settled = learn_ledger.finish(reservation, elapsed,
+                    status != LLAMA_OPT_LEARN_FAILED && !llama_opt_learn_needs_gradient(ctx_tgt) ? 1 : 0, chunk_finished);
+                if (settled != server_learn_refusal::none) {
+                    pending.refusal = learn_refusal_name(settled);
+                    pending.failure = "measured chunk settlement refused";
+                    pending.drained = true;
+                    llama_opt_learn_drain(ctx_tgt);
+                }
+            }
             if (status != LLAMA_OPT_LEARN_MORE) {
                 pending.finished = status == LLAMA_OPT_LEARN_DONE;
-                pending.failure = status == LLAMA_OPT_LEARN_DONE ? "" : llama_opt_failure(ctx_tgt);
+                if (status != LLAMA_OPT_LEARN_DONE) { pending.failure = llama_opt_failure(ctx_tgt); }
             }
             // Even the final chunk yields before the last prompt token is restored below.
             return;
@@ -162,18 +251,18 @@
             slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & c) { return c.n_tokens > n0; });
         }
         learn_outcome out;
-        out.ok       = ok;
+        out.ok       = ok && !pending.drained;
+        out.refusal = pending.refusal;
+        out.deferred = pending.drained;
         out.failure  = pending.failure;
-        out.loss     = loss;
-        out.n_labels = pending.n_labels;
+        out.loss     = pending.drained ? 0.0 : loss;
+        out.n_labels = pending.drained ? 0 : pending.n_labels;
         pending.compute_us += ggml_time_us() - restore_started;
         out.t_ms     = pending.compute_us / 1000.0;
         SRV_INF("learned on slot %d: %d labels from position %d, loss %.4f, %.1f ms%s\n", slot.id, out.n_labels, n0, loss,
                 out.t_ms, ok ? "" : (" (failed: " + out.failure + ")").c_str());
         const bool separate = pending.separate_request;
         const bool cancelled = slot.learn_release_requested;
-        const auto finished = ggml_time_us();
-        learn_next_us = finished + (int64_t) (pending.compute_us * (1.0/LEARN_DUTY - 1.0));
         learning.reset();
         slot.state = SLOT_STATE_DONE_PROMPT; // release now owns fully restored KV
         if (!cancelled) {

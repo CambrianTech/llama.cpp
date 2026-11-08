@@ -15,6 +15,7 @@ struct server_context_impl; // private implementation
 
 struct server_context_meta {
     std::string build_info;
+    std::string learn_engine;
     std::string model_name;
     std::set<std::string> model_aliases;
     std::set<std::string> model_tags;
@@ -172,6 +173,7 @@ struct server_routes {
     server_http_context::handler_t post_lora_adapters_load;
     server_http_context::handler_t post_lora_adapters_unload;
     server_http_context::handler_t post_learn;
+    server_http_context::handler_t get_learn_grants, post_learn_grants, revoke_learn_grant;
     server_http_context::handler_t get_train;
     server_http_context::handler_t post_train;
     server_http_context::handler_t post_train_cancel;

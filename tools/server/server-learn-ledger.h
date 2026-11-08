@@ -27,6 +27,7 @@
 #include <iterator>
 #include <map>
 #include <string>
+#include <vector>
 
 struct server_learn_grant {
     std::string id;
@@ -200,6 +201,17 @@ public:
     int64_t committed_steps(const std::string & grant) const {
         const auto it = accounts.find(grant);
         return it == accounts.end() ? 0 : it->second.steps;
+    }
+
+    struct snapshot_entry {
+        server_learn_grant grant;
+        bool revoked;
+        int64_t outstanding;
+    };
+    std::vector<snapshot_entry> snapshot() const {
+        std::vector<snapshot_entry> out;
+        for (const auto & a : accounts) { out.push_back({a.second.grant, a.second.revoked, a.second.outstanding}); }
+        return out;
     }
 
     size_t n_accounts() const {

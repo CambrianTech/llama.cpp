@@ -555,6 +555,7 @@ task_params eval_llama_cmpl_schema(
             throw std::invalid_argument("\"learn\" must be an object with a non-empty \"reply\" string");
         }
         learn_request L;
+        L.grant = json_value(l, "grant", std::string());
         L.lora_id = json_value(l, "lora_id", -1);
         L.lr      = json_value(l, "lr", 1e-4f);
         L.reply   = common_tokenize(vocab, l.at("reply").get<std::string>(), false, true);

@@ -221,6 +221,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_lora_adapters_load     = models_routes->proxy_post;
         routes.post_lora_adapters_unload   = models_routes->proxy_post;
         routes.post_learn                  = models_routes->proxy_post;
+        routes.get_learn_grants            = models_routes->proxy_get;
+        routes.post_learn_grants           = models_routes->proxy_post;
+        routes.revoke_learn_grant          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
         routes.get_cells                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
@@ -278,6 +281,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/lora-adapters/load",       ex_wrapper(routes.post_lora_adapters_load));
     ctx_http.post("/lora-adapters/unload",     ex_wrapper(routes.post_lora_adapters_unload));
     ctx_http.post("/learn",                    ex_wrapper(routes.post_learn));
+    ctx_http.get ("/learn/grants",              ex_wrapper(routes.get_learn_grants));
+    ctx_http.post("/learn/grants",              ex_wrapper(routes.post_learn_grants));
+    ctx_http.post("/learn/grants/revoke",       ex_wrapper(routes.revoke_learn_grant));
     ctx_http.get ("/train",                    ex_wrapper(routes.get_train));
     ctx_http.post("/train",                    ex_wrapper(routes.post_train));
     ctx_http.post("/train/cancel",             ex_wrapper(routes.post_train_cancel));

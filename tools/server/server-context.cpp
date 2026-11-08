@@ -11,6 +11,7 @@
 #include "server-stream.h"
 #include "server-page-adapters.h"
 #include "server-prefill.h"
+#include "server-learn-ledger.h"
 #include "server-test-faults.h"
 
 #include "build-info.h"
@@ -33,6 +34,7 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <random>
 
 // Continuum fork: an adapter file's revision (size, mtime in ns since the epoch; (0, 0) when it
 // cannot be read), stored in a saved slot's `.lora` sidecar so a restore refuses a page computed
@@ -955,12 +957,19 @@ private:
     // LEARNING IN THE SERVING CONTEXT (SERVER_TASK_TYPE_LEARN): the learning rate the next step reads
     // (each mind's shadow has its own optimizer in the context: llama_opt_init selects it)
     float   learn_lr      = 1e-4f;
-    // LEARNING BARELY TOUCHES THE FLOW: while any other slot is working, learning may take at most
-    // LEARN_DUTY of the loop's time (the step after a learn of t ms waits t*(1/LEARN_DUTY - 1) ms);
-    // with every other slot idle it runs at once. Back to back, learns took the 4B's other slot from
-    // p50 218 / p95 450 ms per token to 686 / 2,567 (M5, 2026-10-15).
-    static constexpr double LEARN_DUTY = 0.10;
-    int64_t learn_next_us = 0;
+    const std::string learn_engine = [] {
+        std::random_device rd;
+        const char * hex = "0123456789abcdef";
+        std::string id;
+        for (int i = 0; i < 16; ++i) {
+            const auto byte = rd() & 255;
+            id += hex[byte >> 4]; id += hex[byte & 15];
+        }
+        return id;
+    }();
+    server_learn_ledger learn_ledger{learn_engine};
+    std::map<int32_t, int64_t> learn_chunk_us; // measured worst chunk per loaded shadow
+
     static ggml_opt_optimizer_params learn_opt_pars(void * ud) {
         ggml_opt_optimizer_params p = ggml_opt_get_default_optimizer_params(nullptr);
         p.adamw.alpha = *(const float *) ud;
@@ -980,6 +989,10 @@ private:
         int64_t compute_us = 0;
         bool separate_request = false;
         bool began = false;
+        std::string grant;
+        int32_t lora_id = -1;
+        std::string refusal = "none";
+        bool drained = false;
         std::optional<bool> finished;
         std::string failure;
         ~pending_learn() { ggml_opt_result_free(result); }
@@ -3179,6 +3192,9 @@ private:
                     res->path    = la.path;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_LEARN_GRANTS:
+                process_learn_grants(task);
+                break;
             case SERVER_TASK_TYPE_LEARN:
                 {
                     auto res = std::make_unique<server_task_result_learn>();
@@ -4862,6 +4878,7 @@ server_context_meta server_context::get_meta() const {
 
     return server_context_meta {
         /* build_info             */ std::string(llama_build_info()),
+        /* learn_engine           */ impl->learn_engine,
         /* model_name             */ impl->model_name,
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
@@ -5338,6 +5355,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
+        { "learn_ledger",                {{"engine", meta.learn_engine}, {"clock_us", ggml_time_us()}} },
         { "slot_save_size_version",      1 },
         { "expert_container_custody_version", 1 },
         { "model_alias",                 meta.model_name },
@@ -6138,6 +6156,39 @@ void server_routes::init_routes() {
     // Duty rest returns a deferred outcome: the caller retains replayable input context, reply or
     // labels, and adapter parameters, then retries after retry_after_ms. A slot's prompt may have
     // changed by then. The slot-release queue cannot wake a cooldown on an already idle slot.
+    auto grant_route = [this](const server_http_req & req, const char * op) {
+        auto res = create_response();
+        server_task task(SERVER_TASK_TYPE_LEARN_GRANTS);
+        task.learn_grants = req.body.empty() ? json::object() : json::parse(req.body);
+        if (!task.learn_grants.is_object()) {
+            res->error(format_error_response("grant body must be an object", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        for (const char * key : {"id", "engine"}) {
+            if (task.learn_grants.contains(key) && !task.learn_grants.at(key).is_string()) {
+                res->error(format_error_response("grant identity must be a string", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        for (const char * key : {"period_ms", "share_ppm", "expires_in_ms"}) {
+            if (task.learn_grants.contains(key) && (!task.learn_grants.at(key).is_number_integer() ||
+                    task.learn_grants.at(key).get<double>() >= double(INT64_MAX))) {
+                res->error(format_error_response("grant terms must be signed integers", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        task.learn_grants["op"] = op;
+        auto & rd = res->rd;
+        task.id = rd.get_new_id();
+        rd.post_task(std::move(task));
+        auto result = rd.next(req.should_stop);
+        if (result) { res->ok(result->to_json()); }
+        return res;
+    };
+    this->get_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "list"); };
+    this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
+    this->revoke_learn_grant = [grant_route](const server_http_req & req) { return grant_route(req, "revoke"); };
+
     this->post_learn = [this](const server_http_req & req) {
         auto res = create_response();
         if (params.train_dir.empty()) {
@@ -6146,6 +6197,7 @@ void server_routes::init_routes() {
         }
         const json body = json::parse(req.body);
         server_task task(SERVER_TASK_TYPE_LEARN);
+        task.learn.grant = json_value(body, "grant", std::string());
         task.learn.id_slot  = json_value(body, "id_slot",  -1);
         task.id_slot        = task.learn.id_slot; // a deferred learn comes back when her slot frees
         task.learn.n_prefix = json_value(body, "n_prefix", 0);

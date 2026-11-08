@@ -61,6 +61,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_LOAD_LORA,
     SERVER_TASK_TYPE_UNLOAD_LORA,
     SERVER_TASK_TYPE_LEARN,
+    SERVER_TASK_TYPE_LEARN_GRANTS,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -85,6 +86,7 @@ enum stop_type {
 // no second context, her prompt never decoded again. Asked by POST /learn, or carried by a
 // completion request (task_params::learn), which learns on its own slot before releasing it.
 struct learn_request {
+    std::string              grant; // reference only: never authority terms
     int32_t                  id_slot  = -1;
     int32_t                  n_prefix = 0;      // the served prompt's tokens, before the reply
     std::vector<llama_token> reply;             // what she should have said (her reply, or the reviewed correction)
@@ -94,6 +96,7 @@ struct learn_request {
 };
 
 struct learn_outcome {
+    std::string refusal = "none";
     bool        ok       = false;
     bool        deferred = false;
     int64_t     retry_after_ms = 0;
@@ -263,6 +266,8 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_UNLOAD_LORA: the adapter id to retire
     int32_t unload_lora = -1;
+
+    json learn_grants; // authority operation, processed on the serving queue
 
     // used by SERVER_TASK_TYPE_LEARN
     learn_request learn;
@@ -667,6 +672,11 @@ struct server_task_result_lora_change : server_task_result {
     std::string path;
     bool        loaded  = true;
     virtual json to_json() override;
+};
+
+struct server_task_result_learn_grants : server_task_result {
+    json receipt;
+    virtual json to_json() override { return receipt; }
 };
 
 struct server_task_result_learn : server_task_result {

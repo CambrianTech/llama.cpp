@@ -100,6 +100,10 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
 bool llama_context::opt_learn_drain() {
     if (!opt_reply) { return false; }
     if (!opt_reply->restoring && opt_reply->cursor < opt_reply->n_train) {
+        // The full reply is one optimizer update. A revoked partial reply has only
+        // accumulated gradients: clear those, preserving moments and completed updates.
+        synchronize();
+        if (opt_reply->labels_done > 0) { ggml_opt_reset(opt_ctx, false); }
         opt_reply->cursor = opt_reply->n_train;
     }
     return true;
