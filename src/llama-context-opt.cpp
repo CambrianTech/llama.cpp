@@ -108,6 +108,11 @@ const char * llama_context::opt_untrainable(const llama_adapter_lora * adapter, 
 }
 
 bool llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
+    // a live reply holds the active optimizer and its accumulators between chunks, through restoration
+    if (opt_reply) {
+        opt_failure = "a live reply owns this context's optimizer until its restoration finishes";
+        return false;
+    }
     if (lopt_params.adapter != nullptr) {
         if (const char * why = opt_untrainable(lopt_params.adapter, lopt_params)) {
             opt_failure = why;
@@ -258,6 +263,11 @@ bool llama_context::opt_select(const llama_adapter_lora * adapter, struct llama_
 }
 
 bool llama_context::opt_release(const llama_adapter_lora * adapter) {
+    // a live reply holds the active optimizer and its accumulators between chunks, through restoration
+    if (opt_reply) {
+        opt_failure = "a live reply owns this context's optimizer until its restoration finishes";
+        return false;
+    }
     const auto mind = opt_minds.find(adapter);
     if (mind == opt_minds.end()) {
         return false;
