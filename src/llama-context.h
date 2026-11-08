@@ -223,6 +223,26 @@ struct llama_context {
     // the largest training graph the allocation preflight measured on a GPU device (bytes)
     size_t opt_graph_bytes() const;
 
+    struct opt_live_reply {
+        llama_seq_id seq;
+        llama_pos prefix;
+        std::vector<llama_token> tokens, labels, restore_tokens;
+        std::vector<uint8_t> snapshot;
+        llama_memory_i * attention = nullptr;
+        llama_memory_i * recurrent = nullptr;
+        llama_batch batch{};
+        ggml_opt_result_t result = nullptr;
+        int32_t chunk_tokens = 0, cursor = 0, n_train = 0;
+        int64_t n_labels = 0, labels_done = 0;
+        bool restoring = false;
+        std::string failure;
+        ~opt_live_reply() { if (batch.token) { llama_batch_free(batch); } }
+    };
+    std::unique_ptr<opt_live_reply> opt_reply;
+    bool opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens,
+            const llama_token * labels, int32_t n, const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result);
+    llama_opt_learn_status opt_learn_step();
+
     bool opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens, const llama_token * labels, int32_t n,
             ggml_opt_result_t result);
 

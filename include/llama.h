@@ -1852,6 +1852,22 @@ extern "C" {
     // A reply within one batch is one exact step; a longer one steps per batch, its gradient
     // stopped at each batch boundary. false: refused or failed by name (llama_opt_failure),
     // with the sequence restored.
+    // Resumable form of the same live-sequence owner. The caller retains exclusive custody
+    // of the learning sequence and optimizer until DONE/FAILED; other sequences may decode
+    // between steps. Each step executes at most one chunk (training OR stable restoration).
+    // restore_tokens are the exact original served tail, which may differ from a correction.
+    // The chunk is a compute quantum, not a context/window limit. result must outlive the reply.
+    enum llama_opt_learn_status {
+        LLAMA_OPT_LEARN_MORE,
+        LLAMA_OPT_LEARN_DONE,
+        LLAMA_OPT_LEARN_FAILED,
+    };
+    LLAMA_API bool llama_opt_learn_begin(
+            struct llama_context * ctx, llama_seq_id seq, llama_pos n_cached,
+            const llama_token * tokens, const llama_token * labels, int32_t n,
+            const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result);
+    LLAMA_API enum llama_opt_learn_status llama_opt_learn_step(struct llama_context * ctx);
+
     LLAMA_API bool llama_opt_learn(
             struct llama_context * lctx,
             llama_seq_id           seq,
