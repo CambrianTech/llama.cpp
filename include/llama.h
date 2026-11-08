@@ -1855,6 +1855,7 @@ extern "C" {
     // Resumable form of the same live-sequence owner. The caller retains exclusive custody
     // of the learning sequence and optimizer until DONE/FAILED; other sequences may decode
     // between steps. Each step executes at most one chunk (training OR stable restoration).
+    // restore_tokens are the exact original served tail, which may differ from a correction.
     // The chunk is a compute quantum, not a context/window limit. result must outlive the reply.
     enum llama_opt_learn_status {
         LLAMA_OPT_LEARN_MORE,
@@ -1864,7 +1865,7 @@ extern "C" {
     LLAMA_API bool llama_opt_learn_begin(
             struct llama_context * ctx, llama_seq_id seq, llama_pos n_cached,
             const llama_token * tokens, const llama_token * labels, int32_t n,
-            ggml_opt_result_t result);
+            const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result);
     LLAMA_API enum llama_opt_learn_status llama_opt_learn_step(struct llama_context * ctx);
 
     LLAMA_API bool llama_opt_learn(

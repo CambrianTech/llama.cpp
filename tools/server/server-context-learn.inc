@@ -101,11 +101,14 @@
         if (cp != nullptr) {
             cp->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
+        const auto & served_tokens = slot.prompt.tokens.get_tokens();
         ggml_opt_result_t result = ggml_opt_result_init();
-        const bool begun = llama_opt_learn_begin(ctx_tgt, slot.id, n0, toks.data(), labels.data(), (int32_t) toks.size(), result);
+        const bool begun = llama_opt_learn_begin(ctx_tgt, slot.id, n0, toks.data(), labels.data(), (int32_t) toks.size(),
+            served_tokens.data() + n0, (int32_t) served_tokens.size() - n0, result);
         common_set_adapter_lora(ctx_tgt, slot.lora);
         learning = std::unique_ptr<pending_learn>(new pending_learn{ &slot, cp, std::move(set), result,
             toks[0], L.n_prefix, (int32_t) toks.size() - 1, t0 });
+        learning->began = begun;
         if (!begun) {
             learning->finished = false;
             learning->failure = llama_opt_failure(ctx_tgt);
@@ -142,40 +145,19 @@
         // already off for a batch without labels: llama-graph.cpp lora_on, n_shadow_rows =
         // the ubatch's label count; this does not rely on it)
         common_set_adapter_lora(ctx_tgt, slot.lora);
-        // her slot goes back to her whole served prompt (attention cells, recurrent state,
-        // tokens and checkpoints agree; her next turn reuses all of it): back to n0 from the
-        // checkpoint, then the last prompt token decoded again under her stable set. A draft
-        // model's cache is cut to n0 with its own checkpoint, and the slot's tokens with it.
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, n0, -1);
-        if (cp != nullptr) {
-            cp->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        }
-        int32_t n_keep = n0;
-        if (ctx_dft != nullptr) {
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, n0, -1);
-            if (cp != nullptr) {
-                cp->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // The native owner restored the exact served tail once (not the supplied correction).
+        // Target KV, token metadata and the untouched draft therefore still name the same tail.
+        // If begin refused after loading the recurrent prefix, retain only that proven prefix.
+        if (!pending.began || !ok) {
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, n0, -1);
+            if (cp) { cp->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); }
+            if (ctx_dft) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, n0, -1);
+                if (cp) { cp->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); }
             }
-        } else {
-            llama_batch one = llama_batch_get_one(&pending.last_prompt, 1);
-            llama_pos pos = n0;
-            one.pos = &pos;
-            llama_seq_id sid = slot.id;
-            int32_t nsid = 1;
-            llama_seq_id * sids = &sid;
-            one.n_seq_id = &nsid;
-            one.seq_id = &sids;
-            if (llama_decode(ctx_tgt, one) == 0) {
-                n_keep = pending.prefix;
-            } else {
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, n0, -1);
-                if (cp != nullptr) {
-                    cp->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                }
-            }
+            slot.prompt.tokens.keep_first(n0);
+            slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & c) { return c.n_tokens > n0; });
         }
-        slot.prompt.tokens.keep_first(n_keep);
-        slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & c) { return c.n_tokens > n_keep; });
         learn_outcome out;
         out.ok       = ok;
         out.failure  = pending.failure;

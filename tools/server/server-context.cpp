@@ -978,6 +978,7 @@ private:
         int64_t started;
         int64_t compute_us = 0;
         bool separate_request = false;
+        bool began = false;
         std::optional<bool> finished;
         std::string failure;
         ~pending_learn() { ggml_opt_result_free(result); }

@@ -5,7 +5,7 @@
 #include <algorithm>
 
 bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens, const llama_token * labels,
-        int32_t n, ggml_opt_result_t result) {
+        int32_t n, const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result) {
     if (opt_reply) {
         opt_fail("a live reply already owns this context's optimizer; finish its restoration first");
         return false;
@@ -22,6 +22,10 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
     opt_alloc_failed.store(false);
     opt_stop_requested.store(false);
     opt_failure.clear();
+    if (n_restore <= 0 || restore_tokens == nullptr || (int64_t) n_cached + n_restore > (int64_t) cparams.n_ctx_seq) {
+        opt_fail("live learn needs the exact served tail to restore within the existing window");
+        return false;
+    }
     if (n <= 0 || n_cached < 0 || tokens == nullptr || labels == nullptr) {
         opt_fail("llama_opt_learn: an empty reply, a negative served prefix, or no tokens / labels");
         return false;
@@ -58,21 +62,25 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
         opt_fail("llama_opt_learn: sequence " + std::to_string(seq) + " has a pending recurrent rollback: finish or drop the draft first");
         return false;
     }
-    if (attn != nullptr && !attn->seq_rm(seq, n_cached, -1)) {
-        opt_fail("llama_opt_learn: could not drop sequence " + std::to_string(seq) + "'s cells past " + std::to_string(n_cached));
-        return false;
-    }
     // her stable recurrent state at the served prefix, for the restore
     std::vector<uint8_t> snap;
     if (recr != nullptr) {
         synchronize();
         snap.resize(state_seq_get_size(seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-        GGML_ASSERT(state_seq_get_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap.size());
+        if (state_seq_get_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != snap.size()) {
+            opt_fail("could not capture the recurrent prefix; live learning was not started");
+            return false;
+        }
+    }
+    if (attn != nullptr && !attn->seq_rm(seq, n_cached, -1)) {
+        opt_fail("llama_opt_learn: could not drop sequence " + std::to_string(seq) + "'s cells past " + std::to_string(n_cached));
+        return false;
     }
     auto state = std::make_unique<opt_live_reply>();
     state->seq = seq;
     state->prefix = n_cached;
     state->tokens.assign(tokens, tokens + n);
+    state->restore_tokens.assign(restore_tokens, restore_tokens + n_restore);
     state->labels.assign(labels, labels + n);
     state->snapshot = std::move(snap);
     state->recurrent = recr;
@@ -110,12 +118,12 @@ llama_opt_learn_status llama_context::opt_learn_step() {
             return LLAMA_OPT_LEARN_FAILED;
         }
     }
-    const int32_t end = s.restoring ? (int32_t) s.tokens.size() : s.n_train;
+    const int32_t end = s.restoring ? (int32_t) s.restore_tokens.size() : s.n_train;
     const int32_t m = std::min(s.chunk_tokens, end - s.cursor);
     auto & batch = s.batch;
     batch.n_tokens = m;
     for (int32_t i = 0; i < m; ++i) {
-        batch.token[i] = s.tokens[s.cursor + i];
+        batch.token[i] = s.restoring ? s.restore_tokens[s.cursor + i] : s.tokens[s.cursor + i];
         batch.pos[i] = s.prefix + s.cursor + i;
         batch.n_seq_id[i] = 1;
         batch.seq_id[i][0] = s.seq;
@@ -160,7 +168,7 @@ llama_opt_learn_status llama_context::opt_learn_step() {
 
 bool llama_context::opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens,
         const llama_token * labels, int32_t n, ggml_opt_result_t result) {
-    if (!opt_learn_begin(seq, n_cached, tokens, labels, n, result)) { return false; }
+    if (!opt_learn_begin(seq, n_cached, tokens, labels, n, tokens, n, result)) { return false; }
     llama_opt_learn_status status;
     do { status = opt_learn_step(); } while (status == LLAMA_OPT_LEARN_MORE);
     return status == LLAMA_OPT_LEARN_DONE;
@@ -168,8 +176,8 @@ bool llama_context::opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_
 
 bool llama_opt_learn_begin(llama_context * ctx, llama_seq_id seq, llama_pos prefix,
         const llama_token * tokens, const llama_token * labels, int32_t n,
-        ggml_opt_result_t result) {
-    return ctx->opt_learn_begin(seq, prefix, tokens, labels, n, result);
+        const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result) {
+    return ctx->opt_learn_begin(seq, prefix, tokens, labels, n, restore_tokens, n_restore, result);
 }
 
 llama_opt_learn_status llama_opt_learn_step(llama_context * ctx) { return ctx->opt_learn_step(); }

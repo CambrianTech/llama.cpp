@@ -50,10 +50,10 @@ def learn():
     try:
         result.append(request("/completion", {
             "prompt": "Remember these observed facts:", "id_slot": 0,
-            "n_predict": 1, "temperature": 0,
+            "n_predict": 8, "temperature": 0,
             "learn": {"lora_id": shadow, "lr": 0.001,
                       "reply": "A room contains a card and a window. " * 55},
-        })["learn"])
+        }))
     except Exception as error:
         errors.append(str(error))
 
@@ -74,11 +74,15 @@ try:
         time.sleep(0.01)
     training.join(timeout=1)
     assert not training.is_alive() and not errors, errors
-    assert result and result[0]["success"] and result[0]["n_labels"] > 256, result
+    assert result and result[0]["learn"]["success"] and result[0]["learn"]["n_labels"] > 256, result
     assert len(observed) >= 2 and max(observed) > min(observed), observed
     slots = request("/slots")
     assert not slots[0]["is_learning"] and not slots[0]["is_processing"], slots
-    print(json.dumps({"learn": result[0], "learning_observations": len(observed),
+    # The supplied correction is different from the generated reply. Retain the actual
+    # served reply's cache, never advertise correction tokens under generated metadata.
+    assert result[0]["tokens_predicted"] >= 3, result
+    assert slots[0]["kv_pos_max"] > result[0]["tokens_evaluated"] - 1, (slots, result)
+    print(json.dumps({"learn": result[0]["learn"], "retained_kv_end": slots[0]["kv_pos_max"], "learning_observations": len(observed),
                       "neighbour_frames_during_learning": max(observed) - min(observed)}))
 finally:
     stop.set()

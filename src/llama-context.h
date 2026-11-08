@@ -226,7 +226,7 @@ struct llama_context {
     struct opt_live_reply {
         llama_seq_id seq;
         llama_pos prefix;
-        std::vector<llama_token> tokens, labels;
+        std::vector<llama_token> tokens, labels, restore_tokens;
         std::vector<uint8_t> snapshot;
         llama_memory_i * attention = nullptr;
         llama_memory_i * recurrent = nullptr;
@@ -240,7 +240,7 @@ struct llama_context {
     };
     std::unique_ptr<opt_live_reply> opt_reply;
     bool opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens,
-            const llama_token * labels, int32_t n, ggml_opt_result_t result);
+            const llama_token * labels, int32_t n, const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result);
     llama_opt_learn_status opt_learn_step();
 
     bool opt_learn(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens, const llama_token * labels, int32_t n,

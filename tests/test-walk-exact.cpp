@@ -776,7 +776,7 @@ int main(int argc, char ** argv) {
         // What this catches: yielding with training flags still installed, losing accumulated
         // labels between chunks, or restoring the neighbour instead of the learning sequence.
         // Real neighbour inference runs at every yield; learning still covers the entire reply.
-        GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
+        GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, tokens.data() + r0, WINDOW - r0, nullptr));
         // A checkpoint may not publish an optimizer/cursor pair from half a live reply.
         FILE * partial_state = tmpfile();
         GGML_ASSERT(partial_state != nullptr);
