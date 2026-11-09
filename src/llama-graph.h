@@ -280,6 +280,9 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * s_write = nullptr; // I64 destinations, Qwen3.5 serving without rollback
+    ggml_tensor * s_write_main = nullptr;
+    ggml_tensor * s_write_extra = nullptr;
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
@@ -1391,7 +1394,8 @@ struct llm_graph_context {
                uint32_t   rs_head,
                uint32_t   rs_size,
                 int32_t   rs_zero,
-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
+            ggml_tensor * state_write_extra = nullptr) const;
 
     llm_graph_input_rs * build_rs_inp() const;
 
