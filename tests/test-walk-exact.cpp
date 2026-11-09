@@ -747,12 +747,26 @@ int main(int argc, char ** argv) {
         decode_span(ctx, 1, neighbour, 0, 200);
         decode_span(ctx, 0, tokens.data(), 0, r0); // her context, as served
         const std::vector<uint8_t> neighbour_before = seq_state(ctx, 1);
+        struct admission_counts { size_t statics = 0, workspace = 0; } stale_admission, current_admission;
         llama_opt_params lopt{};
         lopt.param_filter   = llama_opt_param_filter_all;
         lopt.get_opt_pars   = sgd_pars;
         lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
         lopt.adapter        = adapter;
+        lopt.static_admission = [](ggml_backend_buffer_type_t, const char *, size_t, void * data) {
+            ++static_cast<admission_counts *>(data)->statics;
+            return true;
+        };
+        lopt.workspace_admission = [](ggml_backend_buffer_type_t, size_t, size_t, void * data) {
+            ++static_cast<admission_counts *>(data)->workspace;
+            return true;
+        };
+        lopt.static_admission_data = lopt.workspace_admission_data = &stale_admission;
         llama_opt_init(ctx, model, lopt);
+        // What this catches: renewing authority for the already selected mind must replace
+        // both callback bindings; retaining a prior request's user data is a dangling lease.
+        lopt.static_admission_data = lopt.workspace_admission_data = &current_admission;
+        GGML_ASSERT(llama_opt_init(ctx, model, lopt));
         // What this catches: the real served-window labelled graph can be priced
         // without allocating optimizer buffers or changing either resident's KV.
         {
@@ -838,6 +852,8 @@ int main(int argc, char ** argv) {
         // Restore the fixture's original neighbour for its unchanged-custody assertions below.
         GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
         const bool learned = progress == LLAMA_OPT_LEARN_DONE;
+        GGML_ASSERT(current_admission.statics > 0 && current_admission.workspace > 0);
+        GGML_ASSERT(stale_admission.statics == 0 && stale_admission.workspace == 0);
         const std::vector<uint8_t> her_after = seq_state(ctx, 0);
         const std::vector<uint8_t> neighbour_after = seq_state(ctx, 1);
         if (learned && !streams) {

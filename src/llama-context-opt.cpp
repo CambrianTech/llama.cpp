@@ -182,6 +182,11 @@ bool llama_opt_measure_shadow(llama_context * ctx, llama_opt_params params,
     return ctx && ctx->opt_measure_shadow(params, callback, user_data);
 }
 
+static void opt_bind_admission(ggml_opt_context_t optimizer, const llama_opt_params & params) {
+    ggml_opt_set_static_allocation_callback(optimizer, params.static_admission, params.static_admission_data);
+    ggml_opt_set_graph_allocation_callback(optimizer, params.workspace_admission, params.workspace_admission_data);
+}
+
 bool llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     // a live reply holds the active optimizer and its accumulators between chunks, through restoration
     if (opt_reply) {
@@ -243,6 +248,7 @@ bool llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     // one target token per row: no one-hot tensor as wide as the vocabulary beside the logits
     ggml_opt_params opt_params = opt_params_for(lopt_params);
     opt_ctx = ggml_opt_init(opt_params);
+    opt_bind_admission(opt_ctx, lopt_params);
     ggml_opt_set_alloc_budget(opt_ctx, opt_memory_budget);
     opt_params_base = opt_params;
 
@@ -295,6 +301,7 @@ bool llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 // shadow keeps its own optimizer (moments, accumulators), so a switch back resumes where it was.
 bool llama_context::opt_select(const llama_adapter_lora * adapter, struct llama_opt_params lopt_params) {
     if (adapter == opt_shadow) {
+        opt_bind_admission(opt_ctx, lopt_params);
         return true;
     }
     // checked before the previous shadow's parameters are cleared: a refused switch changes nothing
@@ -327,6 +334,7 @@ bool llama_context::opt_select(const llama_adapter_lora * adapter, struct llama_
         LLAMA_LOG_INFO("%s: a new shadow's optimizer: %lld adapter tensors trainable (%zu shadows)\n", __func__,
                 (long long) n_params, opt_minds.size());
     }
+    opt_bind_admission(opt_ctx, lopt_params);
     opt_shadow = adapter;
     return true;
 }

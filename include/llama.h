@@ -1777,6 +1777,14 @@ extern "C" {
         // before a chunk receive its gradient (0 = the whole window).
         bool     walk_exact;
         uint32_t walk_horizon;
+
+        // Allocation authority belongs to the caller. These existing allocator callbacks
+        // are refreshed on every shadow selection, including selecting the same shadow.
+        // User data must outlive the reply and its stable restoration.
+        ggml_opt_static_allocation_callback static_admission;
+        void * static_admission_data;
+        ggml_backend_sched_allocation_callback workspace_admission;
+        void * workspace_admission_data;
     };
 
     // false, with nothing changed and llama_opt_failure saying why, when the adapter to train cannot
