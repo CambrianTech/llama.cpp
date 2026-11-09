@@ -1397,7 +1397,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return res;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        const bool allocated = opt_serving_continuation
+            ? ggml_backend_sched_alloc_graph_admitted(sched.get(), gf, nullptr, nullptr, opt_admit_serving_workspace, this)
+            : ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if (!allocated) {
+            // Splitting rewrites graph inputs even when allocation is refused.
+            // A later admitted retry must rebuild, not reuse those unallocated tensors.
+            res->reset();
+            ggml_backend_sched_reset(sched.get());
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1673,8 +1680,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 
 int llama_context::decode(const llama_batch & batch_inp) {
     if (ggml_backend_sched_graph_pending(sched.get())) {
-        LLAMA_LOG_ERROR("%s: a learning graph retains this workspace; resume it before decode\n", __func__);
-        return -3;
+        return opt_decode_beside_graph(batch_inp);
     }
 
     for (const auto & entry : *loras) {
@@ -1800,7 +1806,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    memory_update(false);
+    if (!opt_serving_continuation) { memory_update(false); }
 
     llama_memory_context_ptr mctx;
 
@@ -1822,7 +1828,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
                 {
-                    if (!did_optimize) {
+                    if (!did_optimize && !opt_serving_continuation) {
                         did_optimize = true;
 
                         if (memory_update(true)) {
@@ -1918,7 +1924,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // The live owner retains the prepared graph and publishes no partial outputs.
         // Its segmented path admits a single whole ubatch, never token partitions.
-        if (opt_reply && opt_reply->graph_meta) { return 0; }
+        if (!opt_serving_continuation && opt_reply && opt_reply->graph_meta) { return 0; }
 
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
@@ -3389,6 +3395,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            if (opt_reply && opt_reply->serving_sched) {
+                const auto other = opt_reply->serving_sched.get();
+                ret[ggml_backend_sched_get_buffer_type(other, backend)].compute +=
+                    ggml_backend_sched_get_buffer_size(other, backend);
+            }
         }
     }
     return ret;

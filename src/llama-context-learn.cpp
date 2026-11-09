@@ -3,6 +3,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 #include <algorithm>
+#include <limits>
 
 bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens, const llama_token * labels,
         int32_t n, const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result) {
@@ -237,4 +238,64 @@ bool llama_opt_learn(
         int32_t                n,
         ggml_opt_result_t      result) {
     return ctx->opt_learn(seq, n_cached, tokens, labels, n, result);
+}
+
+// Both arenas remain charged to the same physical workspace authority. The training
+// arena is retained, not a reusable discount against the neighbour's allocation.
+bool llama_context::opt_admit_serving_workspace(ggml_backend_buffer_type_t buft,
+        size_t required, size_t held, void * data) {
+    auto & ctx = *static_cast<llama_context *>(data);
+    if (!ctx.opt_workspace_admission || !ctx.opt_reply || !ctx.opt_reply->serving_sched) { return false; }
+    const auto training = ctx.opt_reply->serving_sched.get(); // swapped out during serving
+    size_t retained = 0;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(training); ++i) {
+        if (ggml_backend_sched_get_buffer_type(training, ggml_backend_sched_get_backend(training, i)) == buft) {
+            const auto bytes = ggml_backend_sched_get_buffer_size(training, ggml_backend_sched_get_backend(training, i));
+            if (bytes > std::numeric_limits<size_t>::max() - retained) { return false; }
+            retained += bytes;
+        }
+    }
+    if (std::max(required, held) > std::numeric_limits<size_t>::max() - retained) { return false; }
+    return ctx.opt_workspace_admission(buft, retained + std::max(required, held), retained + held,
+            ctx.opt_workspace_admission_data);
+}
+
+int llama_context::opt_decode_beside_graph(const llama_batch & batch) {
+    if (!opt_reply || !opt_reply->graph_meta || !opt_workspace_admission || batch.n_tokens <= 0) { return -3; }
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        if (batch.label && batch.label[i] >= 0) { return -3; }
+        const int count = batch.n_seq_id ? batch.n_seq_id[i] : 1;
+        for (int j = 0; j < count; ++j) {
+            if ((batch.seq_id ? batch.seq_id[i][j] : 0) == opt_reply->seq) { return -3; }
+        }
+    }
+    auto & state = *opt_reply;
+    if (!state.serving_sched) {
+        const auto nodes = graph_max_nodes(n_ubatch());
+        state.serving_sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
+                backend_ptrs.size(), nodes, false, cparams.op_offload));
+        state.serving_graph.reset(new llm_graph_result(nodes));
+        state.serving_reserve.reset(new llm_graph_result(nodes));
+    }
+    struct restore_owner {
+        llama_context & ctx;
+        opt_live_reply & state;
+        llama_cparams params;
+        bool reserve;
+        ~restore_owner() {
+            ggml_backend_sched_synchronize(ctx.sched.get());
+            ctx.sched.swap(state.serving_sched);
+            ctx.gf_res_prev.swap(state.serving_graph);
+            ctx.gf_res_reserve.swap(state.serving_reserve);
+            ctx.cparams = params;
+            ctx.sched_need_reserve = reserve;
+            ctx.opt_serving_continuation = false;
+        }
+    } guard{*this, state, cparams, sched_need_reserve};
+    sched.swap(state.serving_sched);
+    gf_res_prev.swap(state.serving_graph);
+    gf_res_reserve.swap(state.serving_reserve);
+    sched_need_reserve = false;
+    opt_serving_continuation = true;
+    return decode(batch);
 }

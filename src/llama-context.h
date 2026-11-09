@@ -249,12 +249,20 @@ struct llama_context {
         // Zero keeps synchronous evaluation; positive values resume graph nodes.
         int graph_nodes = 0;
         ggml_context_ptr graph_meta;
+        ggml_backend_sched_ptr serving_sched;
+        llm_graph_result_ptr serving_graph;
+        llm_graph_result_ptr serving_reserve;
         bool drain_graph = false;
         bool restoring = false;
         std::string failure;
         ~opt_live_reply() { if (batch.token) { llama_batch_free(batch); } }
     };
     std::unique_ptr<opt_live_reply> opt_reply;
+    bool opt_serving_continuation = false;
+    ggml_backend_sched_allocation_callback opt_workspace_admission = nullptr;
+    void * opt_workspace_admission_data = nullptr;
+    static bool opt_admit_serving_workspace(ggml_backend_buffer_type_t buft, size_t required, size_t held, void * data);
+    int opt_decode_beside_graph(const llama_batch & batch);
     bool opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens,
             const llama_token * labels, int32_t n, const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result);
     llama_opt_learn_status opt_learn_step();

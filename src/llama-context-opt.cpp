@@ -249,6 +249,8 @@ bool llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     ggml_opt_params opt_params = opt_params_for(lopt_params);
     opt_ctx = ggml_opt_init(opt_params);
     opt_bind_admission(opt_ctx, lopt_params);
+    opt_workspace_admission = lopt_params.workspace_admission;
+    opt_workspace_admission_data = lopt_params.workspace_admission_data;
     ggml_opt_set_alloc_budget(opt_ctx, opt_memory_budget);
     opt_params_base = opt_params;
 
@@ -302,6 +304,8 @@ bool llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 bool llama_context::opt_select(const llama_adapter_lora * adapter, struct llama_opt_params lopt_params) {
     if (adapter == opt_shadow) {
         opt_bind_admission(opt_ctx, lopt_params);
+        opt_workspace_admission = lopt_params.workspace_admission;
+        opt_workspace_admission_data = lopt_params.workspace_admission_data;
         return true;
     }
     // checked before the previous shadow's parameters are cleared: a refused switch changes nothing
@@ -335,6 +339,8 @@ bool llama_context::opt_select(const llama_adapter_lora * adapter, struct llama_
                 (long long) n_params, opt_minds.size());
     }
     opt_bind_admission(opt_ctx, lopt_params);
+    opt_workspace_admission = lopt_params.workspace_admission;
+    opt_workspace_admission_data = lopt_params.workspace_admission_data;
     opt_shadow = adapter;
     return true;
 }

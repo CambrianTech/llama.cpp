@@ -758,7 +758,7 @@ int main(int argc, char ** argv) {
         decode_span(ctx, 1, neighbour, 0, 200);
         decode_span(ctx, 0, tokens.data(), 0, r0); // her context, as served
         const std::vector<uint8_t> neighbour_before = seq_state(ctx, 1);
-        struct admission_counts { size_t statics = 0, workspace = 0; } stale_admission, current_admission;
+        struct admission_counts { size_t statics = 0, workspace = 0; bool allow_workspace = true; std::map<std::string, size_t> limits; } stale_admission, current_admission;
         llama_opt_params lopt{};
         lopt.param_filter   = llama_opt_param_filter_all;
         lopt.get_opt_pars   = sgd_pars;
@@ -768,9 +768,13 @@ int main(int argc, char ** argv) {
             ++static_cast<admission_counts *>(data)->statics;
             return true;
         };
-        lopt.workspace_admission = [](ggml_backend_buffer_type_t, size_t, size_t, void * data) {
-            ++static_cast<admission_counts *>(data)->workspace;
-            return true;
+        lopt.workspace_admission = [](ggml_backend_buffer_type_t buft, size_t required, size_t, void * data) {
+            auto & admission = *static_cast<admission_counts *>(data);
+            ++admission.workspace;
+            if (!admission.allow_workspace) { return false; }
+            if (admission.limits.empty()) { return true; }
+            const auto limit = admission.limits.find(ggml_backend_buft_name(buft));
+            return limit != admission.limits.end() && required <= limit->second;
         };
         lopt.static_admission_data = lopt.workspace_admission_data = &stale_admission;
         llama_opt_init(ctx, model, lopt);
@@ -784,13 +788,16 @@ int main(int argc, char ** argv) {
             const auto her_preflight = seq_state(ctx, 0);
             const auto neighbour_preflight = seq_state(ctx, 1);
             size_t requirements = 0, allocated = 0;
+            struct measured_plan { size_t * total; admission_counts * admission; } plan{&requirements, &current_admission};
             const bool measured = llama_opt_measure_memory(ctx,
-                [](const llama_adapter_lora *, const char *, const char *, const char * kind,
+                [](const llama_adapter_lora *, const char *, const char * buft, const char * kind,
                         size_t bytes, bool, void * data) {
-                    if (std::string(kind).find("required") != std::string::npos) {
-                        *static_cast<size_t *>(data) += bytes;
+                    auto & plan = *static_cast<measured_plan *>(data);
+                    if (std::string(kind).find("required") != std::string::npos) { *plan.total += bytes; }
+                    if (getenv("WALK_LIVE_GRAPH_NEIGHBOUR") && std::string(kind) == "shared_compute_required") {
+                        plan.admission->limits[buft] = bytes;
                     }
-                }, &requirements);
+                }, &plan);
             llama_opt_visit_memory(ctx, [](const llama_adapter_lora *, const char *, const char *,
                     const char *, size_t bytes, bool, void * data) {
                 *static_cast<size_t *>(data) += bytes;
@@ -841,7 +848,7 @@ int main(int argc, char ** argv) {
 
         // What this catches: yielding with training flags still installed, losing accumulated
         // labels between chunks, or restoring the neighbour instead of the learning sequence.
-        // Real neighbour inference runs at every yield; learning still covers the entire reply.
+        // Neighbour inference runs at returned boundaries; learning covers the entire reply.
         GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, tokens.data() + r0, WINDOW - r0, nullptr));
         // Diagnostic: change only scheduling boundaries, not the served graph/window
         // or the independent whole-reply gradient oracle. No production chunk policy.
@@ -858,6 +865,7 @@ int main(int argc, char ** argv) {
         fclose(partial_state);
         llama_opt_learn_status progress;
         int yielded = 0;
+        int graph_neighbour_turns = 0;
         do {
             if (getenv("WALK_LIVE_SMALL_CHUNKS") && !llama_opt_learn_needs_gradient(ctx)) {
                 ctx->opt_reply->chunk_tokens = WINDOW; // retain the control's restoration segmentation
@@ -869,9 +877,26 @@ int main(int argc, char ** argv) {
                     GGML_ASSERT(llama_opt_learn_drain(ctx));
                     GGML_ASSERT(ctx->opt_reply->drain_graph);
                 }
-                if (!getenv("WALK_LIVE_GRAPH_CONTINUATION")) {
+                if ((!getenv("WALK_LIVE_GRAPH_CONTINUATION") || (getenv("WALK_LIVE_GRAPH_NEIGHBOUR") && yielded % 128 == 0))) {
                     GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
+                    if (getenv("WALK_LIVE_GRAPH_NEIGHBOUR") && graph_neighbour_turns == 0) {
+                        const auto held = llama_get_memory_breakdown(ctx);
+                        auto denied = llama_batch_init(1, 0, 1);
+                        denied.n_tokens = 1;
+                        denied.token[0] = neighbour[200]; denied.pos[0] = 200;
+                        denied.n_seq_id[0] = 1; denied.seq_id[0][0] = 1; denied.logits[0] = true;
+                        current_admission.allow_workspace = false;
+                        GGML_ASSERT(llama_decode(ctx, denied) != 0);
+                        current_admission.allow_workspace = true;
+                        llama_batch_free(denied);
+                        const auto after_refusal = llama_get_memory_breakdown(ctx);
+                        for (const auto & row : held) {
+                            GGML_ASSERT(after_refusal.at(row.first).compute == row.second.compute);
+                        }
+                        GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
+                    }
                     decode_span(ctx, 1, neighbour + 200, 200, 1);
+                    ++graph_neighbour_turns;
                     GGML_ASSERT(seq_state(ctx, 1) == want_neighbour_turn);
                 }
                 ++yielded;
@@ -880,7 +905,8 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(yielded >= 1);
         if (getenv("WALK_LIVE_GRAPH_CONTINUATION")) {
             GGML_ASSERT(yielded > 100);
-            printf("  native graph continuation returns: %d (serving workspace integration pending)\n", yielded);
+            if (getenv("WALK_LIVE_GRAPH_NEIGHBOUR")) { GGML_ASSERT(graph_neighbour_turns > 1); }
+            printf("  native graph continuation returns: %d; neighbour turns: %d\n", yielded, graph_neighbour_turns);
         }
         // Restore the fixture's original neighbour for its unchanged-custody assertions below.
         GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());

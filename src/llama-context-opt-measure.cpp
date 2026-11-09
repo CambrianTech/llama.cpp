@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include <algorithm>
+#include <limits>
 
 bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void * user_data, ggml_backend_sched_t held) {
     if (!callback || !opt_shadow || opt_reply || !memory) {
@@ -17,12 +18,15 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
         return false;
     }
     const auto saved_cparams = cparams;
+    const auto saved_outputs = n_outputs;
     struct restore {
         llama_cparams & params;
         llama_cparams saved;
         ggml_backend_sched_t sched;
-        ~restore() { ggml_backend_sched_reset(sched); params = saved; }
-    } guard{cparams, saved_cparams, sched.get()};
+        uint32_t & outputs;
+        uint32_t saved_outputs;
+        ~restore() { ggml_backend_sched_reset(sched); params = saved; outputs = saved_outputs; }
+    } guard{cparams, saved_cparams, sched.get(), n_outputs, saved_outputs};
     // Scope cleanup also invalidates reuse of scheduler-rewritten graph metadata.
     ggml_backend_sched_reset(sched.get());
     gf_res_prev->reset();
@@ -81,6 +85,32 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
         static_bytes = std::max(static_bytes, step_static);
         host_bytes = std::max(host_bytes, step_host);
         for (int i = 0; i < n_backends; ++i) { sizes[i] = std::max(sizes[i], step_sizes[i]); }
+    }
+    // A suspended backward graph retains its arena while a neighbour serves.
+    // Price the second arena with the same scheduler planner, never a ratio.
+    cparams.training = false;
+    {
+        llm_graph_result res(max_nodes);
+        llama_batch_allocr serving_batch(model.hparams.n_pos_per_embd());
+        auto ubatch = serving_batch.ubatch_reserve(chunk, 1);
+        for (uint32_t i = 0; i < chunk; ++i) { ubatch.output[i] = 1; }
+        n_outputs = chunk;
+        const auto params = graph_params(&res, ubatch, mctx.get(), graph_type());
+        auto * graph = model.build_graph(params);
+        if (!graph) {
+            opt_failure = "cannot measure serving workspace beside the retained learning graph";
+            return false;
+        }
+        std::vector<size_t> serving(n_backends, 0);
+        ggml_backend_sched_measure_graph(sched.get(), graph, serving.data());
+        ggml_backend_sched_reset(sched.get());
+        for (int i = 0; i < n_backends; ++i) {
+            if (serving[i] > std::numeric_limits<size_t>::max() - sizes[i]) {
+                opt_failure = "combined serving and learning workspace size overflow";
+                return false;
+            }
+            sizes[i] += serving[i];
+        }
     }
     cparams = saved_cparams;
     auto report = [&](ggml_backend_buffer_type_t buft, const char * kind, size_t bytes) {
