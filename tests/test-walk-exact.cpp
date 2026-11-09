@@ -711,6 +711,7 @@ int main(int argc, char ** argv) {
         auto two_seq_ctx = [&]() {
             auto cp = common_context_params_to_llama(params);
             cp.n_ctx = 2*WINDOW; cp.n_batch = WINDOW; cp.n_ubatch = WINDOW; cp.n_seq_max = 2; cp.kv_unified = !streams;
+            if (getenv("WALK_LIVE_GRAPH_SMALL_UBATCH")) { cp.n_ubatch = WINDOW / 8; }
             cp.flash_attn_type = streams ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
             cp.type_k = streams ? GGML_TYPE_F16 : GGML_TYPE_F32; cp.type_v = cp.type_k;
             // Graph segmentation preserves the full token graph and its gradient.

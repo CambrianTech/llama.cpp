@@ -87,7 +87,7 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
     state->recurrent = recr;
     state->attention = attn;
     state->chunk_tokens = n_batch();
-    state->batch = llama_batch_init(n_batch(), 0, 1);
+    state->batch = llama_batch_init(std::max<int32_t>(n_batch(), n), 0, 1);
     state->result = result;
     state->n_train = n;
     while (state->n_train > 0 && labels[state->n_train - 1] < 0) { --state->n_train; }
@@ -128,10 +128,6 @@ llama_opt_learn_status llama_context::opt_learn_step() {
         return LLAMA_OPT_LEARN_FAILED;
     }
     auto & s = *opt_reply;
-    if (s.graph_nodes > 0 && !s.restoring && s.n_train > (int32_t) n_ubatch()) {
-        s.failure = "whole-reply graph exceeds the currently prepared ubatch; token partition is not a latency yield";
-        s.cursor = s.n_train;
-    }
     if (s.graph_meta) {
         bool complete = false;
         const auto status = ggml_opt_eval_step(opt_ctx, s.result, s.graph_nodes, &complete);
@@ -188,7 +184,20 @@ llama_opt_learn_status llama_context::opt_learn_step() {
     opt_outputs_internal = !s.restoring;
     opt_learn_labels = s.restoring ? 0 : s.n_labels;
     opt_learn_labels_done = s.labels_done;
-    const bool ok = decode(batch) == 0;
+    // Build one graph for the entire reply. Serving retains its configured batches;
+    // the served context window and label denominator never change.
+    const bool ok = [&] {
+        struct restore_batches {
+            llama_cparams & params;
+            uint32_t batch, ubatch;
+            ~restore_batches() { params.n_batch = batch; params.n_ubatch = ubatch; }
+        } restore{cparams, cparams.n_batch, cparams.n_ubatch};
+        if (!s.restoring && s.graph_nodes > 0) {
+            cparams.n_batch = std::max<uint32_t>(cparams.n_batch, m);
+            cparams.n_ubatch = std::max<uint32_t>(cparams.n_ubatch, m);
+        }
+        return decode(batch) == 0;
+    }();
     s.labels_done = opt_learn_labels_done;
     // No training flags leak into a neighbour's decode between calls.
     opt_result_active = nullptr;

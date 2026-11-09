@@ -32,7 +32,7 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
     gf_res_prev->reset();
     cparams.training = true;
     cparams.walk_active = false;
-    const uint32_t chunk = std::min(n_ubatch(), cparams.n_ctx_seq);
+    const uint32_t chunk = cparams.n_ctx_seq;
     size_t max_nodes = graph_max_nodes(chunk);
     if (cparams.flash_attn && !cparams.fa_back_native) {
         max_nodes += (size_t) model.hparams.n_layer() * ggml_flash_attn_ext_back_n_nodes(opt_n_ctx_train, 0);
@@ -92,9 +92,10 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
     {
         llm_graph_result res(max_nodes);
         llama_batch_allocr serving_batch(model.hparams.n_pos_per_embd());
-        auto ubatch = serving_batch.ubatch_reserve(chunk, 1);
-        for (uint32_t i = 0; i < chunk; ++i) { ubatch.output[i] = 1; }
-        n_outputs = chunk;
+        const auto serving_tokens = std::min(saved_cparams.n_ubatch, saved_cparams.n_ctx_seq);
+        auto ubatch = serving_batch.ubatch_reserve(serving_tokens, 1);
+        for (uint32_t i = 0; i < serving_tokens; ++i) { ubatch.output[i] = 1; }
+        n_outputs = serving_tokens;
         const auto params = graph_params(&res, ubatch, mctx.get(), graph_type());
         auto * graph = model.build_graph(params);
         if (!graph) {
