@@ -2609,7 +2609,8 @@ void ggml_backend_sched_measure_graph_external(ggml_backend_sched_t sched, struc
     ggml_gallocr_free(probe);
 }
 
-bool ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const size_t * max_new, size_t * sizes) {
+bool ggml_backend_sched_alloc_graph_admitted(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const size_t * max_new, size_t * sizes,
+        ggml_backend_sched_allocation_callback callback, void * user_data) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
@@ -2631,6 +2632,7 @@ bool ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct gg
             sizes[b] = need[b];
         }
         const size_t held  = ggml_gallocr_get_buffer_size(sched->galloc, b);
+        if (callback && !callback(sched->bufts[b], need[b], held, user_data)) { fits = false; }
         const size_t extra = need[b] > held ? need[b] - held : 0;
         if (max_new && extra > max_new[b]) {
             GGML_LOG_ERROR("%s: the graph needs %.1f MiB more on %s, over the %.1f MiB it may add: not allocating it\n",
@@ -2647,6 +2649,11 @@ bool ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct gg
     }
     sched->is_alloc = true;
     return true;
+}
+
+bool ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        const size_t * max_new, size_t * sizes) {
+    return ggml_backend_sched_alloc_graph_admitted(sched, graph, max_new, sizes, nullptr, nullptr);
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {

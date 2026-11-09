@@ -167,6 +167,10 @@ extern "C" {
             ggml_opt_static_allocation_callback callback, void * user_data);
 
 
+    // Checked by the existing scheduler plan before any shared workspace allocation.
+    GGML_API void ggml_opt_set_graph_allocation_callback(ggml_opt_context_t opt_ctx,
+            ggml_backend_sched_allocation_callback callback, void * user_data);
+
     // Dry preparation on a FRESH dynamic optimizer. Builds real loss/backward/step
     // metadata, measures aligned static/default-backend and CPU host bytes plus the
     // shared scheduler's exact per-backend workspace, excluding the static tensors.

@@ -50,6 +50,8 @@ struct ggml_opt_context {
     ggml_backend_buffer_t      buf_static           = nullptr;
     ggml_backend_buffer_t      buf_cpu              = nullptr;
     bool measurement_only = false;
+    ggml_backend_sched_allocation_callback graph_allocation_callback = nullptr;
+    void * graph_allocation_user_data = nullptr;
     ggml_opt_static_allocation_callback static_allocation_callback = nullptr;
     void * static_allocation_user_data = nullptr;
     std::mt19937               rng;
@@ -989,6 +991,12 @@ struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_
     return it == opt_ctx->leaf_grads.end() ? nullptr : it->second;
 }
 
+void ggml_opt_set_graph_allocation_callback(ggml_opt_context_t opt_ctx,
+        ggml_backend_sched_allocation_callback callback, void * user_data) {
+    opt_ctx->graph_allocation_callback = callback;
+    opt_ctx->graph_allocation_user_data = user_data;
+}
+
 void ggml_opt_set_static_allocation_callback(ggml_opt_context_t opt_ctx,
         ggml_opt_static_allocation_callback callback, void * user_data) {
     opt_ctx->static_allocation_callback = callback;
@@ -1822,7 +1830,8 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
             const size_t margin = std::min<size_t>(free, 512u*1024*1024); // allocator slack
             max_new[i] = free - margin;
         }
-        const bool ok = ggml_backend_sched_alloc_graph_within(sched, opt_ctx->allocated_graph_copy, max_new.data(), sizes.data());
+        const bool ok = ggml_backend_sched_alloc_graph_admitted(sched, opt_ctx->allocated_graph_copy, max_new.data(), sizes.data(),
+                opt_ctx->graph_allocation_callback, opt_ctx->graph_allocation_user_data);
         for (int i = 0; i < n; ++i) {
             ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_sched_get_backend(sched, i));
             if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {

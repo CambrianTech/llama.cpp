@@ -368,6 +368,12 @@ extern "C" {
     // allocator, and allocated only if no backend's buffer would grow by more than max_new[b]
     // bytes (max_new may be NULL: no limit). sizes (may be NULL) receives each backend's planned
     // buffer size. Returns false, allocating nothing, when a limit is exceeded or allocation fails.
+    // Admission checks every measured buffer before any shared buffer grows. The callback
+    // validates an existing lease; it must not allocate or partially consume a lease.
+    typedef bool (*ggml_backend_sched_allocation_callback)(ggml_backend_buffer_type_t buft,
+            size_t required, size_t held, void * user_data);
+    GGML_API bool ggml_backend_sched_alloc_graph_admitted(ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+            const size_t * max_new, size_t * sizes, ggml_backend_sched_allocation_callback callback, void * user_data);
     GGML_API bool                 ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const size_t * max_new, size_t * sizes); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);

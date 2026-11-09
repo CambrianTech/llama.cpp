@@ -51,10 +51,27 @@ int main() {
       CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == held);
       ggml_backend_sched_reset(sched);
     }
+    // A residency refusal wins even when device free memory and growth allowance suffice.
+    struct admission { size_t required; size_t held; bool allow; int calls = 0; } gate{measured, held, false};
+    auto check_lease = +[](ggml_backend_buffer_type_t, size_t required, size_t held_bytes, void * data) {
+        auto & gate = *static_cast<admission *>(data);
+        CHECK(required == gate.required && held_bytes == gate.held);
+        ++gate.calls;
+        return gate.allow;
+    };
+    { graph_fixture big(65536);
+      size_t actual = 0;
+      CHECK(!ggml_backend_sched_alloc_graph_admitted(sched, big.graph, nullptr, &actual, check_lease, &gate));
+      CHECK(gate.calls == 1 && actual == measured);
+      CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == held);
+      CHECK(big.x->data == nullptr && big.out->data == nullptr);
+      ggml_backend_sched_reset(sched);
+    }
+    gate.allow = true;
     { graph_fixture big(65536);
       const size_t lease = measured - held;
       size_t actual = 0;
-      CHECK(ggml_backend_sched_alloc_graph_within(sched, big.graph, &lease, &actual));
+      CHECK(ggml_backend_sched_alloc_graph_admitted(sched, big.graph, &lease, &actual, check_lease, &gate));
       CHECK(actual == measured);
       const float value = 3.0f;
       ggml_backend_tensor_set(big.x, &value, 0, sizeof(value));
