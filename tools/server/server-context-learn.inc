@@ -524,6 +524,11 @@
         }
         out.loss     = pending.committed_steps > 0 ? loss : 0.0;
         out.n_labels = pending.committed_steps > 0 ? pending.n_labels : 0;
+        // Reconcile retained buffers and release result storage before settling
+        // execution custody: both are synchronous parts of leaving learning.
+        settle_learning_residency(pending.lora_id);
+        ggml_opt_result_free(pending.result);
+        pending.result = nullptr;
         const auto cleanup_us = ggml_time_us() - restore_started;
         pending.compute_us += cleanup_us;
         pending.restoration_us += cleanup_us;
@@ -547,7 +552,6 @@
                 out.t_ms, ok ? "" : (" (failed: " + out.failure + ")").c_str());
         const bool separate = pending.separate_request;
         const bool cancelled = slot.learn_release_requested;
-        settle_learning_residency(pending.lora_id);
         learning.reset();
         slot.state = SLOT_STATE_DONE_PROMPT; // release now owns fully restored KV
         if (!cancelled) {
