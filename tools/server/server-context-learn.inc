@@ -3,7 +3,7 @@
         switch (r) {
 #define LEARN_REFUSAL(x) case server_learn_refusal::x: return #x
             LEARN_REFUSAL(none); LEARN_REFUSAL(invalid); LEARN_REFUSAL(stale_engine);
-            LEARN_REFUSAL(grant_mismatch); LEARN_REFUSAL(unknown_grant); LEARN_REFUSAL(never_fits);
+            LEARN_REFUSAL(grant_mismatch); LEARN_REFUSAL(unknown_grant); LEARN_REFUSAL(never_fits); LEARN_REFUSAL(uncontended_only);
             LEARN_REFUSAL(budget_exhausted); LEARN_REFUSAL(started); LEARN_REFUSAL(not_started);
             LEARN_REFUSAL(already_started); LEARN_REFUSAL(unknown_reservation);
 #undef LEARN_REFUSAL

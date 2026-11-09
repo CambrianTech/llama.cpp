@@ -43,6 +43,7 @@ enum class server_learn_refusal {
     stale_engine,     // registered for another engine incarnation
     grant_mismatch,   // this live id is registered with other terms
     unknown_grant,    // no live grant has this id (never registered, revoked or expired)
+    uncontended_only, // bootstrap authority never permits contended gradients
     never_fits,       // the step costs more than the grant's whole period allows
     budget_exhausted, // the period's share is spent: retry_after_ms says when it renews
     started,          // cancel after the step started: it must settle with its measured time
@@ -126,7 +127,7 @@ public:
         // Explicit bootstrap authority: no contended execution, even with a zero
         // estimate. Idle measurement remains authorized and retains normal custody.
         if (contended && a.grant.share_ppm == 0) {
-            out.refusal = server_learn_refusal::never_fits;
+            out.refusal = server_learn_refusal::uncontended_only;
             return out;
         }
         roll(a, now_us);
