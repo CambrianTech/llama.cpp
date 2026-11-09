@@ -37,12 +37,9 @@ a = load('shadow-05.gguf', 'weights-a')
 b = load('shadow-06.gguf', 'weights-b')
 checkpoint_prefix = 'checkpoint-' + uuid.uuid4().hex
 checkpoint_spec = {'engine': engine, 'binding': checkpoint_prefix, 'provenance': {'journal_through': 7}}
-try:
-    call('/lora-adapters/save', {'id': a['id'], 'name': checkpoint_prefix + '-empty.gguf',
-                               'checkpoint': checkpoint_spec})
-    raise AssertionError('uninitialized optimizer checkpoint accepted')
-except urllib.error.HTTPError as error:
-    assert error.code == 400
+empty = call('/lora-adapters/save', {'id': a['id'], 'name': checkpoint_prefix + '-empty.gguf',
+                                   'checkpoint': checkpoint_spec})
+assert not empty['success'] and empty['refusal'] == 'no_optimizer_state', empty
 assert not (Path(a['path']).parent / (checkpoint_prefix + '-empty.gguf.checkpoint')).exists()
 # A stale cleanup must not unload an id reused by a different engine incarnation.
 held_before_stale = call('/learn/grants')['residencies']

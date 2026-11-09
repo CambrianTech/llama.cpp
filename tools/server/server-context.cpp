@@ -3200,6 +3200,21 @@ private:
                         break;
                     }
                     const int64_t steps = llama_opt_shadow_steps(ctx_tgt, loras[id].ptr);
+                    if (!task.save_checkpoint.is_null()) {
+                        bool allocated = false;
+                        const auto memory = learn_memory_receipt();
+                        for (const auto & row : memory.at("optimizer_owned_buffers")) {
+                            allocated |= row.at("lora_id") == id && row.at("bytes").get<uint64_t>() != 0;
+                        }
+                        if (!allocated) {
+                            auto refused = std::make_unique<server_task_result_learn_grants>();
+                            refused->id = task.id;
+                            refused->receipt = {{"success", false}, {"refusal", "no_optimizer_state"},
+                                {"engine", learn_engine}, {"id", id}};
+                            queue_results.send(std::move(refused));
+                            break;
+                        }
+                    }
                     json checkpoint;
                     std::string saved_path = task.load_lora_path;
                     std::string error;

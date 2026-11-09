@@ -16,8 +16,9 @@
 #include <unistd.h>
 #endif
 
-inline bool server_flush_checkpoint_path(const std::filesystem::path & path) {
+inline bool server_flush_checkpoint_path(const std::filesystem::path & path, bool directory = false) {
 #ifdef _WIN32
+    (void) directory;
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) { return false; }
     const bool flushed = FlushFileBuffers(file) != 0;
@@ -26,7 +27,12 @@ inline bool server_flush_checkpoint_path(const std::filesystem::path & path) {
 #else
     const int file = open(path.c_str(), O_RDONLY);
     if (file < 0) { return false; }
+#ifdef __APPLE__
+    const bool flushed = directory ? fsync(file) == 0 : fcntl(file, F_FULLFSYNC) == 0;
+#else
+    (void) directory;
     const bool flushed = fsync(file) == 0;
+#endif
     const bool closed = close(file) == 0;
     return flushed && closed;
 #endif
@@ -63,10 +69,10 @@ inline std::string server_publish_adapter_generation(const std::string & path,
         return "checkpoint publication refused: " + std::to_string(GetLastError());
     }
 #else
-    if (!server_flush_checkpoint_path(staging)) { return "checkpoint directory flush failed"; }
+    if (!server_flush_checkpoint_path(staging, true)) { return "checkpoint directory flush failed"; }
     fs::rename(staging, path, ec);
     if (ec) { return "checkpoint publication refused: " + ec.message(); }
-    if (!server_flush_checkpoint_path(fs::path(path).parent_path())) {
+    if (!server_flush_checkpoint_path(fs::path(path).parent_path(), true)) {
         return "checkpoint published but parent flush unconfirmed; retain prior cursor";
     }
 #endif
