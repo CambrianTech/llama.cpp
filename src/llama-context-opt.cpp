@@ -897,8 +897,17 @@ size_t llama_context::opt_graph_bytes() const {
     return opt_ctx ? ggml_opt_peak_graph_bytes(opt_ctx) : 0;
 }
 
+int64_t llama_opt_shadow_steps(const llama_context * ctx, const llama_adapter_lora * shadow) {
+    return ctx ? ctx->opt_shadow_steps(shadow) : 0;
+}
+
 size_t llama_opt_graph_bytes(struct llama_context * ctx) {
     return ctx->opt_graph_bytes();
+}
+
+int64_t llama_context::opt_shadow_steps(const llama_adapter_lora * shadow) const {
+    const auto mind = opt_minds.find(shadow);
+    return mind == opt_minds.end() ? 0 : ggml_opt_committed_steps(mind->second);
 }
 
 void llama_context::opt_visit_memory(llama_opt_memory_callback callback, void * user_data) const {

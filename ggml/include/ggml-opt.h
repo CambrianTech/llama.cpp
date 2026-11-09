@@ -156,6 +156,8 @@ extern "C" {
     // Read on the context owner between evaluations; no allocation or device synchronization.
     typedef void (*ggml_opt_buffer_callback)(ggml_backend_buffer_t buffer, const char * kind, void * user_data);
     GGML_API void ggml_opt_visit_owned_buffers(ggml_opt_context_t opt_ctx, ggml_opt_buffer_callback callback, void * user_data);
+    // Optimizer steps this context has committed (each AdamW/SGD update applied), 0 before the first.
+    GGML_API int64_t ggml_opt_committed_steps(ggml_opt_context_t opt_ctx);
     // Runs BEFORE each optimizer-owned tensor buffer allocation, with the exact aligned
     // allocator size. false refuses allocation; caller retains the measured requirement.
     // This guards optimizer buffers only, not the shared graph/scheduler or adapter weights.

@@ -58,7 +58,9 @@ fresh = ok("/lora-adapters/fresh", {"name": fresh_name, "rank": 8,
 assert complete() == baseline, "dormant shadow changed base output"
 assert complete(fresh["id"]) == baseline, "zero-B shadow changed enabled output"
 before_name = prefix + "-before.gguf"
-ok("/lora-adapters/save", {"id": fresh["id"], "name": before_name})
+# What this catches (#86's report, on the one save route): a snapshot names how much learning it
+# holds. The count is the shadow's own optimizer's committed steps, not a server tally.
+assert ok("/lora-adapters/save", {"id": fresh["id"], "name": before_name})["steps"] == 0, "a fresh shadow has committed nothing"
 before = hashlib.sha256((train_dir / before_name).read_bytes()).hexdigest()
 repeat_name = prefix + "-repeat.gguf"
 ok("/lora-adapters/save", {"id": fresh["id"], "name": repeat_name})
@@ -87,6 +89,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
 trained_text = complete(fresh["id"])
 snapshot_name = prefix + "-snapshot.gguf"
 snapshot = ok("/lora-adapters/save", {"id": fresh["id"], "name": snapshot_name})
+assert snapshot["steps"] == 2, ("two whole replies learned are two committed steps", snapshot)
 after = hashlib.sha256((train_dir / snapshot_name).read_bytes()).hexdigest()
 assert after != before, "successful learn did not change saved adapter weights"
 loaded = ok("/lora-adapters/load", {"name": snapshot_name})

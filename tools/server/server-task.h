@@ -676,6 +676,8 @@ struct server_task_result_lora_change : server_task_result {
     int32_t     lora_id = -1;
     std::string path;
     bool        loaded  = true;
+    // a save: the optimizer steps the saved shadow had committed (what the immutable file holds)
+    std::optional<int64_t> steps;
     virtual json to_json() override;
 };
 

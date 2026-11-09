@@ -230,6 +230,7 @@ struct llama_context {
     size_t opt_graph_bytes() const;
     void opt_visit_memory(llama_opt_memory_callback callback, void * user_data) const;
     bool opt_measure_memory(llama_opt_memory_callback callback, void * user_data);
+    int64_t opt_shadow_steps(const llama_adapter_lora * shadow) const;
 
     struct opt_live_reply {
         llama_seq_id seq;

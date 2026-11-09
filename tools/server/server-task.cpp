@@ -1707,6 +1707,9 @@ json server_task_result_lora_change::to_json() {
     if (!loaded) {
         res["retired"] = true;
     }
+    if (steps) {
+        res["steps"] = *steps;
+    }
     return res;
 }
 
