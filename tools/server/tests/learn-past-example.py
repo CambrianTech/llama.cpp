@@ -53,14 +53,15 @@ fresh = {"name": prefix + "-shadow.gguf", "rank": 8, "alpha": 16,
 plan = ok("/lora-adapters/fresh", dict(fresh, dry_run=True))
 weights = register("-weights", {"fresh": fresh}, [dict(row, kind="weights") for row in plan["weights"]])
 shadow = ok("/lora-adapters/fresh", dict(fresh, residency=weights))
-plan = ok("/learn/preflight", {"engine": ledger["engine"], "lora_id": shadow["id"]})
+example = [{"role": "user", "content": "What is the capital of Kansas?"},
+           {"role": "assistant", "content": "Topeka."}]
+plan = ok("/learn/preflight", {"engine": ledger["engine"], "lora_id": shadow["id"], "messages": example})
 assert plan["refusal"] == "none", plan
 optimizer = register("-optimizer", {"loaded": {"lora_id": shadow["id"], "path": shadow["path"]}},
                      [row for row in plan["requirements"] if row["kind"].startswith("optimizer_")])
 workspace = register("-workspace", {"workspace": True},
                      [row for row in plan["requirements"] if row["kind"] == "shared_compute_required"])
-example = [{"role": "user", "content": "What is the capital of Kansas?"},
-           {"role": "assistant", "content": "Topeka."}]
+
 learn = {"messages": example, "id_slot": 0, "lora_id": shadow["id"], "grant": grant, "lr": 0.001,
          "optimizer_residency": optimizer, "workspace_residency": workspace}
 

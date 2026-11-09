@@ -6363,6 +6363,68 @@ void server_routes::init_routes() {
     // Duty rest returns a deferred outcome: the caller retains replayable input context, reply or
     // labels, and adapter parameters, then retries after retry_after_ms. A slot's prompt may have
     // changed by then. The slot-release queue cannot wake a cooldown on an already idle slot.
+    // Both routes use the same served template, reply markers and token owner.
+    auto render_learn_example = [this](const json & body) {
+        learn_request example;
+        // the conversation she was served, its last message her reply (or the correction). The
+        // served prompt is every earlier message through the SAME parser and template arguments
+        // /v1/chat/completions used (chat_template_kwargs included: a thinking template renders a
+        // different prompt without them), with the generation prompt; the reply is what the model
+        // would have generated after it, including the template's native turn/tool markers
+        const json & messages = body.at("messages");
+        if (!messages.is_array() || messages.size() < 2 || !messages.back().is_object()
+                || messages.back().value("role", std::string()) != "assistant") {
+            throw std::invalid_argument("\"messages\" must end with the assistant reply to learn, after the conversation it answers");
+        }
+        json served = body;
+        served["messages"] = json::array();
+        for (size_t i = 0; i + 1 < messages.size(); ++i) {
+            served["messages"].push_back(messages[i]);
+        }
+        std::vector<raw_buffer> files;
+        const json parsed = oaicompat_chat_params_parse(served, meta->chat_params, files);
+        if (!files.empty()) {
+            throw std::invalid_argument("a conversation with media cannot be learned yet: only text prompts");
+        }
+        example.prompt   = serving_prompt_tokens(ctx_server.vocab, ctx_server.mctx, parsed.at("prompt"), files, true)[0].get_text_tokens();
+        example.n_prefix = (int32_t) example.prompt.size();
+        // Reuse the trainer's template-derived spans. Only this final assistant turn is
+        // labelled; tool syntax, reasoning and end markers come from the served template.
+        auto render = [&](const json & turns, const json & tools, bool generation) {
+            json framed = body;
+            framed["messages"] = turns;
+            framed["tools"] = tools;
+            framed["add_generation_prompt"] = generation;
+            std::vector<raw_buffer> media;
+            const json rendered = oaicompat_chat_params_parse(framed, meta->chat_params, media,
+                generation ? server_chat_render::serving : server_chat_render::closed_transcript);
+            if (!media.empty()) {
+                throw std::invalid_argument("learning media is not supported");
+            }
+            return rendered.at("prompt").get<std::string>();
+        };
+        std::string why;
+        if (!train_reply_rendered(messages, json_value(body, "tools", json()), render, why)) {
+            throw std::invalid_argument(why);
+        }
+        std::vector<bool> trained(messages.size(), false);
+        trained.back() = true;
+        std::vector<llama_token> tokens;
+        std::vector<uint8_t> loss;
+        if (!train_render(messages, trained, json_value(body, "tools", json()), render,
+                          ctx_server.vocab, "messages", tokens, loss, why)) {
+            throw std::invalid_argument(why);
+        }
+        const auto first = std::find(loss.begin(), loss.end(), uint8_t{1});
+        const size_t prefix = (size_t) std::distance(loss.begin(), first);
+        if (first == loss.end() || prefix != example.prompt.size()
+                || !std::equal(example.prompt.begin(), example.prompt.end(), tokens.begin())
+                || !std::all_of(first, loss.end(), [](uint8_t label) { return label == 1; })) {
+            throw std::invalid_argument("the template's learned reply is not a contiguous suffix of the exact served prompt");
+        }
+        example.reply.assign(tokens.begin() + prefix, tokens.end());
+        return example;
+    };
     auto grant_route = [this](const server_http_req & req, const char * op) {
         auto res = create_response();
         server_task task(SERVER_TASK_TYPE_LEARN_GRANTS);
@@ -6392,7 +6454,32 @@ void server_routes::init_routes() {
         if (result) { res->ok(result->to_json()); }
         return res;
     };
-    this->post_learn_preflight = [grant_route](const server_http_req & req) { return grant_route(req, "preflight"); };
+    this->post_learn_preflight = [this, grant_route, render_learn_example](const server_http_req & req) {
+        auto res = create_response();
+        try {
+            json body = json::parse(req.body);
+            if (!body.is_object() || body.contains("reply_rows")) {
+                throw std::invalid_argument("preflight requires the example, not caller-computed reply_rows");
+            }
+            size_t rows;
+            if (body.contains("messages")) {
+                rows = render_learn_example(body).reply.size();
+            } else if (body.contains("learn")) {
+                // Completion-attached corrections share the completion schema, including EOT.
+                rows = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog,
+                    json{{"learn", body.at("learn")}}).learn->reply.size();
+            } else {
+                throw std::invalid_argument("preflight requires messages or a completion learn example");
+            }
+            body["reply_rows"] = rows;
+            server_http_req measured = req;
+            measured.body = body.dump();
+            return grant_route(measured, "preflight");
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+    };
     this->post_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_register"); };
     this->release_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_release"); };
     this->revoke_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_revoke"); };
@@ -6400,7 +6487,7 @@ void server_routes::init_routes() {
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
     this->revoke_learn_grant = [grant_route](const server_http_req & req) { return grant_route(req, "revoke"); };
 
-    this->post_learn = [this](const server_http_req & req) {
+    this->post_learn = [this, render_learn_example](const server_http_req & req) {
         auto res = create_response();
         if (params.train_dir.empty()) {
             res->error(format_error_response("learning is off: start the server with --train-dir", ERROR_TYPE_NOT_SUPPORTED));
@@ -6417,70 +6504,15 @@ void server_routes::init_routes() {
         task.learn.lora_id  = json_value(body, "lora_id",  -1);
         task.learn.lr       = json_value(body, "lr",       1e-4f);
         if (body.contains("messages")) {
-            // the conversation she was served, its last message her reply (or the correction). The
-            // served prompt is every earlier message through the SAME parser and template arguments
-            // /v1/chat/completions used (chat_template_kwargs included: a thinking template renders a
-            // different prompt without them), with the generation prompt; the reply is what the model
-            // would have generated after it, including the template's native turn/tool markers
-            const json & messages = body.at("messages");
-            if (!messages.is_array() || messages.size() < 2 || !messages.back().is_object()
-                    || messages.back().value("role", std::string()) != "assistant") {
-                res->error(format_error_response("\"messages\" must end with the assistant reply to learn, after the conversation it answers",
-                                                 ERROR_TYPE_INVALID_REQUEST));
+            try {
+                const auto example = render_learn_example(body);
+                task.learn.prompt = example.prompt;
+                task.learn.n_prefix = example.n_prefix;
+                task.learn.reply = example.reply;
+            } catch (const std::exception & e) {
+                res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
-            json served = body;
-            served["messages"] = json::array();
-            for (size_t i = 0; i + 1 < messages.size(); ++i) {
-                served["messages"].push_back(messages[i]);
-            }
-            std::vector<raw_buffer> files;
-            const json parsed = oaicompat_chat_params_parse(served, meta->chat_params, files);
-            if (!files.empty()) {
-                res->error(format_error_response("a conversation with media cannot be learned yet: only text prompts", ERROR_TYPE_INVALID_REQUEST));
-                return res;
-            }
-            task.learn.prompt   = serving_prompt_tokens(ctx_server.vocab, ctx_server.mctx, parsed.at("prompt"), files, true)[0].get_text_tokens();
-            task.learn.n_prefix = (int32_t) task.learn.prompt.size();
-            // Reuse the trainer's template-derived spans. Only this final assistant turn is
-            // labelled; tool syntax, reasoning and end markers come from the served template.
-            auto render = [&](const json & turns, const json & tools, bool generation) {
-                json framed = body;
-                framed["messages"] = turns;
-                framed["tools"] = tools;
-                framed["add_generation_prompt"] = generation;
-                std::vector<raw_buffer> media;
-                const json rendered = oaicompat_chat_params_parse(framed, meta->chat_params, media,
-                    generation ? server_chat_render::serving : server_chat_render::closed_transcript);
-                if (!media.empty()) {
-                    throw std::invalid_argument("learning media is not supported");
-                }
-                return rendered.at("prompt").get<std::string>();
-            };
-            std::string why;
-            if (!train_reply_rendered(messages, json_value(body, "tools", json()), render, why)) {
-                res->error(format_error_response(why, ERROR_TYPE_INVALID_REQUEST));
-                return res;
-            }
-            std::vector<bool> trained(messages.size(), false);
-            trained.back() = true;
-            std::vector<llama_token> tokens;
-            std::vector<uint8_t> loss;
-            if (!train_render(messages, trained, json_value(body, "tools", json()), render,
-                              ctx_server.vocab, "messages", tokens, loss, why)) {
-                res->error(format_error_response(why, ERROR_TYPE_INVALID_REQUEST));
-                return res;
-            }
-            const auto first = std::find(loss.begin(), loss.end(), uint8_t{1});
-            const size_t prefix = (size_t) std::distance(loss.begin(), first);
-            if (first == loss.end() || prefix != task.learn.prompt.size()
-                    || !std::equal(task.learn.prompt.begin(), task.learn.prompt.end(), tokens.begin())
-                    || !std::all_of(first, loss.end(), [](uint8_t label) { return label == 1; })) {
-                res->error(format_error_response("the template's learned reply is not a contiguous suffix of the exact served prompt",
-                                                 ERROR_TYPE_INVALID_REQUEST));
-                return res;
-            }
-            task.learn.reply.assign(tokens.begin() + prefix, tokens.end());
             // A past example (S4 (f); fork #89): her slot may no longer hold this prompt. Serve it
             // first through the ordinary completion path (prompt cache, checkpoints, the slot's
             // own admission and the grant), one token, and learn as it finishes: when the slot

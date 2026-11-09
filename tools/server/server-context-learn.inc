@@ -95,7 +95,7 @@
         if (const auto why = train_repack_refusal(model_tgt, params_base); !why.empty()) {
             return refuse("unsupported", why);
         }
-        const int64_t reply_rows = body.value("reply_rows", int64_t(llama_n_ctx_seq(ctx_tgt)));
+        const int64_t reply_rows = body.value("reply_rows", int64_t(0));
         if (reply_rows <= 0 || reply_rows > llama_n_ctx_seq(ctx_tgt)) {
             return refuse("invalid", "reply_rows must describe a nonempty example within the served window");
         }
