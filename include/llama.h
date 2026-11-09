@@ -799,6 +799,10 @@ extern "C" {
     // Measure aligned residency through the loader's metadata/placement owner, without buffers.
     typedef void (*llama_adapter_memory_callback)(const char * device, const char * buffer_type,
                                                   size_t bytes, bool host, void * user_data);
+    typedef bool (*llama_adapter_admission_callback)(const char * device, const char * buffer_type,
+                                                     size_t bytes, bool host, void * user_data);
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_admitted(struct llama_model * model,
+            const char * path, llama_adapter_admission_callback callback, void * user_data);
     LLAMA_API bool llama_adapter_lora_measure(struct llama_model * model, const char * path,
             llama_adapter_memory_callback callback, void * user_data);
     LLAMA_API bool llama_adapter_lora_measure_metadata(const struct llama_model * model,

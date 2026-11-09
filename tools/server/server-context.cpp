@@ -13,6 +13,7 @@
 #include "server-page-adapters.h"
 #include "server-prefill.h"
 #include "server-learn-ledger.h"
+#include "server-learn-residency.h"
 #include "server-test-faults.h"
 
 #include "build-info.h"
@@ -900,6 +901,11 @@ public:
 
     // the adapter set the main loop last published (publish_lora_report): GET /lora-adapters reads
     // it here, never through the task queue
+    server_residency_mirror & residencies() { return residency_mirror; }
+    std::string claim_weight_residency(const std::string & id, const json & subject) {
+        try { return residency_mirror.claim(id, residency_subject(subject)); }
+        catch (const std::exception &) { return "invalid"; }
+    }
     const std::string & learning_engine_identity() const { return learn_engine; }
 
     json lora_report_snapshot() const {
@@ -972,6 +978,7 @@ private:
         return id;
     }();
     server_learn_ledger learn_ledger{learn_engine};
+    server_residency_mirror residency_mirror{learn_engine};
     std::map<int32_t, int64_t> learn_chunk_us; // measured worst chunk per loaded shadow
 
     static ggml_opt_optimizer_params learn_opt_pars(void * ud) {
@@ -3203,6 +3210,7 @@ private:
                     }
                     if (existing >= 0) {
                         llama_adapter_lora_free(task.load_lora);
+                        residency_mirror.finish(task.load_lora_residency, false);
                         auto res = std::make_unique<server_task_result_lora_change>();
                         res->id      = task.id;
                         res->lora_id = existing;
@@ -3220,6 +3228,7 @@ private:
                     llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
                     la.prompt_prefix = buf;
                     params_base.lora_adapters.push_back(la);
+                    residency_mirror.finish(task.load_lora_residency, true, (int32_t) params_base.lora_adapters.size() - 1);
                     publish_lora_report();
                     SRV_INF("loaded lora adapter id=%zu path=%s (dormant)\n", params_base.lora_adapters.size() - 1, la.path.c_str());
                     auto res = std::make_unique<server_task_result_lora_change>();
@@ -3324,6 +3333,7 @@ private:
                     // update_slots); the draft/MTP context never does.
                     llama_set_adapters_lora(ctx_tgt, nullptr, 0, nullptr);
                     llama_adapter_lora_free(ptr);
+                    residency_mirror.freed_lora(id);
                     // An empty path is the retired mark: a model reload after sleep skips it
                     // (common_init_from_params) and the id stays taken.
                     auto res = std::make_unique<server_task_result_lora_change>();
@@ -6250,7 +6260,24 @@ void server_routes::init_routes() {
         }
         // Reading the tensors happens here, on the HTTP thread, like the trainer's own
         // adapter init: the server loop only appends the pointer between decode steps.
-        llama_adapter_lora * adapter = llama_adapter_lora_init(ctx_server.model_tgt, path.c_str());
+        const auto residency = body.value("residency", std::string());
+        const auto subject = req.path == "/lora-adapters/fresh" ? json{{"fresh", body}} : json{{"load", {{"name", name}}}};
+        const auto refusal = ctx_server.claim_weight_residency(residency, subject);
+        if (refusal != "none") {
+            res->error(format_error_response("adapter residency refused: " + refusal, ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        struct allocation_guard {
+            server_residency_mirror & mirror;
+            std::string id;
+            bool transferred = false;
+            ~allocation_guard() { if (!transferred) { mirror.finish(id, false); } }
+        } custody{ctx_server.residencies(), residency};
+        auto * adapter = llama_adapter_lora_init_admitted(ctx_server.model_tgt, path.c_str(),
+            [](const char * device, const char * buft, size_t bytes, bool host, void * data) {
+                auto & c = *static_cast<allocation_guard *>(data);
+                return c.mirror.allows(c.id, {device, buft, "weights", bytes, host});
+            }, &custody);
         if (adapter == nullptr) {
             res->error(format_error_response("failed to load LoRA adapter '" + name + "' (missing, or not a LoRA for this model)",
                                              ERROR_TYPE_INVALID_REQUEST));
@@ -6265,7 +6292,9 @@ void server_routes::init_routes() {
             task.id             = rd.get_new_id();
             task.load_lora      = adapter;
             task.load_lora_path = path;
+            task.load_lora_residency = residency;
             rd.post_task(std::move(task));
+            custody.transferred = true;
         }
         auto result = rd.next(req.should_stop);
         if (!result) {
@@ -6319,6 +6348,9 @@ void server_routes::init_routes() {
         return res;
     };
     this->post_learn_preflight = [grant_route](const server_http_req & req) { return grant_route(req, "preflight"); };
+    this->post_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_register"); };
+    this->release_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_release"); };
+    this->revoke_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_revoke"); };
     this->get_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "list"); };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
     this->revoke_learn_grant = [grant_route](const server_http_req & req) { return grant_route(req, "revoke"); };

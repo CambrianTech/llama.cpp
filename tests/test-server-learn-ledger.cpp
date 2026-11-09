@@ -2,6 +2,7 @@
 // milliseconds: authority-only registration, immutable live grants, no replenishment by retry,
 // free reservations as live custody, cancel only before start, checked ranges, bounded accounts.
 #include "../tools/server/server-learn-ledger.h"
+#include "../tools/server/server-learn-residency.h"
 
 #include <climits>
 #include <cstdlib>
@@ -22,7 +23,41 @@ static int64_t used(const server_learn_ledger & l, const char * grant, int64_t n
     return out;
 }
 
+static void residency_custody() {
+    server_residency_mirror mirror("engine-a");
+    server_residency r{"r1", "engine-a", "core-a", "shadow-a",
+        {{"CUDA0", "CUDA0", "weights", 128, false}, {"host", "CPU", "optimizer_host_required", 32, true}},
+        {{"vram", "vram-1", 128}, {"ram", "ram-1", 32}}};
+    auto bad = r; bad.engine = "old";
+    require(mirror.register_residency(bad) == "stale_engine", "residency binds engine");
+    bad = r; bad.leases[0].bytes = 127;
+    require(mirror.register_residency(bad) == "uncovered", "no bytes without physical lease");
+    bad = r; bad.rows.push_back(r.rows[0]);
+    require(mirror.register_residency(bad) == "invalid", "duplicate rows cannot mint coverage");
+    require(mirror.register_residency(r) == "none", "register residency");
+    require(mirror.register_residency(r) == "none", "idempotent registration");
+    bad = r; bad.owner = "core-b";
+    require(mirror.register_residency(bad) == "residency_mismatch", "new core cannot adopt silently");
+    bad = r; bad.id = "r2";
+    require(mirror.register_residency(bad) == "lease_already_bound", "one lease cannot fund two residencies");
+    require(mirror.claim("r1", "shadow-b") == "subject_mismatch", "subject checked before allocation");
+    require(mirror.claim("r1", "shadow-a") == "none", "claim preallocation custody");
+    require(mirror.claim("r1", "shadow-a") == "busy", "concurrent duplicate cannot allocate twice");
+    require(mirror.release("r1") == "busy", "cannot release while loading");
+    require(mirror.allows("r1", r.rows[0]), "exact aligned bytes admitted");
+    auto larger = r.rows[0]; ++larger.bytes;
+    require(!mirror.allows("r1", larger), "larger allocation refused");
+    mirror.finish("r1", true, 3);
+    require(mirror.revoke("r1") == "none", "revoke allocation authority");
+    require(!mirror.allows("r1", r.rows[0]), "revocation stops new allocation");
+    require(mirror.release("r1") == "busy", "revocation does not free resident bytes");
+    mirror.freed("r1");
+    require(mirror.release("r1") == "none", "release after actual free");
+    require(mirror.register_residency(r) == "retired", "retired reference cannot be reused");
+}
+
 int main() {
+    residency_custody();
     server_learn_ledger ledger("engine-a");
     const int64_t day_us = 86400000000;
     // 10% of a 1000 ms period: 100 ms of contended learning per period, for a day

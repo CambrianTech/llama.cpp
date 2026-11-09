@@ -266,6 +266,7 @@ struct server_task {
     // server loop; the loop only appends it (dormant, scale 0) to the adapter list
     llama_adapter_lora * load_lora = nullptr;
     std::string          load_lora_path;
+    std::string          load_lora_residency;
     // SAVE_LORA runs between decode/learn steps; path is confined by the route.
     int32_t save_lora = -1;
 

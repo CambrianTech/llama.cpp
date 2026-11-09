@@ -104,6 +104,68 @@
         return out;
     }
 
+    static std::string residency_subject(const json & subject) {
+        if (!subject.is_object() || subject.size() != 1) { return {}; }
+        if (subject.contains("workspace") && subject.at("workspace") == true) { return "workspace"; }
+        json normalized;
+        if (subject.contains("fresh")) {
+            const auto & f = subject.at("fresh");
+            normalized = {{"fresh", {{"name", f.at("name").get<std::string>()},
+                {"rank", f.value("rank", 8)}, {"alpha", f.value("alpha", 16.0)},
+                {"targets", f.value("targets", std::string("attn_q,attn_v"))},
+                {"top_layers", f.value("top_layers", 0)}, {"seed", f.value("seed", uint32_t(42))}}}};
+        } else if (subject.contains("load")) {
+            normalized = {{"load", {{"name", subject.at("load").at("name").get<std::string>()}}}};
+        } else if (subject.contains("loaded")) {
+            normalized = {{"loaded", {{"lora_id", subject.at("loaded").at("lora_id").get<int32_t>()},
+                {"path", subject.at("loaded").at("path").get<std::string>()}}}};
+        } else { return {}; }
+        return normalized.dump();
+    }
+
+    std::string register_residency(const json & body) {
+        try {
+            server_residency r;
+            r.id = body.at("id").get<std::string>();
+            r.engine = body.at("engine").get<std::string>();
+            r.owner = body.at("owner").get<std::string>();
+            r.subject = residency_subject(body.at("subject"));
+            auto bytes = [](const json & j) -> uint64_t {
+                if (!j.is_number_integer() || j.get<double>() < 0 || j.get<double>() >= double(INT64_MAX)) {
+                    throw std::runtime_error("invalid residency bytes");
+                }
+                return j.get<uint64_t>();
+            };
+            if (!body.at("rows").is_array() || !body.at("leases").is_array()) { return "invalid"; }
+            for (const auto & row : body.at("rows")) {
+                r.rows.push_back({row.at("device").get<std::string>(), row.at("buffer_type").get<std::string>(),
+                    row.at("kind").get<std::string>(), bytes(row.at("bytes")), row.at("host").get<bool>()});
+            }
+            for (const auto & lease : body.at("leases")) {
+                r.leases.push_back({lease.at("kind").get<std::string>(), lease.at("lease_id").get<std::string>(), bytes(lease.at("bytes"))});
+            }
+            return residency_mirror.register_residency(r);
+        } catch (const std::exception &) { return "invalid"; }
+    }
+
+    json residency_snapshot() const {
+        json out = json::array();
+        for (const auto & r : residency_mirror.snapshot()) {
+            json rows = json::array(), leases = json::array();
+            for (const auto & row : r.rows) {
+                rows.push_back({{"device", row.device}, {"buffer_type", row.buffer_type}, {"kind", row.kind},
+                    {"bytes", row.bytes}, {"host", row.host}});
+            }
+            for (const auto & lease : r.leases) {
+                leases.push_back({{"kind", lease.kind}, {"lease_id", lease.lease_id}, {"bytes", lease.bytes}});
+            }
+            out.push_back({{"id", r.id}, {"engine", r.engine}, {"owner", r.owner}, {"subject", r.subject == "workspace" ? json{{"workspace", true}} : json::parse(r.subject)},
+                {"rows", rows}, {"leases", leases}, {"pending", r.pending}, {"live", r.live},
+                {"revoked", r.revoked}, {"lora_id", r.lora_id}});
+        }
+        return out;
+    }
+
     void process_learn_grants(const server_task & task) {
         const auto now = ggml_time_us();
         auto result = std::make_unique<server_task_result_learn_grants>();
@@ -116,7 +178,13 @@
             queue_results.send(std::move(result));
             return;
         }
-        if (op == "register") {
+        if (op == "residency_register") {
+            out["refusal"] = register_residency(body);
+        } else if (op == "residency_release") {
+            out["refusal"] = residency_mirror.release(body.value("id", std::string()));
+        } else if (op == "residency_revoke") {
+            out["refusal"] = residency_mirror.revoke(body.value("id", std::string()));
+        } else if (op == "register") {
             const auto duration = body.value("expires_in_ms", int64_t(0));
             server_learn_grant g{body.value("id", std::string()), body.value("engine", std::string()),
                 body.value("period_ms", int64_t(0)), body.value("share_ppm", int64_t(0)), 0};
@@ -143,6 +211,7 @@
             }
         }
         out["memory"] = learn_memory_receipt();
+        out["residencies"] = residency_snapshot();
         result->receipt = std::move(out);
         queue_results.send(std::move(result));
     }

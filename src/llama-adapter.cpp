@@ -152,7 +152,7 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
 
 static void llama_adapter_lora_build(llama_model & model, const char * path_lora,
         llama_adapter_lora & adapter, gguf_context * ctx_gguf, ggml_context * ctx,
-        llama_adapter_memory_callback measure, void * user_data) {
+        llama_adapter_memory_callback measure, void * user_data, llama_adapter_admission_callback admission = nullptr) {
     // check metadata
     {
         const gguf_context * gguf_ctx = ctx_gguf;
@@ -377,6 +377,18 @@ static void llama_adapter_lora_build(llama_model & model, const char * path_lora
         return;
     }
 
+    if (admission) {
+        bool accepted = true;
+        for (const auto & entry : ctx_map) {
+            auto buft = entry.first;
+            auto dev = ggml_backend_buft_get_device(buft);
+            accepted &= admission(dev ? ggml_backend_dev_name(dev) : "host", ggml_backend_buft_name(buft),
+                    ggml_backend_alloc_ctx_tensors_from_buft_size(entry.second, buft),
+                    ggml_backend_buft_is_host(buft), user_data);
+        }
+        if (!accepted) { throw std::runtime_error("adapter residency refused before allocation"); }
+    }
+
     // allocate tensors / buffers and zero
     {
         adapter.ctxs.reserve(ctx_map.size());
@@ -425,7 +437,8 @@ static void llama_adapter_lora_build(llama_model & model, const char * path_lora
     LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
 }
 static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter,
-        llama_adapter_memory_callback measure = nullptr, void * user_data = nullptr) {
+        llama_adapter_memory_callback measure = nullptr, void * user_data = nullptr,
+        llama_adapter_admission_callback admission = nullptr) {
     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
 
     ggml_context * ctx_init;
@@ -441,7 +454,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
 
     ggml_context_ptr ctx { ctx_init };
 
-    llama_adapter_lora_build(model, path_lora, adapter, ctx_gguf.get(), ctx.get(), measure, user_data);
+    llama_adapter_lora_build(model, path_lora, adapter, ctx_gguf.get(), ctx.get(), measure, user_data, admission);
 }
 
 bool llama_adapter_lora_measure(llama_model * model, const char * path,
@@ -478,6 +491,20 @@ void llama_adapter_lora_visit_memory(const llama_adapter_lora * adapter,
         auto dev = ggml_backend_buft_get_device(buft);
         callback(dev ? ggml_backend_dev_name(dev) : "host", ggml_backend_buft_name(buft),
                 ggml_backend_buffer_get_size(buffer.get()), ggml_backend_buft_is_host(buft), user_data);
+    }
+}
+
+llama_adapter_lora * llama_adapter_lora_init_admitted(llama_model * model, const char * path,
+        llama_adapter_admission_callback callback, void * user_data) {
+    if (!model || !path || !callback) { return nullptr; }
+    auto * adapter = new llama_adapter_lora(model);
+    try {
+        llama_adapter_lora_init_impl(*model, path, *adapter, nullptr, user_data, callback);
+        return adapter;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        delete adapter;
+        return nullptr;
     }
 }
 
