@@ -1211,4 +1211,5 @@ struct common_prompt_checkpoint {
 // memory is dominated by those saved activations, ~linear in the depth it reaches).
 bool common_lora_write_fresh(const struct llama_model * model, const std::string & path,
                              int32_t rank, float alpha, const std::vector<std::string> & targets, uint32_t seed,
-                             int32_t top_layers = 0);
+                             int32_t top_layers = 0,
+                             llama_adapter_memory_callback measure = nullptr, void * user_data = nullptr);

@@ -150,25 +150,12 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
     return nullptr;
 }
 
-static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
-    LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
-
-    ggml_context * ctx_init;
-    gguf_init_params meta_gguf_params = {
-        /* .no_alloc = */ true,
-        /* .ctx      = */ &ctx_init,
-    };
-
-    gguf_context_ptr ctx_gguf { gguf_init_from_file(path_lora, meta_gguf_params) };
-    if (!ctx_gguf) {
-        throw std::runtime_error("failed to load lora adapter file from " + std::string(path_lora));
-    }
-
-    ggml_context_ptr ctx { ctx_init };
-
+static void llama_adapter_lora_build(llama_model & model, const char * path_lora,
+        llama_adapter_lora & adapter, gguf_context * ctx_gguf, ggml_context * ctx,
+        llama_adapter_memory_callback measure, void * user_data) {
     // check metadata
     {
-        const gguf_context * gguf_ctx = ctx_gguf.get();
+        const gguf_context * gguf_ctx = ctx_gguf;
 
         LLAMA_LOG_INFO("%s: Dumping metadata keys/values.\n", __func__);
 
@@ -223,17 +210,17 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
 
         // parse alora invocation sequence vector
         const auto & key = llm_kv(LLM_KV_ADAPTER_ALORA_INVOCATION_TOKENS);
-        const int kid = gguf_find_key(ctx_gguf.get(), key.c_str());
+        const int kid = gguf_find_key(ctx_gguf, key.c_str());
         if (kid >= 0) {
-            if (gguf_get_kv_type(ctx_gguf.get(), kid) != GGUF_TYPE_ARRAY) {
+            if (gguf_get_kv_type(ctx_gguf, kid) != GGUF_TYPE_ARRAY) {
                 throw std::runtime_error("invalid gguf type for " + key);
             }
-            const auto arr_type = gguf_get_arr_type(ctx_gguf.get(), kid);
+            const auto arr_type = gguf_get_arr_type(ctx_gguf, kid);
             if (arr_type != GGUF_TYPE_UINT32) {
                 throw std::runtime_error("invalid gguf element type for " + key);
             }
-            const size_t seq_len = gguf_get_arr_n(ctx_gguf.get(), kid);
-            const void * data = gguf_get_arr_data(ctx_gguf.get(), kid);
+            const size_t seq_len = gguf_get_arr_n(ctx_gguf, kid);
+            const void * data = gguf_get_arr_data(ctx_gguf, kid);
             adapter.alora_invocation_tokens.resize(seq_len);
             std::copy(
                 (const llama_token *)data,
@@ -242,7 +229,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         }
     }
 
-    int n_tensors = gguf_get_n_tensors(ctx_gguf.get());
+    int n_tensors = gguf_get_n_tensors(ctx_gguf);
 
     // contexts for each buffer type
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
@@ -272,7 +259,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         return str.size() >= suffix.size() && str.compare(str.size()-suffix.size(), suffix.size(), suffix) == 0;
     };
 
-    for (ggml_tensor * cur = ggml_get_first_tensor(ctx.get()); cur; cur = ggml_get_next_tensor(ctx.get(), cur)) {
+    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
         std::string name(cur->name);
         if (str_endswith(name, ".lora_a")) {
             replace_all(name, ".lora_a", "");
@@ -379,6 +366,17 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         adapter.ab_map[name] = llama_adapter_lora_weight(tensor_a, tensor_b);
     }
 
+    if (measure) {
+        for (auto & entry : ctx_map) {
+            auto buft = entry.first;
+            auto dev = ggml_backend_buft_get_device(buft);
+            measure(dev ? ggml_backend_dev_name(dev) : "host", ggml_backend_buft_name(buft),
+                    ggml_backend_alloc_ctx_tensors_from_buft_size(entry.second, buft),
+                    ggml_backend_buft_is_host(buft), user_data);
+        }
+        return;
+    }
+
     // allocate tensors / buffers and zero
     {
         adapter.ctxs.reserve(ctx_map.size());
@@ -400,7 +398,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         llama_file gguf_file(path_lora, "rb");
         std::vector<uint8_t> read_buf;
         auto set_tensor = [&](ggml_tensor * orig, ggml_tensor * dev) {
-            const size_t offs = gguf_get_data_offset(ctx_gguf.get()) + gguf_get_tensor_offset(ctx_gguf.get(), gguf_find_tensor(ctx_gguf.get(), orig->name));
+            const size_t offs = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, gguf_find_tensor(ctx_gguf, orig->name));
             const size_t size = ggml_nbytes(orig);
             if (offs + size < offs || offs + size > gguf_file.size()) {
                 throw std::runtime_error(format("LoRA tensor '%s' data is not within the file bounds, file is corrupted or incomplete", orig->name));
@@ -425,6 +423,62 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
     }
 
     LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
+}
+static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter,
+        llama_adapter_memory_callback measure = nullptr, void * user_data = nullptr) {
+    LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
+
+    ggml_context * ctx_init;
+    gguf_init_params meta_gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ &ctx_init,
+    };
+
+    gguf_context_ptr ctx_gguf { gguf_init_from_file(path_lora, meta_gguf_params) };
+    if (!ctx_gguf) {
+        throw std::runtime_error("failed to load lora adapter file from " + std::string(path_lora));
+    }
+
+    ggml_context_ptr ctx { ctx_init };
+
+    llama_adapter_lora_build(model, path_lora, adapter, ctx_gguf.get(), ctx.get(), measure, user_data);
+}
+
+bool llama_adapter_lora_measure(llama_model * model, const char * path,
+        llama_adapter_memory_callback callback, void * user_data) {
+    if (!model || !path || !callback) { return false; }
+    llama_adapter_lora adapter(model);
+    try {
+        llama_adapter_lora_init_impl(*model, path, adapter, callback, user_data);
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return false;
+    }
+}
+
+bool llama_adapter_lora_measure_metadata(const llama_model * model, gguf_context * metadata,
+        ggml_context * tensors, llama_adapter_memory_callback callback, void * user_data) {
+    if (!model || !metadata || !tensors || !callback) { return false; }
+    llama_adapter_lora adapter(const_cast<llama_model *>(model));
+    try {
+        llama_adapter_lora_build(*const_cast<llama_model *>(model), nullptr, adapter, metadata, tensors, callback, user_data);
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return false;
+    }
+}
+
+void llama_adapter_lora_visit_memory(const llama_adapter_lora * adapter,
+        llama_adapter_memory_callback callback, void * user_data) {
+    if (!adapter || !callback) { return; }
+    for (const auto & buffer : adapter->bufs) {
+        auto buft = ggml_backend_buffer_get_type(buffer.get());
+        auto dev = ggml_backend_buft_get_device(buft);
+        callback(dev ? ggml_backend_dev_name(dev) : "host", ggml_backend_buft_name(buft),
+                ggml_backend_buffer_get_size(buffer.get()), ggml_backend_buft_is_host(buft), user_data);
+    }
 }
 
 llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * path_lora) {

@@ -796,6 +796,17 @@ extern "C" {
     // NOTE: loaded adapters that are not manually freed will be freed when the associated model is deleted
     LLAMA_API void llama_adapter_lora_free(struct llama_adapter_lora * adapter);
 
+    // Measure aligned residency through the loader's metadata/placement owner, without buffers.
+    typedef void (*llama_adapter_memory_callback)(const char * device, const char * buffer_type,
+                                                  size_t bytes, bool host, void * user_data);
+    LLAMA_API bool llama_adapter_lora_measure(struct llama_model * model, const char * path,
+            llama_adapter_memory_callback callback, void * user_data);
+    LLAMA_API bool llama_adapter_lora_measure_metadata(const struct llama_model * model,
+            struct gguf_context * metadata, struct ggml_context * tensors,
+            llama_adapter_memory_callback callback, void * user_data);
+    LLAMA_API void llama_adapter_lora_visit_memory(const struct llama_adapter_lora * adapter,
+            llama_adapter_memory_callback callback, void * user_data);
+
     // Get the invocation tokens if the current lora is an alora
     LLAMA_API uint64_t            llama_adapter_get_alora_n_invocation_tokens(const struct llama_adapter_lora * adapter);
     LLAMA_API const llama_token * llama_adapter_get_alora_invocation_tokens  (const struct llama_adapter_lora * adapter);

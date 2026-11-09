@@ -53,8 +53,17 @@ assert ok("/learn/grants", {"id": grant, "engine": ledger["engine"],
           "period_ms": 1000, "share_ppm": 1000000, "expires_in_ms": 120000})["refusal"] == "none"
 baseline = complete()
 fresh_name = prefix + "-fresh.gguf"
+# Dry-run uses the real loader's placement/alignment before any adapter is seated or file written.
+fresh_spec = {"name": fresh_name, "rank": 8, "alpha": 16, "targets": "attn_q,attn_v", "top_layers": 1, "seed": 42}
+plan = ok("/lora-adapters/fresh", dict(fresh_spec, dry_run=True))
+assert not plan["reserved"] and plan["weights"]
+assert not (train_dir / fresh_name).exists(), "dry run published an adapter"
+assert complete() == baseline, "dry run changed serving"
 fresh = ok("/lora-adapters/fresh", {"name": fresh_name, "rank": 8,
            "alpha": 16, "targets": "attn_q,attn_v", "top_layers": 1, "seed": 42})
+assert fresh["weights"] == plan["weights"], ("allocated weights differ from dry plan", fresh, plan)
+file_plan = ok("/lora-adapters/load", {"name": fresh_name, "dry_run": True})
+assert file_plan["weights"] == plan["weights"]
 assert complete() == baseline, "dormant shadow changed base output"
 assert complete(fresh["id"]) == baseline, "zero-B shadow changed enabled output"
 before_name = prefix + "-before.gguf"

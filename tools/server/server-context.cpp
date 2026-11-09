@@ -900,6 +900,8 @@ public:
 
     // the adapter set the main loop last published (publish_lora_report): GET /lora-adapters reads
     // it here, never through the task queue
+    const std::string & learning_engine_identity() const { return learn_engine; }
+
     json lora_report_snapshot() const {
         std::lock_guard<std::mutex> lock(lora_report_mutex);
         return lora_report;
@@ -6166,7 +6168,11 @@ void server_routes::init_routes() {
         return res;
     };
 
-    this->post_lora_adapters_fresh = [this](const server_http_req & req) -> server_http_res_ptr {
+    auto adapter_memory_row = +[](const char * device, const char * buft, size_t bytes, bool host, void * data) {
+        static_cast<json *>(data)->push_back({{"device", device}, {"buffer_type", buft},
+            {"bytes", bytes}, {"host", host}});
+    };
+    this->post_lora_adapters_fresh = [this, adapter_memory_row](const server_http_req & req) -> server_http_res_ptr {
         auto res = create_response();
         const json body = json::parse(req.body);
         const auto path = confine_out(params.train_dir, json_value(body, "name", std::string()));
@@ -6197,6 +6203,16 @@ void server_routes::init_routes() {
             res->error(format_error_response("targets must name at least one module", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+        if (body.value("dry_run", false)) {
+            json receipt = {{"engine", ctx_server.learning_engine_identity()}, {"reserved", false}, {"weights", json::array()}};
+            if (!common_lora_write_fresh(ctx_server.model_tgt, path, (int32_t) rank, (float) alpha,
+                    targets, (uint32_t) seed, (int32_t) top, adapter_memory_row, &receipt["weights"])) {
+                res->error(format_error_response("cannot measure fresh adapter placement", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            res->ok(receipt);
+            return res;
+        }
         const auto error = server_publish_adapter(path, [&](const std::string & temporary) {
             return common_lora_write_fresh(ctx_server.model_tgt, temporary, (int32_t) rank, (float) alpha,
                                            targets, (uint32_t) seed, (int32_t) top);
@@ -6209,7 +6225,7 @@ void server_routes::init_routes() {
         return post_lora_adapters_load(req);
     };
 
-    this->post_lora_adapters_load = [this](const server_http_req & req) {
+    this->post_lora_adapters_load = [this, adapter_memory_row](const server_http_req & req) {
         auto res = create_response();
         const json body = json::parse(req.body);
         const std::string name = json_value(body, "name", std::string());
@@ -6223,6 +6239,15 @@ void server_routes::init_routes() {
             res->error(format_error_response("no model is loaded", ERROR_TYPE_UNAVAILABLE));
             return res;
         }
+        if (body.value("dry_run", false)) {
+            json receipt = {{"engine", ctx_server.learning_engine_identity()}, {"reserved", false}, {"weights", json::array()}};
+            if (!llama_adapter_lora_measure(ctx_server.model_tgt, path.c_str(), adapter_memory_row, &receipt["weights"])) {
+                res->error(format_error_response("cannot measure adapter placement", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            res->ok(receipt);
+            return res;
+        }
         // Reading the tensors happens here, on the HTTP thread, like the trainer's own
         // adapter init: the server loop only appends the pointer between decode steps.
         llama_adapter_lora * adapter = llama_adapter_lora_init(ctx_server.model_tgt, path.c_str());
@@ -6232,6 +6257,8 @@ void server_routes::init_routes() {
             return res;
         }
 
+        json weights = json::array();
+        llama_adapter_lora_visit_memory(adapter, adapter_memory_row, &weights);
         auto & rd = res->rd;
         {
             server_task task(SERVER_TASK_TYPE_LOAD_LORA);
@@ -6250,7 +6277,9 @@ void server_routes::init_routes() {
             res->error(result->to_json());
             return res;
         }
-        res->ok(result->to_json());
+        auto loaded = result->to_json();
+        loaded["weights"] = std::move(weights);
+        res->ok(loaded);
         return res;
     };
 

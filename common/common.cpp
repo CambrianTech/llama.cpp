@@ -2397,7 +2397,7 @@ void common_prompt_checkpoint::clear_dft() {
 // because the optimizer steps F32 parameters.
 bool common_lora_write_fresh(const llama_model * model, const std::string & path,
                                 int32_t rank, float alpha, const std::vector<std::string> & targets,
-                                uint32_t seed, int32_t top_layers) {
+                                uint32_t seed, int32_t top_layers, llama_adapter_memory_callback measure, void * user_data) {
     struct shape { std::string name; int64_t n_in; int64_t n_out; };
     std::vector<shape> shapes;
     const int32_t n_layer = llama_model_n_layer(model);
@@ -2434,9 +2434,9 @@ bool common_lora_write_fresh(const llama_model * model, const std::string & path
         data_size += (size_t) (s.n_in * rank + rank * s.n_out) * sizeof(float);
     }
     ggml_init_params params = {
-        /*.mem_size   =*/ 2 * shapes.size() * ggml_tensor_overhead() + data_size,
+        /*.mem_size   =*/ 2 * shapes.size() * ggml_tensor_overhead() + (measure ? 0 : data_size),
         /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ false,
+        /*.no_alloc   =*/ measure != nullptr,
     };
     ggml_context * ctx = ggml_init(params);
     gguf_context * out = gguf_init_empty();
@@ -2457,18 +2457,21 @@ bool common_lora_write_fresh(const llama_model * model, const std::string & path
         ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, s.n_out);
         ggml_set_name(a, (s.name + ".lora_a").c_str());
         ggml_set_name(b, (s.name + ".lora_b").c_str());
-        const float bound = 1.0f / std::sqrt((float) s.n_in);
-        std::uniform_real_distribution<float> uniform(-bound, bound);
-        float * ad = (float *) a->data;
-        for (int64_t i = 0; i < ggml_nelements(a); ++i) {
-            ad[i] = uniform(rng);
+        if (!measure) {
+            const float bound = 1.0f / std::sqrt((float) s.n_in);
+            std::uniform_real_distribution<float> uniform(-bound, bound);
+            float * ad = (float *) a->data;
+            for (int64_t i = 0; i < ggml_nelements(a); ++i) {
+                ad[i] = uniform(rng);
+            }
+            std::fill_n((float *) b->data, ggml_nelements(b), 0.0f);
         }
-        std::fill_n((float *) b->data, ggml_nelements(b), 0.0f);
         gguf_add_tensor(out, a);
         gguf_add_tensor(out, b);
     }
 
-    const bool ok = gguf_write_to_file(out, path.c_str(), false);
+    const bool ok = measure ? llama_adapter_lora_measure_metadata(model, out, ctx, measure, user_data)
+                            : gguf_write_to_file(out, path.c_str(), false);
     LOG_INF("%s: fresh adapter: %zu target tensors, rank %d, alpha %.1f, seed %u -> %s\n",
             __func__, shapes.size(), rank, (double) alpha, seed, path.c_str());
     gguf_free(out);
