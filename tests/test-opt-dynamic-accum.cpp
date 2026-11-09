@@ -64,6 +64,7 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
 
 
     bool measured_once = false;
+    bool cancelled_preparation = false;
     size_t measured_static = 0, measured_host = 0, measured_graph = 0;
     const int n_evals = 3 * opt_period;
     for (int i = 0; i < n_evals; ++i) {
@@ -113,6 +114,23 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
             ggml_free(ctx_compute);
             --i;
             continue;
+        }
+        if (graph_nodes > 0) {
+            CHECK(ggml_opt_alloc_begin(opt_ctx, true));
+            CHECK(!ggml_opt_alloc_begin(opt_ctx, true));
+            CHECK(!ggml_opt_alloc(opt_ctx, false));
+            CHECK(!ggml_opt_can_prepare_restore(opt_ctx));
+            float held;
+            ggml_backend_tensor_get(w, &held, 0, sizeof(held));
+            CHECK(held == w_now);
+            if (!cancelled_preparation) {
+                CHECK(ggml_opt_alloc_cancel(opt_ctx));
+                CHECK(!ggml_opt_alloc_cancel(opt_ctx));
+                cancelled_preparation = true;
+                ggml_free(ctx_compute);
+                --i;
+                continue;
+            }
         }
         CHECK(ggml_opt_alloc(opt_ctx, true));
         if (test_measurement && i == 0) {

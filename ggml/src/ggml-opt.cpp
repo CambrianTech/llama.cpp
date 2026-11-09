@@ -74,6 +74,8 @@ struct ggml_opt_context {
     size_t alloc_budget          = 0; // bytes a graph may add on a non-CPU device; 0 = the device's own free figure
     size_t peak_graph_bytes      = 0; // largest graph measured by the preflight on a non-CPU device
     bool eval_ready              = false;
+    bool allocation_pending      = false;
+    bool allocation_backward     = false;
     // Accumulators and momenta belong to a PARAMETER (or to the loss), never to a node index: a
     // graph built per step may differ in topology from the first one (the training walk's chunks
     // with and without a prefix, its reverse pass with GRAD leaves and a surrogate term), and an
@@ -962,7 +964,7 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     if (opt_ctx == nullptr) {
         return;
     }
-    GGML_ASSERT(!ggml_backend_sched_graph_pending(opt_ctx->backend_sched));
+    GGML_ASSERT(!opt_ctx->allocation_pending && !ggml_backend_sched_graph_pending(opt_ctx->backend_sched));
     ggml_backend_buffer_free(opt_ctx->buf_static);
     ggml_backend_buffer_free(opt_ctx->buf_cpu);
     ggml_free(opt_ctx->ctx_static);
@@ -972,7 +974,7 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
 }
 
 void ggml_opt_set_next_step(ggml_opt_context_t opt_ctx, bool period_end, float loss_scale, struct ggml_tensor * extra_loss) {
-    GGML_ASSERT(!opt_ctx->eval_ready && "set the next step before ggml_opt_alloc");
+    GGML_ASSERT(!opt_ctx->allocation_pending && !opt_ctx->eval_ready && "set the next step before ggml_opt_alloc");
     opt_ctx->next_manual     = true;
     opt_ctx->next_period_end = period_end;
     opt_ctx->next_loss_scale = loss_scale;
@@ -980,7 +982,7 @@ void ggml_opt_set_next_step(ggml_opt_context_t opt_ctx, bool period_end, float l
 }
 
 void ggml_opt_accumulate_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * tensor, struct ggml_tensor * acc) {
-    GGML_ASSERT(!opt_ctx->eval_ready && "register an accumulator before ggml_opt_alloc");
+    GGML_ASSERT(!opt_ctx->allocation_pending && !opt_ctx->eval_ready && "register an accumulator before ggml_opt_alloc");
     GGML_ASSERT(acc->type == GGML_TYPE_F32 && ggml_are_same_shape(tensor, acc));
     GGML_ASSERT((acc->view_src ? acc->view_src : acc)->buffer != nullptr && "the accumulator lives in the caller's buffer");
     ggml_set_grad(tensor);
@@ -1019,7 +1021,7 @@ void ggml_opt_visit_owned_buffers(ggml_opt_context_t opt_ctx, ggml_opt_buffer_ca
 }
 
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
-    GGML_ASSERT(!ggml_backend_sched_graph_pending(opt_ctx->backend_sched));
+    GGML_ASSERT(!opt_ctx->allocation_pending && !ggml_backend_sched_graph_pending(opt_ctx->backend_sched));
     opt_ctx->checkpoint_ready = false;
     if (optimizer) {
         ggml_graph_reset(opt_ctx->gb_opt);
@@ -1116,7 +1118,7 @@ static bool opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * bi
 
 bool ggml_opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * binding) {
     if (!file || !binding || !*binding || !ctx->checkpoint_ready || !ctx->checkpoint_trusted ||
-        !ctx->period_fresh || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+        !ctx->period_fresh || ctx->allocation_pending || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
         return false;
     }
     return opt_state_write(ctx, file, binding, false);
@@ -1124,7 +1126,7 @@ bool ggml_opt_state_write(ggml_opt_context_t ctx, FILE * file, const char * bind
 
 bool ggml_opt_state_write_initial(ggml_opt_context_t ctx, FILE * file, const char * binding) {
     if (!ctx || !file || !binding || !*binding || !ctx->restore_pending || ctx->restore_preparation_failed ||
-        ctx->evaluation_attempted || ctx->eval_ready || ctx->checkpoint_ready || !ctx->checkpoint_trusted ||
+        ctx->evaluation_attempted || ctx->allocation_pending || ctx->eval_ready || ctx->checkpoint_ready || !ctx->checkpoint_trusted ||
         ctx->iter != 1 || ctx->opt_i != 0 || !ctx->period_fresh || ctx->next_manual || ctx->next_extra_loss) {
         return false;
     }
@@ -1157,7 +1159,7 @@ struct ggml_opt_state {
 };
 
 ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t ctx, FILE * file, const char * binding) {
-    if (!file || !binding || !*binding || ctx->restore_preparation_failed || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+    if (!file || !binding || !*binding || ctx->restore_preparation_failed || ctx->allocation_pending || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
         return nullptr;
     }
     std::map<std::string, ggml_tensor *> tensors;
@@ -1261,7 +1263,7 @@ ggml_opt_state * ggml_opt_state_prepare(ggml_opt_context_t ctx, FILE * file, con
 }
 
 bool ggml_opt_state_apply(ggml_opt_context_t ctx, ggml_opt_state * state) {
-    if (!state || state->owner != ctx || ctx->restore_preparation_failed || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
+    if (!state || state->owner != ctx || ctx->restore_preparation_failed || ctx->allocation_pending || ctx->eval_ready || ctx->next_manual || ctx->next_extra_loss) {
         return false;
     }
     std::map<std::string, ggml_tensor *> tensors;
@@ -1321,7 +1323,7 @@ struct ggml_tensor * ggml_opt_label_weights(ggml_opt_context_t opt_ctx) {
 }
 
 void ggml_opt_set_next_label_weights(ggml_opt_context_t opt_ctx, bool weighted) {
-    GGML_ASSERT(!opt_ctx->eval_ready && "set before ggml_opt_alloc");
+    GGML_ASSERT(!opt_ctx->allocation_pending && !opt_ctx->eval_ready && "set before ggml_opt_alloc");
     opt_ctx->next_label_weights = weighted;
 }
 
@@ -1429,7 +1431,7 @@ void ggml_opt_prepare_alloc(
         struct ggml_cgraph  * gf,
         struct ggml_tensor  * inputs,
         struct ggml_tensor  * outputs) {
-    GGML_ASSERT(!ggml_backend_sched_graph_pending(opt_ctx->backend_sched));
+    GGML_ASSERT(!opt_ctx->allocation_pending && !ggml_backend_sched_graph_pending(opt_ctx->backend_sched));
     GGML_ASSERT(!opt_ctx->static_graphs);
     opt_ctx->ctx_compute = ctx_compute;
     opt_ctx->gf          = gf;
@@ -1680,7 +1682,11 @@ bool ggml_opt_measure_alloc(ggml_opt_context_t opt_ctx, bool backward,
     return true;
 }
 
-bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
+static bool opt_alloc(ggml_opt_context_t opt_ctx, bool backward, bool build_only) {
+    if (opt_ctx->allocation_pending && (build_only || backward != opt_ctx->allocation_backward)) {
+        opt_ctx->refusal = "pending preparation must finish with its original graph phase";
+        return false;
+    }
     if (opt_ctx->measurement_only) {
         opt_ctx->refusal = "discard the measurement optimizer and rebuild before allocating";
         return false;
@@ -1694,34 +1700,42 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
         return false;
     }
     GGML_ASSERT(!opt_ctx->eval_ready);
-    if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
-        ggml_graph_reset(opt_ctx->gb_grad);
-    }
-    if (backward && opt_ctx->next_manual) {
-        opt_ctx->build_type = opt_ctx->next_period_end ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
-    } else if (backward) {
-        const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
-        opt_ctx->build_type = opt_i_next == 0 ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
-    } else {
-        opt_ctx->build_type = GGML_OPT_BUILD_TYPE_FORWARD;
-    }
-
-    if (!opt_ctx->static_graphs) {
-        if (!ggml_opt_build(opt_ctx)) {
-            return false;
+    if (!opt_ctx->allocation_pending) {
+        if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
+            ggml_graph_reset(opt_ctx->gb_grad);
+        }
+        if (backward && opt_ctx->next_manual) {
+            opt_ctx->build_type = opt_ctx->next_period_end ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
+        } else if (backward) {
+            const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+            opt_ctx->build_type = opt_i_next == 0 ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
+        } else {
+            opt_ctx->build_type = GGML_OPT_BUILD_TYPE_FORWARD;
         }
 
-        // Graphs built per step keep their gradient accumulators in ctx_static across graphs,
-        // and the reset above found no graph to reset (gb_grad is rebuilt every step). Without
-        // this, a period's step applied the SUM of every gradient since the run began, since
-        // each backward adds into the accumulator in place (test-opt-dynamic-accum).
-        if (backward && (opt_ctx->next_manual ? opt_ctx->period_fresh : opt_ctx->opt_i == 0)) {
-            for (auto & [param, acc] : opt_ctx->param_grad_acc) {
-                ggml_set_zero(acc);
+        if (!opt_ctx->static_graphs) {
+            if (!ggml_opt_build(opt_ctx)) {
+                return false;
+            }
+
+            // Graphs built per step keep their gradient accumulators in ctx_static across graphs,
+            // and the reset above found no graph to reset (gb_grad is rebuilt every step). Without
+            // this, a period's step applied the SUM of every gradient since the run began, since
+            // each backward adds into the accumulator in place (test-opt-dynamic-accum).
+            if (backward && (opt_ctx->next_manual ? opt_ctx->period_fresh : opt_ctx->opt_i == 0)) {
+                for (auto & [param, acc] : opt_ctx->param_grad_acc) {
+                    ggml_set_zero(acc);
+                }
             }
         }
-    }
 
+    }
+    if (build_only) {
+        opt_ctx->allocation_pending = true;
+        opt_ctx->allocation_backward = backward;
+        return true;
+    }
+    opt_ctx->allocation_pending = false;
     struct ggml_cgraph * graph = nullptr;
     switch (opt_ctx->build_type) {
         case GGML_OPT_BUILD_TYPE_FORWARD: {
@@ -1898,8 +1912,24 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     return true;
 }
 
+bool ggml_opt_alloc_begin(ggml_opt_context_t opt_ctx, bool backward) {
+    return opt_alloc(opt_ctx, backward, true);
+}
+
+bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
+    return opt_alloc(opt_ctx, backward, false);
+}
+
+bool ggml_opt_alloc_cancel(ggml_opt_context_t opt_ctx) {
+    if (!opt_ctx->allocation_pending) { return false; }
+    opt_ctx->allocation_pending = false;
+    if (opt_ctx->allocation_backward) { ggml_opt_reset(opt_ctx, false); }
+    opt_disarm_evaluation(opt_ctx);
+    return true;
+}
+
 bool ggml_opt_can_prepare_restore(ggml_opt_context_t opt_ctx) {
-    return opt_ctx && !opt_ctx->restore_preparation_failed && !opt_ctx->evaluation_attempted && !opt_ctx->restore_pending && !opt_ctx->eval_ready &&
+    return opt_ctx && !opt_ctx->restore_preparation_failed && !opt_ctx->evaluation_attempted && !opt_ctx->restore_pending && !opt_ctx->allocation_pending && !opt_ctx->eval_ready &&
         opt_ctx->iter == 1 && opt_ctx->opt_i == 0 && opt_ctx->period_fresh &&
         opt_ctx->checkpoint_trusted && !opt_ctx->checkpoint_ready &&
         !opt_ctx->next_manual && !opt_ctx->next_extra_loss;

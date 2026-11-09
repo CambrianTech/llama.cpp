@@ -304,6 +304,12 @@ extern "C" {
     // returns false when the graph could not be allocated (device memory): the graph is then NOT
     // ready and must not be evaluated
     GGML_API bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward);
+    // Optional preparation boundary: build/reset first, then finish with ggml_opt_alloc
+    // using the same backward flag. Retain the graph and optimizer until finish/cancel.
+    // Static buffers use the existing admission callback; no evaluation occurs here.
+    GGML_API bool ggml_opt_alloc_begin(ggml_opt_context_t opt_ctx, bool backward);
+    // Abandon a pending preparation, discarding uncommitted gradients, preserving moments.
+    GGML_API bool ggml_opt_alloc_cancel(ggml_opt_context_t opt_ctx);
 
     // Why the last ggml_opt_alloc returned false, in words a caller can put in front of a person
     // ("" when it did not refuse): a node the device backend cannot run, or the memory gate.
