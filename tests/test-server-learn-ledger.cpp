@@ -127,7 +127,20 @@ int main() {
     require(ledger.register_grant({ "x", "engine-a", 0, 100000, day_us }, 0) == R::invalid, "zero period");
     require(ledger.register_grant({ "x", "engine-a", server_learn_ledger::kMaxPeriodMs + 1, 100000, day_us }, 0) == R::invalid,
             "a period past the checked range");
-    require(ledger.register_grant({ "x", "engine-a", 1000, 0, day_us }, 0) == R::invalid, "zero share is no learning");
+    require(ledger.register_grant({ "x", "engine-a", 1000, -1, day_us }, 0) == R::invalid, "negative share invalid");
+    {
+    server_learn_ledger calibration("engine-a");
+    // What this catches: calibration authority must never become a tiny guessed
+    // contended quota, or admit an unmeasured zero-cost contended step.
+    require(calibration.register_grant({ "bootstrap", "engine-a", 1000, 0, day_us }, 0) == R::none, "explicit idle calibration grant");
+    require(calibration.admit("bootstrap", 0, 0, true).refusal == R::never_fits, "zero estimate cannot bypass idle-only authority");
+    require(calibration.admit("bootstrap", 1, 0, true).refusal == R::never_fits, "measured contention also refused");
+    auto bootstrap = calibration.admit("bootstrap", 0, 0, false);
+    require(bootstrap.refusal == R::none && bootstrap.reservation != 0, "idle calibration retains custody");
+    require(calibration.start(bootstrap.reservation, 0) == R::none, "start idle measurement");
+    require(calibration.finish(bootstrap.reservation, 100, 0, 100) == R::none, "settle idle measurement");
+    require(calibration.register_grant({ "bootstrap", "engine-a", 1000, 100, day_us }, 100) == R::grant_mismatch, "calibrated authority needs a new immutable id");
+    }
     require(ledger.register_grant({ "x", "engine-a", 1000, 1000001, day_us }, 0) == R::invalid, "share over 1e6");
     require(ledger.register_grant({ "x", "engine-a", 1000, 100000, 0 }, 0) == R::invalid, "already expired");
     require(ledger.register_grant({ "x", "engine-b", 1000, 100000, day_us }, 0) == R::stale_engine, "another incarnation");

@@ -39,7 +39,7 @@ struct server_learn_grant {
 
 enum class server_learn_refusal {
     none,
-    invalid,          // a field out of range (see kMaxPeriodMs, share in [1, 1e6], an empty id, a negative cost)
+    invalid,          // a field out of range (see kMaxPeriodMs, share in [0, 1e6], an empty id, a negative cost)
     stale_engine,     // registered for another engine incarnation
     grant_mismatch,   // this live id is registered with other terms
     unknown_grant,    // no live grant has this id (never registered, revoked or expired)
@@ -74,7 +74,7 @@ public:
 
     // The authority registers (or re-confirms) a grant.
     server_learn_refusal register_grant(const server_learn_grant & g, int64_t now_us) {
-        if (!in_clock(now_us) || g.id.empty() || g.period_ms <= 0 || g.period_ms > kMaxPeriodMs || g.share_ppm < 1 ||
+        if (!in_clock(now_us) || g.id.empty() || g.period_ms <= 0 || g.period_ms > kMaxPeriodMs || g.share_ppm < 0 ||
                 g.share_ppm > 1000000 || g.expires_at_us <= now_us || !in_clock(g.expires_at_us)) {
             return server_learn_refusal::invalid;
         }
@@ -123,6 +123,12 @@ public:
             return out;
         }
         account & a = it->second;
+        // Explicit bootstrap authority: no contended execution, even with a zero
+        // estimate. Idle measurement remains authorized and retains normal custody.
+        if (contended && a.grant.share_ppm == 0) {
+            out.refusal = server_learn_refusal::never_fits;
+            return out;
+        }
         roll(a, now_us);
         const int64_t cost   = contended ? est_us : 0;
         const int64_t budget = budget_us(a.grant);

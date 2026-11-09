@@ -200,7 +200,7 @@
             server_learn_grant g{body.value("id", std::string()), body.value("engine", std::string()),
                 body.value("period_ms", int64_t(0)), body.value("share_ppm", int64_t(0)), 0};
             auto refusal = server_learn_refusal::invalid;
-            if (duration > 0 && duration <= server_learn_ledger::kMaxPeriodMs &&
+            if (body.contains("share_ppm") && duration > 0 && duration <= server_learn_ledger::kMaxPeriodMs &&
                     now <= server_learn_ledger::kMaxClockUs - duration * 1000) {
                 g.expires_at_us = now + duration * 1000;
                 refusal = learn_ledger.register_grant(g, now);
