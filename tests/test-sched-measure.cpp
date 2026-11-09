@@ -5,6 +5,7 @@
 #include "ggml-alloc.h"
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAILED line %d: %s\n", __LINE__, #x); exit(1); } } while (0)
 
 struct graph_fixture {
@@ -108,6 +109,80 @@ int main() {
       CHECK(result == 5.0f);
       ggml_backend_sched_reset(sched);
       ggml_backend_buffer_free(input_buffer);
+    }
+    // Yield after each in-place graph node: replaying a prefix changes the answer.
+    { graph_fixture chain(16);
+      auto a = ggml_scale_inplace(chain.ctx, chain.x, 2.0f);
+      auto b = ggml_scale_inplace(chain.ctx, a, 3.0f);
+      auto c = ggml_scale_inplace(chain.ctx, b, 4.0f);
+      chain.graph = ggml_new_graph_custom(chain.ctx, 64, false);
+      ggml_set_output(c);
+      ggml_build_forward_expand(chain.graph, c);
+      CHECK(ggml_backend_sched_alloc_graph(sched, chain.graph));
+      const float value = 1.0f;
+      ggml_backend_tensor_set(chain.x, &value, 0, sizeof(value));
+      const size_t retained = ggml_backend_sched_get_buffer_size(sched, cpu);
+      bool complete = false;
+      CHECK(ggml_backend_sched_graph_step(sched, chain.graph, 1, &complete) == GGML_STATUS_SUCCESS);
+      CHECK(!complete && ggml_backend_sched_graph_pending(sched));
+      graph_fixture intruder(65536);
+      CHECK(!ggml_backend_sched_alloc_graph(sched, intruder.graph));
+      CHECK(!ggml_backend_sched_reserve(sched, intruder.graph));
+      CHECK(ggml_backend_sched_graph_compute(sched, intruder.graph) == GGML_STATUS_FAILED);
+      CHECK(ggml_backend_sched_graph_step(sched, intruder.graph, 1, &complete) == GGML_STATUS_FAILED);
+      CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == retained);
+      int calls = 1;
+      while (!complete) {
+          CHECK(++calls <= 3);
+          CHECK(ggml_backend_sched_graph_step(sched, chain.graph, 1, &complete) == GGML_STATUS_SUCCESS);
+      }
+      CHECK(calls == 3 && !ggml_backend_sched_graph_pending(sched));
+      float result = 0;
+      ggml_backend_tensor_get(c, &result, 0, sizeof(result));
+      CHECK(result == 24.0f);
+      // Discard is quiescent but does not undo already executed mutations.
+      CHECK(ggml_backend_sched_graph_step(sched, chain.graph, 1, &complete) == GGML_STATUS_SUCCESS);
+      CHECK(!complete);
+      ggml_backend_sched_graph_discard(sched);
+      CHECK(!ggml_backend_sched_graph_pending(sched));
+      ggml_backend_tensor_get(c, &result, 0, sizeof(result));
+      CHECK(result == 48.0f);
+    }
+    // Force CUDA -> CPU -> CUDA copies, yielding inside and between backend splits.
+    auto gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    if (gpu) {
+        ggml_backend_t mixed[] = {gpu, cpu};
+        for (int budget : {1, 2, 7}) {
+            auto split_sched = ggml_backend_sched_new(mixed, nullptr, 2, 64, false, true);
+            graph_fixture chain(16);
+            auto a = ggml_scale(chain.ctx, chain.x, 2.0f);
+            auto b = ggml_scale(chain.ctx, a, 3.0f);
+            auto c = ggml_scale(chain.ctx, b, 4.0f);
+            chain.graph = ggml_new_graph_custom(chain.ctx, 64, false);
+            ggml_set_output(c);
+            ggml_build_forward_expand(chain.graph, c);
+            ggml_backend_sched_set_tensor_backend(split_sched, a, gpu);
+            ggml_backend_sched_set_tensor_backend(split_sched, b, cpu);
+            ggml_backend_sched_set_tensor_backend(split_sched, c, gpu);
+            CHECK(ggml_backend_sched_alloc_graph(split_sched, chain.graph));
+            CHECK(ggml_backend_sched_get_n_splits(split_sched) == 3);
+            graph_fixture wrong(16);
+            bool complete = false;
+            CHECK(ggml_backend_sched_graph_step(split_sched, wrong.graph, budget, &complete) == GGML_STATUS_FAILED);
+            const float value = 1.0f;
+            ggml_backend_tensor_set(chain.x, &value, 0, sizeof(value));
+            int calls = 0;
+            do {
+                CHECK(++calls <= 3);
+                CHECK(ggml_backend_sched_graph_step(split_sched, chain.graph, budget, &complete) == GGML_STATUS_SUCCESS);
+            } while (!complete);
+            float result = 0;
+            ggml_backend_tensor_get(c, &result, 0, sizeof(result));
+            CHECK(result == 24.0f);
+            ggml_backend_sched_free(split_sched);
+        }
+        ggml_backend_free(gpu);
+        printf("PASS CUDA/CPU continuation across three backend splits\n");
     }
     ggml_backend_sched_free(sched);
     ggml_backend_free(cpu);

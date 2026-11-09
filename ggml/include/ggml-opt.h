@@ -321,6 +321,13 @@ extern "C" {
 
     // do forward pass, increment result if not NULL, do backward pass if allocated
     GGML_API void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result);
+    // Resume the same prepared graph without replaying nodes. A pending evaluation
+    // retains scheduler custody and must finish before reset, snapshot or reallocation.
+    // Counters and result are published once, only after whole-graph completion.
+    // max_nodes == 0 executes synchronously; positive values bound graph nodes, not tokens.
+    GGML_API enum ggml_status ggml_opt_eval_step(ggml_opt_context_t opt_ctx, ggml_opt_result_t result,
+            int max_nodes, bool * complete);
+
 
     // A caller-driven optimizer period, for graphs built per step (the training walk's reverse
     // pass: one graph per chunk, ONE optimizer step per window). Applies to the next

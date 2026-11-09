@@ -962,6 +962,7 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     if (opt_ctx == nullptr) {
         return;
     }
+    GGML_ASSERT(!ggml_backend_sched_graph_pending(opt_ctx->backend_sched));
     ggml_backend_buffer_free(opt_ctx->buf_static);
     ggml_backend_buffer_free(opt_ctx->buf_cpu);
     ggml_free(opt_ctx->ctx_static);
@@ -1018,6 +1019,7 @@ void ggml_opt_visit_owned_buffers(ggml_opt_context_t opt_ctx, ggml_opt_buffer_ca
 }
 
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
+    GGML_ASSERT(!ggml_backend_sched_graph_pending(opt_ctx->backend_sched));
     opt_ctx->checkpoint_ready = false;
     if (optimizer) {
         ggml_graph_reset(opt_ctx->gb_opt);
@@ -1427,6 +1429,7 @@ void ggml_opt_prepare_alloc(
         struct ggml_cgraph  * gf,
         struct ggml_tensor  * inputs,
         struct ggml_tensor  * outputs) {
+    GGML_ASSERT(!ggml_backend_sched_graph_pending(opt_ctx->backend_sched));
     GGML_ASSERT(!opt_ctx->static_graphs);
     opt_ctx->ctx_compute = ctx_compute;
     opt_ctx->gf          = gf;
@@ -1915,12 +1918,17 @@ bool ggml_opt_alloc_for_restore(ggml_opt_context_t opt_ctx) {
     return allocated;
 }
 
-void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
+enum ggml_status ggml_opt_eval_step(ggml_opt_context_t opt_ctx, ggml_opt_result_t result,
+        int max_nodes, bool * complete) {
+    GGML_ASSERT(complete);
+    *complete = false;
+    const bool pending = ggml_backend_sched_graph_pending(opt_ctx->backend_sched);
+    if (max_nodes < 0 || (pending && max_nodes == 0)) { return GGML_STATUS_FAILED; }
     GGML_ASSERT(opt_ctx->eval_ready);
     // a caller-driven step's loss is not scaled by 1/opt_period (ggml_opt_build): recorded as if it
     // were, so the result's reader (which multiplies a per-datapoint loss by opt_period) reports it right
     const bool manual = opt_ctx->next_manual;
-    if (opt_ctx->allocated_graph == opt_ctx->gb_opt) {
+    if (!pending && opt_ctx->allocated_graph == opt_ctx->gb_opt) {
         const ggml_opt_optimizer_params & opt_pars = opt_ctx->get_opt_pars(opt_ctx->get_opt_pars_ud);
 
         switch (opt_ctx->optimizer) {
@@ -1961,7 +1969,12 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     }
 
     opt_ctx->evaluation_attempted = true;
-    const enum ggml_status status = ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+    opt_ctx->checkpoint_ready = false;
+    bool graph_complete = max_nodes == 0;
+    const enum ggml_status status = max_nodes == 0
+        ? ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy)
+        : ggml_backend_sched_graph_step(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy, max_nodes, &graph_complete);
+    if (status == GGML_STATUS_SUCCESS && !graph_complete) { return status; }
     opt_ctx->checkpoint_trusted &= status == GGML_STATUS_SUCCESS;
     opt_ctx->checkpoint_ready = opt_ctx->checkpoint_trusted && opt_ctx->allocated_graph == opt_ctx->gb_opt;
     if (status != GGML_STATUS_SUCCESS) {
@@ -1970,6 +1983,8 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         opt_ctx->refusal = std::string("the backend failed to compute the training graph (") + ggml_status_to_string(status)
             + "): this step's gradients are not trusted, so the run stopped and nothing was written";
         GGML_LOG_ERROR("%s: %s\n", __func__, opt_ctx->refusal.c_str());
+        // Partial graph mutations cannot be published as an optimizer commit.
+        return status;
     }
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
     opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
@@ -1979,9 +1994,10 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
         opt_ctx->period_fresh = false;
     }
     opt_disarm_evaluation(opt_ctx);
+    *complete = true;
 
     if (!result) {
-        return;
+        return GGML_STATUS_SUCCESS;
     }
 
     if (result->ndata == 0) {
@@ -2011,7 +2027,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
 
     if (!opt_ctx->ncorrect || result->ncorrect < 0) {
         result->ncorrect = -1;
-        return;
+        return GGML_STATUS_SUCCESS;
     }
 
     GGML_ASSERT(ggml_is_scalar(opt_ctx->ncorrect));
@@ -2019,6 +2035,12 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     int64_t ncorrect;
     ggml_backend_tensor_get(opt_ctx->ncorrect, &ncorrect, 0, ggml_nbytes(opt_ctx->ncorrect));
     result->ncorrect += ncorrect;
+    return GGML_STATUS_SUCCESS;
+}
+
+void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
+    bool complete = false;
+    ggml_opt_eval_step(opt_ctx, result, 0, &complete);
 }
 
 // ====== High-Level Functions ======

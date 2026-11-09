@@ -27,19 +27,21 @@ static ggml_opt_optimizer_params sgd_pars(void *) {
     return p;
 }
 
-static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false, bool test_measurement = false) {
+static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false, bool test_measurement = false, int graph_nodes = 0, bool use_gpu = false) {
     // by type, not ggml_backend_cpu_init: in a dynamically loaded backend build (CI) the CPU
     // backend is its own library
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     GGML_ASSERT(cpu != nullptr);
-    ggml_backend_t backends[] = { cpu };
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_backend_t gpu = use_gpu ? ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr) : nullptr;
+    CHECK(!use_gpu || gpu);
+    ggml_backend_t backends[] = { gpu ? gpu : cpu, cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, gpu ? 2 : 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
 
     ggml_init_params sp = { 8 * ggml_tensor_overhead(), nullptr, true };
     ggml_context * ctx_static = ggml_init(sp);
     ggml_tensor * w = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
     ggml_set_param(w);
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, cpu);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, gpu ? gpu : cpu);
     float w_now = 1.0f;
     ggml_backend_tensor_set(w, &w_now, 0, sizeof(float));
 
@@ -130,7 +132,20 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
             CHECK(allocated == gate.measured);
         }
         ggml_backend_tensor_set(x, &X, 0, sizeof(float));
-        ggml_opt_eval(opt_ctx, result);
+        if (graph_nodes > 0) {
+            const auto before = ggml_opt_committed_steps(opt_ctx);
+            bool complete = false;
+            int calls = 0;
+            do {
+                CHECK(++calls < 1000);
+                CHECK(ggml_opt_eval_step(opt_ctx, result, graph_nodes, &complete) == GGML_STATUS_SUCCESS);
+                if (!complete) { CHECK(ggml_opt_committed_steps(opt_ctx) == before); }
+            } while (!complete);
+            CHECK(calls > 1);
+            CHECK(ggml_opt_committed_steps(opt_ctx) == before + ((i + 1) % opt_period == 0));
+        } else {
+            ggml_opt_eval(opt_ctx, result);
+        }
         ggml_free(ctx_compute);
 
         float w_after;
@@ -154,6 +169,7 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
     ggml_backend_buffer_free(buf);
     ggml_free(ctx_static);
     ggml_backend_sched_free(sched);
+    if (gpu) { ggml_backend_free(gpu); }
     ggml_backend_free(cpu);
 }
 
@@ -590,6 +606,11 @@ static void run_refuses_misshaped_gradient() {
 
 int main() {
     ggml_backend_load_all();
+    for (int period : {1, 2, 3}) { run(period, false, false, false, 1); }
+    if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
+        for (int period : {1, 2, 3}) { run(period, false, false, false, 1, true); }
+        printf("PASS CUDA optimizer continuation commits once across periods 1/2/3\n");
+    }
     run(1);
     run(2);
     run(1, true);

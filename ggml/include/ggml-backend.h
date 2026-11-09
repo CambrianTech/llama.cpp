@@ -382,6 +382,14 @@ extern "C" {
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
+    // Dense graph continuation. Each call completes at most max_nodes and synchronizes.
+    // While pending, the caller retains graph metadata and inputs; this scheduler cannot
+    // allocate or compute another graph. Discard releases custody, not committed effects.
+    GGML_API enum ggml_status ggml_backend_sched_graph_step(ggml_backend_sched_t sched,
+            struct ggml_cgraph * graph, int max_nodes, bool * complete);
+    GGML_API bool ggml_backend_sched_graph_pending(ggml_backend_sched_t sched);
+    GGML_API void ggml_backend_sched_graph_discard(ggml_backend_sched_t sched);
+
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
     // Set a callback to be called for each resulting node during graph compute
