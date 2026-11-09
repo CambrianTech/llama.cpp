@@ -1006,6 +1006,8 @@ private:
         bool drained = false;
         uint64_t restoration_reservation = 0;
         int64_t restoration_us = 0;
+        int64_t restoration_steps = 0;
+        int64_t committed_steps = 0;
         int64_t max_chunk_us = 0;
         std::optional<bool> finished;
         std::string failure;

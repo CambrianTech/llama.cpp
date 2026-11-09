@@ -417,7 +417,12 @@
             }
             learning_residencies.at(pending.lora_id)->restoring = !llama_opt_learn_needs_gradient(ctx_tgt);
             common_set_adapter_lora(ctx_tgt, pending.adapters);
+            const auto steps_before = llama_opt_shadow_steps(ctx_tgt, pending.shadow);
             const auto status = llama_opt_learn_step(ctx_tgt);
+            const auto committed = llama_opt_shadow_steps(ctx_tgt, pending.shadow) - steps_before;
+            GGML_ASSERT(committed >= 0); // optimizer custody prevents generation replacement here
+            pending.committed_steps += committed;
+            if (!reservation) { pending.restoration_steps += committed; }
             common_set_adapter_lora(ctx_tgt, slot.lora);
             const auto chunk_finished = ggml_time_us();
             const auto elapsed = chunk_finished - chunk_started;
@@ -427,7 +432,7 @@
             if (reservation) {
                 learn_chunk_us[pending.lora_id] = std::max(learn_chunk_us[pending.lora_id], elapsed);
                 const auto settled = learn_ledger.finish(reservation, elapsed,
-                    status != LLAMA_OPT_LEARN_FAILED && !llama_opt_learn_needs_gradient(ctx_tgt) ? 1 : 0, chunk_finished);
+                    committed, chunk_finished);
                 if (settled != server_learn_refusal::none) {
                     pending.refusal = learn_refusal_name(settled);
                     pending.failure = "measured chunk settlement refused";
@@ -470,13 +475,19 @@
         out.refusal = pending.refusal;
         out.deferred = pending.drained;
         out.failure  = pending.failure;
+        out.committed_steps = pending.committed_steps;
+        out.effects_uncertain = llama_opt_shadow_quarantined(pending.shadow);
+        if (out.effects_uncertain) {
+            out.ok = false;
+            out.refusal = "effects_uncertain";
+        }
         out.loss     = pending.drained ? 0.0 : loss;
         out.n_labels = pending.drained ? 0 : pending.n_labels;
         const auto cleanup_us = ggml_time_us() - restore_started;
         pending.compute_us += cleanup_us;
         pending.restoration_us += cleanup_us;
         pending.max_chunk_us = std::max(pending.max_chunk_us, cleanup_us);
-        const auto settled = learn_ledger.finish(pending.restoration_reservation, pending.restoration_us, 0, ggml_time_us());
+        const auto settled = learn_ledger.finish(pending.restoration_reservation, pending.restoration_us, pending.restoration_steps, ggml_time_us());
         if (settled != server_learn_refusal::none) {
             out.ok = false;
             out.refusal = learn_refusal_name(settled);

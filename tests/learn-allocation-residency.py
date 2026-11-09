@@ -59,16 +59,16 @@ assert all(not row['pending'] and not row['live'] for row in state['residencies'
 register('workspace', {'workspace': True}, workspace)
 for shadow, name in ((a, 'opt-a'), (b, 'opt-b'), (a, 'opt-a')):
     result = learn(shadow, name, 'workspace')
-    assert result['success'], result
+    assert result['success'] and result['committed_steps'] == 1 and not result['effects_uncertain'], result
     assert call('/learn/residency/release', {'id': name})['refusal'] == 'busy'
 # What this catches: an engine workspace can move to a new physical grant,
 # without changing scheduler buffers or leaving the other mind's callbacks stale.
 register('workspace-next', {'workspace': True}, workspace)
 result = learn(a, 'opt-a', 'workspace-next')
-assert result['success'], result
+assert result['success'] and result['committed_steps'] == 1 and not result['effects_uncertain'], result
 assert call('/learn/residency/release', {'id': 'workspace'})['refusal'] == 'none'
 result = learn(b, 'opt-b', 'workspace-next')
-assert result['success'], result
+assert result['success'] and result['committed_steps'] == 1 and not result['effects_uncertain'], result
 assert call('/learn/residency/release', {'id': 'workspace-next'})['refusal'] == 'busy'
 assert call('/lora-adapters/unload', {'id': b['id']})['retired']
 assert call('/learn/residency/release', {'id': 'opt-b'})['refusal'] == 'none'
@@ -89,6 +89,7 @@ with concurrent.futures.ThreadPoolExecutor() as pool:
     assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'busy'
     outcome = future.result()['learn']
     assert not outcome['success'] and outcome['n_labels'] == 0, outcome
+    assert outcome['committed_steps'] == 0 and not outcome['effects_uncertain'], outcome
     assert outcome['refusal'] == 'residency_revoked', outcome
 assert not learn(a, 'opt-a', 'workspace-next')['success']
 assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'busy'
@@ -107,7 +108,7 @@ register('opt-c', {'loaded': {'lora_id': c['id'], 'path': c['path']}},
 register('workspace-c', {'workspace': True},
          [row for row in plan['requirements'] if row['kind'] == 'shared_compute_required'])
 result = learn(c, 'opt-c', 'workspace-c')
-assert result['success'], result
+assert result['success'] and result['committed_steps'] == 1 and not result['effects_uncertain'], result
 assert call('/lora-adapters/unload', {'id': c['id']})['retired']
 assert call('/learn/residency/release', {'id': 'workspace-c'})['refusal'] == 'none'
 assert call('/completion', probe)['content'] == serving_before

@@ -99,6 +99,8 @@ struct learn_request {
 };
 
 struct learn_outcome {
+    int64_t     committed_steps = 0;
+    bool        effects_uncertain = false;
     std::string refusal = "none";
     bool        ok       = false;
     bool        deferred = false;

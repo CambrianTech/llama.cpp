@@ -1021,6 +1021,10 @@ size_t llama_opt_graph_bytes(struct llama_context * ctx) {
     return ctx->opt_graph_bytes();
 }
 
+bool llama_opt_shadow_quarantined(const llama_adapter_lora * shadow) {
+    return shadow && shadow->restore_quarantined;
+}
+
 int64_t llama_context::opt_shadow_steps(const llama_adapter_lora * shadow) const {
     const auto mind = opt_minds.find(shadow);
     return mind == opt_minds.end() ? 0 : ggml_opt_committed_steps(mind->second);
