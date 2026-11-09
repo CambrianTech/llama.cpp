@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <vector>
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
 
@@ -75,7 +76,8 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
     bool cancelled_measurement = false;
     bool cancelled_preparation = false;
     bool cancelled_checkpoint = false;
-    size_t measured_static = 0, measured_host = 0, measured_graph = 0;
+    size_t measured_static = 0, measured_host = 0;
+    std::vector<size_t> measured_graph(ggml_backend_sched_get_n_backends(sched), 0);
     const int n_evals = 3 * opt_period;
     for (int i = 0; i < n_evals; ++i) {
         ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
@@ -89,10 +91,18 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
             // allocates, then a rebuilt graph must allocate exactly the reported bytes.
             auto probe = ggml_opt_init(params);
             ggml_opt_prepare_alloc(probe, ctx_compute, gf, x, out);
-            const size_t held = ggml_backend_sched_get_buffer_size(sched, cpu);
+            std::vector<size_t> held(measured_graph.size());
+            for (size_t b = 0; b < held.size(); ++b) {
+                held[b] = ggml_backend_sched_get_buffer_size(sched, backends[b]);
+            }
+            auto check_held = [&]() {
+                for (size_t b = 0; b < held.size(); ++b) {
+                    CHECK(ggml_backend_sched_get_buffer_size(sched, backends[b]) == held[b]);
+                }
+            };
             if (staged_measurement) {
                 CHECK(ggml_opt_measure_prepare(probe, true));
-                CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == held);
+                check_held();
                 CHECK(!ggml_opt_alloc(probe, true));
                 float unchanged = 0;
                 ggml_backend_tensor_get(w, &unchanged, 0, sizeof(unchanged));
@@ -105,7 +115,7 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
                 if (!cancelled_measurement) {
                     ggml_opt_free(probe);
                     ggml_free(ctx_compute);
-                    CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == held);
+                    check_held();
                     ggml_backend_tensor_get(w, &unchanged, 0, sizeof(unchanged));
                     CHECK(unchanged == w_now);
                     cancelled_measurement = true;
@@ -113,13 +123,13 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
                     continue;
                 }
                 CHECK(!ggml_opt_measure_prepare(probe, true));
-                CHECK(!ggml_opt_measure_alloc(probe, false, &measured_static, &measured_host, &measured_graph));
+                CHECK(!ggml_opt_measure_alloc(probe, false, &measured_static, &measured_host, measured_graph.data()));
             }
-            CHECK(ggml_opt_measure_alloc(probe, true, &measured_static, &measured_host, &measured_graph));
+            CHECK(ggml_opt_measure_alloc(probe, true, &measured_static, &measured_host, measured_graph.data()));
             CHECK(ggml_opt_refusal(probe)[0] == '\0');
-            CHECK(!ggml_opt_measure_alloc(probe, true, &measured_static, &measured_host, &measured_graph));
-            CHECK(measured_static > 0 && measured_host > 0 && measured_graph > 0);
-            CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == held);
+            CHECK(!ggml_opt_measure_alloc(probe, true, &measured_static, &measured_host, measured_graph.data()));
+            CHECK(measured_static > 0 && measured_host > 0 && measured_graph[0] > 0);
+            check_held();
             size_t owned = 0;
             ggml_opt_visit_owned_buffers(probe, [](ggml_backend_buffer_t b, const char *, void * data) {
                 *static_cast<size_t *>(data) += ggml_backend_buffer_get_size(b);
@@ -185,7 +195,9 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
                 (strcmp(kind, "optimizer_static") == 0 ? actual.device : actual.host) += ggml_backend_buffer_get_size(b);
             }, &actual);
             CHECK(actual.device == measured_static && actual.host == measured_host);
-            CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == measured_graph);
+            for (size_t b = 0; b < measured_graph.size(); ++b) {
+                CHECK(ggml_backend_sched_get_buffer_size(sched, backends[b]) == measured_graph[b]);
+            }
         }
         if (test_residency_gate) {
             size_t allocated = 0;
@@ -684,6 +696,9 @@ int main() {
     if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
         for (int period : {1, 2, 3}) { run(period, false, false, false, 1, true); }
         for (int period : {1, 2, 3}) { run(period, false, false, false, 1, true, true); }
+        run(1, false, false, true, 0, true, false, true);
+        run(1, false, false, true, 0, true, true, true);
+        printf("PASS CUDA staged measurement matches both backend allocations\n");
         printf("PASS CUDA optimizer continuation commits once across periods 1/2/3\n");
     }
     run(1);
