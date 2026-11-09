@@ -368,6 +368,7 @@
         }
         slot.state = SLOT_STATE_LEARNING;
         slot.learn_release_requested = false;
+        slot.learn_graph_steps = 0;
         return {}; // no outcome is published until advance_learning restores the slot
     }
 
@@ -387,7 +388,7 @@
                     llama_opt_learn_drain(ctx_tgt);
                 }
             }
-            if (llama_opt_learn_needs_gradient(ctx_tgt)) {
+            if (llama_opt_learn_needs_gradient(ctx_tgt) && !llama_opt_learn_draining_graph(ctx_tgt)) {
                 bool contended = false;
                 for (const auto & other : slots) {
                     contended |= other.id != slot.id && other.is_processing();
@@ -409,10 +410,12 @@
                     llama_opt_learn_drain(ctx_tgt);
                 }
             }
-            learning_residencies.at(pending.lora_id)->restoring = !llama_opt_learn_needs_gradient(ctx_tgt);
+            learning_residencies.at(pending.lora_id)->restoring = !llama_opt_learn_needs_gradient(ctx_tgt) || llama_opt_learn_draining_graph(ctx_tgt);
             common_set_adapter_lora(ctx_tgt, pending.adapters);
             const auto steps_before = llama_opt_shadow_steps(ctx_tgt, pending.shadow);
-            const auto status = llama_opt_learn_step(ctx_tgt);
+            const bool graph_step = llama_opt_learn_needs_gradient(ctx_tgt);
+            const auto status = llama_opt_learn_graph_step(ctx_tgt);
+            if (graph_step) { ++slot.learn_graph_steps; }
             const auto committed = llama_opt_shadow_steps(ctx_tgt, pending.shadow) - steps_before;
             GGML_ASSERT(committed >= 0); // optimizer custody prevents generation replacement here
             pending.committed_steps += committed;
@@ -476,8 +479,8 @@
             out.ok = false;
             out.refusal = "effects_uncertain";
         }
-        out.loss     = pending.drained ? 0.0 : loss;
-        out.n_labels = pending.drained ? 0 : pending.n_labels;
+        out.loss     = pending.committed_steps > 0 ? loss : 0.0;
+        out.n_labels = pending.committed_steps > 0 ? pending.n_labels : 0;
         const auto cleanup_us = ggml_time_us() - restore_started;
         pending.compute_us += cleanup_us;
         pending.restoration_us += cleanup_us;

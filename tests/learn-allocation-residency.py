@@ -93,7 +93,7 @@ with concurrent.futures.ThreadPoolExecutor() as pool:
     deadline = time.monotonic() + 30
     observed = False
     while time.monotonic() < deadline and not future.done():
-        if any(slot.get('is_learning') for slot in call('/slots')):
+        if any(slot.get('is_learning') and slot.get('learn_graph_steps', 0) >= 2 for slot in call('/slots')):
             observed = True
             break
         time.sleep(0.005)
@@ -101,8 +101,9 @@ with concurrent.futures.ThreadPoolExecutor() as pool:
     assert call('/learn/residency/revoke', {'id': 'opt-a'})['refusal'] == 'none'
     assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'busy'
     outcome = future.result()['learn']
-    assert not outcome['success'] and outcome['n_labels'] == 0, outcome
-    assert outcome['committed_steps'] == 0 and not outcome['effects_uncertain'], outcome
+    assert not outcome['success'] and outcome['n_labels'] > 128, outcome
+    assert outcome['committed_steps'] == 1 and not outcome['effects_uncertain'], outcome
+    print('revoked graph completed before restoration', outcome, flush=True)
     assert outcome['refusal'] == 'residency_revoked', outcome
 assert not learn(a, 'opt-a', 'workspace-next')['success']
 assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'busy'

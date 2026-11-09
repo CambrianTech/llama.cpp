@@ -244,6 +244,15 @@ bool llama_opt_learn_begin(llama_context * ctx, llama_seq_id seq, llama_pos pref
 }
 
 llama_opt_learn_status llama_opt_learn_step(llama_context * ctx) { return ctx->opt_learn_step(); }
+llama_opt_learn_status llama_opt_learn_graph_step(llama_context * ctx) {
+    if (ctx->opt_reply && ctx->opt_reply->graph_nodes == 0) {
+        ctx->opt_reply->graph_nodes = 1;
+    }
+    return ctx->opt_learn_step();
+}
+bool llama_opt_learn_draining_graph(const llama_context * ctx) {
+    return ctx->opt_reply && ctx->opt_reply->drain_graph && ctx->opt_reply->graph_meta;
+}
 bool llama_opt_learn_drain(llama_context * ctx) { return ctx->opt_learn_drain(); }
 bool llama_opt_learn_needs_gradient(const llama_context * ctx) { return ctx->opt_learn_needs_gradient(); }
 
