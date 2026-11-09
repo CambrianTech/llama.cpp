@@ -890,9 +890,14 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     }
 
+    // Admit all newly owned buffers before allocating either one. A host refusal must
+    // not leave device residency allocated from an otherwise refused preparation.
+    if (!opt_ctx->buf_static && !ggml_opt_static_allocation_allowed(opt_ctx, opt_ctx->ctx_static,
+            ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0)), "optimizer_static")) { return false; }
+    if (!ggml_opt_static_allocation_allowed(opt_ctx, opt_ctx->ctx_cpu,
+            ggml_backend_cpu_buffer_type(), "optimizer_host")) { return false; }
+
     if (!opt_ctx->buf_static) {
-        if (!ggml_opt_static_allocation_allowed(opt_ctx, opt_ctx->ctx_static,
-                ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0)), "optimizer_static")) { return false; }
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         ggml_graph_reset(opt_ctx->gb_opt);
@@ -902,8 +907,6 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->buf_static ? ggml_backend_buffer_get_size(opt_ctx->buf_static) : (size_t) 0, opt_ctx->param_m.size());
     }
 
-    if (!ggml_opt_static_allocation_allowed(opt_ctx, opt_ctx->ctx_cpu,
-            ggml_backend_cpu_buffer_type(), "optimizer_host")) { return false; }
     opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
     return true;
 }

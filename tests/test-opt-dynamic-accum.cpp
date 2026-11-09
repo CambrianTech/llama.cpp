@@ -27,7 +27,7 @@ static ggml_opt_optimizer_params sgd_pars(void *) {
     return p;
 }
 
-static void run(int32_t opt_period, bool test_residency_gate = false) {
+static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false) {
     // by type, not ggml_backend_cpu_init: in a dynamically loaded backend build (CI) the CPU
     // backend is its own library
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -49,13 +49,14 @@ static void run(int32_t opt_period, bool test_residency_gate = false) {
     params.opt_period   = opt_period;
     ggml_opt_context_t opt_ctx = ggml_opt_init(params); // no ctx_compute: graphs are built per step
     ggml_opt_result_t  result  = ggml_opt_result_init();
-    struct gate_state { bool allow = false; size_t measured = 0; } gate;
+    struct gate_state { bool allow = false; size_t measured = 0; bool refuse_host; bool host_seen = false; } gate{false, 0, refuse_host};
     if (test_residency_gate) {
         ggml_opt_set_static_allocation_callback(opt_ctx, [](ggml_backend_buffer_type_t,
                 const char * kind, size_t bytes, void * data) {
             auto & gate = *static_cast<gate_state *>(data);
             if (strcmp(kind, "optimizer_static") == 0) { gate.measured = bytes; }
-            return gate.allow;
+            if (strcmp(kind, "optimizer_host") == 0) { gate.host_seen = true; }
+            return gate.allow || (gate.refuse_host && strcmp(kind, "optimizer_static") == 0);
         }, &gate);
     }
 
@@ -74,6 +75,7 @@ static void run(int32_t opt_period, bool test_residency_gate = false) {
             // any optimizer buffer allocation, and re-preparing after admission is usable.
             CHECK(!ggml_opt_alloc(opt_ctx, true));
             CHECK(gate.measured > 0);
+            CHECK(!refuse_host || gate.host_seen);
             size_t allocated = 0;
             ggml_opt_visit_owned_buffers(opt_ctx, [](ggml_backend_buffer_t b, const char *, void * data) {
                 *static_cast<size_t *>(data) += ggml_backend_buffer_get_size(b);
@@ -556,6 +558,8 @@ int main() {
     run(1);
     run(2);
     run(1, true);
+    // Static admission alone must not allocate when the host lease is refused.
+    run(1, true, true);
     run_manual();
     run_manual(true);
     run_refuses_graph_without_backward();
