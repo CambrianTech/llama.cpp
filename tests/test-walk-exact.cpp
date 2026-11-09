@@ -707,11 +707,21 @@ int main(int argc, char ** argv) {
         // unified F32 cache with explicit attention, then a stream per slot with an f16 cache and
         // flash attention: how a serving lane runs (each slot attends over its own stream)
         printf("  live sequence, %s:\n", streams ? "a stream per slot, f16 cache, flash attention" : "one unified F32 cache, explicit attention");
+        size_t graph_segments = 0;
         auto two_seq_ctx = [&]() {
             auto cp = common_context_params_to_llama(params);
             cp.n_ctx = 2*WINDOW; cp.n_batch = WINDOW; cp.n_ubatch = WINDOW; cp.n_seq_max = 2; cp.kv_unified = !streams;
             cp.flash_attn_type = streams ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
             cp.type_k = streams ? GGML_TYPE_F16 : GGML_TYPE_F32; cp.type_v = cp.type_k;
+            // Graph segmentation preserves the full token graph and its gradient.
+            // This tests existing scheduler views only, NOT resumable serving yields.
+            if (getenv("WALK_LIVE_GRAPH_SEGMENTS")) {
+                cp.cb_eval = [](ggml_tensor *, bool ask, void * data) {
+                    if (!ask) { ++*static_cast<size_t *>(data); }
+                    return true;
+                };
+                cp.cb_eval_user_data = &graph_segments;
+            }
             return llama_init_from_model(model, cp);
         };
         auto decode_span = [&](llama_context * c, llama_seq_id sq, const llama_token * t, llama_pos p0, int32_t n) {
@@ -861,6 +871,10 @@ int main(int argc, char ** argv) {
         // Restore the fixture's original neighbour for its unchanged-custody assertions below.
         GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
         const bool learned = progress == LLAMA_OPT_LEARN_DONE;
+        if (getenv("WALK_LIVE_GRAPH_SEGMENTS")) {
+            GGML_ASSERT(graph_segments > 0);
+            printf("  synchronous graph-view segments observed: %zu (not serving yields)\n", graph_segments);
+        }
         GGML_ASSERT(current_admission.statics > 0 && current_admission.workspace > 0);
         GGML_ASSERT(stale_admission.statics == 0 && stale_admission.workspace == 0);
         const std::vector<uint8_t> her_after = seq_state(ctx, 0);
