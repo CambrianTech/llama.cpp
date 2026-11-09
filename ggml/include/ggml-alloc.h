@@ -61,6 +61,11 @@ GGML_API void ggml_gallocr_reserve_n_size(
     const int * node_buffer_ids,
     const int * leaf_buffer_ids,
     size_t * sizes);
+// Measure with separately owned tensor storage excluded, without inventing data pointers.
+// Measurement only: discard this plan before allocation; external owners must allocate first.
+GGML_API void ggml_gallocr_reserve_n_size_external(
+    ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids,
+    const int * leaf_buffer_ids, size_t * sizes, struct ggml_tensor * const * external, size_t n_external);
 GGML_API bool ggml_gallocr_reserve_n(
     ggml_gallocr_t galloc,
     struct ggml_cgraph * graph,

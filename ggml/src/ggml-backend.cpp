@@ -2593,6 +2593,22 @@ void ggml_backend_sched_measure_graph(ggml_backend_sched_t sched, struct ggml_cg
     ggml_backend_sched_measure_splits(sched, sizes);
 }
 
+void ggml_backend_sched_measure_graph_external(ggml_backend_sched_t sched, struct ggml_cgraph * graph,
+        size_t * sizes, struct ggml_tensor * const * external, ggml_backend_t const * owners, size_t n_external) {
+    GGML_ASSERT(sched && sizes && !sched->is_alloc);
+    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs + (int)n_external);
+    GGML_ASSERT(n_external == 0 || (external && owners));
+    for (size_t i = 0; i < n_external; ++i) {
+        ggml_backend_sched_set_tensor_backend(sched, external[i], owners[i]);
+    }
+    sched->cur_copy = sched->next_copy;
+    ggml_backend_sched_split_graph(sched, graph);
+    ggml_gallocr_t probe = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    ggml_gallocr_reserve_n_size_external(probe, &sched->graph, sched->node_backend_ids,
+            sched->leaf_backend_ids, sizes, external, n_external);
+    ggml_gallocr_free(probe);
+}
+
 bool ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const size_t * max_new, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);

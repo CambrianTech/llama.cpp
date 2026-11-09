@@ -462,6 +462,7 @@ struct hash_node {
     int buffer_id;
     struct buffer_address addr;
     bool allocated;
+    bool external; // measurement-only externally owned storage, not yet allocated
 };
 
 struct tensor_alloc {
@@ -480,6 +481,8 @@ struct node_alloc {
 };
 
 struct ggml_gallocr {
+    struct ggml_tensor * const * measure_external;
+    size_t n_measure_external;
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
@@ -593,6 +596,7 @@ static bool ggml_gallocr_is_own(ggml_gallocr_t galloc, struct ggml_tensor * t) {
 static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor * t) {
     return t->data != NULL // tensor data already set externally
         || t->buffer // tensor on external buffer (but not yet allocated)
+        || ggml_gallocr_hash_get(galloc, t)->external
         || ggml_gallocr_is_own(galloc, t); // tensor will be allocated by galloc
 }
 
@@ -719,6 +723,9 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+    for (size_t i = 0; i < galloc->n_measure_external; ++i) {
+        ggml_gallocr_hash_get(galloc, galloc->measure_external[i])->external = true;
+    }
 
     // allocate leafs
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
@@ -824,7 +831,7 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
-    size_t min_hash_size = graph->n_nodes + graph->n_leafs;
+    size_t min_hash_size = graph->n_nodes + graph->n_leafs + galloc->n_measure_external;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
 
@@ -857,7 +864,7 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
-        if (node->view_src || node->data) {
+        if (node->view_src || node->data || ggml_gallocr_hash_get(galloc, node)->external) {
             node_alloc->dst.buffer_id = -1;
             node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
             node_alloc->dst.size_max = 0;
@@ -869,7 +876,7 @@ static bool ggml_gallocr_reserve_n_impl(
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
-            if (!src || src->view_src || src->data) {
+            if (!src || src->view_src || src->data || ggml_gallocr_hash_get(galloc, src)->external) {
                 node_alloc->src[j].buffer_id = -1;
                 node_alloc->src[j].addr = GGML_BUFFER_ADDRESS_INVALID;
                 node_alloc->src[j].size_max = 0;
@@ -890,7 +897,7 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         struct hash_node * hn = ggml_gallocr_hash_get(galloc, leaf);
-        if (leaf->view_src || leaf->data) {
+        if (leaf->view_src || leaf->data || hn->external) {
             galloc->leaf_allocs[i].leaf.buffer_id = -1;
             galloc->leaf_allocs[i].leaf.addr = GGML_BUFFER_ADDRESS_INVALID;
             galloc->leaf_allocs[i].leaf.size_max = 0;
@@ -957,6 +964,17 @@ void ggml_gallocr_reserve_n_size(
             sizes[i] += galloc->buf_tallocs[i]->chunks[c]->max_size;
         }
     }
+}
+
+void ggml_gallocr_reserve_n_size_external(
+        ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids,
+        const int * leaf_buffer_ids, size_t * sizes, struct ggml_tensor * const * external, size_t n_external) {
+    GGML_ASSERT(external || n_external == 0);
+    galloc->measure_external = external;
+    galloc->n_measure_external = n_external;
+    ggml_gallocr_reserve_n_size(galloc, graph, node_buffer_ids, leaf_buffer_ids, sizes);
+    galloc->measure_external = NULL;
+    galloc->n_measure_external = 0;
 }
 
 bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {

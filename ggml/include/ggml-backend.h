@@ -357,6 +357,13 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_measure_graph(ggml_backend_sched_t sched,
             struct ggml_cgraph * graph, size_t * sizes);
 
+    // Same dry plan with separately owned, not-yet-allocated tensors placed on their
+    // real backends and excluded from workspace. No tensor data/buffer is fabricated.
+    // Reset/discard the graph after measuring; allocate external owners before allocation.
+    GGML_API void ggml_backend_sched_measure_graph_external(ggml_backend_sched_t sched,
+            struct ggml_cgraph * graph, size_t * sizes, struct ggml_tensor * const * external,
+            ggml_backend_t const * owners, size_t n_external);
+
     // As ggml_backend_sched_alloc_graph, but the graph is split ONCE, planned with a throwaway
     // allocator, and allocated only if no backend's buffer would grow by more than max_new[b]
     // bytes (max_new may be NULL: no limit). sizes (may be NULL) receives each backend's planned
