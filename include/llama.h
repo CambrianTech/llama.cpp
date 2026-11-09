@@ -1857,6 +1857,9 @@ extern "C" {
     // decode. Allocates metadata only, never evaluates or changes optimizer/KV data.
     // Reports *_required static/host/workspace and shared_compute_held by buffer type.
     // Measurement is not a lease: admission must revalidate before actual allocation.
+    // Select only in disposable metadata: preserve serving scheduler buffers and optimizer state.
+    LLAMA_API bool llama_opt_measure_shadow(struct llama_context * ctx, struct llama_opt_params params,
+            llama_opt_memory_callback callback, void * user_data);
     LLAMA_API bool llama_opt_measure_memory(struct llama_context * ctx,
             llama_opt_memory_callback callback, void * user_data);
 

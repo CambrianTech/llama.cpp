@@ -107,6 +107,81 @@ const char * llama_context::opt_untrainable(const llama_adapter_lora * adapter, 
     return nullptr;
 }
 
+ggml_opt_params llama_context::opt_params_for(llama_opt_params lopt_params) {
+    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS);
+    opt_params.opt_period      = std::min(n_batch(), opt_n_ctx_train) / std::min(n_ubatch(), opt_n_ctx_train);
+    opt_params.get_opt_pars    = lopt_params.get_opt_pars;
+    // per-layer recompute: the layer outputs are the checkpoints (llm_graph names them l_out-N)
+    opt_params.checkpoint_prefix = lopt_params.recompute ? "l_out" : nullptr;
+    opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
+    opt_params.optimizer       = lopt_params.optimizer_type;
+    return opt_params;
+}
+
+bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory_callback callback, void * user_data) {
+    if (!callback || !params.adapter || opt_reply) {
+        opt_failure = "shadow preflight requires an idle learning boundary";
+        return false;
+    }
+    if (const auto why = opt_untrainable(params.adapter, params)) {
+        opt_failure = why;
+        return false;
+    }
+    synchronize();
+    const auto held_scheduler = sched.get();
+    struct restore_measurement {
+        llama_context & ctx;
+        llama_cparams cparams;
+        ggml_opt_params opt_params;
+        uint32_t window;
+        const llama_adapter_lora * shadow;
+        ggml_backend_sched_ptr scheduler;
+        llm_graph_result_ptr graph;
+        std::unordered_map<ggml_tensor *, int32_t> flags;
+        ~restore_measurement() {
+            ctx.sched = std::move(scheduler);
+            ctx.gf_res_prev = std::move(graph);
+            ctx.cparams = cparams;
+            ctx.opt_params_base = opt_params;
+            ctx.opt_n_ctx_train = window;
+            ctx.opt_shadow = shadow;
+            for (const auto & item : flags) { item.first->flags = item.second; }
+        }
+    } restore{*this, cparams, opt_params_base, opt_n_ctx_train, opt_shadow,
+              std::move(sched), std::move(gf_res_prev), {}};
+    for (const auto * adapter : {opt_shadow, static_cast<const llama_adapter_lora *>(params.adapter)}) {
+        if (!adapter) { continue; }
+        for (const auto & item : adapter->ab_map) {
+            for (auto * tensor : {item.second.a, item.second.b}) {
+                restore.flags.emplace(tensor, tensor->flags);
+                tensor->flags &= ~GGML_TENSOR_FLAG_PARAM;
+            }
+        }
+    }
+    for (const auto & item : params.adapter->ab_map) {
+        llama_set_param(item.second.a, params.param_filter, params.param_filter_ud);
+        llama_set_param(item.second.b, params.param_filter, params.param_filter_ud);
+    }
+    opt_shadow = params.adapter;
+    opt_n_ctx_train = n_ctx();
+    cparams.training = true;
+    cparams.fa_back_native = opt_fa_back_native();
+    size_t max_nodes = graph_max_nodes(n_ubatch());
+    if (cparams.flash_attn && !cparams.fa_back_native) {
+        max_nodes += (size_t) model.hparams.n_layer() * ggml_flash_attn_ext_back_n_nodes(opt_n_ctx_train, 0);
+    }
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    gf_res_prev.reset(new llm_graph_result(max_nodes));
+    opt_params_base = opt_params_for(params);
+    return opt_measure_memory(callback, user_data, held_scheduler);
+}
+
+bool llama_opt_measure_shadow(llama_context * ctx, llama_opt_params params,
+        llama_opt_memory_callback callback, void * user_data) {
+    return ctx && ctx->opt_measure_shadow(params, callback, user_data);
+}
+
 bool llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     // a live reply holds the active optimizer and its accumulators between chunks, through restoration
     if (opt_reply) {
@@ -166,13 +241,7 @@ bool llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             cparams.fa_back_native ? "one op (ggml_flash_attn_back): no score is kept" : "composed from tiles (a device has no ggml_flash_attn_back kernel)");
 
     // one target token per row: no one-hot tensor as wide as the vocabulary beside the logits
-    ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY_TARGETS);
-    opt_params.opt_period      = n_batch / n_ubatch;
-    opt_params.get_opt_pars    = lopt_params.get_opt_pars;
-    // per-layer recompute: the layer outputs are the checkpoints (llm_graph names them l_out-N)
-    opt_params.checkpoint_prefix = lopt_params.recompute ? "l_out" : nullptr;
-    opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
-    opt_params.optimizer       = lopt_params.optimizer_type;
+    ggml_opt_params opt_params = opt_params_for(lopt_params);
     opt_ctx = ggml_opt_init(opt_params);
     ggml_opt_set_alloc_budget(opt_ctx, opt_memory_budget);
     opt_params_base = opt_params;

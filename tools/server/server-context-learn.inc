@@ -49,14 +49,18 @@
         return out;
     }
 
-    bool select_learning_shadow(int32_t id) {
+    llama_opt_params learning_shadow_params(int32_t id) {
         llama_opt_params lopt{};
         lopt.param_filter = llama_opt_param_filter_all;
         lopt.get_opt_pars = learn_opt_pars;
         lopt.get_opt_pars_ud = &learn_lr;
         lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
         lopt.adapter = params_base.lora_adapters[id].ptr;
-        return llama_opt_init(ctx_tgt, model_tgt, lopt);
+        return lopt;
+    }
+
+    bool select_learning_shadow(int32_t id) {
+        return llama_opt_init(ctx_tgt, model_tgt, learning_shadow_params(id));
     }
 
     json learn_preflight(const json & body) {
@@ -90,10 +94,7 @@
         auto set = construct_lora_list({});
         set[id].scale = 1.0f;
         common_set_adapter_lora(ctx_tgt, set);
-        if (!select_learning_shadow((int32_t) id)) {
-            return refuse("unsupported", llama_opt_failure(ctx_tgt));
-        }
-        const bool ok = llama_opt_measure_memory(ctx_tgt, [](const llama_adapter_lora *, const char * device,
+        const bool ok = llama_opt_measure_shadow(ctx_tgt, learning_shadow_params((int32_t) id), [](const llama_adapter_lora *, const char * device,
                 const char * buft, const char * kind, size_t bytes, bool host, void * data) {
             static_cast<json *>(data)->push_back({{"device", device}, {"buffer_type", buft},
                 {"kind", kind}, {"bytes", bytes}, {"host", host}});

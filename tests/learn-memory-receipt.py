@@ -12,11 +12,18 @@ a=call('/lora-adapters/load',{'name':'shadow-05.gguf'})['id'];b=call('/lora-adap
 engine=call('/props')['learn_ledger']['engine']
 assert call('/learn/preflight',{'engine':'stale','lora_id':a})['refusal']=='stale_engine'
 assert call('/learn/preflight',{'engine':engine,'lora_id':-1})['refusal']=='invalid'
+# Start with real held serving buffers; first preflight must not replace their scheduler.
+probe={'id_slot':0,'prompt':'The capital of Kansas is','n_predict':4,'temperature':0}
+served=call('/completion',probe)['content']
+held=snapshot()['shared_compute_buffers']
+assert held
 for shadow in (a,b):
  plan=call('/learn/preflight',{'engine':engine,'lora_id':shadow})
  assert plan['refusal']=='none' and not plan['reserved'],plan
  assert plan['requirements'] and all(row['bytes']>=0 for row in plan['requirements'])
  assert owned(snapshot(),shadow)==0, 'dry preflight allocated optimizer storage'
+ assert snapshot()['shared_compute_buffers']==held, 'preflight changed held serving compute'
+ assert call('/completion',probe)['content']==served, 'preflight changed serving output'
  print('preflight',json.dumps(plan),flush=True)
 assert call('/learn/grants',{'id':'memory-test','engine':engine,'period_ms':1000,'share_ppm':1000000,'expires_in_ms':120000})['refusal']=='none'
 def learn(id):

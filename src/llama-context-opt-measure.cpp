@@ -5,8 +5,8 @@
 #include "llama-batch.h"
 #include <algorithm>
 
-bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void * user_data) {
-    if (!callback || !opt_ctx || !opt_shadow || opt_reply || !memory) {
+bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void * user_data, ggml_backend_sched_t held) {
+    if (!callback || !opt_shadow || opt_reply || !memory) {
         opt_failure = "learning preflight requires a selected shadow and an idle learning boundary";
         return false;
     }
@@ -75,7 +75,7 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
     for (int i = 0; i < n_backends; ++i) {
         auto backend = ggml_backend_sched_get_backend(sched.get(), i);
         report(backend_buft[i], "shared_compute_required", sizes[i]);
-        report(backend_buft[i], "shared_compute_held", ggml_backend_sched_get_buffer_size(sched.get(), backend));
+        report(backend_buft[i], "shared_compute_held", ggml_backend_sched_get_buffer_size(held ? held : sched.get(), backend));
     }
     return true;
 }

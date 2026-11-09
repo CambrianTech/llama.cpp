@@ -229,7 +229,9 @@ struct llama_context {
     // the largest training graph the allocation preflight measured on a GPU device (bytes)
     size_t opt_graph_bytes() const;
     void opt_visit_memory(llama_opt_memory_callback callback, void * user_data) const;
-    bool opt_measure_memory(llama_opt_memory_callback callback, void * user_data);
+    bool opt_measure_memory(llama_opt_memory_callback callback, void * user_data, ggml_backend_sched_t held = nullptr);
+    bool opt_measure_shadow(llama_opt_params params, llama_opt_memory_callback callback, void * user_data);
+    ggml_opt_params opt_params_for(llama_opt_params params);
     int64_t opt_shadow_steps(const llama_adapter_lora * shadow) const;
 
     struct opt_live_reply {
