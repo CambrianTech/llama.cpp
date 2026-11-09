@@ -192,7 +192,13 @@
         if (op == "residency_register") {
             out["refusal"] = register_residency(body);
         } else if (op == "residency_release") {
-            out["refusal"] = residency_mirror.release(body.value("id", std::string()));
+            const auto id = body.value("id", std::string());
+            if (id == learning_workspace_residency) {
+                // Serialized with learning and unload. A failed serving reserve
+                // remains busy and may be retried without another shadow unload.
+                reclaim_learning_workspace();
+            }
+            out["refusal"] = residency_mirror.release(id);
         } else if (op == "residency_revoke") {
             out["refusal"] = residency_mirror.revoke(body.value("id", std::string()));
         } else if (op == "register") {

@@ -3347,13 +3347,9 @@ private:
                     llama_adapter_lora_free(ptr);
                     residency_mirror.freed_lora(id);
                     learning_residencies.erase(id);
-                    if (learning_residencies.empty() && !learning_workspace_residency.empty() &&
-                            llama_opt_release_workspace(ctx_tgt)) {
-                        // The original serving owner now holds a rebuilt serving
-                        // scheduler. No training scheduler or optimizer references remain.
-                        residency_mirror.freed(learning_workspace_residency);
-                        learning_workspace_residency.clear();
-                    }
+                    // Failure retains the reference; the existing release operation
+                    // retries this same owner after the transient reserve failure clears.
+                    reclaim_learning_workspace();
                     // An empty path is the retired mark: a model reload after sleep skips it
                     // (common_init_from_params) and the id stays taken.
                     auto res = std::make_unique<server_task_result_lora_change>();

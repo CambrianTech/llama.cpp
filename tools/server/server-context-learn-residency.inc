@@ -28,6 +28,14 @@
     std::map<int32_t, std::unique_ptr<learning_residency>> learning_residencies;
     std::string learning_workspace_residency;
 
+    bool reclaim_learning_workspace() {
+        if (learning_workspace_residency.empty()) { return true; }
+        if (!learning_residencies.empty() || !llama_opt_release_workspace(ctx_tgt)) { return false; }
+        residency_mirror.freed(learning_workspace_residency);
+        learning_workspace_residency.clear();
+        return true;
+    }
+
     std::string admit_learning_residency(const learn_request & request) {
         if (request.optimizer_residency.empty() || request.workspace_residency.empty()) {
             return "learning requires optimizer_residency and workspace_residency references";
