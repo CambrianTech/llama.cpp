@@ -136,7 +136,7 @@ public:
             out.refusal = server_learn_refusal::never_fits;
             return out;
         }
-        if (a.used_us + a.reserved_us + cost > budget) {
+        if (contended && a.used_us + a.reserved_us + cost > budget) {
             out.refusal        = server_learn_refusal::budget_exhausted;
             out.retry_after_ms = (a.period_start_us + a.grant.period_ms * 1000 - now_us + 999) / 1000;
             return out;
@@ -145,6 +145,16 @@ public:
         a.outstanding += 1;
         out.reservation = ++next_reservation;
         reservations.emplace(out.reservation, reservation{ grant, cost, contended, false });
+        return out;
+    }
+
+    // Restoration is an obligation, not permission for a gradient. Keep its
+    // measured debit even on an idle-only grant and after revocation.
+    server_learn_admission hold_restoration(const std::string & grant, int64_t now_us) {
+        auto out = admit(grant, 0, now_us, false);
+        if (out.refusal == server_learn_refusal::none) {
+            reservations.at(out.reservation).contended = true;
+        }
         return out;
     }
 

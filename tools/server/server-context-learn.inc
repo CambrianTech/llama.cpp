@@ -241,7 +241,7 @@
         // Validate authority before touching adapters, optimizer, or sequence state.
         // This zero-estimate obligation remains live until the served tail is restored.
         // Its measured setup/restoration time is charged even if authority ends meanwhile.
-        auto probe = learn_ledger.admit(L.grant, 0, t0, true);
+        auto probe = learn_ledger.hold_restoration(L.grant, t0);
         if (probe.refusal != server_learn_refusal::none) {
             learn_outcome out;
             out.refusal = learn_refusal_name(probe.refusal);

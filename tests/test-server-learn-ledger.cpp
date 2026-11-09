@@ -139,6 +139,13 @@ int main() {
     require(bootstrap.refusal == R::none && bootstrap.reservation != 0, "idle calibration retains custody");
     require(calibration.start(bootstrap.reservation, 0) == R::none, "start idle measurement");
     require(calibration.finish(bootstrap.reservation, 100, 0, 100) == R::none, "settle idle measurement");
+    auto restoration = calibration.hold_restoration("bootstrap", 100);
+    require(restoration.refusal == R::none && calibration.start(restoration.reservation, 100) == R::none, "restoration custody with zero contended authority");
+    require(calibration.finish(restoration.reservation, 50, 0, 150) == R::none, "restoration remains measured");
+    require(used(calibration, "bootstrap", 150) == 50, "do not erase restoration debit");
+    auto idle_again = calibration.admit("bootstrap", 100, 150, false);
+    require(idle_again.refusal == R::none, "measured restoration must not starve subsequent idle learning");
+    require(calibration.cancel(idle_again.reservation, 150) == R::none, "release unused idle custody");
     require(calibration.register_grant({ "bootstrap", "engine-a", 1000, 100, day_us }, 100) == R::grant_mismatch, "calibrated authority needs a new immutable id");
     }
     require(ledger.register_grant({ "x", "engine-a", 1000, 1000001, day_us }, 0) == R::invalid, "share over 1e6");
