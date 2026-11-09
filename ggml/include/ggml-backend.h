@@ -350,6 +350,13 @@ extern "C" {
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // Exact planned bytes per backend, WITHOUT allocating or releasing live buffers.
+    // Requires reset scheduler. Like splitting, rewrites graph inputs: after measurement,
+    // reset the scheduler and discard/rebuild this graph before serving or allocating.
+    // Later allocation still revalidates via alloc_graph_within; this is not a reservation.
+    GGML_API void                 ggml_backend_sched_measure_graph(ggml_backend_sched_t sched,
+            struct ggml_cgraph * graph, size_t * sizes);
+
     // As ggml_backend_sched_alloc_graph, but the graph is split ONCE, planned with a throwaway
     // allocator, and allocated only if no backend's buffer would grow by more than max_new[b]
     // bytes (max_new may be NULL: no limit). sizes (may be NULL) receives each backend's planned

@@ -2577,6 +2577,22 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     return true;
 }
 
+// Measure the already split graph through the SAME allocator owner as guarded allocation.
+// A separate planning instance keeps the serving allocator's held buffers untouched.
+static void ggml_backend_sched_measure_splits(ggml_backend_sched_t sched, size_t * sizes) {
+    ggml_gallocr_t probe = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    ggml_gallocr_reserve_n_size(probe, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    ggml_gallocr_free(probe);
+}
+
+void ggml_backend_sched_measure_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t * sizes) {
+    GGML_ASSERT(sched && sizes && !sched->is_alloc);
+    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+    sched->cur_copy = sched->next_copy;
+    ggml_backend_sched_split_graph(sched, graph);
+    ggml_backend_sched_measure_splits(sched, sizes);
+}
+
 bool ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const size_t * max_new, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
@@ -2592,9 +2608,7 @@ bool ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct gg
     // plan the split graph with a throwaway allocator: exact sizes, nothing allocated, and the
     // live allocator's buffers untouched (a measure-only reserve on it frees what would grow)
     std::vector<size_t> need(sched->n_backends, 0);
-    ggml_gallocr_t probe = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
-    ggml_gallocr_reserve_n_size(probe, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, need.data());
-    ggml_gallocr_free(probe);
+    ggml_backend_sched_measure_splits(sched, need.data());
     bool fits = true;
     for (int b = 0; b < sched->n_backends; b++) {
         if (sizes) {
