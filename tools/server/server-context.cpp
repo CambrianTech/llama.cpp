@@ -3288,6 +3288,10 @@ private:
                 } break;
             case SERVER_TASK_TYPE_UNLOAD_LORA:
                 {
+                    if (task.unload_engine != learn_engine) {
+                        send_error(task, "stale_engine: unload must name this engine incarnation", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     auto & loras = params_base.lora_adapters;
                     const int32_t id = task.unload_lora;
                     if (id < 0 || (size_t) id >= loras.size() || loras[id].ptr == nullptr) {
@@ -6564,6 +6568,10 @@ void server_routes::init_routes() {
     this->post_lora_adapters_unload = [this](const server_http_req & req) {
         auto res = create_response();
         const json body = json::parse(req.body);
+        if (!body.contains("engine") || !body.at("engine").is_string() || body.at("engine").get<std::string>().empty()) {
+            res->error(format_error_response("engine incarnation is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         if (!body.contains("id") || !body.at("id").is_number_integer()) {
             res->error(format_error_response("\"id\" (an integer adapter id) is required", ERROR_TYPE_INVALID_REQUEST));
             return res;
@@ -6573,6 +6581,7 @@ void server_routes::init_routes() {
             server_task task(SERVER_TASK_TYPE_UNLOAD_LORA);
             task.id          = rd.get_new_id();
             task.unload_lora = body.at("id").get<int32_t>();
+            task.unload_engine = body.at("engine").get<std::string>();
             rd.post_task(std::move(task));
         }
         auto result = rd.next(req.should_stop);

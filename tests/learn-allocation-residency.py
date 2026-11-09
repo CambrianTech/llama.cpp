@@ -8,6 +8,9 @@ import time
 URL = 'http://127.0.0.1:58219'
 
 def call(path, body=None):
+    if path in ('/lora-adapters/unload', '/learn/residency/release', '/learn/residency/revoke') and body is not None:
+        body = dict(body)
+        body.setdefault('engine', engine)
     req = urllib.request.Request(URL + path, data=None if body is None else json.dumps(body).encode(),
                                  headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=120) as response:
@@ -30,6 +33,19 @@ def load(name, lease):
 
 a = load('shadow-05.gguf', 'weights-a')
 b = load('shadow-06.gguf', 'weights-b')
+# A stale cleanup must not unload an id reused by a different engine incarnation.
+held_before_stale = call('/learn/grants')['residencies']
+for stale_engine in ('', '0' * 32):
+    try:
+        call('/lora-adapters/unload', {'id': a['id'], 'engine': stale_engine})
+        raise AssertionError('stale unload accepted')
+    except urllib.error.HTTPError as error:
+        assert error.code == 400
+    for route in ('/learn/residency/release', '/learn/residency/revoke'):
+        stale = call(route, {'id': 'weights-a', 'engine': stale_engine})
+        assert stale['refusal'] == 'stale_engine' and stale['engine'] == engine, stale
+assert call('/learn/grants')['residencies'] == held_before_stale
+
 probe = {'id_slot': 0, 'prompt': 'The capital of Kansas is', 'n_predict': 1, 'temperature': 0}
 serving_before = call('/completion', probe)['content']
 assert call('/learn/grants', {'id': 'compute', 'engine': engine, 'period_ms': 1000,

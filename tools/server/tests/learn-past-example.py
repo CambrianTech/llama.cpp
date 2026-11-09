@@ -16,6 +16,8 @@ prefix = "past-" + uuid.uuid4().hex
 
 
 def post(route, body):
+    if route in ('/lora-adapters/unload', '/learn/residency/release', '/learn/residency/revoke'):
+        body = dict(body, engine=ledger['engine'])
     request = urllib.request.Request(url + route, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=600) as response:

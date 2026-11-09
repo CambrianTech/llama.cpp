@@ -279,6 +279,7 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_UNLOAD_LORA: the adapter id to retire
     int32_t unload_lora = -1;
+    std::string unload_engine;
 
     json learn_grants; // authority operation, processed on the serving queue
 

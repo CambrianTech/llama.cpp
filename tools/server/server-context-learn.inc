@@ -198,6 +198,9 @@
         }
         if (op == "residency_register") {
             out["refusal"] = register_residency(body);
+        } else if ((op == "residency_release" || op == "residency_revoke") &&
+                   body.value("engine", std::string()) != learn_engine) {
+            out["refusal"] = "stale_engine";
         } else if (op == "residency_release") {
             const auto id = body.value("id", std::string());
             if (id == learning_workspace_residency) {
