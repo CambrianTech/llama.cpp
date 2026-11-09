@@ -3512,6 +3512,7 @@ private:
 #endif
 
     void update_slots() {
+        const bool learning_at_start = bool(learning);
         publish_busy_slots();
         struct publish_on_exit { server_context_impl * s; ~publish_on_exit() { s->publish_busy_slots(); } } publish_guard{this};
 #ifdef DEBUG_TIMINGS
@@ -3633,7 +3634,10 @@ private:
         // a prefill step adds its duration to the decode time owed; a decode-only step pays it back
         const int64_t t_step = ggml_time_us() - t_step_start;
         t_decode_owed_us = has_prompt ? t_decode_owed_us + t_step : std::max<int64_t>(0, t_decode_owed_us - t_step);
-        advance_learning();
+        // Completion-triggered learning can begin inside post_decode. Its entry
+        // preparation is already one measured blocking segment; do not append a
+        // graph segment before the queued NEXT_RESPONSE lets serving run again.
+        if (learning_at_start) { advance_learning(); }
     }
 
     void pre_decode() {
