@@ -1017,6 +1017,9 @@ private:
         int64_t restoration_steps = 0;
         int64_t committed_steps = 0;
         int64_t max_chunk_us = 0;
+        int64_t entry_us = 0;
+        int64_t max_graph_us = 0;
+        int64_t max_restore_us = 0;
         size_t served_tokens = 0;
         int64_t max_restoration_chunk_us = 0;
         std::optional<bool> finished;

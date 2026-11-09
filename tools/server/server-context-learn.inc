@@ -304,6 +304,7 @@
             learning->served_tokens = std::get<3>(geometry);
             learning->restoration_reservation = probe.reservation;
             learning->restoration_us = setup_us;
+            learning->entry_us = setup_us;
             learning->compute_us += setup_us;
             learning->max_chunk_us = setup_us;
         } else {
@@ -459,6 +460,10 @@
             const auto elapsed = chunk_finished - chunk_started;
             pending.compute_us += elapsed;
             pending.max_chunk_us = std::max(pending.max_chunk_us, elapsed);
+            // Classify the work, not its charging reservation: a revoked graph
+            // still runs graph nodes under restoration custody until it commits.
+            auto & phase_max = graph_step ? pending.max_graph_us : pending.max_restore_us;
+            phase_max = std::max(phase_max, elapsed);
             if (!reservation) {
                 pending.restoration_us += elapsed;
                 pending.max_restoration_chunk_us = std::max(pending.max_restoration_chunk_us, elapsed);
@@ -533,6 +538,10 @@
         }
         out.max_chunk_ms = pending.max_chunk_us / 1000.0;
         out.restoration_ms = pending.restoration_us / 1000.0;
+        out.entry_ms = pending.entry_us / 1000.0;
+        out.max_graph_ms = pending.max_graph_us / 1000.0;
+        out.max_restore_ms = pending.max_restore_us / 1000.0;
+        out.cleanup_ms = cleanup_us / 1000.0;
         out.t_ms     = pending.compute_us / 1000.0;
         SRV_INF("learned on slot %d: %d labels from position %d, loss %.4f, %.1f ms%s\n", slot.id, out.n_labels, n0, loss,
                 out.t_ms, ok ? "" : (" (failed: " + out.failure + ")").c_str());

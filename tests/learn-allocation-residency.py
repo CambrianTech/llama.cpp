@@ -17,7 +17,13 @@ def call(path, body=None):
     req = urllib.request.Request(URL + path, data=None if body is None else json.dumps(body).encode(),
                                  headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=120) as response:
-        return json.load(response)
+        result = json.load(response)
+    if path == '/learn' and 'max_chunk_ms' in result:
+        phases = [result[key] for key in ('entry_ms', 'max_graph_ms', 'max_restore_ms', 'cleanup_ms')]
+        assert all(value >= 0 for value in phases), result
+        assert abs(max(phases) - result['max_chunk_ms']) < 0.000001, result
+        assert result['restoration_ms'] <= result['t_ms'] + 0.000001, result
+    return result
 
 engine = call('/props')['learn_ledger']['engine']
 

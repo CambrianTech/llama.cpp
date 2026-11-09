@@ -111,6 +111,11 @@ struct learn_outcome {
     double      t_ms     = 0.0;
     double      max_chunk_ms = 0.0;
     double      restoration_ms = 0.0;
+    // Blocking phase measurements; restoration_ms above is aggregate custody debit.
+    double      entry_ms = 0.0;
+    double      max_graph_ms = 0.0;
+    double      max_restore_ms = 0.0;
+    double      cleanup_ms = 0.0;
     json to_json() const;
 };
 
