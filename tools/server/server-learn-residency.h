@@ -100,7 +100,8 @@ public:
     // caller can mutate the context. A failed second binding must not claim the first.
     // Live bindings are reused, not charged again; only new claims enter pending.
     std::string claim_plan(const std::vector<server_residency_need> & plan,
-                           std::vector<std::string> & acquired) {
+                           std::vector<std::string> & acquired,
+                           const std::string & previous_workspace = {}) {
         std::lock_guard<std::mutex> lock(mutex);
         acquired.clear();
         if (plan.empty()) { return "invalid"; }
@@ -125,6 +126,37 @@ public:
                 }
                 if (!covered) { return "uncovered"; }
             }
+        }
+        // Transfer retained workspace custody only as part of this successful whole
+        // plan. The replacement covers every old row, not merely the next graph.
+        // Nothing is freed: the new physical lease assumes the existing allocation.
+        server_residency * previous = nullptr;
+        server_residency * replacement = nullptr;
+        if (!previous_workspace.empty()) {
+            const auto it = records.find(previous_workspace);
+            if (it == records.end()) { return "unknown_residency"; }
+            previous = &it->second;
+            if (previous->subject != "workspace" || previous->owner != owner) { return "owner_mismatch"; }
+            if (previous->pending) { return "busy"; }
+            for (const auto & need : plan) {
+                if (need.subject == "workspace") {
+                    if (replacement) { return "invalid"; }
+                    replacement = &records.at(need.id);
+                }
+            }
+            if (!replacement || replacement == previous || replacement->live) { return "invalid"; }
+            for (const auto & row : previous->rows) {
+                bool covered = false;
+                for (const auto & allowed : replacement->rows) {
+                    covered |= allowed.device == row.device && allowed.buffer_type == row.buffer_type &&
+                        allowed.kind == row.kind && allowed.host == row.host && row.bytes <= allowed.bytes;
+                }
+                if (!covered) { return "uncovered"; }
+            }
+        }
+        if (previous && previous->live) {
+            replacement->live = true;
+            previous->live = false;
         }
         for (const auto & need : plan) {
             auto & record = records.at(need.id);

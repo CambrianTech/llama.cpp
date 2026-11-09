@@ -31,7 +31,7 @@ def load(name, lease):
 a = load('shadow-05.gguf', 'weights-a')
 b = load('shadow-06.gguf', 'weights-b')
 probe = {'id_slot': 0, 'prompt': 'The capital of Kansas is', 'n_predict': 1, 'temperature': 0}
-call('/completion', probe)
+serving_before = call('/completion', probe)['content']
 assert call('/learn/grants', {'id': 'compute', 'engine': engine, 'period_ms': 1000,
                             'share_ppm': 1000000, 'expires_in_ms': 120000})['refusal'] == 'none'
 
@@ -61,13 +61,22 @@ for shadow, name in ((a, 'opt-a'), (b, 'opt-b'), (a, 'opt-a')):
     result = learn(shadow, name, 'workspace')
     assert result['success'], result
     assert call('/learn/residency/release', {'id': name})['refusal'] == 'busy'
+# What this catches: an engine workspace can move to a new physical grant,
+# without changing scheduler buffers or leaving the other mind's callbacks stale.
+register('workspace-next', {'workspace': True}, workspace)
+result = learn(a, 'opt-a', 'workspace-next')
+assert result['success'], result
+assert call('/learn/residency/release', {'id': 'workspace'})['refusal'] == 'none'
+result = learn(b, 'opt-b', 'workspace-next')
+assert result['success'], result
+assert call('/learn/residency/release', {'id': 'workspace-next'})['refusal'] == 'busy'
 assert call('/lora-adapters/unload', {'id': b['id']})['retired']
 assert call('/learn/residency/release', {'id': 'opt-b'})['refusal'] == 'none'
-assert call('/learn/residency/release', {'id': 'workspace'})['refusal'] == 'busy'
+assert call('/learn/residency/release', {'id': 'workspace-next'})['refusal'] == 'busy'
 with concurrent.futures.ThreadPoolExecutor() as pool:
     future = pool.submit(call, '/completion', dict(probe, learn={'grant': 'compute', 'lora_id': a['id'],
         'reply': 'Topeka is the capital of Kansas. ' * 50,
-        'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace'}))
+        'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace-next'}))
     deadline = time.monotonic() + 30
     observed = False
     while time.monotonic() < deadline and not future.done():
@@ -81,9 +90,25 @@ with concurrent.futures.ThreadPoolExecutor() as pool:
     outcome = future.result()['learn']
     assert not outcome['success'] and outcome['n_labels'] == 0, outcome
     assert outcome['refusal'] == 'residency_revoked', outcome
-assert not learn(a, 'opt-a', 'workspace')['success']
+assert not learn(a, 'opt-a', 'workspace-next')['success']
 assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'busy'
 assert call('/lora-adapters/unload', {'id': a['id']})['retired']
 assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'none'
-assert call('/learn/residency/release', {'id': 'workspace'})['refusal'] == 'busy'
-print('PASS actual CUDA whole-plan refusal before mutation, two-mind allocations, reuse, revoke, independent workspace custody')
+assert call('/learn/residency/release', {'id': 'workspace-next'})['refusal'] == 'none'
+assert call('/completion', probe)['content'] == serving_before
+assert not call('/learn/grants')['memory']['optimizer_owned_buffers']
+# Re-enter learning after returning to the serving scheduler; no stale scheduler
+# pointer or retired residency may survive the previous minds.
+c = load('shadow-05.gguf', 'weights-c')
+plan = call('/learn/preflight', {'engine': engine, 'lora_id': c['id']})
+assert plan['refusal'] == 'none', plan
+register('opt-c', {'loaded': {'lora_id': c['id'], 'path': c['path']}},
+         [row for row in plan['requirements'] if row['kind'].startswith('optimizer_')])
+register('workspace-c', {'workspace': True},
+         [row for row in plan['requirements'] if row['kind'] == 'shared_compute_required'])
+result = learn(c, 'opt-c', 'workspace-c')
+assert result['success'], result
+assert call('/lora-adapters/unload', {'id': c['id']})['retired']
+assert call('/learn/residency/release', {'id': 'workspace-c'})['refusal'] == 'none'
+assert call('/completion', probe)['content'] == serving_before
+print('PASS actual CUDA whole-plan refusal, two minds, workspace transfer/reclaim, revoke, serving parity and relearning')

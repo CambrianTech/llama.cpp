@@ -364,6 +364,26 @@ bool llama_context::opt_release(const llama_adapter_lora * adapter) {
     return true;
 }
 
+bool llama_context::opt_release_workspace() {
+    if (opt_reply || opt_configured()) {
+        opt_failure = "learning still holds the scheduler";
+        return false;
+    }
+    // All ggml optimizers have released their raw scheduler pointers. Reuse the
+    // serving owner's reservation path; it synchronizes before replacing buffers,
+    // rebuilds graph metadata, and never clears or resizes the sequence memory.
+    cparams.training = false;
+    sched_need_reserve = true;
+    try {
+        sched_reserve();
+        return true;
+    } catch (const std::exception & error) {
+        opt_failure = error.what();
+        sched_need_reserve = true;
+        return false; // caller conservatively retains custody until a successful retry
+    }
+}
+
 // THE WALK (Fable's design, continuum 2026-10-06; objective 2026-10-14): one pass over a window
 // in one context. A run with no label is context: a plain decode into the cache, as served, no
 // backward. A labelled run is her reply, trained GIVEN EVERYTHING BEFORE IT AS SERVED: only its
@@ -943,6 +963,10 @@ bool llama_opt_init(struct llama_context * ctx, struct llama_model * model, stru
 
 bool llama_opt_release(struct llama_context * ctx, const struct llama_adapter_lora * adapter) {
     return ctx->opt_release(adapter);
+}
+
+bool llama_opt_release_workspace(struct llama_context * ctx) {
+    return ctx->opt_release_workspace();
 }
 
 void llama_opt_stop(struct llama_context * ctx, bool stop) {

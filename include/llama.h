@@ -1797,6 +1797,9 @@ extern "C" {
     // when no optimizer references the adapter any more (released, or it never had one); false,
     // with llama_opt_failure saying why, when a live reply is training that shadow (unload must wait).
     LLAMA_API bool llama_opt_release(struct llama_context * lctx, const struct llama_adapter_lora * adapter);
+    // Restore the serving scheduler only after every optimizer and reply releases it.
+    // True proves training workspace was replaced; serving KV and window are unchanged.
+    LLAMA_API bool llama_opt_release_workspace(struct llama_context * lctx);
     // Restore one shadow generation in place, preserving optimizer tensor identity. The caller
     // owns verified same-generation files/binding, stable adapter exclusion, and serialized queue
     // custody. Both payloads are prepared before mutation. An interrupted apply quarantines the

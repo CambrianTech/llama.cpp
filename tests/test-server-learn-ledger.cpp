@@ -91,8 +91,27 @@ static void residency_plan() {
     require(mirror.revoke(workspace.id) == "none", "revoke workspace authority");
     require(mirror.claim_plan({plan[1]}, acquired) == "unknown_residency", "revoked live workspace refuses new work");
     require(mirror.release(workspace.id) == "busy", "revocation does not free workspace");
-    mirror.freed(workspace.id);
-    require(mirror.release(workspace.id) == "none", "actual workspace free permits release");
+    // What this catches: a larger lease must take custody of retained bytes as
+    // well as the next graph, atomically, even when the former lease is revoked.
+    auto replacement = workspace;
+    replacement.id = "replacement";
+    replacement.rows[0].bytes = 63;
+    replacement.leases[0] = {"vram", "lease-replacement", 128};
+    require(mirror.register_residency(replacement) == "none", "register short replacement");
+    server_residency_need next{replacement.id, "workspace", replacement.rows};
+    require(mirror.claim_plan({next}, acquired, workspace.id) == "uncovered", "old retained bytes must be covered");
+    require(mirror.release(workspace.id) == "busy", "failed replacement retains old custody");
+    require(mirror.release(replacement.id) == "none", "failed replacement claims nothing");
+    replacement.id = "grown";
+    replacement.rows[0].bytes = 128;
+    require(mirror.register_residency(replacement) == "none", "register full replacement");
+    next = {replacement.id, "workspace", replacement.rows};
+    require(mirror.claim_plan({next}, acquired, workspace.id) == "none" && acquired.empty(), "transfer existing allocation without new pending allocation");
+    require(mirror.release(workspace.id) == "none", "old reference releasable after custody transfer");
+    require(mirror.allows(replacement.id, workspace.rows[0]), "retained bytes belong to replacement");
+    require(mirror.release(replacement.id) == "busy", "new owner retains workspace");
+    mirror.freed(replacement.id);
+    require(mirror.release(replacement.id) == "none", "actual workspace free permits release");
 }
 
 int main() {

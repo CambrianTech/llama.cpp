@@ -36,9 +36,6 @@
         if (old != learning_residencies.end() && old->second->optimizer != request.optimizer_residency) {
             return "optimizer residency cannot change while its buffers are retained";
         }
-        if (!learning_workspace_residency.empty() && learning_workspace_residency != request.workspace_residency) {
-            return "workspace residency cannot change while the engine retains its scheduler";
-        }
         const auto measured = learn_preflight({{"engine", learn_engine}, {"lora_id", request.lora_id}});
         if (measured.at("refusal") != "none") { return measured.value("detail", std::string("preflight refused")); }
         server_residency_need optimizer{request.optimizer_residency,
@@ -61,8 +58,19 @@
         // Admit the complete required workspace before that transition, then recheck
         // every actual allocator plan. The workspace remains an engine-wide binding.
         std::vector<std::string> acquired;
-        const auto refusal = residency_mirror.claim_plan({optimizer, workspace}, acquired);
+        const bool replacing_workspace = !learning_workspace_residency.empty() &&
+            learning_workspace_residency != request.workspace_residency;
+        const auto refusal = residency_mirror.claim_plan({optimizer, workspace}, acquired,
+            replacing_workspace ? learning_workspace_residency : std::string{});
         if (refusal != "none") { return "learning residency plan refused: " + refusal; }
+        // The server task queue serializes this with learning and unload. Move every
+        // persistent allocator callback before another operation can release the old
+        // reference; the scheduler and its actual buffers remain in place.
+        if (replacing_workspace) {
+            for (auto & entry : learning_residencies) {
+                entry.second->workspace = request.workspace_residency;
+            }
+        }
         if (old == learning_residencies.end()) {
             learning_residencies[request.lora_id] = std::move(binding);
         } else {
