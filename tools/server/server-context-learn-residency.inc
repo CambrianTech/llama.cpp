@@ -44,7 +44,7 @@
         if (old != learning_residencies.end() && old->second->optimizer != request.optimizer_residency) {
             return "optimizer residency cannot change while its buffers are retained";
         }
-        const auto measured = learn_preflight({{"engine", learn_engine}, {"lora_id", request.lora_id}});
+        const auto measured = learn_preflight({{"engine", learn_engine}, {"lora_id", request.lora_id}, {"reply_rows", request.reply.size()}});
         if (measured.at("refusal") != "none") { return measured.value("detail", std::string("preflight refused")); }
         server_residency_need optimizer{request.optimizer_residency,
             residency_subject({{"loaded", {{"lora_id", request.lora_id},

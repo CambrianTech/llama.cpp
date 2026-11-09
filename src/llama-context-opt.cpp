@@ -118,7 +118,7 @@ ggml_opt_params llama_context::opt_params_for(llama_opt_params lopt_params) {
     return opt_params;
 }
 
-bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory_callback callback, void * user_data) {
+bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory_callback callback, void * user_data, uint32_t reply_rows) {
     if (!callback || !params.adapter || opt_reply) {
         opt_failure = "shadow preflight requires an idle learning boundary";
         return false;
@@ -174,12 +174,17 @@ bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory
                 max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     opt_params_base = opt_params_for(params);
-    return opt_measure_memory(callback, user_data, held_scheduler);
+    return opt_measure_memory(callback, user_data, held_scheduler, reply_rows);
 }
 
 bool llama_opt_measure_shadow(llama_context * ctx, llama_opt_params params,
         llama_opt_memory_callback callback, void * user_data) {
     return ctx && ctx->opt_measure_shadow(params, callback, user_data);
+}
+
+bool llama_opt_measure_shadow_rows(llama_context * ctx, llama_opt_params params, uint32_t reply_rows,
+        llama_opt_memory_callback callback, void * user_data) {
+    return ctx && reply_rows > 0 && ctx->opt_measure_shadow(params, callback, user_data, reply_rows);
 }
 
 static void opt_bind_admission(ggml_opt_context_t optimizer, const llama_opt_params & params) {

@@ -1877,6 +1877,10 @@ extern "C" {
     // Select only in disposable metadata: preserve serving scheduler buffers and optimizer state.
     LLAMA_API bool llama_opt_measure_shadow(struct llama_context * ctx, struct llama_opt_params params,
             llama_opt_memory_callback callback, void * user_data);
+    // An actual example's labelled rows, not a context/window limit. Execution must
+    // remeasure its own geometry and re-admit growth before any optimizer mutation.
+    LLAMA_API bool llama_opt_measure_shadow_rows(struct llama_context * ctx, struct llama_opt_params params,
+            uint32_t reply_rows, llama_opt_memory_callback callback, void * user_data);
     LLAMA_API bool llama_opt_measure_memory(struct llama_context * ctx,
             llama_opt_memory_callback callback, void * user_data);
 

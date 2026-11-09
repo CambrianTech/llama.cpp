@@ -44,7 +44,15 @@ held = call('/learn/grants')['memory']['shared_compute_buffers']
 assert not learn(a)['success']
 memory = call('/learn/grants')['memory']
 assert not memory['optimizer_owned_buffers'] and memory['shared_compute_buffers'] == held
-plans = [call('/learn/preflight', {'engine': engine, 'lora_id': shadow['id']}) for shadow in (a, b)]
+reply_rows = len(call('/tokenize', {'content': 'Topeka is the capital of Kansas.', 'add_special': False})['tokens']) + 1 # completion learn appends EOT
+plans = [call('/learn/preflight', {'engine': engine, 'lora_id': shadow['id'], 'reply_rows': reply_rows}) for shadow in (a, b)]
+full = call('/learn/preflight', {'engine': engine, 'lora_id': a['id']})
+assert plans[0]['served_window'] == full['served_window'] and plans[0]['reply_rows'] == reply_rows
+assert sum(r['bytes'] for r in plans[0]['requirements']) < sum(r['bytes'] for r in full['requirements'])
+for invalid_rows in (0, -1, full['served_window'] + 1):
+    assert call('/learn/preflight', {'engine': engine, 'lora_id': a['id'], 'reply_rows': invalid_rows})['refusal'] == 'invalid'
+print('reply geometry', reply_rows, 'served window', full['served_window'], 'short/full bytes',
+      sum(r['bytes'] for r in plans[0]['requirements']), sum(r['bytes'] for r in full['requirements']), flush=True)
 for shadow, plan, name in zip((a, b), plans, ('opt-a', 'opt-b')):
     assert plan['refusal'] == 'none', plan
     rows = [row for row in plan['requirements'] if row['kind'].startswith('optimizer_')]
@@ -86,10 +94,19 @@ assert call('/learn/residency/release', {'id': 'workspace-next'})['refusal'] == 
 assert call('/lora-adapters/unload', {'id': b['id']})['retired']
 assert call('/learn/residency/release', {'id': 'opt-b'})['refusal'] == 'none'
 assert call('/learn/residency/release', {'id': 'workspace-next'})['refusal'] == 'busy'
+# A larger actual reply must re-admit growth; the short plan is not a window cap.
+long_reply = 'Topeka is the capital of Kansas. ' * 50
+refused_growth = call('/completion', dict(probe, learn={'grant': 'compute', 'lora_id': a['id'],
+    'reply': long_reply, 'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace-next'}))['learn']
+assert not refused_growth['success'] and refused_growth['committed_steps'] == 0, refused_growth
+long_rows = len(call('/tokenize', {'content': long_reply, 'add_special': False})['tokens']) + 1 # completion learn appends EOT
+long_plan = call('/learn/preflight', {'engine': engine, 'lora_id': a['id'], 'reply_rows': long_rows})
+workspace = [row for row in long_plan['requirements'] if row['kind'] == 'shared_compute_required']
+register('workspace-long', {'workspace': True}, workspace)
 with concurrent.futures.ThreadPoolExecutor() as pool:
     future = pool.submit(call, '/completion', dict(probe, learn={'grant': 'compute', 'lora_id': a['id'],
         'reply': 'Topeka is the capital of Kansas. ' * 50,
-        'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace-next'}))
+        'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace-long'}))
     deadline = time.monotonic() + 30
     observed = False
     while time.monotonic() < deadline and not future.done():
@@ -105,11 +122,11 @@ with concurrent.futures.ThreadPoolExecutor() as pool:
     assert outcome['committed_steps'] == 1 and not outcome['effects_uncertain'], outcome
     print('revoked graph completed before restoration', outcome, flush=True)
     assert outcome['refusal'] == 'residency_revoked', outcome
-assert not learn(a, 'opt-a', 'workspace-next')['success']
+assert not learn(a, 'opt-a', 'workspace-long')['success']
 assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'busy'
 assert call('/lora-adapters/unload', {'id': a['id']})['retired']
 assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'none'
-assert call('/learn/residency/release', {'id': 'workspace-next'})['refusal'] == 'none'
+assert call('/learn/residency/release', {'id': 'workspace-long'})['refusal'] == 'none'
 assert call('/completion', probe)['content'] == serving_before
 assert not call('/learn/grants')['memory']['optimizer_owned_buffers']
 # Re-enter learning after returning to the serving scheduler; no stale scheduler

@@ -6,9 +6,13 @@
 #include <algorithm>
 #include <limits>
 
-bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void * user_data, ggml_backend_sched_t held) {
+bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void * user_data, ggml_backend_sched_t held, uint32_t reply_rows) {
     if (!callback || !opt_shadow || opt_reply || !memory) {
         opt_failure = "learning preflight requires a selected shadow and an idle learning boundary";
+        return false;
+    }
+    if (reply_rows > cparams.n_ctx_seq) {
+        opt_failure = "reply geometry exceeds the served window";
         return false;
     }
     synchronize();
@@ -32,7 +36,8 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
     gf_res_prev->reset();
     cparams.training = true;
     cparams.walk_active = false;
-    const uint32_t chunk = cparams.n_ctx_seq;
+    // Shape only: attention still sees the full served memory, without token cuts.
+    const uint32_t chunk = reply_rows ? reply_rows : cparams.n_ctx_seq;
     size_t max_nodes = graph_max_nodes(chunk);
     if (cparams.flash_attn && !cparams.fa_back_native) {
         max_nodes += (size_t) model.hparams.n_layer() * ggml_flash_attn_ext_back_n_nodes(opt_n_ctx_train, 0);
