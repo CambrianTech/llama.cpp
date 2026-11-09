@@ -56,6 +56,17 @@
         lopt.get_opt_pars_ud = &learn_lr;
         lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
         lopt.adapter = params_base.lora_adapters[id].ptr;
+        const auto binding = learning_residencies.find(id);
+        if (binding != learning_residencies.end()) {
+            lopt.static_admission_data = lopt.workspace_admission_data = binding->second.get();
+            lopt.static_admission = [](ggml_backend_buffer_type_t buft, const char * kind, size_t bytes, void * data) {
+                const auto required = std::string(kind) + "_required";
+                return static_cast<learning_residency *>(data)->allows(buft, required.c_str(), bytes);
+            };
+            lopt.workspace_admission = [](ggml_backend_buffer_type_t buft, size_t required, size_t, void * data) {
+                return static_cast<learning_residency *>(data)->allows(buft, "shared_compute_required", required);
+            };
+        }
         return lopt;
     }
 
@@ -314,6 +325,7 @@
         for (size_t i = 0; i + 1 < toks.size(); ++i) {
             labels[i] = toks[i + 1];
         }
+        if (const auto why = admit_learning_residency(L); !why.empty()) { return refused(why); }
         // her stable set plus the shadow: the shadow applies to labelled rows only
         std::vector<common_adapter_lora_info> set = slot.lora.empty() ? construct_lora_list({}) : slot.lora;
         if ((size_t) L.lora_id >= set.size()) {
@@ -324,6 +336,7 @@
         learn_lr = L.lr;
         if (!select_learning_shadow(L.lora_id)) {
             common_set_adapter_lora(ctx_tgt, slot.lora);
+            settle_learning_residency(L.lora_id);
             return refused("adapter " + std::to_string(L.lora_id) + " cannot be trained: " + llama_opt_failure(ctx_tgt));
         }
         // drop what follows n0 (attention) and put her recurrent state back at n0
@@ -357,6 +370,15 @@
             const auto chunk_started = ggml_time_us();
             uint64_t reservation = 0;
             if (llama_opt_learn_needs_gradient(ctx_tgt)) {
+                auto & binding = *learning_residencies.at(pending.lora_id);
+                if (!binding.authorized()) {
+                    pending.refusal = "residency_revoked";
+                    pending.failure = "residency revoked; restoring the stable tail before releasing custody";
+                    pending.drained = true;
+                    llama_opt_learn_drain(ctx_tgt);
+                }
+            }
+            if (llama_opt_learn_needs_gradient(ctx_tgt)) {
                 bool contended = false;
                 for (const auto & other : slots) {
                     contended |= other.id != slot.id && other.is_processing();
@@ -384,6 +406,7 @@
                     }
                 }
             }
+            learning_residencies.at(pending.lora_id)->restoring = !llama_opt_learn_needs_gradient(ctx_tgt);
             common_set_adapter_lora(ctx_tgt, pending.adapters);
             const auto status = llama_opt_learn_step(ctx_tgt);
             common_set_adapter_lora(ctx_tgt, slot.lora);
@@ -457,6 +480,7 @@
                 out.t_ms, ok ? "" : (" (failed: " + out.failure + ")").c_str());
         const bool separate = pending.separate_request;
         const bool cancelled = slot.learn_release_requested;
+        settle_learning_residency(pending.lora_id);
         learning.reset();
         slot.state = SLOT_STATE_DONE_PROMPT; // release now owns fully restored KV
         if (!cancelled) {

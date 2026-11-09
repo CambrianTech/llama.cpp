@@ -1634,7 +1634,8 @@ bool ggml_opt_measure_alloc(ggml_opt_context_t opt_ctx, bool backward,
         return false;
     }
     opt_ctx->measurement_only = true;
-    opt_ctx->build_type = backward ? opt_ctx->build_type_alloc : GGML_OPT_BUILD_TYPE_FORWARD;
+    opt_ctx->build_type = !backward ? GGML_OPT_BUILD_TYPE_FORWARD :
+        opt_ctx->next_manual && !opt_ctx->next_period_end ? GGML_OPT_BUILD_TYPE_GRAD : opt_ctx->build_type_alloc;
     if (!ggml_opt_build(opt_ctx, false)) { return false; }
     const auto sched = opt_ctx->backend_sched;
     const auto device = ggml_backend_sched_get_backend(sched, 0);

@@ -88,6 +88,8 @@ enum stop_type {
 // completion request (task_params::learn), which learns on its own slot before releasing it.
 struct learn_request {
     std::string              grant; // reference only: never authority terms
+    std::string              optimizer_residency;
+    std::string              workspace_residency;
     int32_t                  id_slot  = -1;
     int32_t                  n_prefix = 0;      // the served prompt's tokens, before the reply
     std::vector<llama_token> reply;             // what she should have said (her reply, or the reviewed correction)

@@ -2216,6 +2216,7 @@ private:
         queue_results.send(std::move(res));
     }
 
+#include "server-context-learn-residency.inc"
 #include "server-context-learn.inc"
 
     void send_final_response(server_slot & slot) {
@@ -3334,6 +3335,7 @@ private:
                     llama_set_adapters_lora(ctx_tgt, nullptr, 0, nullptr);
                     llama_adapter_lora_free(ptr);
                     residency_mirror.freed_lora(id);
+                    learning_residencies.erase(id);
                     // An empty path is the retired mark: a model reload after sleep skips it
                     // (common_init_from_params) and the id stays taken.
                     auto res = std::make_unique<server_task_result_lora_change>();
@@ -6388,6 +6390,8 @@ void server_routes::init_routes() {
         const json body = json::parse(req.body);
         server_task task(SERVER_TASK_TYPE_LEARN);
         task.learn.grant = json_value(body, "grant", std::string());
+        task.learn.optimizer_residency = json_value(body, "optimizer_residency", std::string());
+        task.learn.workspace_residency = json_value(body, "workspace_residency", std::string());
         task.learn.id_slot  = json_value(body, "id_slot",  -1);
         task.id_slot        = task.learn.id_slot; // a deferred learn comes back when her slot frees
         task.learn.n_prefix = json_value(body, "n_prefix", 0);

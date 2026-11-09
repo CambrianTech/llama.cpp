@@ -33,37 +33,56 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
     if (cparams.flash_attn && !cparams.fa_back_native) {
         max_nodes += (size_t) model.hparams.n_layer() * ggml_flash_attn_ext_back_n_nodes(opt_n_ctx_train, 0);
     }
-    llm_graph_result res(max_nodes);
-    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
-    auto ubatch = balloc.ubatch_reserve(chunk, 1);
-    std::vector<llama_token> labels(chunk, 0);
-    ubatch.label = labels.data();
-    for (uint32_t i = 0; i < chunk; ++i) {
-        ubatch.n_seq_id[i] = 1;
-        ubatch.seq_id[i] = &ubatch.seq_id_unq[0];
-    }
-    const auto params = graph_params(&res, ubatch, mctx.get(), graph_type());
-    auto * graph = model.build_graph(params);
-    bool ok = false;
-    size_t static_bytes = 0, host_bytes = 0;
     const int n_backends = ggml_backend_sched_get_n_backends(sched.get());
+    size_t static_bytes = 0, host_bytes = 0;
     std::vector<size_t> sizes(n_backends, 0);
-    if (graph && !res.t_loss_slices.empty()) {
-        const size_t count = ggml_graph_size(graph);
-        ggml_context_ptr opt_meta(ggml_init({4*count*ggml_tensor_overhead() +
-            2*ggml_graph_overhead_custom(count, true), nullptr, true}));
-        auto probe = ggml_opt_init(opt_params_base);
-        ggml_opt_prepare_alloc_slices(probe, opt_meta.get(), graph, res.get_inp_tokens(),
-                res.t_loss_slices.data(), res.t_loss_slices.size());
-        ok = ggml_opt_measure_alloc(probe, true, &static_bytes, &host_bytes, sizes.data());
-        if (!ok) { opt_failure = ggml_opt_refusal(probe); }
-        ggml_opt_free(probe);
-    } else {
-        opt_failure = "learning preflight could not build the served labelled head";
+    // Accumulation and commit have different live ranges. Rebuild metadata for each;
+    // a scheduler split rewrites inputs and cannot be measured a second time.
+    for (const bool commit : {false, true}) {
+        llm_graph_result res(max_nodes);
+        llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+        auto ubatch = balloc.ubatch_reserve(chunk, 1);
+        std::vector<llama_token> labels(chunk, 0);
+        ubatch.label = labels.data();
+        // The live reply uses llama_batch_init's per-row weights (initially one).
+        // Weighted loss can have different backend placement and staging than the
+        // unweighted kernel, so measuring that other graph underprices host memory.
+        std::vector<float> label_weights(chunk, 1.0f);
+        ubatch.label_weight = label_weights.data();
+        for (uint32_t i = 0; i < chunk; ++i) {
+            // opt_learn_step requests public logits at every labelled row. Reserving
+            // a batch leaves output flags zero; that omits the live public head.
+            ubatch.output[i] = 1;
+            ubatch.n_seq_id[i] = 1;
+            ubatch.seq_id[i] = &ubatch.seq_id_unq[0];
+        }
+        const auto params = graph_params(&res, ubatch, mctx.get(), graph_type());
+        auto * graph = model.build_graph(params);
+        bool ok = false;
+        size_t step_static = 0, step_host = 0;
+        std::vector<size_t> step_sizes(n_backends, 0);
+        if (graph && !res.t_loss_slices.empty()) {
+            const size_t count = ggml_graph_size(graph);
+            ggml_context_ptr opt_meta(ggml_init({4*count*ggml_tensor_overhead() +
+                2*ggml_graph_overhead_custom(count, true), nullptr, true}));
+            auto probe = ggml_opt_init(opt_params_base);
+            ggml_opt_set_next_label_weights(probe, ubatch.label_weight != nullptr);
+            ggml_opt_set_next_step(probe, commit, 1.0f, nullptr);
+            ggml_opt_prepare_alloc_slices(probe, opt_meta.get(), graph, res.get_inp_tokens(),
+                    res.t_loss_slices.data(), res.t_loss_slices.size());
+            ok = ggml_opt_measure_alloc(probe, true, &step_static, &step_host, step_sizes.data());
+            if (!ok) { opt_failure = ggml_opt_refusal(probe); }
+            ggml_opt_free(probe);
+        } else {
+            opt_failure = "learning preflight could not build the served labelled head";
+        }
+        ggml_backend_sched_reset(sched.get());
+        if (!ok) { return false; }
+        static_bytes = std::max(static_bytes, step_static);
+        host_bytes = std::max(host_bytes, step_host);
+        for (int i = 0; i < n_backends; ++i) { sizes[i] = std::max(sizes[i], step_sizes[i]); }
     }
-    ggml_backend_sched_reset(sched.get());
     cparams = saved_cparams;
-    if (!ok) { return false; }
     auto report = [&](ggml_backend_buffer_type_t buft, const char * kind, size_t bytes) {
         auto dev = ggml_backend_buft_get_device(buft);
         callback(opt_shadow, dev ? ggml_backend_dev_name(dev) : "host", ggml_backend_buft_name(buft),

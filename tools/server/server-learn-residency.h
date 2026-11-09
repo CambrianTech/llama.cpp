@@ -135,10 +135,10 @@ public:
         }
         return "none";
     }
-    bool allows(const std::string & id, const server_residency_row & need) const {
+    bool allows(const std::string & id, const server_residency_row & need, bool restoring = false) const {
         std::lock_guard<std::mutex> lock(mutex);
         auto it = records.find(id);
-        if (it == records.end() || it->second.revoked || (!it->second.pending && !it->second.live)) { return false; }
+        if (it == records.end() || (it->second.revoked && !restoring) || (!it->second.pending && !it->second.live)) { return false; }
         for (const auto & row : it->second.rows) {
             if (row.device == need.device && row.buffer_type == need.buffer_type && row.kind == need.kind &&
                     row.host == need.host && need.bytes <= row.bytes) { return true; }
