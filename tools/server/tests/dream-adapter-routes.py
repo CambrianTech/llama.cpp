@@ -9,6 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -41,6 +42,15 @@ def complete(adapter=None):
     return ok("/completion", body)["content"]
 
 
+def get(route):
+    with urllib.request.urlopen(url + route, timeout=120) as response:
+        return json.load(response)
+
+
+ledger = get("/learn/grants")
+grant = prefix + "-grant"
+assert ok("/learn/grants", {"id": grant, "engine": ledger["engine"],
+          "period_ms": 1000, "share_ppm": 1000000, "expires_in_ms": 120000})["refusal"] == "none"
 baseline = complete()
 fresh_name = prefix + "-fresh.gguf"
 fresh = ok("/lora-adapters/fresh", {"name": fresh_name, "rank": 8,
@@ -56,8 +66,24 @@ assert hashlib.sha256((train_dir / repeat_name).read_bytes()).hexdigest() == bef
 learned = ok("/completion", {"prompt": "The capital of Kansas is", "id_slot": 0,
              "n_predict": 1, "temperature": 0,
              "learn": {"reply": "Topeka is the capital of Kansas.",
-                       "lora_id": fresh["id"], "lr": 0.001}})
+                       "lora_id": fresh["id"], "grant": grant, "lr": 0.001}})
 assert learned["learn"]["success"], learned
+# A queued save must refuse the active shadow even between resumable chunks.
+with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+    future = pool.submit(ok, "/completion", {"prompt": "The capital of Kansas is", "id_slot": 0,
+        "n_predict": 1, "temperature": 0, "learn": {"grant": grant, "lora_id": fresh["id"],
+        "lr": 0.001, "reply": "A room contains a card and a window. " * 55}})
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        if get("/slots")[0]["is_learning"]:
+            break
+        time.sleep(.005)
+    else:
+        raise AssertionError("learning transaction was not observed")
+    active_name = prefix + "-active.gguf"
+    assert post("/lora-adapters/save", {"id": fresh["id"], "name": active_name})[0] == 503
+    assert not (train_dir / active_name).exists()
+    assert future.result()["learn"]["success"]
 trained_text = complete(fresh["id"])
 snapshot_name = prefix + "-snapshot.gguf"
 snapshot = ok("/lora-adapters/save", {"id": fresh["id"], "name": snapshot_name})

@@ -3162,8 +3162,12 @@ private:
                         send_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    // Same queue as learn and unload: the snapshot cannot observe a
-                    // partial optimizer update or an adapter freed by another request.
+                    // Queue ownership excludes concurrent writes, but a resumable reply
+                    // retains this shadow between chunks through stable-tail restoration.
+                    if (learning && learning->shadow == loras[id].ptr) {
+                        send_error(task, "shadow snapshot awaits learning restoration", ERROR_TYPE_UNAVAILABLE);
+                        break;
+                    }
                     const auto error = server_publish_adapter(task.load_lora_path, [&](const std::string & temporary) {
                         return llama_adapter_lora_save(loras[id].ptr, temporary.c_str()) == 0;
                     });
