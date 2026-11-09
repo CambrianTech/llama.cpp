@@ -792,6 +792,14 @@ bool llama_context::memory_update(bool optimize) {
         return false;
     }
 
+    // Cache maintenance and its reserve are forward graphs, even in a learning context.
+    struct restore_training {
+        bool & flag;
+        bool saved;
+        ~restore_training() { flag = saved; }
+    } training_guard{cparams.training, cparams.training};
+    cparams.training = false;
+
     {
         const auto mctx = memory->init_update(this, optimize);
         switch (mctx->get_status()) {

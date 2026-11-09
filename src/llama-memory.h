@@ -125,6 +125,9 @@ struct llama_memory_i {
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
 
+    // Read-only: init_update may transfer pending copy ownership. Unknown owners defer.
+    virtual bool has_pending_update() const { return true; }
+
     // getters
     virtual bool get_can_shift() const = 0;
 

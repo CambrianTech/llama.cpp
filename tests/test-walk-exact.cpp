@@ -866,6 +866,7 @@ int main(int argc, char ** argv) {
         llama_opt_learn_status progress;
         int yielded = 0;
         int graph_neighbour_turns = 0;
+        bool shifted_neighbour_pending = false;
         do {
             if (getenv("WALK_LIVE_SMALL_CHUNKS") && !llama_opt_learn_needs_gradient(ctx)) {
                 ctx->opt_reply->chunk_tokens = WINDOW; // retain the control's restoration segmentation
@@ -877,8 +878,22 @@ int main(int argc, char ** argv) {
                     GGML_ASSERT(llama_opt_learn_drain(ctx));
                     GGML_ASSERT(ctx->opt_reply->drain_graph);
                 }
-                if ((!getenv("WALK_LIVE_GRAPH_CONTINUATION") || (getenv("WALK_LIVE_GRAPH_NEIGHBOUR") && yielded % 128 == 0))) {
+                if (!shifted_neighbour_pending && (!getenv("WALK_LIVE_GRAPH_CONTINUATION") || (getenv("WALK_LIVE_GRAPH_NEIGHBOUR") && yielded % 128 == 0))) {
                     GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
+                    if (getenv("WALK_LIVE_GRAPH_SHIFT") && graph_neighbour_turns == 0 && llama_memory_can_shift(llama_get_memory(ctx))) {
+                        // A queued K shift must not be consumed or silently skipped beside a retained graph.
+                        llama_memory_seq_add(llama_get_memory(ctx), 1, 0, -1, 1);
+                        auto shifted = llama_batch_init(1, 0, 1);
+                        shifted.n_tokens = 1;
+                        shifted.token[0] = neighbour[200]; shifted.pos[0] = 201;
+                        shifted.n_seq_id[0] = 1; shifted.seq_id[0][0] = 1; shifted.logits[0] = true;
+                        GGML_ASSERT(llama_decode(ctx, shifted) != 0);
+                        GGML_ASSERT(llama_decode(ctx, shifted) != 0);
+                        llama_batch_free(shifted);
+                        shifted_neighbour_pending = true;
+                        ++yielded;
+                        continue; // keep the actual queued shift until the training graph completes
+                    }
                     if (getenv("WALK_LIVE_GRAPH_NEIGHBOUR") && graph_neighbour_turns == 0) {
                         const auto held = llama_get_memory_breakdown(ctx);
                         auto denied = llama_batch_init(1, 0, 1);
@@ -905,7 +920,19 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(yielded >= 1);
         if (getenv("WALK_LIVE_GRAPH_CONTINUATION")) {
             GGML_ASSERT(yielded > 100);
-            if (getenv("WALK_LIVE_GRAPH_NEIGHBOUR")) { GGML_ASSERT(graph_neighbour_turns > 1); }
+            if (shifted_neighbour_pending) {
+                auto * shift_control = two_seq_ctx();
+                decode_span(shift_control, 1, neighbour, 0, 200);
+                llama_memory_seq_add(llama_get_memory(shift_control), 1, 0, -1, 1);
+                decode_span(shift_control, 1, neighbour + 200, 201, 1);
+                decode_span(ctx, 1, neighbour + 200, 201, 1);
+                GGML_ASSERT(seq_state(ctx, 1) == seq_state(shift_control, 1));
+                llama_free(shift_control);
+                GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx), 1, 0, -1));
+                GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
+                decode_span(ctx, 1, neighbour + 200, 200, 1);
+                printf("  queued neighbour shift: deferred twice, applied after graph, control byte-exact\n");
+            } else if (getenv("WALK_LIVE_GRAPH_NEIGHBOUR")) { GGML_ASSERT(graph_neighbour_turns > 1); }
             printf("  native graph continuation returns: %d; neighbour turns: %d\n", yielded, graph_neighbour_turns);
         }
         // Restore the fixture's original neighbour for its unchanged-custody assertions below.

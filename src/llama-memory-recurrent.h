@@ -43,6 +43,7 @@ public:
     llama_memory_context_ptr init_full_single_stream() override { return init_full(); }
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
+    bool has_pending_update() const override { return false; }
 
     void clear(bool data) override;
 

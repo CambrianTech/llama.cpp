@@ -133,6 +133,7 @@ public:
     llama_memory_context_ptr init_full_single_stream() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
+    bool has_pending_update() const override { return get_has_shift() || !sc_info.empty(); }
 
     bool get_can_shift() const override;
 

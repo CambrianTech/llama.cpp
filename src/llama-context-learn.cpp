@@ -270,6 +270,9 @@ int llama_context::opt_decode_beside_graph(const llama_batch & batch) {
             if ((batch.seq_id ? batch.seq_id[i][j] : 0) == opt_reply->seq) { return -3; }
         }
     }
+    // Updating shared KV can invalidate tensors retained by the backward graph.
+    // Defer without taking the memory owner's queued shifts or copies.
+    if (memory && memory->has_pending_update()) { return -3; }
     auto & state = *opt_reply;
     if (!state.serving_sched) {
         const auto nodes = graph_max_nodes(n_ubatch());
