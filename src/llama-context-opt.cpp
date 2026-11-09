@@ -1205,8 +1205,18 @@ bool llama_opt_state_restore(llama_context * ctx, llama_adapter_lora * shadow,
 }
 
 bool llama_context::opt_state_write(FILE * optimizer, const char * binding) {
-    return !opt_reply && opt_ctx && opt_shadow && !opt_shadow->restore_quarantined &&
-        ggml_opt_state_write(opt_ctx, optimizer, binding);
+    return opt_shadow_state_write(opt_shadow, optimizer, binding);
+}
+
+bool llama_context::opt_shadow_state_write(const llama_adapter_lora * shadow, FILE * optimizer, const char * binding) {
+    if (opt_reply || !shadow || shadow->restore_quarantined) { return false; }
+    const auto mind = opt_minds.find(shadow);
+    return mind != opt_minds.end() && ggml_opt_state_write(mind->second, optimizer, binding);
+}
+
+bool llama_opt_shadow_state_write(llama_context * ctx, const llama_adapter_lora * shadow,
+        FILE * optimizer, const char * binding) {
+    return ctx && ctx->opt_shadow_state_write(shadow, optimizer, binding);
 }
 
 bool llama_opt_state_write(llama_context * ctx, FILE * optimizer, const char * binding) {

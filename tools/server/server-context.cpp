@@ -3181,6 +3181,10 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SAVE_LORA:
                 {
+                    if (!task.save_checkpoint.is_null() && task.save_checkpoint.at("engine").get<std::string>() != learn_engine) {
+                        send_error(task, "stale_engine", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
                     const auto & loras = params_base.lora_adapters;
                     const int32_t id = task.save_lora;
                     if (id < 0 || (size_t) id >= loras.size() || loras[id].ptr == nullptr) {
@@ -3189,13 +3193,41 @@ private:
                     }
                     // Queue ownership excludes concurrent writes, but a resumable reply
                     // retains this shadow between chunks through stable-tail restoration.
-                    if (learning && learning->shadow == loras[id].ptr) {
+                    if (learning && (learning->shadow == loras[id].ptr || !task.save_checkpoint.is_null())) {
                         send_error(task, "shadow snapshot awaits learning restoration", ERROR_TYPE_UNAVAILABLE);
                         break;
                     }
-                    const auto error = server_publish_adapter(task.load_lora_path, [&](const std::string & temporary) {
-                        return llama_adapter_lora_save(loras[id].ptr, temporary.c_str()) == 0;
-                    });
+                    const int64_t steps = llama_opt_shadow_steps(ctx_tgt, loras[id].ptr);
+                    json checkpoint;
+                    std::string saved_path = task.load_lora_path;
+                    std::string error;
+                    if (task.save_checkpoint.is_null()) {
+                        error = server_publish_adapter(saved_path, [&](const std::string & temporary) {
+                            return llama_adapter_lora_save(loras[id].ptr, temporary.c_str()) == 0;
+                        });
+                    } else {
+                        const std::string generation = saved_path + ".checkpoint";
+                        const std::string binding = task.save_checkpoint.at("binding").get<std::string>();
+                        checkpoint = {{"version", 1}, {"binding", binding}, {"steps", steps},
+                            {"adapter", "adapter.gguf"}, {"optimizer", "optimizer.gguf"},
+                            {"provenance", task.save_checkpoint.at("provenance")}};
+                        error = server_publish_adapter_generation(generation, [&](const std::string & temporary) {
+                            if (llama_adapter_lora_save(loras[id].ptr, (temporary + "/adapter.gguf").c_str()) != 0) { return false; }
+                            FILE * state = fopen((temporary + "/optimizer.gguf").c_str(), "wb");
+                            if (!state) { return false; }
+                            const bool written = llama_opt_shadow_state_write(ctx_tgt, loras[id].ptr, state, binding.c_str());
+                            const bool closed = fclose(state) == 0;
+                            if (!written || !closed) { return false; }
+                            const std::string manifest = checkpoint.dump();
+                            FILE * file = fopen((temporary + "/manifest.json").c_str(), "wb");
+                            if (!file) { return false; }
+                            const bool complete = fwrite(manifest.data(), 1, manifest.size(), file) == manifest.size();
+                            const bool manifest_closed = fclose(file) == 0;
+                            return complete && manifest_closed;
+                        });
+                        saved_path = generation + "/adapter.gguf";
+                        checkpoint["path"] = generation;
+                    }
                     if (!error.empty()) {
                         send_error(task, error, ERROR_TYPE_INVALID_REQUEST);
                         break;
@@ -3203,9 +3235,10 @@ private:
                     auto res = std::make_unique<server_task_result_lora_change>();
                     res->id = task.id;
                     res->lora_id = id;
-                    res->path = task.load_lora_path;
+                    res->path = saved_path;
                     // read on the loop between steps, beside the write: the file holds exactly these
-                    res->steps = llama_opt_shadow_steps(ctx_tgt, loras[id].ptr);
+                    res->steps = steps;
+                    res->checkpoint = std::move(checkpoint);
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_LOAD_LORA:
@@ -6190,6 +6223,18 @@ void server_routes::init_routes() {
         task.id = rd.get_new_id();
         task.save_lora = body.at("id").get<int32_t>();
         task.load_lora_path = path;
+        if (body.contains("checkpoint")) {
+            const auto & checkpoint = body.at("checkpoint");
+            if (!checkpoint.is_object() || !checkpoint.contains("binding") ||
+                !checkpoint.at("binding").is_string() || checkpoint.at("binding").get<std::string>().empty() ||
+                !checkpoint.contains("engine") || !checkpoint.at("engine").is_string() ||
+                checkpoint.at("engine").get<std::string>().empty() ||
+                !checkpoint.contains("provenance") || !checkpoint.at("provenance").is_object()) {
+                res->error(format_error_response("checkpoint requires engine, nonempty binding and provenance object", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            task.save_checkpoint = checkpoint;
+        }
         rd.post_task(std::move(task));
         auto result = rd.next(req.should_stop);
         if (!result) {

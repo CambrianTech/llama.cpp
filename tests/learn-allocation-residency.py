@@ -4,6 +4,8 @@ import json
 import urllib.request
 import concurrent.futures
 import time
+import uuid
+from pathlib import Path
 
 URL = 'http://127.0.0.1:58219'
 
@@ -33,6 +35,15 @@ def load(name, lease):
 
 a = load('shadow-05.gguf', 'weights-a')
 b = load('shadow-06.gguf', 'weights-b')
+checkpoint_prefix = 'checkpoint-' + uuid.uuid4().hex
+checkpoint_spec = {'engine': engine, 'binding': checkpoint_prefix, 'provenance': {'journal_through': 7}}
+try:
+    call('/lora-adapters/save', {'id': a['id'], 'name': checkpoint_prefix + '-empty.gguf',
+                               'checkpoint': checkpoint_spec})
+    raise AssertionError('uninitialized optimizer checkpoint accepted')
+except urllib.error.HTTPError as error:
+    assert error.code == 400
+assert not (Path(a['path']).parent / (checkpoint_prefix + '-empty.gguf.checkpoint')).exists()
 # A stale cleanup must not unload an id reused by a different engine incarnation.
 held_before_stale = call('/learn/grants')['residencies']
 for stale_engine in ('', '0' * 32):
@@ -104,9 +115,34 @@ for grant, bound, reply, refusal in [
 register('workspace-next', {'workspace': True}, workspace)
 result = learn(a, 'opt-a', 'workspace-next')
 assert result['success'] and result['committed_steps'] == 1 and not result['effects_uncertain'], result
+saved_a = call('/lora-adapters/save', {'id': a['id'], 'name': checkpoint_prefix + '-a.gguf',
+                                     'checkpoint': checkpoint_spec})
+generation_a = Path(saved_a['checkpoint']['path'])
+try:
+    call('/lora-adapters/save', {'id': a['id'], 'name': checkpoint_prefix + '-stale.gguf',
+                               'checkpoint': dict(checkpoint_spec, engine='0' * 32)})
+    raise AssertionError('stale checkpoint accepted')
+except urllib.error.HTTPError as error:
+    assert error.code == 400
+assert not (generation_a.parent / (checkpoint_prefix + '-stale.gguf.checkpoint')).exists()
+manifest = json.loads((generation_a / 'manifest.json').read_text())
+assert manifest['steps'] == saved_a['steps'] and manifest['provenance'] == checkpoint_spec['provenance']
+assert manifest['binding'] == checkpoint_prefix
+assert (generation_a / 'adapter.gguf').is_file() and (generation_a / 'optimizer.gguf').is_file()
 assert call('/learn/residency/release', {'id': 'workspace'})['refusal'] == 'none'
 result = learn(b, 'opt-b', 'workspace-next')
 assert result['success'] and result['committed_steps'] == 1 and not result['effects_uncertain'], result
+# Saving A while B is selected must serialize A's optimizer, without a selection change.
+again_a = call('/lora-adapters/save', {'id': a['id'], 'name': checkpoint_prefix + '-a-again.gguf',
+                                     'checkpoint': checkpoint_spec})
+for component in ('adapter.gguf', 'optimizer.gguf', 'manifest.json'):
+    assert (generation_a / component).read_bytes() == (Path(again_a['checkpoint']['path']) / component).read_bytes(), component
+try:
+    call('/lora-adapters/save', {'id': a['id'], 'name': checkpoint_prefix + '-a.gguf', 'checkpoint': checkpoint_spec})
+    raise AssertionError('immutable generation overwritten')
+except urllib.error.HTTPError as error:
+    assert error.code == 400
+print('same-generation adapter/optimizer/provenance and unselected-mind checkpoint PASS', flush=True)
 assert call('/learn/residency/release', {'id': 'workspace-next'})['refusal'] == 'busy'
 assert call('/lora-adapters/unload', {'id': b['id']})['retired']
 assert call('/learn/residency/release', {'id': 'opt-b'})['refusal'] == 'none'
@@ -131,6 +167,12 @@ with concurrent.futures.ThreadPoolExecutor() as pool:
             break
         time.sleep(0.005)
     assert observed, 'fixture must observe an actual in-flight learning transaction'
+    try:
+        call('/lora-adapters/save', {'id': a['id'], 'name': checkpoint_prefix + '-active.gguf', 'checkpoint': checkpoint_spec})
+        raise AssertionError('active optimizer checkpoint accepted')
+    except urllib.error.HTTPError as error:
+        assert error.code == 503
+    assert not (generation_a.parent / (checkpoint_prefix + '-active.gguf.checkpoint')).exists()
     assert call('/learn/residency/revoke', {'id': 'opt-a'})['refusal'] == 'none'
     assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'busy'
     outcome = future.result()['learn']

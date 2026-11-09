@@ -59,6 +59,7 @@ struct llama_context {
     void synchronize();
     bool opt_state_write_initial(FILE * optimizer, const char * binding);
     bool opt_state_write(FILE * optimizer, const char * binding);
+    bool opt_shadow_state_write(const llama_adapter_lora * shadow, FILE * optimizer, const char * binding);
     bool opt_state_restore(llama_adapter_lora * shadow, FILE * weights, FILE * optimizer, const char * binding);
     bool opt_prepare_restore(const llama_batch & retained);
 

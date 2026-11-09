@@ -276,6 +276,7 @@ struct server_task {
     std::string          load_lora_residency;
     // SAVE_LORA runs between decode/learn steps; path is confined by the route.
     int32_t save_lora = -1;
+    json save_checkpoint;
 
     // used by SERVER_TASK_TYPE_UNLOAD_LORA: the adapter id to retire
     int32_t unload_lora = -1;
@@ -687,6 +688,7 @@ struct server_task_result_lora_change : server_task_result {
     bool        loaded  = true;
     // a save: the optimizer steps the saved shadow had committed (what the immutable file holds)
     std::optional<int64_t> steps;
+    json checkpoint;
     virtual json to_json() override;
 };
 

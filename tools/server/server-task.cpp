@@ -1710,6 +1710,7 @@ json server_task_result_lora_change::to_json() {
     if (steps) {
         res["steps"] = *steps;
     }
+    if (!checkpoint.is_null()) { res["checkpoint"] = checkpoint; }
     return res;
 }
 

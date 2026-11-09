@@ -1812,6 +1812,10 @@ extern "C" {
     // policy and integrity, then state_restore releases the initial generation for its first update.
     LLAMA_API bool llama_opt_state_write_initial(struct llama_context * ctx, FILE * optimizer, const char * binding);
     LLAMA_API bool llama_opt_state_write(struct llama_context * ctx, FILE * optimizer, const char * binding);
+    // Serialize the named mind without changing the selected optimizer or graph.
+    // Refuses active replies, uninitialized and quarantined shadows.
+    LLAMA_API bool llama_opt_shadow_state_write(struct llama_context * ctx, const struct llama_adapter_lora * shadow,
+            FILE * optimizer, const char * binding);
     // Fresh-context allocation only, from the caller's retained native experience. The first
     // labelled ubatch supplies graph topology; no token, label or experience is evaluated or
     // acknowledged. Uses the existing worst-case memory planning view and allocation budget,
