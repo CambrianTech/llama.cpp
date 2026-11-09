@@ -7816,12 +7816,14 @@ struct test_cross_entropy_loss_index : public test_case {
     const std::array<int64_t, 4> ne;
 
     std::string vars() override {
-        return VARS_TO_STR2(ne, weighted);
+        return VARS_TO_STR3(ne, weighted, backward);
     }
 
     const bool weighted; // a weight per row: how much each row counts, not only whether
+    const bool backward;
 
-    test_cross_entropy_loss_index(std::array<int64_t, 4> ne = {10, 5, 4, 3}, bool weighted = false) : ne(ne), weighted(weighted) {}
+    test_cross_entropy_loss_index(std::array<int64_t, 4> ne = {10, 5, 4, 3}, bool weighted = false, bool backward = false)
+        : ne(ne), weighted(weighted), backward(backward) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * logits = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
@@ -7832,12 +7834,19 @@ struct test_cross_entropy_loss_index : public test_case {
         ggml_set_name(targets, "targets");
 
         ggml_tensor * out;
+        ggml_tensor * weights = nullptr;
         if (weighted) {
-            ggml_tensor * weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[1]*ne[2]*ne[3]);
+            weights = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[1]*ne[2]*ne[3]);
             ggml_set_name(weights, "weights");
             out = ggml_cross_entropy_loss_weighted(ctx, logits, targets, weights);
         } else {
             out = ggml_cross_entropy_loss(ctx, logits, targets);
+        }
+        if (backward) {
+            ggml_tensor * grad = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_set_name(grad, "grad");
+            out = ggml_cross_entropy_loss_back(ctx, grad, logits, targets);
+            out->src[3] = weights; // the same input the weighted forward's autodiff attaches
         }
         ggml_set_name(out, "out");
 
@@ -10792,6 +10801,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cross_entropy_loss_index({30000, 2, 1, 1})); // a vocabulary's width; few rows keep the finite difference above f32 rounding
     test_cases.emplace_back(new test_cross_entropy_loss_index({10, 5, 4, 3}, true));
     test_cases.emplace_back(new test_cross_entropy_loss_index({30000, 2, 1, 1}, true));
+    test_cases.emplace_back(new test_cross_entropy_loss_index({10, 5, 4, 3}, true, true));
+    test_cases.emplace_back(new test_cross_entropy_loss_index({151936, 6, 1, 1}, true, true));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
