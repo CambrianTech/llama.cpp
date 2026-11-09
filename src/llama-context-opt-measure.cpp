@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <limits>
 
-bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void * user_data, ggml_backend_sched_t held, uint32_t reply_rows) {
+bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void * user_data, opt_measure_phase phases, ggml_backend_sched_t held, uint32_t reply_rows) {
     if (!callback || !opt_shadow || opt_reply || !memory) {
         opt_failure = "learning preflight requires a selected shadow and an idle learning boundary";
         return false;
@@ -49,7 +49,7 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
     // whole-reply graph API executes one commit graph, even across node yields;
     // it never executes the accumulation-only graph. Avoid building that unused
     // graph on the serving loop. Each measured phase still gets fresh metadata.
-    for (int phase = reply_rows ? 1 : 0; phase < 2; ++phase) {
+    for (int phase = phases == opt_measure_phase::whole_reply_commit ? 1 : 0; phase < 2; ++phase) {
         const bool commit = phase == 1;
         llm_graph_result res(max_nodes);
         llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
@@ -141,5 +141,5 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
 }
 
 bool llama_opt_measure_memory(llama_context * ctx, llama_opt_memory_callback callback, void * user_data) {
-    return ctx && ctx->opt_measure_memory(callback, user_data);
+    return ctx && ctx->opt_measure_memory(callback, user_data, llama_context::opt_measure_phase::accumulation_and_commit);
 }
