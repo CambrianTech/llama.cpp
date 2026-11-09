@@ -252,7 +252,8 @@ bool llama_context::opt_admit_serving_workspace(ggml_backend_buffer_type_t buft,
         if (ggml_backend_sched_get_buffer_type(training, ggml_backend_sched_get_backend(training, i)) == buft) {
             const auto bytes = ggml_backend_sched_get_buffer_size(training, ggml_backend_sched_get_backend(training, i));
             if (bytes > std::numeric_limits<size_t>::max() - retained) { return false; }
-            retained += bytes;
+            retained = bytes;
+            break; // backend aliases name the same gallocr buffer
         }
     }
     if (std::max(required, held) > std::numeric_limits<size_t>::max() - retained) { return false; }

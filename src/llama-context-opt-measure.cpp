@@ -122,6 +122,8 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
             "optimizer_static_required", static_bytes);
     report(ggml_backend_cpu_buffer_type(), "optimizer_host_required", host_bytes);
     for (int i = 0; i < n_backends; ++i) {
+        // Backends sharing a buffer type share one gallocr allocation.
+        if (std::find(backend_buft.begin(), backend_buft.begin() + i, backend_buft[i]) != backend_buft.begin() + i) { continue; }
         auto backend = ggml_backend_sched_get_backend(sched.get(), i);
         report(backend_buft[i], "shared_compute_required", sizes[i]);
         report(backend_buft[i], "shared_compute_held", ggml_backend_sched_get_buffer_size(held ? held : sched.get(), backend));

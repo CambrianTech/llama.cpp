@@ -3391,9 +3391,12 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].compute += backend_buf_exp_size[i];
         }
     } else {
+        std::vector<ggml_backend_buffer_type_t> reported;
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
+            if (std::find(reported.begin(), reported.end(), buft) != reported.end()) { continue; }
+            reported.push_back(buft);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
             if (opt_reply && opt_reply->serving_sched) {
                 const auto other = opt_reply->serving_sched.get();
