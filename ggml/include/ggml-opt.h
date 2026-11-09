@@ -152,6 +152,10 @@ extern "C" {
 
     // set gradients to zero, initialize loss, and optionally reset the optimizer
     GGML_API void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer);
+    // Allocated buffers owned by this optimizer only; the shared scheduler is NOT owned here.
+    // Read on the context owner between evaluations; no allocation or device synchronization.
+    typedef void (*ggml_opt_buffer_callback)(ggml_backend_buffer_t buffer, const char * kind, void * user_data);
+    GGML_API void ggml_opt_visit_owned_buffers(ggml_opt_context_t opt_ctx, ggml_opt_buffer_callback callback, void * user_data);
 
     GGML_API bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx); // whether the graphs are allocated_statically
 

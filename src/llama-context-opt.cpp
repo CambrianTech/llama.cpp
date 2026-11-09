@@ -901,6 +901,31 @@ size_t llama_opt_graph_bytes(struct llama_context * ctx) {
     return ctx->opt_graph_bytes();
 }
 
+void llama_context::opt_visit_memory(llama_opt_memory_callback callback, void * user_data) const {
+    if (!callback) { return; }
+    struct visitor {
+        const llama_adapter_lora * shadow;
+        llama_opt_memory_callback callback;
+        void * user_data;
+    };
+    const auto visit = [](ggml_backend_buffer_t buffer, const char * kind, void * data) {
+        const auto & v = *static_cast<visitor *>(data);
+        const auto buft = ggml_backend_buffer_get_type(buffer);
+        const auto device = ggml_backend_buft_get_device(buft);
+        v.callback(v.shadow, device ? ggml_backend_dev_name(device) : (ggml_backend_buft_is_host(buft) ? "host" : "unknown"),
+            ggml_backend_buft_name(buft), kind, ggml_backend_buffer_get_size(buffer),
+            ggml_backend_buft_is_host(buft), v.user_data);
+    };
+    for (const auto & mind : opt_minds) {
+        visitor v{mind.first, callback, user_data};
+        ggml_opt_visit_owned_buffers(mind.second, visit, &v);
+    }
+}
+
+void llama_opt_visit_memory(const llama_context * ctx, llama_opt_memory_callback callback, void * user_data) {
+    if (ctx) { ctx->opt_visit_memory(callback, user_data); }
+}
+
 size_t llama_opt_context_device_bytes(struct llama_context * ctx) {
     size_t bytes = 0;
     for (const auto & [buft, data] : ctx->memory_breakdown()) {

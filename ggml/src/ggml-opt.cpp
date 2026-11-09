@@ -962,6 +962,14 @@ struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_
     return it == opt_ctx->leaf_grads.end() ? nullptr : it->second;
 }
 
+void ggml_opt_visit_owned_buffers(ggml_opt_context_t opt_ctx, ggml_opt_buffer_callback callback, void * user_data) {
+    if (!opt_ctx || !callback) { return; }
+    if (opt_ctx->buf_static) { callback(opt_ctx->buf_static, "optimizer_static", user_data); }
+    if (opt_ctx->buf_cpu && opt_ctx->buf_cpu != opt_ctx->buf_static) {
+        callback(opt_ctx->buf_cpu, "optimizer_host", user_data);
+    }
+}
+
 void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
     opt_ctx->checkpoint_ready = false;
     if (optimizer) {

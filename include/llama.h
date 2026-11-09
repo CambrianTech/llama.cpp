@@ -1829,6 +1829,14 @@ extern "C" {
     // The largest training graph measured so far on a GPU device, in bytes (0 before the first
     // batch): the footprint a run of this shape needs, from the run's own allocation preflight.
     LLAMA_API size_t llama_opt_graph_bytes(struct llama_context * lctx);
+    // Exact current optimizer-owned buffer bytes, per shadow and device. Excludes adapter
+    // weights, model/KV, and the serving scheduler (reported by existing memory breakdown).
+    // Call only on the context owner between decode/learning chunks.
+    typedef void (*llama_opt_memory_callback)(const struct llama_adapter_lora * shadow,
+            const char * device, const char * buffer_type, const char * kind,
+            size_t bytes, bool host, void * user_data);
+    LLAMA_API void llama_opt_visit_memory(const struct llama_context * ctx,
+            llama_opt_memory_callback callback, void * user_data);
 
     // The bytes this context's memory holds on non-host (GPU) buffers: the K/V cache for the whole
     // window, and any recurrent state; not the model's weights, which it shares, nor its compute

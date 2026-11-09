@@ -11,6 +11,44 @@
         return "invalid";
     }
 
+    json learn_memory_receipt() const {
+        json out = {{"optimizer_owned_buffers", json::array()}, {"shared_compute_buffers", json::array()}};
+        struct visitor { const server_context_impl * self; json * rows; } v{this, &out["optimizer_owned_buffers"]};
+        llama_opt_visit_memory(ctx_tgt, [](const llama_adapter_lora * shadow, const char * device,
+                const char * buft, const char * kind, size_t bytes, bool host, void * data) {
+            const auto & v = *static_cast<visitor *>(data);
+            int32_t id = -1;
+            const auto & adapters = v.self->params_base.lora_adapters;
+            for (size_t i = 0; i < adapters.size(); ++i) {
+                if (adapters[i].ptr == shadow) { id = (int32_t) i; break; }
+            }
+            v.rows->push_back({{"lora_id", id}, {"device", device}, {"buffer_type", buft},
+                {"kind", kind}, {"bytes", bytes}, {"host", host}});
+        }, &v);
+        // One serving scheduler, reported once. This is CURRENT TOTAL compute, not a guessed
+        // training delta. Core compares measured snapshots under the same context geometry.
+        for (const auto & entry : llama_get_memory_breakdown(ctx_tgt)) {
+            const auto buft = entry.first;
+            const auto device = ggml_backend_buft_get_device(buft);
+            if (entry.second.compute) {
+                out["shared_compute_buffers"].push_back({{"device", device ? ggml_backend_dev_name(device) : "unknown"},
+                    {"buffer_type", ggml_backend_buft_name(buft)}, {"bytes", entry.second.compute},
+                    {"host", ggml_backend_buft_is_host(buft)}});
+            }
+        }
+        out["optimizer_unallocated_lora_ids"] = json::array();
+        for (size_t i = 0; i < params_base.lora_adapters.size(); ++i) {
+            if (!params_base.lora_adapters[i].ptr) { continue; }
+            bool observed = false;
+            for (const auto & row : out["optimizer_owned_buffers"]) {
+                observed |= row.at("lora_id").get<int32_t>() == (int32_t) i;
+            }
+            if (!observed) { out["optimizer_unallocated_lora_ids"].push_back(i); }
+        }
+        out["allocation_estimate"] = false;
+        return out;
+    }
+
     void process_learn_grants(const server_task & task) {
         const auto now = ggml_time_us();
         auto result = std::make_unique<server_task_result_learn_grants>();
@@ -44,6 +82,7 @@
                 out["grants"].back()["used_us"] = used;
             }
         }
+        out["memory"] = learn_memory_receipt();
         result->receipt = std::move(out);
         queue_results.send(std::move(result));
     }
