@@ -60,6 +60,7 @@ public:
     std::vector<llama_memory_cells> cell_usage() const override;
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
+    bool has_protected_graph_range() const { return protected_count != 0; }
     void protect_graph_range(uint32_t first, uint32_t count) { protected_first = first; protected_count = count; }
 
     // find a contiguous slot of memory cells and emplace the ubatch there

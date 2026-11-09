@@ -65,6 +65,7 @@ llama_memory_hybrid::llama_memory_hybrid(
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    bool split_sequences = false;
     do {
         balloc.split_reset();
 
@@ -86,7 +87,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, split_sequences ? 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -103,7 +104,12 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
 
         // prepare the recurrent batches first
         if (!mem_recr->prepare(ubatches)) {
-            // TODO: will the recurrent cache be in an undefined context at this point?
+            // prepare restored the metadata without touching tensors. Retry through the same
+            // batch owner with one sequence set per ubatch; keep rollback tails intact.
+            if (!split_sequences && mem_recr->has_protected_graph_range()) {
+                split_sequences = true;
+                continue;
+            }
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
@@ -117,7 +123,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
 
         return std::make_unique<llama_memory_hybrid_context>(
                 this, std::move(heads_attn), std::move(ubatches));
-    } while(false);
+    } while(true);
 
     return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }

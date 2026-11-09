@@ -415,6 +415,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
 }
 
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    bool split_sequences = false;
     do {
         balloc.split_reset();
 
@@ -431,7 +432,7 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0, split_sequences ? 1 : 0);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -447,11 +448,12 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
         }
 
         if (!prepare(ubatches)) {
+            if (!split_sequences && has_protected_graph_range()) { split_sequences = true; continue; }
             break;
         }
 
         return std::make_unique<llama_memory_recurrent_context>(this, std::move(ubatches));
-    } while (false);
+    } while (true);
 
     return std::make_unique<llama_memory_recurrent_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }

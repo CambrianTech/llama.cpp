@@ -761,7 +761,7 @@ int main(int argc, char ** argv) {
                 paired.token[i] = neighbour[200]; paired.pos[i] = 200;
                 paired.n_seq_id[i] = 1; paired.seq_id[i][0] = i + 1; paired.logits[i] = true;
             }
-            if (getenv("WALK_LIVE_BRACKET_SPLIT_RETRY")) {
+            if (llama_model_is_hybrid(model) || llama_model_is_recurrent(model)) {
                 decode_span(ctl, 1, neighbour + 200, 200, 1);
                 decode_span(ctl, 2, neighbour + 200, 200, 1);
             } else {
@@ -930,7 +930,6 @@ int main(int argc, char ** argv) {
         int yielded = 0;
         int graph_neighbour_turns = 0;
         bool shifted_neighbour_pending = false;
-        bool paired_retry_after_graph = false;
         bool injected_graph_failure = false;
         std::vector<float> uncertain_weights;
         do {
@@ -946,23 +945,11 @@ int main(int argc, char ** argv) {
                         paired.token[i] = neighbour[200]; paired.pos[i] = 200;
                         paired.n_seq_id[i] = 1; paired.seq_id[i][0] = i + 1; paired.logits[i] = true;
                     }
-                    const auto held0 = seq_state(ctx, 0), held1 = seq_state(ctx, 1), held2 = seq_state(ctx, 2);
-                    const bool paired_deferred = ctx->opt_reply->recurrent != nullptr;
-                    const int decoded = llama_decode(ctx, paired);
-                    GGML_ASSERT(paired_deferred ? decoded == 1 : decoded == 0);
-                    if (paired_deferred) {
-                        GGML_ASSERT(seq_state(ctx, 0) == held0 && seq_state(ctx, 1) == held1 && seq_state(ctx, 2) == held2);
-                    }
+                    const auto held0 = seq_state(ctx, 0);
+                    GGML_ASSERT(llama_decode(ctx, paired) == 0);
                     llama_batch_free(paired);
-                    if (paired_deferred && getenv("WALK_LIVE_BRACKET_SPLIT_RETRY")) {
-                        // Match the server's ret=1 retry: split serving batches, retaining the whole training graph.
-                        GGML_ASSERT(ctx->opt_reply->graph_meta);
-                        decode_span(ctx, 1, neighbour + 200, 200, 1);
-                        decode_span(ctx, 2, neighbour + 200, 200, 1);
-                        GGML_ASSERT(ctx->opt_reply->graph_meta);
-                    } else if (paired_deferred) {
-                        paired_retry_after_graph = true;
-                    }
+                    GGML_ASSERT(ctx->opt_reply->graph_meta);
+                    GGML_ASSERT(seq_state(ctx, 0) == held0);
                 }
                 if (getenv("WALK_LIVE_GRAPH_FAILURE") && !injected_graph_failure && !ctx->opt_reply->graph_preparing) {
                     GGML_ASSERT(ctx->opt_reply->graph_meta);
@@ -1020,16 +1007,6 @@ int main(int argc, char ** argv) {
                 ++yielded;
             }
         } while (progress == LLAMA_OPT_LEARN_MORE);
-        if (paired_retry_after_graph) {
-            auto paired = llama_batch_init(2, 0, 1);
-            paired.n_tokens = 2;
-            for (int i = 0; i < 2; ++i) {
-                paired.token[i] = neighbour[200]; paired.pos[i] = 200;
-                paired.n_seq_id[i] = 1; paired.seq_id[i][0] = i + 1; paired.logits[i] = true;
-            }
-            GGML_ASSERT(llama_decode(ctx, paired) == 0);
-            llama_batch_free(paired);
-        }
         GGML_ASSERT(yielded >= 1);
         if (injected_graph_failure) {
             GGML_ASSERT(progress == LLAMA_OPT_LEARN_FAILED && !ctx->opt_reply);
