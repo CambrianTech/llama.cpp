@@ -5,6 +5,7 @@ import urllib.request
 import concurrent.futures
 import time
 import uuid
+import shutil
 from pathlib import Path
 
 URL = 'http://127.0.0.1:58219'
@@ -217,11 +218,28 @@ restore_body = dict(example, id_slot=0, lora_id=d['id'], grant='compute',
 for changed in ({'binding': 'wrong'}, {'steps': saved_c['steps'] + 1}, {'engine': '0' * 32}):
     bad = call('/learn', dict(restore_body, restore_checkpoint=dict(restore_body['restore_checkpoint'], **changed)))
     assert not bad['restored'] and bad['committed_steps'] == 0, bad
+# A torn payload can pass the metadata check, then fail after admitted preparation.
+# Custody stays live until unload; the next fresh shadow must still be restorable.
+broken_name = checkpoint_prefix + '-torn.gguf'
+broken = Path(saved_c['checkpoint']['path']).parent / (broken_name + '.checkpoint')
+shutil.copytree(saved_c['checkpoint']['path'], broken)
+with (broken / 'optimizer.gguf').open('r+b') as payload:
+    payload.truncate((broken / 'optimizer.gguf').stat().st_size - 512)
+failed = call('/learn', dict(restore_body, restore_checkpoint=dict(restore_body['restore_checkpoint'], name=broken_name)))
+assert not failed['restored'] and failed['committed_steps'] == 0 and not failed['effects_uncertain'], failed
+assert call('/learn/residency/release', {'id': 'opt-d'})['refusal'] == 'busy'
+assert call('/lora-adapters/unload', {'id': d['id']})['retired']
+assert call('/learn/residency/release', {'id': 'opt-d'})['refusal'] == 'none'
+d = load('shadow-06.gguf', 'weights-d-retry')
+plan_d = call('/learn/preflight', dict(example, engine=engine, lora_id=d['id']))
+register('opt-d-retry', {'loaded': {'lora_id': d['id'], 'path': d['path']}},
+         [row for row in plan_d['requirements'] if row['kind'].startswith('optimizer_')])
+restore_body.update(lora_id=d['id'], optimizer_residency='opt-d-retry')
 restored = call('/learn', restore_body)
 assert restored['restored'] and restored['steps'] == saved_c['steps'] and restored['committed_steps'] == 0, restored
 assert restored['provenance'] == checkpoint_spec['provenance']
 next_d = call('/learn', dict(example, id_slot=0, lora_id=d['id'], grant='compute',
-    optimizer_residency='opt-d', workspace_residency='workspace-c'))
+    optimizer_residency='opt-d-retry', workspace_residency='workspace-c'))
 assert next_d['success'] and next_d['committed_steps'] == 1, next_d
 actual_d = call('/lora-adapters/save', {'id': d['id'], 'name': checkpoint_prefix + '-actual.gguf'})
 assert actual_d['steps'] == expected_c['steps']
