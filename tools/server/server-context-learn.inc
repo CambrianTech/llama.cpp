@@ -49,6 +49,60 @@
         return out;
     }
 
+    bool select_learning_shadow(int32_t id) {
+        llama_opt_params lopt{};
+        lopt.param_filter = llama_opt_param_filter_all;
+        lopt.get_opt_pars = learn_opt_pars;
+        lopt.get_opt_pars_ud = &learn_lr;
+        lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+        lopt.adapter = params_base.lora_adapters[id].ptr;
+        return llama_opt_init(ctx_tgt, model_tgt, lopt);
+    }
+
+    json learn_preflight(const json & body) {
+        json out = {{"engine", learn_engine}, {"refusal", "none"},
+            {"reserved", false}, {"requirements", json::array()}};
+        auto refuse = [&](const char * reason, const std::string & detail) {
+            out["refusal"] = reason;
+            out["detail"] = detail;
+            return out;
+        };
+        if (body.value("engine", std::string()) != learn_engine) {
+            return refuse("stale_engine", "preflight must name this engine incarnation");
+        }
+        if (learning) { return refuse("busy", "learning retains the context through restoration"); }
+        if (params_base.train_dir.empty()) { return refuse("unsupported", "learning is disabled"); }
+        const int64_t id = body.value("lora_id", int64_t(-1));
+        if (id < 0 || (size_t) id >= params_base.lora_adapters.size() || !params_base.lora_adapters[id].ptr) {
+            return refuse("invalid", "preflight requires a loaded shadow");
+        }
+        if (const auto why = train_repack_refusal(model_tgt, params_base); !why.empty()) {
+            return refuse("unsupported", why);
+        }
+        // The loop serializes this with decoding and adapter unload. Restore the active
+        // default composition on exit; update_slots installs each batched slot before decode.
+        auto saved = construct_lora_list({});
+        struct restore_adapters {
+            llama_context * ctx;
+            std::vector<common_adapter_lora_info> & set;
+            ~restore_adapters() { common_set_adapter_lora(ctx, set); }
+        } restore{ctx_tgt, saved};
+        auto set = construct_lora_list({});
+        set[id].scale = 1.0f;
+        common_set_adapter_lora(ctx_tgt, set);
+        if (!select_learning_shadow((int32_t) id)) {
+            return refuse("unsupported", llama_opt_failure(ctx_tgt));
+        }
+        const bool ok = llama_opt_measure_memory(ctx_tgt, [](const llama_adapter_lora *, const char * device,
+                const char * buft, const char * kind, size_t bytes, bool host, void * data) {
+            static_cast<json *>(data)->push_back({{"device", device}, {"buffer_type", buft},
+                {"kind", kind}, {"bytes", bytes}, {"host", host}});
+        }, &out["requirements"]);
+        if (!ok) { return refuse("unsupported", llama_opt_failure(ctx_tgt)); }
+        out["lora_id"] = id;
+        return out;
+    }
+
     void process_learn_grants(const server_task & task) {
         const auto now = ggml_time_us();
         auto result = std::make_unique<server_task_result_learn_grants>();
@@ -56,6 +110,11 @@
         json out = {{"engine", learn_engine}, {"clock_us", now}, {"refusal", "none"}};
         const auto & body = task.learn_grants;
         const auto op = body.value("op", std::string());
+        if (op == "preflight") {
+            result->receipt = learn_preflight(body);
+            queue_results.send(std::move(result));
+            return;
+        }
         if (op == "register") {
             const auto duration = body.value("expires_in_ms", int64_t(0));
             server_learn_grant g{body.value("id", std::string()), body.value("engine", std::string()),
@@ -193,21 +252,9 @@
         set[L.lora_id].scale = 1.0f;
         common_set_adapter_lora(ctx_tgt, set);
         learn_lr = L.lr;
-        {
-            // her shadow is the trained one: its own optimizer, created the first time she learns
-            // and kept (moments and all) while other minds' shadows train in between
-            llama_opt_params lopt{};
-            lopt.param_filter    = llama_opt_param_filter_all;
-            lopt.get_opt_pars    = learn_opt_pars;
-            lopt.get_opt_pars_ud = &learn_lr;
-            lopt.optimizer_type  = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
-            lopt.adapter         = loras[L.lora_id].ptr;
-            if (!llama_opt_init(ctx_tgt, model_tgt, lopt)) {
-                // refused before anything was trained or decoded: her own adapter set again, her
-                // slot untouched, and the server keeps serving
-                common_set_adapter_lora(ctx_tgt, slot.lora);
-                return refused("adapter " + std::to_string(L.lora_id) + " cannot be trained: " + llama_opt_failure(ctx_tgt));
-            }
+        if (!select_learning_shadow(L.lora_id)) {
+            common_set_adapter_lora(ctx_tgt, slot.lora);
+            return refused("adapter " + std::to_string(L.lora_id) + " cannot be trained: " + llama_opt_failure(ctx_tgt));
         }
         // drop what follows n0 (attention) and put her recurrent state back at n0
         if (cp != nullptr) {

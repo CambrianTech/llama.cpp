@@ -10,6 +10,14 @@ def owned(m,id):return sum(x['bytes'] for x in m['optimizer_owned_buffers'] if x
 before=snapshot();assert not before['optimizer_owned_buffers']
 a=call('/lora-adapters/load',{'name':'shadow-05.gguf'})['id'];b=call('/lora-adapters/load',{'name':'shadow-06.gguf'})['id']
 engine=call('/props')['learn_ledger']['engine']
+assert call('/learn/preflight',{'engine':'stale','lora_id':a})['refusal']=='stale_engine'
+assert call('/learn/preflight',{'engine':engine,'lora_id':-1})['refusal']=='invalid'
+for shadow in (a,b):
+ plan=call('/learn/preflight',{'engine':engine,'lora_id':shadow})
+ assert plan['refusal']=='none' and not plan['reserved'],plan
+ assert plan['requirements'] and all(row['bytes']>=0 for row in plan['requirements'])
+ assert owned(snapshot(),shadow)==0, 'dry preflight allocated optimizer storage'
+ print('preflight',json.dumps(plan),flush=True)
 assert call('/learn/grants',{'id':'memory-test','engine':engine,'period_ms':1000,'share_ppm':1000000,'expires_in_ms':120000})['refusal']=='none'
 def learn(id):
  result=call('/completion',{'id_slot':0,'prompt':'The capital of Kansas is','n_predict':1,'temperature':0,'learn':{'grant':'memory-test','lora_id':id,'reply':'Topeka is the capital of Kansas.'}})

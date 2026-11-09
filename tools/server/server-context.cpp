@@ -6272,7 +6272,7 @@ void server_routes::init_routes() {
                 return res;
             }
         }
-        for (const char * key : {"period_ms", "share_ppm", "expires_in_ms"}) {
+        for (const char * key : {"period_ms", "share_ppm", "expires_in_ms", "lora_id"}) {
             if (task.learn_grants.contains(key) && (!task.learn_grants.at(key).is_number_integer() ||
                     task.learn_grants.at(key).get<double>() >= double(INT64_MAX))) {
                 res->error(format_error_response("grant terms must be signed integers", ERROR_TYPE_INVALID_REQUEST));
@@ -6287,6 +6287,7 @@ void server_routes::init_routes() {
         if (result) { res->ok(result->to_json()); }
         return res;
     };
+    this->post_learn_preflight = [grant_route](const server_http_req & req) { return grant_route(req, "preflight"); };
     this->get_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "list"); };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
     this->revoke_learn_grant = [grant_route](const server_http_req & req) { return grant_route(req, "revoke"); };
