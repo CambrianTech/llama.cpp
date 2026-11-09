@@ -210,6 +210,8 @@
             learn_ledger.revoke(body.value("id", std::string()), now);
             out["revoked"] = true; // idempotent: this id can admit no new work
         }
+        out["max_period_ms"] = server_learn_ledger::kMaxPeriodMs;
+        out["max_expiry_ms"] = server_learn_ledger::kMaxPeriodMs;
         out["grants"] = json::array();
         for (const auto & a : learn_ledger.snapshot()) {
             out["grants"].push_back({{"id", a.grant.id}, {"period_ms", a.grant.period_ms},

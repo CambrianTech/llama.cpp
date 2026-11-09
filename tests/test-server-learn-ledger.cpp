@@ -132,7 +132,7 @@ int main() {
     server_learn_ledger calibration("engine-a");
     // What this catches: calibration authority must never become a tiny guessed
     // contended quota, or admit an unmeasured zero-cost contended step.
-    require(calibration.register_grant({ "bootstrap", "engine-a", 1000, 0, day_us }, 0) == R::none, "explicit idle calibration grant");
+    require(calibration.register_grant({ "bootstrap", "engine-a", 0, 0, day_us }, 0) == R::none, "explicit idle calibration grant");
     require(calibration.admit("bootstrap", 0, 0, true).refusal == R::never_fits, "zero estimate cannot bypass idle-only authority");
     require(calibration.admit("bootstrap", 1, 0, true).refusal == R::never_fits, "measured contention also refused");
     auto bootstrap = calibration.admit("bootstrap", 0, 0, false);

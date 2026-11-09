@@ -74,7 +74,7 @@ public:
 
     // The authority registers (or re-confirms) a grant.
     server_learn_refusal register_grant(const server_learn_grant & g, int64_t now_us) {
-        if (!in_clock(now_us) || g.id.empty() || g.period_ms <= 0 || g.period_ms > kMaxPeriodMs || g.share_ppm < 0 ||
+        if (!in_clock(now_us) || g.id.empty() || (g.period_ms < 0 || (g.period_ms == 0 && g.share_ppm != 0)) || g.period_ms > kMaxPeriodMs || g.share_ppm < 0 ||
                 g.share_ppm > 1000000 || g.expires_at_us <= now_us || !in_clock(g.expires_at_us)) {
             return server_learn_refusal::invalid;
         }
@@ -210,7 +210,7 @@ public:
             return server_learn_refusal::none;
         }
         const account & a = it->second;
-        out = now_us >= a.period_start_us + a.grant.period_ms * 1000 ? 0 : a.used_us;
+        out = a.grant.period_ms > 0 && now_us >= a.period_start_us + a.grant.period_ms * 1000 ? 0 : a.used_us;
         return server_learn_refusal::none;
     }
 
@@ -262,6 +262,7 @@ private:
 
     // A new period starts where the old one ended; whole idle periods are skipped, not banked.
     static void roll(account & a, int64_t now_us) {
+        if (a.grant.period_ms == 0) { return; } // idle-only authority has no replenishment period
         const int64_t period_us = a.grant.period_ms * 1000;
         if (now_us >= a.period_start_us + period_us) {
             a.period_start_us += (now_us - a.period_start_us) / period_us * period_us;

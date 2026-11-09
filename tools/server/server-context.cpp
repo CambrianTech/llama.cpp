@@ -5421,7 +5421,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
-        { "learn_ledger",                {{"engine", meta.learn_engine}, {"clock_us", ggml_time_us()}} },
+        { "learn_ledger",                {{"engine", meta.learn_engine}, {"clock_us", ggml_time_us()},
+            {"max_period_ms", server_learn_ledger::kMaxPeriodMs}, {"max_expiry_ms", server_learn_ledger::kMaxPeriodMs}} },
         { "slot_save_size_version",      1 },
         { "expert_container_custody_version", 1 },
         { "model_alias",                 meta.model_name },

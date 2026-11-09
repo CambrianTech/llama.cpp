@@ -32,9 +32,13 @@ def ok(route, body):
 
 with urllib.request.urlopen(url + "/learn/grants", timeout=60) as response:
     ledger = json.load(response)
+with urllib.request.urlopen(url + "/props", timeout=60) as response:
+    props = json.load(response)["learn_ledger"]
+assert props["max_period_ms"] == ledger["max_period_ms"]
+assert props["max_expiry_ms"] == ledger["max_expiry_ms"]
 grant = prefix + "-grant"
-assert ok("/learn/grants", {"id": grant, "engine": ledger["engine"], "period_ms": 1000,
-                            "share_ppm": 0, "expires_in_ms": 600000})["refusal"] == "none"
+assert ok("/learn/grants", {"id": grant, "engine": ledger["engine"], "period_ms": 0,
+                            "share_ppm": 0, "expires_in_ms": ledger["max_expiry_ms"]})["refusal"] == "none"
 def register(suffix, subject, rows):
     rid = prefix + suffix
     leases = [{"kind": kind, "lease_id": rid + kind,
