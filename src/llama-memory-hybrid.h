@@ -55,6 +55,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+    llama_memory_context_ptr init_full_single_stream() override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -101,7 +102,7 @@ public:
     explicit llama_memory_hybrid_context(llama_memory_status status);
 
     // init full
-    explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
+    explicit llama_memory_hybrid_context(llama_memory_hybrid * mem, bool single_stream = false);
 
     // init update
     explicit llama_memory_hybrid_context(

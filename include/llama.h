@@ -1837,6 +1837,14 @@ extern "C" {
             size_t bytes, bool host, void * user_data);
     LLAMA_API void llama_opt_visit_memory(const struct llama_context * ctx,
             llama_opt_memory_callback callback, void * user_data);
+    // Dry preflight of the selected shadow's real labelled graph at this context's
+    // served window and ubatch. Requires opt_init and no active reply; serialize with
+    // decode. Allocates metadata only, never evaluates or changes optimizer/KV data.
+    // Reports *_required static/host/workspace and shared_compute_held by buffer type.
+    // Measurement is not a lease: admission must revalidate before actual allocation.
+    LLAMA_API bool llama_opt_measure_memory(struct llama_context * ctx,
+            llama_opt_memory_callback callback, void * user_data);
+
 
     // The bytes this context's memory holds on non-host (GPU) buffers: the K/V cache for the whole
     // window, and any recurrent state; not the model's weights, which it shares, nor its compute

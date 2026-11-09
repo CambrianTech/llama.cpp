@@ -739,6 +739,10 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache::init_full_single_stream() {
+    return std::make_unique<llama_kv_cache_context>(this, true);
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
@@ -2546,10 +2550,10 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+        llama_kv_cache * kv, bool single_stream) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
 
-    const uint32_t n_stream = kv->get_n_stream();
+    const uint32_t n_stream = single_stream ? 1 : kv->get_n_stream();
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
     sinfos.resize(1);

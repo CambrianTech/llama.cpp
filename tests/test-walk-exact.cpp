@@ -753,6 +753,30 @@ int main(int argc, char ** argv) {
         lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
         lopt.adapter        = adapter;
         llama_opt_init(ctx, model, lopt);
+        // What this catches: the real served-window labelled graph can be priced
+        // without allocating optimizer buffers or changing either resident's KV.
+        {
+            const auto her_preflight = seq_state(ctx, 0);
+            const auto neighbour_preflight = seq_state(ctx, 1);
+            size_t requirements = 0, allocated = 0;
+            const bool measured = llama_opt_measure_memory(ctx,
+                [](const llama_adapter_lora *, const char *, const char *, const char * kind,
+                        size_t bytes, bool, void * data) {
+                    if (std::string(kind).find("required") != std::string::npos) {
+                        *static_cast<size_t *>(data) += bytes;
+                    }
+                }, &requirements);
+            llama_opt_visit_memory(ctx, [](const llama_adapter_lora *, const char *, const char *,
+                    const char *, size_t bytes, bool, void * data) {
+                *static_cast<size_t *>(data) += bytes;
+            }, &allocated);
+            if (!measured || requirements == 0 || allocated != 0 || adapter_params(adapter) != before ||
+                    seq_state(ctx, 0) != her_preflight || seq_state(ctx, 1) != neighbour_preflight) {
+                fprintf(stderr, "FAILED: dry learning preflight changed residency/state or refused: %s\n", llama_opt_failure(ctx));
+                return 1;
+            }
+            printf("  dry learning preflight: %zu required bytes; optimizer unallocated, both sequences unchanged\n", requirements);
+        }
         std::vector<llama_token> labels(WINDOW - r0);
         for (int32_t i = 0; i < (int32_t) WINDOW - r0; ++i) {
             labels[i] = tokens[r0 + i + 1];
