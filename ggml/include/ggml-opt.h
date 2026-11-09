@@ -165,6 +165,15 @@ extern "C" {
             ggml_opt_static_allocation_callback callback, void * user_data);
 
 
+    // Dry preparation on a FRESH dynamic optimizer. Builds real loss/backward/step
+    // metadata, measures aligned static/default-backend and CPU host bytes plus the
+    // shared scheduler's exact per-backend workspace, excluding the static tensors.
+    // No optimizer or scheduler buffers are allocated. Caller serializes scheduler use.
+    // Consumes the metadata optimizer and rewrites graph inputs: free it and discard the
+    // graph after reading sizes; rebuild and revalidate admission before real allocation.
+    GGML_API bool ggml_opt_measure_alloc(ggml_opt_context_t opt_ctx, bool backward,
+            size_t * static_bytes, size_t * host_bytes, size_t * graph_sizes);
+
     GGML_API bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx); // whether the graphs are allocated_statically
 
     // get underlying tensors that store data

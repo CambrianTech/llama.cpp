@@ -49,6 +49,7 @@ struct ggml_opt_context {
     struct ggml_context      * ctx_copy             = nullptr;
     ggml_backend_buffer_t      buf_static           = nullptr;
     ggml_backend_buffer_t      buf_cpu              = nullptr;
+    bool measurement_only = false;
     ggml_opt_static_allocation_callback static_allocation_callback = nullptr;
     void * static_allocation_user_data = nullptr;
     std::mt19937               rng;
@@ -557,7 +558,7 @@ static bool ggml_opt_static_allocation_allowed(ggml_opt_context_t opt_ctx, ggml_
     return false;
 }
 
-static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
+static bool ggml_opt_build(ggml_opt_context_t opt_ctx, bool allocate = true) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
 
@@ -746,6 +747,7 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
             return true;
         }
     } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_FORWARD) {
+        if (!allocate) { return true; }
         if (!ggml_opt_static_allocation_allowed(opt_ctx, opt_ctx->ctx_static,
                 ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0)), "optimizer_static")) { return false; }
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
@@ -845,6 +847,7 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
             return true;
         }
     } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_GRAD) {
+        if (!allocate) { return true; }
         if (!ggml_opt_static_allocation_allowed(opt_ctx, opt_ctx->ctx_static,
                 ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0)), "optimizer_static")) { return false; }
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
@@ -889,6 +892,8 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
             ggml_build_forward_expand(opt_ctx->gb_opt, opt_step);
         }
     }
+
+    if (!allocate) { return true; }
 
     // Admit all newly owned buffers before allocating either one. A host refusal must
     // not leave device residency allocated from an otherwise refused preparation.
@@ -1604,7 +1609,57 @@ static void opt_disarm_evaluation(ggml_opt_context_t opt_ctx) {
 
 }
 
+bool ggml_opt_measure_alloc(ggml_opt_context_t opt_ctx, bool backward,
+        size_t * static_bytes, size_t * host_bytes, size_t * graph_sizes) {
+    // A disposable metadata optimizer cannot free or overwrite an existing mind's
+    // moments/host parameters. It shares only the graph's parameter tensor pointers.
+    if (!static_bytes || !host_bytes || !graph_sizes || opt_ctx->static_graphs ||
+            opt_ctx->ctx_static || opt_ctx->measurement_only || opt_ctx->restore_pending ||
+            opt_ctx->restore_preparation_failed) {
+        opt_ctx->refusal = "measurement requires a fresh dynamic optimizer and output sizes";
+        return false;
+    }
+    opt_ctx->measurement_only = true;
+    opt_ctx->build_type = backward ? opt_ctx->build_type_alloc : GGML_OPT_BUILD_TYPE_FORWARD;
+    if (!ggml_opt_build(opt_ctx, false)) { return false; }
+    const auto sched = opt_ctx->backend_sched;
+    const auto device = ggml_backend_sched_get_backend(sched, 0);
+    const auto static_buft = ggml_backend_get_default_buffer_type(device);
+    *static_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(opt_ctx->ctx_static, static_buft);
+    *host_bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
+    ggml_backend_t cpu = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        auto candidate = ggml_backend_sched_get_backend(sched, i);
+        auto dev = ggml_backend_get_device(candidate);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) { cpu = candidate; break; }
+    }
+    if (*host_bytes && !cpu) {
+        opt_ctx->refusal = "optimizer host measurement requires the scheduler's CPU backend";
+        return false;
+    }
+    std::vector<ggml_tensor *> external;
+    std::vector<ggml_backend_t> owners;
+    auto add = [&](ggml_context * ctx, ggml_backend_t owner) {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            external.push_back(t);
+            owners.push_back(owner);
+        }
+    };
+    add(opt_ctx->ctx_static, device);
+    if (*host_bytes) { add(opt_ctx->ctx_cpu, cpu); }
+    ggml_cgraph * graph = opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT ? opt_ctx->gb_opt :
+        opt_ctx->build_type == GGML_OPT_BUILD_TYPE_GRAD ? opt_ctx->gb_grad : opt_ctx->gf;
+    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_measure_graph_external(sched, graph, graph_sizes, external.data(), owners.data(), external.size());
+    ggml_backend_sched_reset(sched);
+    return true;
+}
+
 bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
+    if (opt_ctx->measurement_only) {
+        opt_ctx->refusal = "discard the measurement optimizer and rebuild before allocating";
+        return false;
+    }
     if (opt_ctx->restore_preparation_failed) {
         opt_ctx->refusal = "failed restore allocation requires optimizer teardown";
         return false;

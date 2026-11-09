@@ -27,7 +27,7 @@ static ggml_opt_optimizer_params sgd_pars(void *) {
     return p;
 }
 
-static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false) {
+static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false, bool test_measurement = false) {
     // by type, not ggml_backend_cpu_init: in a dynamically loaded backend build (CI) the CPU
     // backend is its own library
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -61,6 +61,8 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
     }
 
 
+    bool measured_once = false;
+    size_t measured_static = 0, measured_host = 0, measured_graph = 0;
     const int n_evals = 3 * opt_period;
     for (int i = 0; i < n_evals; ++i) {
         ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
@@ -69,6 +71,30 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
         ggml_tensor * out = ggml_mul(ctx_compute, w, x);
         ggml_cgraph * gf  = ggml_new_graph_custom(ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
         ggml_build_forward_expand(gf, out);
+        if (test_measurement && !measured_once) {
+            // The real optimizer graph must be measurable before either residency owner
+            // allocates, then a rebuilt graph must allocate exactly the reported bytes.
+            auto probe = ggml_opt_init(params);
+            ggml_opt_prepare_alloc(probe, ctx_compute, gf, x, out);
+            const size_t held = ggml_backend_sched_get_buffer_size(sched, cpu);
+            CHECK(ggml_opt_measure_alloc(probe, true, &measured_static, &measured_host, &measured_graph));
+            CHECK(measured_static > 0 && measured_host > 0 && measured_graph > 0);
+            CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == held);
+            size_t owned = 0;
+            ggml_opt_visit_owned_buffers(probe, [](ggml_backend_buffer_t b, const char *, void * data) {
+                *static_cast<size_t *>(data) += ggml_backend_buffer_get_size(b);
+            }, &owned);
+            CHECK(owned == 0);
+            CHECK(!ggml_opt_alloc(probe, true)); // no reuse of a dry, rewritten graph
+            float unchanged = 0;
+            ggml_backend_tensor_get(w, &unchanged, 0, sizeof(unchanged));
+            CHECK(unchanged == w_now);
+            ggml_opt_free(probe);
+            ggml_free(ctx_compute);
+            measured_once = true;
+            --i;
+            continue;
+        }
         ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, x, out);
         if (test_residency_gate && !gate.allow) {
             // What this catches: denied residency is measured by the real allocator before
@@ -87,6 +113,15 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
             continue;
         }
         CHECK(ggml_opt_alloc(opt_ctx, true));
+        if (test_measurement && i == 0) {
+            struct sizes { size_t device = 0; size_t host = 0; } actual;
+            ggml_opt_visit_owned_buffers(opt_ctx, [](ggml_backend_buffer_t b, const char * kind, void * data) {
+                auto & actual = *static_cast<sizes *>(data);
+                (strcmp(kind, "optimizer_static") == 0 ? actual.device : actual.host) += ggml_backend_buffer_get_size(b);
+            }, &actual);
+            CHECK(actual.device == measured_static && actual.host == measured_host);
+            CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == measured_graph);
+        }
         if (test_residency_gate) {
             size_t allocated = 0;
             ggml_opt_visit_owned_buffers(opt_ctx, [](ggml_backend_buffer_t b, const char * kind, void * data) {
@@ -560,6 +595,7 @@ int main() {
     run(1, true);
     // Static admission alone must not allocate when the host lease is refused.
     run(1, true, true);
+    run(1, false, false, true);
     run_manual();
     run_manual(true);
     run_refuses_graph_without_backward();
