@@ -56,7 +56,47 @@ static void residency_custody() {
     require(mirror.register_residency(r) == "retired", "retired reference cannot be reused");
 }
 
+static void residency_plan() {
+    server_residency_mirror mirror("engine");
+    server_residency optimizer;
+    optimizer.id = "optimizer"; optimizer.engine = "engine"; optimizer.owner = "core";
+    optimizer.subject = "mind-a";
+    optimizer.rows = {{"GPU", "CUDA", "optimizer_static_required", 64, false}};
+    optimizer.leases = {{"vram", "lease-opt", 64}};
+    auto workspace = optimizer;
+    workspace.id = "workspace"; workspace.subject = "workspace";
+    workspace.rows[0].kind = "shared_compute_required";
+    workspace.leases[0].lease_id = "lease-workspace";
+    require(mirror.register_residency(optimizer) == "none" &&
+            mirror.register_residency(workspace) == "none", "register separate allocation owners");
+    std::vector<server_residency_need> plan = {
+        {optimizer.id, optimizer.subject, optimizer.rows},
+        {workspace.id, workspace.subject, workspace.rows}};
+    std::vector<std::string> acquired;
+    ++plan[1].rows[0].bytes;
+    require(mirror.claim_plan(plan, acquired) == "uncovered" && acquired.empty(), "second refusal rolls back whole plan");
+    for (const auto & row : mirror.snapshot()) { require(!row.pending && !row.live, "failed plan changes no custody"); }
+    --plan[1].rows[0].bytes;
+    plan[1].rows.push_back(plan[1].rows[0]);
+    require(mirror.claim_plan(plan, acquired) == "invalid", "duplicate requirement cannot multiply one allowance");
+    plan[1].rows.pop_back();
+    require(mirror.claim_plan(plan, acquired) == "none" && acquired.size() == 2, "whole plan acquires custody");
+    require(mirror.claim_plan(plan, acquired) == "busy", "pending plan cannot be reused concurrently");
+    mirror.finish(optimizer.id, true, 7);
+    mirror.finish(workspace.id, true);
+    require(mirror.claim_plan(plan, acquired) == "none" && acquired.empty(), "reuse live owners without another lease");
+    mirror.freed_lora(7);
+    require(mirror.release(optimizer.id) == "none", "mind unload frees only optimizer");
+    require(mirror.release(workspace.id) == "busy", "engine workspace survives mind unload");
+    require(mirror.revoke(workspace.id) == "none", "revoke workspace authority");
+    require(mirror.claim_plan({plan[1]}, acquired) == "unknown_residency", "revoked live workspace refuses new work");
+    require(mirror.release(workspace.id) == "busy", "revocation does not free workspace");
+    mirror.freed(workspace.id);
+    require(mirror.release(workspace.id) == "none", "actual workspace free permits release");
+}
+
 int main() {
+    residency_plan();
     residency_custody();
     server_learn_ledger ledger("engine-a");
     const int64_t day_us = 86400000000;

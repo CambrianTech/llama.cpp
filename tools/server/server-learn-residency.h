@@ -33,6 +33,10 @@ struct server_residency {
     bool pending = false, live = false, revoked = false;
     int32_t lora_id = -1;
 };
+struct server_residency_need {
+    std::string id, subject;
+    std::vector<server_residency_row> rows;
+};
 class server_residency_mirror {
     std::string engine;
     mutable std::mutex mutex;
@@ -90,6 +94,45 @@ public:
         if (r.subject != subject) { return "subject_mismatch"; }
         if (r.pending || r.live) { return "busy"; }
         r.pending = true;
+        return "none";
+    }
+    // Validate the entire measured optimizer + engine workspace plan before the
+    // caller can mutate the context. A failed second binding must not claim the first.
+    // Live bindings are reused, not charged again; only new claims enter pending.
+    std::string claim_plan(const std::vector<server_residency_need> & plan,
+                           std::vector<std::string> & acquired) {
+        std::lock_guard<std::mutex> lock(mutex);
+        acquired.clear();
+        if (plan.empty()) { return "invalid"; }
+        std::set<std::string> ids;
+        std::string owner;
+        for (const auto & need : plan) {
+            if (!ids.insert(need.id).second || need.rows.empty()) { return "invalid"; }
+            const auto it = records.find(need.id);
+            if (it == records.end() || it->second.revoked) { return "unknown_residency"; }
+            const auto & record = it->second;
+            if (!owner.empty() && owner != record.owner) { return "owner_mismatch"; }
+            owner = record.owner;
+            if (record.subject != need.subject) { return "subject_mismatch"; }
+            if (record.pending) { return "busy"; }
+            std::set<std::tuple<std::string, std::string, std::string>> keys;
+            for (const auto & row : need.rows) {
+                if (!keys.emplace(row.device, row.buffer_type, row.kind).second) { return "invalid"; }
+                bool covered = false;
+                for (const auto & allowed : record.rows) {
+                    covered |= allowed.device == row.device && allowed.buffer_type == row.buffer_type &&
+                        allowed.kind == row.kind && allowed.host == row.host && row.bytes <= allowed.bytes;
+                }
+                if (!covered) { return "uncovered"; }
+            }
+        }
+        for (const auto & need : plan) {
+            auto & record = records.at(need.id);
+            if (!record.live) {
+                record.pending = true;
+                acquired.push_back(need.id);
+            }
+        }
         return "none";
     }
     bool allows(const std::string & id, const server_residency_row & need) const {
