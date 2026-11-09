@@ -286,6 +286,7 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_LEARN
     learn_request learn;
+    json restore_checkpoint;
 
     server_task() = default;
 

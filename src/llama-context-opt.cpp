@@ -1134,10 +1134,10 @@ bool llama_context::opt_prepare_restore(const llama_batch & retained) {
         opt_fail("restore preparation could not form a labelled ubatch");
         return false;
     }
-    // init_full is the existing read-only graph-planning view. Never call apply, decode, or
+    // Use the same full-capacity single-stream planning view as admission. Never apply, decode, or
     // graph_reserve here: allocation does not insert cache cells or execute a retained sample.
-    auto planning = memory ? memory->init_full() : llama_memory_context_ptr{};
-    if (planning && llama_memory_status_is_fail(planning->get_status())) {
+    auto planning = memory ? memory->init_full_single_stream() : llama_memory_context_ptr{};
+    if (memory && (!planning || llama_memory_status_is_fail(planning->get_status()))) {
         opt_fail("restore memory planning refused");
         return false;
     }

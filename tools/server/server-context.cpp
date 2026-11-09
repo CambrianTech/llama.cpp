@@ -20,6 +20,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "gguf.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -2222,6 +2223,7 @@ private:
 
 #include "server-context-learn-residency.inc"
 #include "server-context-learn.inc"
+#include "server-context-learn-checkpoint.inc"
 
     void send_final_response(server_slot & slot) {
         if (slot.task->params.learn_only) {
@@ -3291,6 +3293,13 @@ private:
                 break;
             case SERVER_TASK_TYPE_LEARN:
                 {
+                    if (!task.restore_checkpoint.is_null()) {
+                        auto result = std::make_unique<server_task_result_learn_grants>();
+                        result->id = task.id;
+                        result->receipt = restore_learning_checkpoint(task.learn, task.restore_checkpoint);
+                        queue_results.send(std::move(result));
+                        break;
+                    }
                     auto res = std::make_unique<server_task_result_learn>();
                     res->id = task.id;
                     const auto & L = task.learn;
@@ -6544,6 +6553,10 @@ void server_routes::init_routes() {
         }
         const json body = json::parse(req.body);
         server_task task(SERVER_TASK_TYPE_LEARN);
+        if (body.contains("restore_checkpoint") && !body.contains("messages")) {
+            res->error(format_error_response("checkpoint restoration requires the retained messages", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         task.learn.grant = json_value(body, "grant", std::string());
         task.learn.optimizer_residency = json_value(body, "optimizer_residency", std::string());
         task.learn.workspace_residency = json_value(body, "workspace_residency", std::string());
@@ -6560,6 +6573,26 @@ void server_routes::init_routes() {
                 task.learn.reply = example.reply;
             } catch (const std::exception & e) {
                 res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            if (body.contains("restore_checkpoint")) {
+                const auto & checkpoint = body.at("restore_checkpoint");
+                if (!checkpoint.is_object() || !checkpoint.contains("engine") || !checkpoint.at("engine").is_string() ||
+                    !checkpoint.contains("name") || !checkpoint.at("name").is_string() ||
+                    confine_out(params.train_dir, checkpoint.at("name").get<std::string>()).empty() ||
+                    !checkpoint.contains("binding") || !checkpoint.at("binding").is_string() ||
+                    checkpoint.at("binding").get<std::string>().empty() ||
+                    !checkpoint.contains("steps") || !checkpoint.at("steps").is_number_integer() ||
+                    checkpoint.at("steps").get<int64_t>() < 0) {
+                    res->error(format_error_response("restore_checkpoint requires engine, bare .gguf name, binding and nonnegative steps", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                task.restore_checkpoint = checkpoint;
+                auto & rd = res->rd;
+                task.id = rd.get_new_id();
+                rd.post_task(std::move(task));
+                auto result = rd.next(req.should_stop);
+                if (result) { res->ok(result->to_json()); }
                 return res;
             }
             // A past example (S4 (f); fork #89): her slot may no longer hold this prompt. Serve it

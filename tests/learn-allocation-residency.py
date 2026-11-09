@@ -204,6 +204,33 @@ result = call('/learn', dict(example, id_slot=0, lora_id=c['id'], grant='compute
 assert result['n_labels'] == plan['reply_rows'], (plan, result)
 print('same messages template preflight/execution labels', result['n_labels'], flush=True)
 assert result['success'] and result['committed_steps'] == 1 and not result['effects_uncertain'], result
+restore_name = checkpoint_prefix + '-restore.gguf'
+saved_c = call('/lora-adapters/save', {'id': c['id'], 'name': restore_name, 'checkpoint': checkpoint_spec})
+next_c = call('/learn', dict(example, id_slot=0, lora_id=c['id'], grant='compute',
+    optimizer_residency='opt-c', workspace_residency='workspace-c'))
+assert next_c['success'] and next_c['committed_steps'] == 1, next_c
+expected_c = call('/lora-adapters/save', {'id': c['id'], 'name': checkpoint_prefix + '-expected.gguf'})
+d = load('shadow-06.gguf', 'weights-d')
+plan_d = call('/learn/preflight', dict(example, engine=engine, lora_id=d['id']))
+register('opt-d', {'loaded': {'lora_id': d['id'], 'path': d['path']}},
+         [row for row in plan_d['requirements'] if row['kind'].startswith('optimizer_')])
+restore_body = dict(example, id_slot=0, lora_id=d['id'], grant='compute',
+    optimizer_residency='opt-d', workspace_residency='workspace-c',
+    restore_checkpoint={'engine': engine, 'name': restore_name, 'binding': checkpoint_prefix, 'steps': saved_c['steps']})
+for changed in ({'binding': 'wrong'}, {'steps': saved_c['steps'] + 1}, {'engine': '0' * 32}):
+    bad = call('/learn', dict(restore_body, restore_checkpoint=dict(restore_body['restore_checkpoint'], **changed)))
+    assert not bad['restored'] and bad['committed_steps'] == 0, bad
+restored = call('/learn', restore_body)
+assert restored['restored'] and restored['steps'] == saved_c['steps'] and restored['committed_steps'] == 0, restored
+assert restored['provenance'] == checkpoint_spec['provenance']
+next_d = call('/learn', dict(example, id_slot=0, lora_id=d['id'], grant='compute',
+    optimizer_residency='opt-d', workspace_residency='workspace-c'))
+assert next_d['success'] and next_d['committed_steps'] == 1, next_d
+actual_d = call('/lora-adapters/save', {'id': d['id'], 'name': checkpoint_prefix + '-actual.gguf'})
+assert actual_d['steps'] == expected_c['steps']
+assert Path(actual_d['path']).read_bytes() == Path(expected_c['path']).read_bytes(), 'restored next update differs from uninterrupted trajectory'
+print('restored optimizer steps and next-update bytes equal uninterrupted trajectory', restored, flush=True)
+assert call('/lora-adapters/unload', {'id': d['id']})['retired']
 assert call('/lora-adapters/unload', {'id': c['id']})['retired']
 assert call('/learn/residency/release', {'id': 'workspace-c'})['refusal'] == 'none'
 assert call('/completion', probe)['content'] == serving_before
