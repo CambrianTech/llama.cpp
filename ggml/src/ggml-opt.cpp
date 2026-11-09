@@ -990,6 +990,12 @@ void ggml_opt_set_static_allocation_callback(ggml_opt_context_t opt_ctx,
     opt_ctx->static_allocation_user_data = user_data;
 }
 
+// iter starts at 1 and advances once per applied optimizer step (ggml_opt_eval), so the committed
+// count is one less; a reset with optimizer=true returns it to 0.
+int64_t ggml_opt_committed_steps(ggml_opt_context_t opt_ctx) {
+    return opt_ctx ? opt_ctx->iter - 1 : 0;
+}
+
 void ggml_opt_visit_owned_buffers(ggml_opt_context_t opt_ctx, ggml_opt_buffer_callback callback, void * user_data) {
     if (!opt_ctx || !callback) { return; }
     if (opt_ctx->buf_static) { callback(opt_ctx->buf_static, "optimizer_static", user_data); }

@@ -3179,6 +3179,8 @@ private:
                     res->id = task.id;
                     res->lora_id = id;
                     res->path = task.load_lora_path;
+                    // read on the loop between steps, beside the write: the file holds exactly these
+                    res->steps = llama_opt_shadow_steps(ctx_tgt, loras[id].ptr);
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_LOAD_LORA:
