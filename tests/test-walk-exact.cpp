@@ -21,6 +21,7 @@
 #include "common.h"
 #include "llama.h"
 #include "../src/llama-adapter.h"
+#include "../src/llama-context.h"
 #include "../src/llama-memory-hybrid.h"
 #include "../src/llama-memory-recurrent.h"
 
@@ -832,6 +833,11 @@ int main(int argc, char ** argv) {
         // labels between chunks, or restoring the neighbour instead of the learning sequence.
         // Real neighbour inference runs at every yield; learning still covers the entire reply.
         GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, tokens.data() + r0, WINDOW - r0, nullptr));
+        // Diagnostic: change only scheduling boundaries, not the served graph/window
+        // or the independent whole-reply gradient oracle. No production chunk policy.
+        if (getenv("WALK_LIVE_SMALL_CHUNKS")) {
+            ctx->opt_reply->chunk_tokens = WINDOW / 8;
+        }
         // A checkpoint may not publish an optimizer/cursor pair from half a live reply.
         FILE * partial_state = tmpfile();
         GGML_ASSERT(partial_state != nullptr);
@@ -840,6 +846,9 @@ int main(int argc, char ** argv) {
         llama_opt_learn_status progress;
         int yielded = 0;
         do {
+            if (getenv("WALK_LIVE_SMALL_CHUNKS") && !llama_opt_learn_needs_gradient(ctx)) {
+                ctx->opt_reply->chunk_tokens = WINDOW; // retain the control's restoration segmentation
+            }
             progress = llama_opt_learn_step(ctx);
             if (progress == LLAMA_OPT_LEARN_MORE) {
                 GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
