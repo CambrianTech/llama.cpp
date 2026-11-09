@@ -34,7 +34,7 @@ static ggml_opt_optimizer_params adam_pars(void *) {
     return p;
 }
 
-static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false, bool test_measurement = false, int graph_nodes = 0, bool use_gpu = false, bool adam = false) {
+static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false, bool test_measurement = false, int graph_nodes = 0, bool use_gpu = false, bool adam = false, bool staged_measurement = false) {
     // by type, not ggml_backend_cpu_init: in a dynamically loaded backend build (CI) the CPU
     // backend is its own library
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -72,6 +72,7 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
 
 
     bool measured_once = false;
+    bool cancelled_measurement = false;
     bool cancelled_preparation = false;
     bool cancelled_checkpoint = false;
     size_t measured_static = 0, measured_host = 0, measured_graph = 0;
@@ -89,7 +90,34 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
             auto probe = ggml_opt_init(params);
             ggml_opt_prepare_alloc(probe, ctx_compute, gf, x, out);
             const size_t held = ggml_backend_sched_get_buffer_size(sched, cpu);
+            if (staged_measurement) {
+                CHECK(ggml_opt_measure_prepare(probe, true));
+                CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == held);
+                CHECK(!ggml_opt_alloc(probe, true));
+                float unchanged = 0;
+                ggml_backend_tensor_get(w, &unchanged, 0, sizeof(unchanged));
+                CHECK(unchanged == w_now);
+                size_t prepared_owned = 0;
+                ggml_opt_visit_owned_buffers(probe, [](ggml_backend_buffer_t b, const char *, void * data) {
+                    *static_cast<size_t *>(data) += ggml_backend_buffer_get_size(b);
+                }, &prepared_owned);
+                CHECK(prepared_owned == 0);
+                if (!cancelled_measurement) {
+                    ggml_opt_free(probe);
+                    ggml_free(ctx_compute);
+                    CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == held);
+                    ggml_backend_tensor_get(w, &unchanged, 0, sizeof(unchanged));
+                    CHECK(unchanged == w_now);
+                    cancelled_measurement = true;
+                    --i;
+                    continue;
+                }
+                CHECK(!ggml_opt_measure_prepare(probe, true));
+                CHECK(!ggml_opt_measure_alloc(probe, false, &measured_static, &measured_host, &measured_graph));
+            }
             CHECK(ggml_opt_measure_alloc(probe, true, &measured_static, &measured_host, &measured_graph));
+            CHECK(ggml_opt_refusal(probe)[0] == '\0');
+            CHECK(!ggml_opt_measure_alloc(probe, true, &measured_static, &measured_host, &measured_graph));
             CHECK(measured_static > 0 && measured_host > 0 && measured_graph > 0);
             CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == held);
             size_t owned = 0;
@@ -505,7 +533,7 @@ static void run_label_projection(bool projected) {
 // clamp, a view with no backward) must refuse ggml_opt_alloc by the op's name, not abort: the
 // abort took the M5's serving engine down on the 35B-A3B's first /train (2026-11-01). The same
 // context then trains a graph it can differentiate.
-static void run_refuses_graph_without_backward() {
+static void run_refuses_graph_without_backward(bool measurement = false) {
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     CHECK(cpu != nullptr);
     ggml_backend_t backends[] = { cpu };
@@ -534,8 +562,18 @@ static void run_refuses_graph_without_backward() {
         ggml_build_forward_expand(gf, out);
         ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, x, out);
         if (!differentiable) {
-            CHECK(!ggml_opt_alloc(opt_ctx, true));
+            CHECK(!(measurement ? ggml_opt_measure_prepare(opt_ctx, true) : ggml_opt_alloc(opt_ctx, true)));
             CHECK(std::strstr(ggml_opt_refusal(opt_ctx), "no backward through CLAMP") != nullptr);
+            if (measurement) {
+                size_t device = 0, host = 0, graph = 0;
+                CHECK(!ggml_opt_measure_alloc(opt_ctx, true, &device, &host, &graph));
+                CHECK(!ggml_opt_alloc(opt_ctx, true));
+                ggml_opt_free(opt_ctx);
+                opt_ctx = ggml_opt_init(params);
+                float unchanged = 0;
+                ggml_backend_tensor_get(w, &unchanged, 0, sizeof(unchanged));
+                CHECK(unchanged == w0);
+            }
         } else {
             CHECK(ggml_opt_alloc(opt_ctx, true));
             ggml_backend_tensor_set(x, &X, 0, sizeof(float));
@@ -654,9 +692,11 @@ int main() {
     // Static admission alone must not allocate when the host lease is refused.
     run(1, true, true);
     run(1, false, false, true);
+    run(1, false, false, true, 0, false, false, true);
     run_manual();
     run_manual(true);
     run_refuses_graph_without_backward();
+    run_refuses_graph_without_backward(true);
     run_trains_through_broadcast_divisor();
     run_refuses_misshaped_gradient();
     run_label_projection(false);

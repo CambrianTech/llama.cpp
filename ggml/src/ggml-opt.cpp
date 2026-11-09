@@ -50,6 +50,8 @@ struct ggml_opt_context {
     ggml_backend_buffer_t      buf_static           = nullptr;
     ggml_backend_buffer_t      buf_cpu              = nullptr;
     bool measurement_only = false;
+    bool measurement_ready = false;
+    bool measurement_backward = false;
     ggml_backend_sched_allocation_callback graph_allocation_callback = nullptr;
     void * graph_allocation_user_data = nullptr;
     ggml_opt_static_allocation_callback static_allocation_callback = nullptr;
@@ -1635,20 +1637,36 @@ void ggml_opt_eval_quarantine(ggml_opt_context_t opt_ctx) {
     opt_disarm_evaluation(opt_ctx);
 }
 
-bool ggml_opt_measure_alloc(ggml_opt_context_t opt_ctx, bool backward,
-        size_t * static_bytes, size_t * host_bytes, size_t * graph_sizes) {
-    // A disposable metadata optimizer cannot free or overwrite an existing mind's
-    // moments/host parameters. It shares only the graph's parameter tensor pointers.
-    if (!static_bytes || !host_bytes || !graph_sizes || opt_ctx->static_graphs ||
-            opt_ctx->ctx_static || opt_ctx->measurement_only || opt_ctx->restore_pending ||
-            opt_ctx->restore_preparation_failed) {
-        opt_ctx->refusal = "measurement requires a fresh dynamic optimizer and output sizes";
+bool ggml_opt_measure_prepare(ggml_opt_context_t opt_ctx, bool backward) {
+    // This owner builds metadata only. Its scheduler and tensors must remain alive
+    // until measure_alloc or teardown; no optimizer update can use this probe.
+    if (opt_ctx->static_graphs || opt_ctx->ctx_static || opt_ctx->measurement_only ||
+            opt_ctx->restore_pending || opt_ctx->restore_preparation_failed) {
+        opt_ctx->refusal = "measurement requires a fresh dynamic optimizer";
         return false;
     }
     opt_ctx->measurement_only = true;
+    opt_ctx->measurement_backward = backward;
     opt_ctx->build_type = !backward ? GGML_OPT_BUILD_TYPE_FORWARD :
         opt_ctx->next_manual && !opt_ctx->next_period_end ? GGML_OPT_BUILD_TYPE_GRAD : opt_ctx->build_type_alloc;
     if (!ggml_opt_build(opt_ctx, false)) { return false; }
+    opt_ctx->measurement_ready = true;
+    opt_ctx->refusal.clear();
+    return true;
+}
+
+bool ggml_opt_measure_alloc(ggml_opt_context_t opt_ctx, bool backward,
+        size_t * static_bytes, size_t * host_bytes, size_t * graph_sizes) {
+    if (!static_bytes || !host_bytes || !graph_sizes) {
+        opt_ctx->refusal = "measurement requires output sizes";
+        return false;
+    }
+    if (!opt_ctx->measurement_only && !ggml_opt_measure_prepare(opt_ctx, backward)) { return false; }
+    if (!opt_ctx->measurement_ready || opt_ctx->measurement_backward != backward) {
+        opt_ctx->refusal = "measurement must consume its prepared phase exactly once";
+        return false;
+    }
+    opt_ctx->measurement_ready = false;
     const auto sched = opt_ctx->backend_sched;
     const auto device = ggml_backend_sched_get_backend(sched, 0);
     const auto static_buft = ggml_backend_get_default_buffer_type(device);
@@ -1679,6 +1697,7 @@ bool ggml_opt_measure_alloc(ggml_opt_context_t opt_ctx, bool backward,
     ggml_backend_sched_reset(sched);
     ggml_backend_sched_measure_graph_external(sched, graph, graph_sizes, external.data(), owners.data(), external.size());
     ggml_backend_sched_reset(sched);
+    opt_ctx->refusal.clear();
     return true;
 }
 
