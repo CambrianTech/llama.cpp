@@ -848,6 +848,9 @@ int main(int argc, char ** argv) {
         if (getenv("WALK_LIVE_SMALL_CHUNKS")) {
             ctx->opt_reply->chunk_tokens = WINDOW / 8;
         }
+        if (getenv("WALK_LIVE_GRAPH_CONTINUATION")) {
+            ctx->opt_reply->graph_nodes = 1;
+        }
         // A checkpoint may not publish an optimizer/cursor pair from half a live reply.
         FILE * partial_state = tmpfile();
         GGML_ASSERT(partial_state != nullptr);
@@ -861,13 +864,24 @@ int main(int argc, char ** argv) {
             }
             progress = llama_opt_learn_step(ctx);
             if (progress == LLAMA_OPT_LEARN_MORE) {
-                GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
-                decode_span(ctx, 1, neighbour + 200, 200, 1);
-                GGML_ASSERT(seq_state(ctx, 1) == want_neighbour_turn);
+                if (getenv("WALK_LIVE_GRAPH_DRAIN") && yielded == 0) {
+                    GGML_ASSERT(ctx->opt_reply->graph_meta);
+                    GGML_ASSERT(llama_opt_learn_drain(ctx));
+                    GGML_ASSERT(ctx->opt_reply->drain_graph);
+                }
+                if (!getenv("WALK_LIVE_GRAPH_CONTINUATION")) {
+                    GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
+                    decode_span(ctx, 1, neighbour + 200, 200, 1);
+                    GGML_ASSERT(seq_state(ctx, 1) == want_neighbour_turn);
+                }
                 ++yielded;
             }
         } while (progress == LLAMA_OPT_LEARN_MORE);
         GGML_ASSERT(yielded >= 1);
+        if (getenv("WALK_LIVE_GRAPH_CONTINUATION")) {
+            GGML_ASSERT(yielded > 100);
+            printf("  native graph continuation returns: %d (serving workspace integration pending)\n", yielded);
+        }
         // Restore the fixture's original neighbour for its unchanged-custody assertions below.
         GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
         const bool learned = progress == LLAMA_OPT_LEARN_DONE;

@@ -99,6 +99,12 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
 // existing stable-restoration path; no optimizer, KV, or completed update is discarded.
 bool llama_context::opt_learn_drain() {
     if (!opt_reply) { return false; }
+    if (opt_reply->graph_meta) {
+        // Update nodes may already have run. Finish this graph before restoration;
+        // its committed step remains visible rather than pretending to roll it back.
+        opt_reply->drain_graph = true;
+        return true;
+    }
     if (!opt_reply->restoring && opt_reply->cursor < opt_reply->n_train) {
         // The full reply is one optimizer update. A revoked partial reply has only
         // accumulated gradients: clear those, preserving moments and completed updates.
@@ -121,6 +127,25 @@ llama_opt_learn_status llama_context::opt_learn_step() {
         return LLAMA_OPT_LEARN_FAILED;
     }
     auto & s = *opt_reply;
+    if (s.graph_nodes > 0 && !s.restoring && s.n_train > (int32_t) n_ubatch()) {
+        s.failure = "whole-reply graph exceeds the currently prepared ubatch; token partition is not a latency yield";
+        s.cursor = s.n_train;
+    }
+    if (s.graph_meta) {
+        bool complete = false;
+        const auto status = ggml_opt_eval_step(opt_ctx, s.result, s.graph_nodes, &complete);
+        if (status != GGML_STATUS_SUCCESS) {
+            // Backend failure can leave parameter writes. Keep metadata/custody for
+            // recovery rather than releasing an uncertain optimizer as restored.
+            opt_fail(ggml_opt_refusal(opt_ctx));
+            return LLAMA_OPT_LEARN_FAILED;
+        }
+        if (!complete) { return LLAMA_OPT_LEARN_MORE; }
+        s.graph_meta.reset();
+        s.cursor += s.batch.n_tokens;
+        if (s.drain_graph) { s.cursor = s.n_train; }
+        return LLAMA_OPT_LEARN_MORE;
+    }
     if (!s.restoring && s.cursor >= s.n_train) {
         s.restoring = true;
         s.cursor = 0;
@@ -137,7 +162,7 @@ llama_opt_learn_status llama_context::opt_learn_step() {
         }
     }
     const int32_t end = s.restoring ? (int32_t) s.restore_tokens.size() : s.n_train;
-    const int32_t m = std::min(s.chunk_tokens, end - s.cursor);
+    const int32_t m = !s.restoring && s.graph_nodes > 0 ? end - s.cursor : std::min(s.chunk_tokens, end - s.cursor);
     auto & batch = s.batch;
     batch.n_tokens = m;
     for (int32_t i = 0; i < m; ++i) {
@@ -161,6 +186,7 @@ llama_opt_learn_status llama_context::opt_learn_step() {
     opt_learn_labels = 0;
     opt_learn_labels_done = 0;
     synchronize(); // completion and its duration belong to this chunk, not the next turn
+    if (s.graph_meta) { return LLAMA_OPT_LEARN_MORE; }
     if (!ok) {
         if (s.restoring) {
             opt_fail("live reply restoration failed: re-prefill its sequence");

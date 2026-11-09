@@ -1984,6 +1984,7 @@ enum ggml_status ggml_opt_eval_step(ggml_opt_context_t opt_ctx, ggml_opt_result_
             + "): this step's gradients are not trusted, so the run stopped and nothing was written";
         GGML_LOG_ERROR("%s: %s\n", __func__, opt_ctx->refusal.c_str());
         // Partial graph mutations cannot be published as an optimizer commit.
+        if (!ggml_backend_sched_graph_pending(opt_ctx->backend_sched)) { opt_disarm_evaluation(opt_ctx); }
         return status;
     }
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;

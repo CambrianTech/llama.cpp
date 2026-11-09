@@ -1672,6 +1672,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (ggml_backend_sched_graph_pending(sched.get())) {
+        LLAMA_LOG_ERROR("%s: a learning graph retains this workspace; resume it before decode\n", __func__);
+        return -3;
+    }
+
     for (const auto & entry : *loras) {
         if (entry.first->restore_quarantined) {
             LLAMA_LOG_ERROR("%s: adapter generation restore is uncertain\n", __func__);
@@ -1910,6 +1915,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
         }
+
+        // The live owner retains the prepared graph and publishes no partial outputs.
+        // Its segmented path admits a single whole ubatch, never token partitions.
+        if (opt_reply && opt_reply->graph_meta) { return 0; }
 
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {

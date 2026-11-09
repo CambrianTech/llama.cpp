@@ -246,6 +246,10 @@ struct llama_context {
         ggml_opt_result_t result = nullptr;
         int32_t chunk_tokens = 0, cursor = 0, n_train = 0;
         int64_t n_labels = 0, labels_done = 0;
+        // Zero keeps synchronous evaluation; positive values resume graph nodes.
+        int graph_nodes = 0;
+        ggml_context_ptr graph_meta;
+        bool drain_graph = false;
         bool restoring = false;
         std::string failure;
         ~opt_live_reply() { if (batch.token) { llama_batch_free(batch); } }

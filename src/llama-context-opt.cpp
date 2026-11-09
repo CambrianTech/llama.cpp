@@ -652,7 +652,16 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
             memset(a->data, 0, ggml_nbytes(a));
         }
     }
-    ggml_opt_eval(opt_ctx, opt_result_active);
+    if (opt_reply && opt_reply->graph_nodes > 0 && xc == nullptr) {
+        bool complete = false;
+        ggml_opt_eval_step(opt_ctx, opt_result_active, opt_reply->graph_nodes, &complete);
+        if (!complete && ggml_backend_sched_graph_pending(sched.get())) {
+            opt_reply->graph_meta.reset(ctx_compute_opt);
+            return true;
+        }
+    } else {
+        ggml_opt_eval(opt_ctx, opt_result_active);
+    }
     ggml_free(ctx_compute_opt);
     if (const char * why = ggml_opt_refusal(opt_ctx); why[0] != '\0') {
         // the backend failed the graph (ggml_opt_eval): the run fails, as a refused graph does
