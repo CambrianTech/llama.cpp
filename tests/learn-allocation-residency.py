@@ -106,6 +106,9 @@ for grant, bound, reply, refusal in [
                    'reply': reply, 'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace'}))['learn']
     assert not refused['success'] and refused['refusal'] == refusal, refused
     assert refused['committed_steps'] == 0 and not refused['effects_uncertain'], refused
+    assert refused['t_ms'] == 0 and refused['max_chunk_ms'] == 0, 'latency refusal ran setup before admission'
+    account = next(row for row in call('/learn/grants')['grants'] if row['id'] == grant)
+    assert account['used_us'] == 0 and account['outstanding'] == 0, account
     print('latency admission', refusal, flush=True)
 
 # What this catches: an engine workspace can move to a new physical grant,

@@ -256,6 +256,28 @@
             out.failure = "the lane optimizer is restoring an admitted reply; retain this experience for retry";
             return out;
         }
+        const learn_geometry geometry{L.lora_id, L.n_prefix, (int32_t) L.reply.size(), slot.prompt.tokens.size()};
+        const bool warm = learning_residencies.count(L.lora_id) != 0;
+        const auto prior = learn_chunk_us.find(geometry);
+        int64_t boundary_us = 0;
+        if (prior != learn_chunk_us.end()) {
+            const auto & cost = prior->second;
+            const auto entry = warm ? cost.entry_warm : cost.entry_cold;
+            if (entry > 0 && cost.exit > 0) { boundary_us = std::max(entry, cost.exit); }
+        }
+        bool contended = false;
+        for (const auto & other : slots) { contended |= other.id != slot.id && other.is_processing(); }
+        auto boundary = learn_ledger.admit_chunk(L.grant, boundary_us, t0, contended);
+        if (boundary.refusal != server_learn_refusal::none) {
+            learn_outcome out;
+            out.refusal = learn_refusal_name(boundary.refusal);
+            out.failure = "entry/restoration geometry has no admitted measured latency budget";
+            out.deferred = true;
+            return out;
+        }
+        // No work ran under this reservation. The serialized loop transfers to the
+        // existing restoration obligation below, which debits setup and exit exactly once.
+        learn_ledger.cancel(boundary.reservation, t0);
         // Validate authority before touching adapters, optimizer, or sequence state.
         // This zero-estimate obligation remains live until the served tail is restored.
         // Its measured setup/restoration time is charged even if authority ends meanwhile.
@@ -276,7 +298,10 @@
         }
         auto out = learn_on_slot_admitted(slot, L, t0);
         const auto setup_us = ggml_time_us() - t0;
+        auto & entry = warm ? learn_chunk_us[geometry].entry_warm : learn_chunk_us[geometry].entry_cold;
+        entry = std::max(entry, setup_us);
         if (learning) {
+            learning->served_tokens = std::get<3>(geometry);
             learning->restoration_reservation = probe.reservation;
             learning->restoration_us = setup_us;
             learning->compute_us += setup_us;
@@ -402,10 +427,10 @@
                 for (const auto & other : slots) {
                     contended |= other.id != slot.id && other.is_processing();
                 }
-                const auto geometry = std::make_tuple(pending.lora_id, pending.prefix, pending.n_labels);
+                const learn_geometry geometry{pending.lora_id, pending.prefix, pending.n_labels, pending.served_tokens};
                 const auto measured = learn_chunk_us.find(geometry);
                 auto admission = learn_ledger.admit_chunk(pending.grant,
-                    measured == learn_chunk_us.end() ? 0 : measured->second, chunk_started, contended);
+                    measured == learn_chunk_us.end() ? 0 : measured->second.gradient, chunk_started, contended);
                 if (admission.refusal == server_learn_refusal::budget_exhausted) { return; }
                 if (admission.refusal == server_learn_refusal::none) {
                     admission.refusal = learn_ledger.start(admission.reservation, chunk_started);
@@ -434,10 +459,14 @@
             const auto elapsed = chunk_finished - chunk_started;
             pending.compute_us += elapsed;
             pending.max_chunk_us = std::max(pending.max_chunk_us, elapsed);
-            if (!reservation) { pending.restoration_us += elapsed; }
+            if (!reservation) {
+                pending.restoration_us += elapsed;
+                pending.max_restoration_chunk_us = std::max(pending.max_restoration_chunk_us, elapsed);
+            }
             if (reservation) {
-                const auto geometry = std::make_tuple(pending.lora_id, pending.prefix, pending.n_labels);
-                learn_chunk_us[geometry] = std::max(learn_chunk_us[geometry], elapsed);
+                const learn_geometry geometry{pending.lora_id, pending.prefix, pending.n_labels, pending.served_tokens};
+                auto & cost = learn_chunk_us[geometry].gradient;
+                cost = std::max(cost, elapsed);
                 const auto settled = learn_ledger.finish(reservation, elapsed,
                     committed, chunk_finished);
                 if (settled != server_learn_refusal::none) {
@@ -494,6 +523,8 @@
         pending.compute_us += cleanup_us;
         pending.restoration_us += cleanup_us;
         pending.max_chunk_us = std::max(pending.max_chunk_us, cleanup_us);
+        auto & exit_cost = learn_chunk_us[learn_geometry{pending.lora_id, pending.prefix, pending.n_labels, pending.served_tokens}].exit;
+        exit_cost = std::max(exit_cost, std::max(cleanup_us, pending.max_restoration_chunk_us));
         const auto settled = learn_ledger.finish(pending.restoration_reservation, pending.restoration_us, pending.restoration_steps, ggml_time_us());
         if (settled != server_learn_refusal::none) {
             out.ok = false;

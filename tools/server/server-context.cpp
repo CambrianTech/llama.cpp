@@ -982,7 +982,12 @@ private:
     }();
     server_learn_ledger learn_ledger{learn_engine};
     server_residency_mirror residency_mirror{learn_engine};
-    std::map<std::tuple<int32_t, int32_t, int32_t>, int64_t> learn_chunk_us; // shadow, served prefix, label geometry
+    // Include the served tail: restoring a long generated answer is not the same geometry.
+    using learn_geometry = std::tuple<int32_t, int32_t, int32_t, size_t>;
+    struct learn_phase_cost {
+        int64_t gradient = 0, entry_cold = 0, entry_warm = 0, exit = 0;
+    };
+    std::map<learn_geometry, learn_phase_cost> learn_chunk_us;
 
     static ggml_opt_optimizer_params learn_opt_pars(void * ud) {
         ggml_opt_optimizer_params p = ggml_opt_get_default_optimizer_params(nullptr);
@@ -1012,6 +1017,8 @@ private:
         int64_t restoration_steps = 0;
         int64_t committed_steps = 0;
         int64_t max_chunk_us = 0;
+        size_t served_tokens = 0;
+        int64_t max_restoration_chunk_us = 0;
         std::optional<bool> finished;
         std::string failure;
         ~pending_learn() { ggml_opt_result_free(result); }
