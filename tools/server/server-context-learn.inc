@@ -392,27 +392,21 @@
                 for (const auto & other : slots) {
                     contended |= other.id != slot.id && other.is_processing();
                 }
-                const auto measured = learn_chunk_us.find(pending.lora_id);
-                if (contended && measured == learn_chunk_us.end()) {
-                    pending.refusal = "pending_calibration";
-                    pending.failure = "no measured chunk cost for this shadow under contention";
+                const auto geometry = std::make_tuple(pending.lora_id, pending.prefix, pending.n_labels);
+                const auto measured = learn_chunk_us.find(geometry);
+                auto admission = learn_ledger.admit_chunk(pending.grant,
+                    measured == learn_chunk_us.end() ? 0 : measured->second, chunk_started, contended);
+                if (admission.refusal == server_learn_refusal::budget_exhausted) { return; }
+                if (admission.refusal == server_learn_refusal::none) {
+                    admission.refusal = learn_ledger.start(admission.reservation, chunk_started);
+                    if (admission.refusal == server_learn_refusal::none) { reservation = admission.reservation; }
+                    else { learn_ledger.cancel(admission.reservation, chunk_started); }
+                }
+                if (admission.refusal != server_learn_refusal::none) {
+                    pending.refusal = learn_refusal_name(admission.refusal);
+                    pending.failure = "authority refused the next gradient chunk; stable tail restored";
                     pending.drained = true;
                     llama_opt_learn_drain(ctx_tgt);
-                } else {
-                    auto admission = learn_ledger.admit(pending.grant,
-                        measured == learn_chunk_us.end() ? 0 : measured->second, chunk_started, contended);
-                    if (admission.refusal == server_learn_refusal::budget_exhausted) { return; }
-                    if (admission.refusal == server_learn_refusal::none) {
-                        admission.refusal = learn_ledger.start(admission.reservation, chunk_started);
-                        if (admission.refusal == server_learn_refusal::none) { reservation = admission.reservation; }
-                        else { learn_ledger.cancel(admission.reservation, chunk_started); }
-                    }
-                    if (admission.refusal != server_learn_refusal::none) {
-                        pending.refusal = learn_refusal_name(admission.refusal);
-                        pending.failure = "authority refused the next gradient chunk; stable tail restored";
-                        pending.drained = true;
-                        llama_opt_learn_drain(ctx_tgt);
-                    }
                 }
             }
             learning_residencies.at(pending.lora_id)->restoring = !llama_opt_learn_needs_gradient(ctx_tgt);
@@ -430,7 +424,8 @@
             pending.max_chunk_us = std::max(pending.max_chunk_us, elapsed);
             if (!reservation) { pending.restoration_us += elapsed; }
             if (reservation) {
-                learn_chunk_us[pending.lora_id] = std::max(learn_chunk_us[pending.lora_id], elapsed);
+                const auto geometry = std::make_tuple(pending.lora_id, pending.prefix, pending.n_labels);
+                learn_chunk_us[geometry] = std::max(learn_chunk_us[geometry], elapsed);
                 const auto settled = learn_ledger.finish(reservation, elapsed,
                     committed, chunk_finished);
                 if (settled != server_learn_refusal::none) {

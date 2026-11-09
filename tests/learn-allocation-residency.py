@@ -33,7 +33,7 @@ b = load('shadow-06.gguf', 'weights-b')
 probe = {'id_slot': 0, 'prompt': 'The capital of Kansas is', 'n_predict': 1, 'temperature': 0}
 serving_before = call('/completion', probe)['content']
 assert call('/learn/grants', {'id': 'compute', 'engine': engine, 'period_ms': 1000,
-                            'share_ppm': 1000000, 'expires_in_ms': 120000})['refusal'] == 'none'
+                            'share_ppm': 0, 'expires_in_ms': 120000})['refusal'] == 'none'
 
 def learn(shadow, optimizer='', workspace=''):
     return call('/completion', dict(probe, learn={'grant': 'compute', 'lora_id': shadow['id'],
@@ -61,6 +61,19 @@ for shadow, name in ((a, 'opt-a'), (b, 'opt-b'), (a, 'opt-a')):
     result = learn(shadow, name, 'workspace')
     assert result['success'] and result['committed_steps'] == 1 and not result['effects_uncertain'], result
     assert call('/learn/residency/release', {'id': name})['refusal'] == 'busy'
+# Measured latency authority must gate the actual caller, including idle work.
+for grant, bound, reply, refusal in [
+        ('no-bound', 0, 'Topeka is the capital of Kansas.', 'pending_calibration'),
+        ('too-slow', 1, 'Topeka is the capital of Kansas.', 'chunk_exceeds_latency'),
+        ('new-geometry', 1000000, 'Topeka.', 'pending_calibration')]:
+    assert call('/learn/grants', {'id': grant, 'engine': engine, 'period_ms': 1000,
+                'share_ppm': 1000000, 'max_chunk_us': bound, 'expires_in_ms': 120000})['refusal'] == 'none'
+    refused = call('/completion', dict(probe, learn={'grant': grant, 'lora_id': a['id'],
+                   'reply': reply, 'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace'}))['learn']
+    assert not refused['success'] and refused['refusal'] == refusal, refused
+    assert refused['committed_steps'] == 0 and not refused['effects_uncertain'], refused
+    print('latency admission', refusal, flush=True)
+
 # What this catches: an engine workspace can move to a new physical grant,
 # without changing scheduler buffers or leaving the other mind's callbacks stale.
 register('workspace-next', {'workspace': True}, workspace)

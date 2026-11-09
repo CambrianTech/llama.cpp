@@ -979,7 +979,7 @@ private:
     }();
     server_learn_ledger learn_ledger{learn_engine};
     server_residency_mirror residency_mirror{learn_engine};
-    std::map<int32_t, int64_t> learn_chunk_us; // measured worst chunk per loaded shadow
+    std::map<std::tuple<int32_t, int32_t, int32_t>, int64_t> learn_chunk_us; // shadow, served prefix, label geometry
 
     static ggml_opt_optimizer_params learn_opt_pars(void * ud) {
         ggml_opt_optimizer_params p = ggml_opt_get_default_optimizer_params(nullptr);
