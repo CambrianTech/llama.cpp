@@ -27,7 +27,7 @@ static ggml_opt_optimizer_params sgd_pars(void *) {
     return p;
 }
 
-static void run(int32_t opt_period) {
+static void run(int32_t opt_period, bool test_residency_gate = false) {
     // by type, not ggml_backend_cpu_init: in a dynamically loaded backend build (CI) the CPU
     // backend is its own library
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -49,6 +49,16 @@ static void run(int32_t opt_period) {
     params.opt_period   = opt_period;
     ggml_opt_context_t opt_ctx = ggml_opt_init(params); // no ctx_compute: graphs are built per step
     ggml_opt_result_t  result  = ggml_opt_result_init();
+    struct gate_state { bool allow = false; size_t measured = 0; } gate;
+    if (test_residency_gate) {
+        ggml_opt_set_static_allocation_callback(opt_ctx, [](ggml_backend_buffer_type_t,
+                const char * kind, size_t bytes, void * data) {
+            auto & gate = *static_cast<gate_state *>(data);
+            if (strcmp(kind, "optimizer_static") == 0) { gate.measured = bytes; }
+            return gate.allow;
+        }, &gate);
+    }
+
 
     const int n_evals = 3 * opt_period;
     for (int i = 0; i < n_evals; ++i) {
@@ -59,7 +69,29 @@ static void run(int32_t opt_period) {
         ggml_cgraph * gf  = ggml_new_graph_custom(ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
         ggml_build_forward_expand(gf, out);
         ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, x, out);
+        if (test_residency_gate && !gate.allow) {
+            // What this catches: denied residency is measured by the real allocator before
+            // any optimizer buffer allocation, and re-preparing after admission is usable.
+            CHECK(!ggml_opt_alloc(opt_ctx, true));
+            CHECK(gate.measured > 0);
+            size_t allocated = 0;
+            ggml_opt_visit_owned_buffers(opt_ctx, [](ggml_backend_buffer_t b, const char *, void * data) {
+                *static_cast<size_t *>(data) += ggml_backend_buffer_get_size(b);
+            }, &allocated);
+            CHECK(allocated == 0);
+            gate.allow = true;
+            ggml_free(ctx_compute);
+            --i;
+            continue;
+        }
         CHECK(ggml_opt_alloc(opt_ctx, true));
+        if (test_residency_gate) {
+            size_t allocated = 0;
+            ggml_opt_visit_owned_buffers(opt_ctx, [](ggml_backend_buffer_t b, const char * kind, void * data) {
+                if (strcmp(kind, "optimizer_static") == 0) { *static_cast<size_t *>(data) = ggml_backend_buffer_get_size(b); }
+            }, &allocated);
+            CHECK(allocated == gate.measured);
+        }
         ggml_backend_tensor_set(x, &X, 0, sizeof(float));
         ggml_opt_eval(opt_ctx, result);
         ggml_free(ctx_compute);
@@ -523,6 +555,7 @@ int main() {
     ggml_backend_load_all();
     run(1);
     run(2);
+    run(1, true);
     run_manual();
     run_manual(true);
     run_refuses_graph_without_backward();

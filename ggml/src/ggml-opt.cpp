@@ -49,6 +49,8 @@ struct ggml_opt_context {
     struct ggml_context      * ctx_copy             = nullptr;
     ggml_backend_buffer_t      buf_static           = nullptr;
     ggml_backend_buffer_t      buf_cpu              = nullptr;
+    ggml_opt_static_allocation_callback static_allocation_callback = nullptr;
+    void * static_allocation_user_data = nullptr;
     std::mt19937               rng;
     enum ggml_opt_loss_type    loss_type;
     enum ggml_opt_build_type   build_type;
@@ -546,6 +548,15 @@ static int64_t ggml_opt_output_rows(ggml_opt_context_t opt_ctx) {
 }
 
 // false (with refusal set) when the loss's gradient cannot pass through the graph
+static bool ggml_opt_static_allocation_allowed(ggml_opt_context_t opt_ctx, ggml_context * ctx,
+        ggml_backend_buffer_type_t buft, const char * kind) {
+    if (!opt_ctx->static_allocation_callback) { return true; }
+    const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+    if (opt_ctx->static_allocation_callback(buft, kind, bytes, opt_ctx->static_allocation_user_data)) { return true; }
+    opt_ctx->refusal = std::string("optimizer residency not admitted: ") + kind;
+    return false;
+}
+
 static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
@@ -735,6 +746,8 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
             return true;
         }
     } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_FORWARD) {
+        if (!ggml_opt_static_allocation_allowed(opt_ctx, opt_ctx->ctx_static,
+                ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0)), "optimizer_static")) { return false; }
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         return true;
@@ -832,6 +845,8 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
             return true;
         }
     } else if (opt_ctx->build_type_alloc == GGML_OPT_BUILD_TYPE_GRAD) {
+        if (!ggml_opt_static_allocation_allowed(opt_ctx, opt_ctx->ctx_static,
+                ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0)), "optimizer_static")) { return false; }
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         ggml_graph_reset(opt_ctx->gb_grad);
     }
@@ -876,6 +891,8 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     if (!opt_ctx->buf_static) {
+        if (!ggml_opt_static_allocation_allowed(opt_ctx, opt_ctx->ctx_static,
+                ggml_backend_get_default_buffer_type(ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0)), "optimizer_static")) { return false; }
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         ggml_graph_reset(opt_ctx->gb_opt);
@@ -885,6 +902,8 @@ static bool ggml_opt_build(ggml_opt_context_t opt_ctx) {
             opt_ctx->buf_static ? ggml_backend_buffer_get_size(opt_ctx->buf_static) : (size_t) 0, opt_ctx->param_m.size());
     }
 
+    if (!ggml_opt_static_allocation_allowed(opt_ctx, opt_ctx->ctx_cpu,
+            ggml_backend_cpu_buffer_type(), "optimizer_host")) { return false; }
     opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
     return true;
 }
@@ -960,6 +979,12 @@ void ggml_opt_accumulate_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * t
 struct ggml_tensor * ggml_opt_leaf_grad(ggml_opt_context_t opt_ctx, struct ggml_tensor * leaf) {
     const auto it = opt_ctx->leaf_grads.find(leaf);
     return it == opt_ctx->leaf_grads.end() ? nullptr : it->second;
+}
+
+void ggml_opt_set_static_allocation_callback(ggml_opt_context_t opt_ctx,
+        ggml_opt_static_allocation_callback callback, void * user_data) {
+    opt_ctx->static_allocation_callback = callback;
+    opt_ctx->static_allocation_user_data = user_data;
 }
 
 void ggml_opt_visit_owned_buffers(ggml_opt_context_t opt_ctx, ggml_opt_buffer_callback callback, void * user_data) {
