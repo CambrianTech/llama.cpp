@@ -27,7 +27,14 @@ static ggml_opt_optimizer_params sgd_pars(void *) {
     return p;
 }
 
-static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false, bool test_measurement = false, int graph_nodes = 0, bool use_gpu = false) {
+static ggml_opt_optimizer_params adam_pars(void *) {
+    auto p = ggml_opt_get_default_optimizer_params(nullptr);
+    p.adamw.alpha = LR;
+    p.adamw.wd = 0.0f;
+    return p;
+}
+
+static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false, bool test_measurement = false, int graph_nodes = 0, bool use_gpu = false, bool adam = false) {
     // by type, not ggml_backend_cpu_init: in a dynamically loaded backend build (CI) the CPU
     // backend is its own library
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -40,14 +47,15 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
     ggml_init_params sp = { 8 * ggml_tensor_overhead(), nullptr, true };
     ggml_context * ctx_static = ggml_init(sp);
     ggml_tensor * w = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
+    ggml_set_name(w, "weight");
     ggml_set_param(w);
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, gpu ? gpu : cpu);
     float w_now = 1.0f;
     ggml_backend_tensor_set(w, &w_now, 0, sizeof(float));
 
     ggml_opt_params params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_SUM);
-    params.optimizer    = GGML_OPT_OPTIMIZER_TYPE_SGD;
-    params.get_opt_pars = sgd_pars;
+    params.optimizer    = adam ? GGML_OPT_OPTIMIZER_TYPE_ADAMW : GGML_OPT_OPTIMIZER_TYPE_SGD;
+    params.get_opt_pars = adam ? adam_pars : sgd_pars;
     params.opt_period   = opt_period;
     ggml_opt_context_t opt_ctx = ggml_opt_init(params); // no ctx_compute: graphs are built per step
     ggml_opt_result_t  result  = ggml_opt_result_init();
@@ -65,6 +73,7 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
 
     bool measured_once = false;
     bool cancelled_preparation = false;
+    bool cancelled_checkpoint = false;
     size_t measured_static = 0, measured_host = 0, measured_graph = 0;
     const int n_evals = 3 * opt_period;
     for (int i = 0; i < n_evals; ++i) {
@@ -123,9 +132,17 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
             float held;
             ggml_backend_tensor_get(w, &held, 0, sizeof(held));
             CHECK(held == w_now);
-            if (!cancelled_preparation) {
+            if (!cancelled_preparation || (i == opt_period && !cancelled_checkpoint)) {
+                const bool committed_boundary = i == opt_period;
                 CHECK(ggml_opt_alloc_cancel(opt_ctx));
                 CHECK(!ggml_opt_alloc_cancel(opt_ctx));
+                if (committed_boundary) {
+                    FILE * checkpoint = tmpfile();
+                    CHECK(checkpoint);
+                    CHECK(ggml_opt_state_write(opt_ctx, checkpoint, "prepared-cancel"));
+                    fclose(checkpoint);
+                    cancelled_checkpoint = true;
+                }
                 cancelled_preparation = true;
                 ggml_free(ctx_compute);
                 --i;
@@ -170,7 +187,7 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
         ggml_backend_tensor_get(w, &w_after, 0, sizeof(float));
         if ((i + 1) % opt_period == 0) {
             // one period = opt_period evals of gradient X each, scaled by nothing (LOSS_TYPE_SUM)
-            const float expected = w_now - LR * X * opt_period;
+            const float expected = w_now - (adam ? LR : LR * X * opt_period);
             if (std::fabs(w_after - expected) > 1e-6f) {
                 fprintf(stderr, "opt_period %d, step %d: w moved to %f, expected %f (from %f)\n",
                         opt_period, (i + 1) / opt_period, w_after, expected, w_now);
@@ -625,8 +642,10 @@ static void run_refuses_misshaped_gradient() {
 int main() {
     ggml_backend_load_all();
     for (int period : {1, 2, 3}) { run(period, false, false, false, 1); }
+    for (int period : {1, 2, 3}) { run(period, false, false, false, 1, false, true); }
     if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
         for (int period : {1, 2, 3}) { run(period, false, false, false, 1, true); }
+        for (int period : {1, 2, 3}) { run(period, false, false, false, 1, true, true); }
         printf("PASS CUDA optimizer continuation commits once across periods 1/2/3\n");
     }
     run(1);

@@ -1923,9 +1923,11 @@ bool ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
 
 bool ggml_opt_alloc_cancel(ggml_opt_context_t opt_ctx) {
     if (!opt_ctx->allocation_pending) { return false; }
+    const bool committed_boundary = opt_ctx->checkpoint_ready && opt_ctx->period_fresh && opt_ctx->opt_i == 0;
     opt_ctx->allocation_pending = false;
     if (opt_ctx->allocation_backward) { ggml_opt_reset(opt_ctx, false); }
     opt_disarm_evaluation(opt_ctx);
+    opt_ctx->checkpoint_ready = committed_boundary;
     return true;
 }
 
