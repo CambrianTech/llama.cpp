@@ -179,7 +179,9 @@ llama_opt_learn_status llama_context::opt_learn_step() {
         batch.label[i] = s.restoring ? -1 : s.labels[s.cursor + i];
         batch.logits[i] = !s.restoring && batch.label[i] >= 0;
     }
-    if (s.restoring) { batch.logits[m - 1] = true; }
+    // Intermediate restoration batches only rebuild KV. Their vocabulary logits
+    // are never consumed; publish the served tail's logits once, at the end.
+    if (s.restoring && s.cursor + m == end) { batch.logits[m - 1] = true; }
     opt_result_active = s.restoring ? nullptr : s.result;
     opt_outputs_internal = !s.restoring;
     opt_learn_labels = s.restoring ? 0 : s.n_labels;

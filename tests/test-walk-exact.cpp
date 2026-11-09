@@ -712,6 +712,7 @@ int main(int argc, char ** argv) {
             auto cp = common_context_params_to_llama(params);
             cp.n_ctx = 2*WINDOW; cp.n_batch = WINDOW; cp.n_ubatch = WINDOW; cp.n_seq_max = 2; cp.kv_unified = !streams;
             if (getenv("WALK_LIVE_GRAPH_SMALL_UBATCH")) { cp.n_ubatch = WINDOW / 8; }
+            if (getenv("WALK_LIVE_SMALL_RESTORE_BATCH")) { cp.n_batch = cp.n_ubatch = WINDOW / 8; }
             cp.flash_attn_type = streams ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
             cp.type_k = streams ? GGML_TYPE_F16 : GGML_TYPE_F32; cp.type_v = cp.type_k;
             // Graph segmentation preserves the full token graph and its gradient.
@@ -727,11 +728,15 @@ int main(int argc, char ** argv) {
         };
         auto decode_span = [&](llama_context * c, llama_seq_id sq, const llama_token * t, llama_pos p0, int32_t n) {
             llama_batch b = llama_batch_init(WINDOW, 0, 1);
-            common_batch_clear(b);
-            for (int32_t i = 0; i < n; ++i) {
-                common_batch_add(b, t[i], p0 + i, { sq }, i + 1 == n);
+            for (int32_t first = 0; first < n;) {
+                const int32_t last = std::min(n, first + (int32_t) llama_n_batch(c));
+                common_batch_clear(b);
+                for (int32_t i = first; i < last; ++i) {
+                    common_batch_add(b, t[i], p0 + i, { sq }, i + 1 == n);
+                }
+                GGML_ASSERT(llama_decode(c, b) == 0);
+                first = last;
             }
-            GGML_ASSERT(llama_decode(c, b) == 0);
             llama_batch_free(b);
         };
         auto seq_state = [&](llama_context * c, llama_seq_id sq) {
