@@ -632,6 +632,19 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
         }
     }
     const bool train = walk == nullptr || walk->train;
+    if (opt_reply && opt_reply->graph_nodes > 0 && xc == nullptr) {
+        if (!ubatch.data || !ggml_opt_alloc_begin(opt_ctx, train)) {
+            ggml_free(ctx_compute_opt);
+            opt_fail("live graph preparation needs owned batch data and admitted optimizer storage");
+            return false;
+        }
+        opt_reply->graph_meta.reset(ctx_compute_opt);
+        opt_reply->graph_preparing = true;
+        opt_reply->graph_ubatch = ubatch;
+        opt_reply->graph_targets = std::move(targets);
+        opt_reply->graph_weights = std::move(weights);
+        return true;
+    }
     if (!ggml_opt_alloc(opt_ctx, train)) {
         ggml_free(ctx_compute_opt);
         opt_fail(ggml_opt_refusal(opt_ctx),
@@ -664,16 +677,7 @@ bool llama_context::opt_ubatch(llm_graph_result * res, ggml_cgraph * gf, const l
             memset(a->data, 0, ggml_nbytes(a));
         }
     }
-    if (opt_reply && opt_reply->graph_nodes > 0 && xc == nullptr) {
-        bool complete = false;
-        ggml_opt_eval_step(opt_ctx, opt_result_active, opt_reply->graph_nodes, &complete);
-        if (!complete && ggml_backend_sched_graph_pending(sched.get())) {
-            opt_reply->graph_meta.reset(ctx_compute_opt);
-            return true;
-        }
-    } else {
-        ggml_opt_eval(opt_ctx, opt_result_active);
-    }
+    ggml_opt_eval(opt_ctx, opt_result_active);
     ggml_free(ctx_compute_opt);
     if (const char * why = ggml_opt_refusal(opt_ctx); why[0] != '\0') {
         // the backend failed the graph (ggml_opt_eval): the run fails, as a refused graph does

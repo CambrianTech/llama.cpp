@@ -251,6 +251,11 @@ struct llama_context {
         // Zero keeps synchronous evaluation; positive values resume graph nodes.
         int graph_nodes = 0;
         ggml_context_ptr graph_meta;
+        bool graph_preparing = false;
+        llama_ubatch graph_ubatch{};
+        llama_memory_context_ptr graph_memory;
+        std::vector<int32_t> graph_targets;
+        std::vector<float> graph_weights;
         ggml_backend_sched_ptr serving_sched;
         llm_graph_result_ptr serving_graph;
         llm_graph_result_ptr serving_reserve;

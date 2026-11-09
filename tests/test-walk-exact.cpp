@@ -852,6 +852,34 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(seq_state(ctx, 1) == neighbour_before);
         GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
 
+        if (getenv("WALK_LIVE_GRAPH_CONTINUATION")) {
+            GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0,
+                tokens.data() + r0, WINDOW - r0, nullptr));
+            ctx->opt_reply->graph_nodes = 1;
+            GGML_ASSERT(llama_opt_learn_step(ctx) == LLAMA_OPT_LEARN_MORE);
+            GGML_ASSERT(ctx->opt_reply->graph_preparing);
+            GGML_ASSERT(llama_opt_learn_drain(ctx));
+            do { drained = llama_opt_learn_step(ctx); } while (drained == LLAMA_OPT_LEARN_MORE);
+            GGML_ASSERT(drained == LLAMA_OPT_LEARN_DONE);
+            GGML_ASSERT(adapter_params(adapter) == before);
+            GGML_ASSERT(seq_state(ctx, 0) == want_her && seq_state(ctx, 1) == neighbour_before);
+            GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
+
+            GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0,
+                tokens.data() + r0, WINDOW - r0, nullptr));
+            ctx->opt_reply->graph_nodes = 1;
+            GGML_ASSERT(llama_opt_learn_step(ctx) == LLAMA_OPT_LEARN_MORE);
+            GGML_ASSERT(ctx->opt_reply->graph_preparing);
+            current_admission.allow_workspace = false;
+            GGML_ASSERT(llama_opt_learn_step(ctx) == LLAMA_OPT_LEARN_MORE);
+            current_admission.allow_workspace = true;
+            do { drained = llama_opt_learn_step(ctx); } while (drained == LLAMA_OPT_LEARN_MORE);
+            GGML_ASSERT(drained == LLAMA_OPT_LEARN_FAILED);
+            GGML_ASSERT(adapter_params(adapter) == before);
+            GGML_ASSERT(seq_state(ctx, 0) == want_her && seq_state(ctx, 1) == neighbour_before);
+            GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
+        }
+
         // What this catches: yielding with training flags still installed, losing accumulated
         // labels between chunks, or restoring the neighbour instead of the learning sequence.
         // Neighbour inference runs at returned boundaries; learning covers the entire reply.
@@ -881,7 +909,7 @@ int main(int argc, char ** argv) {
             }
             progress = llama_opt_learn_step(ctx);
             if (progress == LLAMA_OPT_LEARN_MORE) {
-                if (getenv("WALK_LIVE_GRAPH_FAILURE") && !injected_graph_failure) {
+                if (getenv("WALK_LIVE_GRAPH_FAILURE") && !injected_graph_failure && !ctx->opt_reply->graph_preparing) {
                     GGML_ASSERT(ctx->opt_reply->graph_meta);
                     // Model a parameter write before failure; recovery must preserve and quarantine it, not invent rollback.
                     auto * changed = adapter->ab_map.begin()->second.a;
@@ -893,7 +921,7 @@ int main(int argc, char ** argv) {
                     ctx->opt_reply->graph_nodes = -1; // fail the next continuation with live graph custody
                     injected_graph_failure = true;
                 }
-                if (getenv("WALK_LIVE_GRAPH_DRAIN") && yielded == 0) {
+                if (getenv("WALK_LIVE_GRAPH_DRAIN") && yielded == 1) {
                     GGML_ASSERT(ctx->opt_reply->graph_meta);
                     GGML_ASSERT(llama_opt_learn_drain(ctx));
                     GGML_ASSERT(ctx->opt_reply->drain_graph);

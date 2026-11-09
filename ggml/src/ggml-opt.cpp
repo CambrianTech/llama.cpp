@@ -1867,6 +1867,7 @@ static bool opt_alloc(ggml_opt_context_t opt_ctx, bool backward, bool build_only
             ggml_backend_sched_reset(sched);
             opt_ctx->allocated_graph = nullptr;
             opt_ctx->eval_ready      = false;
+            opt_ctx->refusal = "optimizer workspace allocation was refused";
             return false;
         }
     }

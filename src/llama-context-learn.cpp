@@ -100,6 +100,15 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
 // existing stable-restoration path; no optimizer, KV, or completed update is discarded.
 bool llama_context::opt_learn_drain() {
     if (!opt_reply) { return false; }
+    if (opt_reply->graph_preparing) {
+        ggml_opt_alloc_cancel(opt_ctx);
+        opt_reply->graph_preparing = false;
+        opt_reply->graph_meta.reset();
+        opt_reply->graph_memory.reset();
+        gf_res_prev->reset();
+        opt_reply->cursor = opt_reply->n_train;
+        return true;
+    }
     if (opt_reply->graph_meta) {
         // Update nodes may already have run. Finish this graph before restoration;
         // its committed step remains visible rather than pretending to roll it back.
@@ -129,6 +138,25 @@ llama_opt_learn_status llama_context::opt_learn_step() {
     }
     auto & s = *opt_reply;
     if (s.graph_meta) {
+        if (s.graph_preparing) {
+            if (!ggml_opt_alloc(opt_ctx, true)) {
+                s.failure = ggml_opt_refusal(opt_ctx);
+                s.graph_preparing = false;
+                s.graph_meta.reset();
+                s.graph_memory.reset();
+                gf_res_prev->reset();
+                s.cursor = s.n_train;
+                return LLAMA_OPT_LEARN_MORE;
+            }
+            gf_res_prev->set_inputs(&s.graph_ubatch);
+            auto * labels = ggml_opt_labels(opt_ctx);
+            ggml_backend_tensor_set(labels, s.graph_targets.data(), 0, ggml_nbytes(labels));
+            if (auto * weights = ggml_opt_label_weights(opt_ctx)) {
+                GGML_ASSERT(s.graph_weights.size() == s.graph_targets.size());
+                ggml_backend_tensor_set(weights, s.graph_weights.data(), 0, ggml_nbytes(weights));
+            }
+            s.graph_preparing = false;
+        }
         bool complete = false;
         const auto status = ggml_opt_eval_step(opt_ctx, s.result, s.graph_nodes, &complete);
         if (status != GGML_STATUS_SUCCESS) {

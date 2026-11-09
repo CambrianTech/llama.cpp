@@ -195,7 +195,10 @@ private:
 
     //
     // data needed for building the compute graph for the current ubatch:
-    // TODO: extract all the state like `head` and `n` here
+    // A later sequence may change the memory owner's current batch before this
+    // context's retained graph inputs are populated.
+    uint32_t batch_head = 0, batch_n = 0;
+    int32_t batch_rs_z = 0;
     //
 
     const bool is_full = false;

@@ -1213,6 +1213,9 @@ bool llama_memory_recurrent_context::apply() {
     }
 
     mem->find_slot(ubatches[i_next]);
+    batch_head = mem->head;
+    batch_n = mem->n;
+    batch_rs_z = mem->rs_z;
 
     return true;
 }
@@ -1228,15 +1231,15 @@ const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_n_rs() const {
-    return is_full ? mem->size : mem->n;
+    return is_full ? mem->size : batch_n;
 }
 
 uint32_t llama_memory_recurrent_context::get_head() const {
-    return is_full ? 0 : mem->head;
+    return is_full ? 0 : batch_head;
 }
 
 int32_t llama_memory_recurrent_context::get_rs_z() const {
-    return is_full ? 0 : mem->rs_z;
+    return is_full ? 0 : batch_rs_z;
 }
 
 uint32_t llama_memory_recurrent_context::get_size() const {
@@ -1252,7 +1255,7 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
-    const uint32_t cell_idx = i + mem->head;
+    const uint32_t cell_idx = i + (is_full ? mem->head : batch_head);
     const int32_t  src0     = mem->cells[cell_idx].src0;
 
     if (mem->n_rs_seq == 0) {
