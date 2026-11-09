@@ -182,7 +182,7 @@ bool llama_opt_measure_shadow(llama_context * ctx, llama_opt_params params,
     return ctx && ctx->opt_measure_shadow(params, callback, user_data);
 }
 
-bool llama_opt_measure_shadow_rows(llama_context * ctx, llama_opt_params params, uint32_t reply_rows,
+bool llama_opt_measure_shadow_graph(llama_context * ctx, llama_opt_params params, uint32_t reply_rows,
         llama_opt_memory_callback callback, void * user_data) {
     return ctx && reply_rows > 0 && ctx->opt_measure_shadow(params, callback, user_data, reply_rows);
 }

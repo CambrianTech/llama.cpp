@@ -45,9 +45,12 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
     const int n_backends = ggml_backend_sched_get_n_backends(sched.get());
     size_t static_bytes = 0, host_bytes = 0;
     std::vector<size_t> sizes(n_backends, 0);
-    // Accumulation and commit have different live ranges. Rebuild metadata for each;
-    // a scheduler split rewrites inputs and cannot be measured a second time.
-    for (const bool commit : {false, true}) {
+    // General callers need both accumulation and commit live ranges. The explicit
+    // whole-reply graph API executes one commit graph, even across node yields;
+    // it never executes the accumulation-only graph. Avoid building that unused
+    // graph on the serving loop. Each measured phase still gets fresh metadata.
+    for (int phase = reply_rows ? 1 : 0; phase < 2; ++phase) {
+        const bool commit = phase == 1;
         llm_graph_result res(max_nodes);
         llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
         auto ubatch = balloc.ubatch_reserve(chunk, 1);

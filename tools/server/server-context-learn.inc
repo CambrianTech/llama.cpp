@@ -110,7 +110,7 @@
         auto set = construct_lora_list({});
         set[id].scale = 1.0f;
         common_set_adapter_lora(ctx_tgt, set);
-        const bool ok = llama_opt_measure_shadow_rows(ctx_tgt, learning_shadow_params((int32_t) id), (uint32_t) reply_rows, [](const llama_adapter_lora *, const char * device,
+        const bool ok = llama_opt_measure_shadow_graph(ctx_tgt, learning_shadow_params((int32_t) id), (uint32_t) reply_rows, [](const llama_adapter_lora *, const char * device,
                 const char * buft, const char * kind, size_t bytes, bool host, void * data) {
             static_cast<json *>(data)->push_back({{"device", device}, {"buffer_type", buft},
                 {"kind", kind}, {"bytes", bytes}, {"host", host}});
