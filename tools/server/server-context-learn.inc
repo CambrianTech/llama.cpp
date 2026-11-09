@@ -5,6 +5,7 @@
             LEARN_REFUSAL(none); LEARN_REFUSAL(invalid); LEARN_REFUSAL(stale_engine);
             LEARN_REFUSAL(grant_mismatch); LEARN_REFUSAL(unknown_grant); LEARN_REFUSAL(never_fits); LEARN_REFUSAL(uncontended_only);
             LEARN_REFUSAL(budget_exhausted); LEARN_REFUSAL(started); LEARN_REFUSAL(not_started);
+            LEARN_REFUSAL(pending_calibration); LEARN_REFUSAL(chunk_exceeds_latency);
             LEARN_REFUSAL(already_started); LEARN_REFUSAL(unknown_reservation);
 #undef LEARN_REFUSAL
         }
@@ -204,7 +205,7 @@
         } else if (op == "register") {
             const auto duration = body.value("expires_in_ms", int64_t(0));
             server_learn_grant g{body.value("id", std::string()), body.value("engine", std::string()),
-                body.value("period_ms", int64_t(0)), body.value("share_ppm", int64_t(0)), 0};
+                body.value("period_ms", int64_t(0)), body.value("share_ppm", int64_t(0)), 0, body.value("max_chunk_us", int64_t(0))};
             auto refusal = server_learn_refusal::invalid;
             if (body.contains("share_ppm") && duration > 0 && duration <= server_learn_ledger::kMaxPeriodMs &&
                     now <= server_learn_ledger::kMaxClockUs - duration * 1000) {
@@ -221,7 +222,7 @@
         out["grants"] = json::array();
         for (const auto & a : learn_ledger.snapshot()) {
             out["grants"].push_back({{"id", a.grant.id}, {"period_ms", a.grant.period_ms},
-                {"share_ppm", a.grant.share_ppm}, {"expires_at_us", a.grant.expires_at_us},
+                {"max_chunk_us", a.grant.max_chunk_us}, {"share_ppm", a.grant.share_ppm}, {"expires_at_us", a.grant.expires_at_us},
                 {"revoked", a.revoked}, {"outstanding", a.outstanding},
                 {"committed_steps", learn_ledger.committed_steps(a.grant.id)}});
             int64_t used = 0;

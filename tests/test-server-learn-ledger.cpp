@@ -114,7 +114,40 @@ static void residency_plan() {
     require(mirror.release(replacement.id) == "none", "actual workspace free permits release");
 }
 
+// A known latency bound applies during idle too; refusals must not reserve duty.
+static void chunk_latency() {
+    server_learn_ledger ledger("engine-a");
+    server_learn_grant g{"latency", "engine-a", 1000, 100000, 10000000, 2000};
+    require(ledger.register_grant(g, 0) == R::none, "measured latency grant");
+    auto changed = g; changed.max_chunk_us++;
+    require(ledger.register_grant(changed, 0) == R::grant_mismatch, "latency bound is immutable");
+    for (bool contended : {false, true}) {
+        const auto unknown = ledger.admit_chunk(g.id, 0, 0, contended);
+        require(unknown.refusal == R::pending_calibration && unknown.reservation == 0, "unknown cost is not a measurement");
+        const auto over = ledger.admit_chunk(g.id, 2001, 0, contended);
+        require(over.refusal == R::chunk_exceeds_latency && over.reservation == 0, "idle cannot bypass known bound");
+        const auto fit = ledger.admit_chunk(g.id, 2000, 0, contended);
+        require(fit.refusal == R::none, "exact measured boundary fits");
+        require(ledger.cancel(fit.reservation, 0) == R::none, "test reservation released");
+    }
+    ledger.revoke(g.id, 1);
+    require(ledger.admit_chunk(g.id, 1, 2, false).refusal == R::unknown_grant, "revocation fences chunk admission");
+    g.id = "bootstrap"; g.share_ppm = 0; g.period_ms = 0; g.max_chunk_us = 0;
+    require(ledger.register_grant(g, 0) == R::none, "explicit idle bootstrap");
+    const auto bootstrap = ledger.admit_chunk(g.id, 0, 0, false);
+    require(bootstrap.refusal == R::none, "bootstrap is possible without pretending latency proof");
+    require(ledger.cancel(bootstrap.reservation, 0) == R::none, "bootstrap released");
+    require(ledger.admit_chunk(g.id, 0, 0, true).refusal == R::uncontended_only, "bootstrap cannot block known serving work");
+    g.id = "uncalibrated"; g.period_ms = 1000; g.share_ppm = 100000;
+    require(ledger.register_grant(g, 0) == R::none, "uncalibrated ordinary grant");
+    require(ledger.admit_chunk(g.id, 1000, 0, false).refusal == R::pending_calibration, "no invented latency allowance");
+    const auto restore = ledger.hold_restoration(g.id, 0);
+    require(restore.refusal == R::none, "latency calibration never strands restoration");
+    require(ledger.cancel(restore.reservation, 0) == R::none, "restoration probe released");
+}
+
 int main() {
+    chunk_latency();
     residency_plan();
     residency_custody();
     server_learn_ledger ledger("engine-a");

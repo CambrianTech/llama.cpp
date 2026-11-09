@@ -35,6 +35,7 @@ struct server_learn_grant {
     int64_t     period_ms     = 0;
     int64_t     share_ppm     = 0;
     int64_t     expires_at_us = 0; // the authority's expiry, on the engine's clock
+    int64_t     max_chunk_us  = 0; // zero means no measured latency allowance yet
 };
 
 enum class server_learn_refusal {
@@ -44,6 +45,8 @@ enum class server_learn_refusal {
     grant_mismatch,   // this live id is registered with other terms
     unknown_grant,    // no live grant has this id (never registered, revoked or expired)
     uncontended_only, // bootstrap authority never permits contended gradients
+    pending_calibration, // no measured segment cost or latency allowance
+    chunk_exceeds_latency, // measured segment cannot fit, even when currently idle
     never_fits,       // the step costs more than the grant's whole period allows
     budget_exhausted, // the period's share is spent: retry_after_ms says when it renews
     started,          // cancel after the step started: it must settle with its measured time
@@ -76,7 +79,7 @@ public:
     // The authority registers (or re-confirms) a grant.
     server_learn_refusal register_grant(const server_learn_grant & g, int64_t now_us) {
         if (!in_clock(now_us) || g.id.empty() || (g.period_ms < 0 || (g.period_ms == 0 && g.share_ppm != 0)) || g.period_ms > kMaxPeriodMs || g.share_ppm < 0 ||
-                g.share_ppm > 1000000 || g.expires_at_us <= now_us || !in_clock(g.expires_at_us)) {
+                g.share_ppm > 1000000 || g.max_chunk_us < 0 || g.max_chunk_us > kMaxCostUs || g.expires_at_us <= now_us || !in_clock(g.expires_at_us)) {
             return server_learn_refusal::invalid;
         }
         if (g.engine != engine) {
@@ -90,7 +93,7 @@ public:
         const auto it = accounts.find(g.id);
         if (it != accounts.end()) {
             const auto & r = it->second.grant;
-            const bool same = r.period_ms == g.period_ms && r.share_ppm == g.share_ppm && r.expires_at_us == g.expires_at_us;
+            const bool same = r.period_ms == g.period_ms && r.share_ppm == g.share_ppm && r.expires_at_us == g.expires_at_us && r.max_chunk_us == g.max_chunk_us;
             return same ? server_learn_refusal::none : server_learn_refusal::grant_mismatch;
         }
         accounts.emplace(g.id, account{ g, now_us, 0, 0, 0, false });
@@ -147,6 +150,30 @@ public:
         out.reservation = ++next_reservation;
         reservations.emplace(out.reservation, reservation{ grant, cost, contended, false });
         return out;
+    }
+
+    // Latency admission is separate from duty and restoration custody. A new
+    // serving arrival may wait for this segment even when admission is idle.
+    server_learn_admission admit_chunk(const std::string & grant, int64_t measured_us, int64_t now_us, bool contended) {
+        if (measured_us < 0 || measured_us > kMaxCostUs || !in_clock(now_us)) {
+            return {server_learn_refusal::invalid};
+        }
+        const auto it = accounts.find(grant);
+        if (it == accounts.end() || it->second.revoked || now_us >= it->second.grant.expires_at_us) {
+            return {server_learn_refusal::unknown_grant};
+        }
+        const auto & g = it->second.grant;
+        if (contended && g.share_ppm == 0) {
+            return {server_learn_refusal::uncontended_only};
+        }
+        if (g.max_chunk_us == 0) {
+            // Only explicit idle-only authority can bootstrap without a bound.
+            if (g.share_ppm != 0) { return {server_learn_refusal::pending_calibration}; }
+        } else {
+            if (measured_us == 0) { return {server_learn_refusal::pending_calibration}; }
+            if (measured_us > g.max_chunk_us) { return {server_learn_refusal::chunk_exceeds_latency}; }
+        }
+        return admit(grant, measured_us, now_us, contended);
     }
 
     // Restoration is an obligation, not permission for a gradient. Keep its
