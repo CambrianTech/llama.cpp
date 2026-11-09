@@ -136,10 +136,19 @@ llama_opt_learn_status llama_context::opt_learn_step() {
         bool complete = false;
         const auto status = ggml_opt_eval_step(opt_ctx, s.result, s.graph_nodes, &complete);
         if (status != GGML_STATUS_SUCCESS) {
-            // Backend failure can leave parameter writes. Keep metadata/custody for
-            // recovery rather than releasing an uncertain optimizer as restored.
-            opt_fail(ggml_opt_refusal(opt_ctx));
-            return LLAMA_OPT_LEARN_FAILED;
+            // Release graph custody only after quiescence. Preserve uncertain writes,
+            // quarantine the shadow, and restore the served sequence with stable weights.
+            s.failure = "learning graph failed; parameter effects uncertain; shadow quarantined";
+            ggml_opt_eval_quarantine(opt_ctx);
+            if (opt_shadow) {
+                auto * shadow = const_cast<llama_adapter_lora *>(opt_shadow);
+                shadow->restore_quarantined = true;
+                loras->erase(shadow);
+            }
+            s.graph_meta.reset();
+            gf_res_prev->reset();
+            s.cursor = s.n_train;
+            return LLAMA_OPT_LEARN_MORE;
         }
         if (!complete) { return LLAMA_OPT_LEARN_MORE; }
         s.graph_meta.reset();

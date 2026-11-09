@@ -1626,6 +1626,13 @@ static void opt_disarm_evaluation(ggml_opt_context_t opt_ctx) {
 
 }
 
+void ggml_opt_eval_quarantine(ggml_opt_context_t opt_ctx) {
+    ggml_backend_sched_graph_discard(opt_ctx->backend_sched);
+    opt_ctx->checkpoint_trusted = false;
+    opt_ctx->checkpoint_ready = false;
+    opt_disarm_evaluation(opt_ctx);
+}
+
 bool ggml_opt_measure_alloc(ggml_opt_context_t opt_ctx, bool backward,
         size_t * static_bytes, size_t * host_bytes, size_t * graph_sizes) {
     // A disposable metadata optimizer cannot free or overwrite an existing mind's
@@ -1981,7 +1988,7 @@ enum ggml_status ggml_opt_eval_step(ggml_opt_context_t opt_ctx, ggml_opt_result_
         // the step's gradients (and the optimizer update inside this graph) were computed on
         // memory the backend says it did not have: the run must stop, never continue on them
         opt_ctx->refusal = std::string("the backend failed to compute the training graph (") + ggml_status_to_string(status)
-            + "): this step's gradients are not trusted, so the run stopped and nothing was written";
+            + "): this step's gradients are not trusted, so the run stopped; parameter effects are uncertain";
         GGML_LOG_ERROR("%s: %s\n", __func__, opt_ctx->refusal.c_str());
         // Partial graph mutations cannot be published as an optimizer commit.
         if (!ggml_backend_sched_graph_pending(opt_ctx->backend_sched)) { opt_disarm_evaluation(opt_ctx); }

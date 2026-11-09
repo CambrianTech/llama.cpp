@@ -327,6 +327,10 @@ extern "C" {
     // max_nodes == 0 executes synchronously; positive values bound graph nodes, not tokens.
     GGML_API enum ggml_status ggml_opt_eval_step(ggml_opt_context_t opt_ctx, ggml_opt_result_t result,
             int max_nodes, bool * complete);
+    // Quiesce and release a failed evaluation. Parameter effects remain uncertain;
+    // checkpointing stays disabled until a validated generation is restored.
+    GGML_API void ggml_opt_eval_quarantine(ggml_opt_context_t opt_ctx);
+
 
 
     // A caller-driven optimizer period, for graphs built per step (the training walk's reverse

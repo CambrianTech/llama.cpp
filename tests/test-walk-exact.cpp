@@ -867,12 +867,26 @@ int main(int argc, char ** argv) {
         int yielded = 0;
         int graph_neighbour_turns = 0;
         bool shifted_neighbour_pending = false;
+        bool injected_graph_failure = false;
+        std::vector<float> uncertain_weights;
         do {
             if (getenv("WALK_LIVE_SMALL_CHUNKS") && !llama_opt_learn_needs_gradient(ctx)) {
                 ctx->opt_reply->chunk_tokens = WINDOW; // retain the control's restoration segmentation
             }
             progress = llama_opt_learn_step(ctx);
             if (progress == LLAMA_OPT_LEARN_MORE) {
+                if (getenv("WALK_LIVE_GRAPH_FAILURE") && !injected_graph_failure) {
+                    GGML_ASSERT(ctx->opt_reply->graph_meta);
+                    // Model a parameter write before failure; recovery must preserve and quarantine it, not invent rollback.
+                    auto * changed = adapter->ab_map.begin()->second.a;
+                    float value;
+                    ggml_backend_tensor_get(changed, &value, 0, sizeof(value));
+                    value += 0.125f;
+                    ggml_backend_tensor_set(changed, &value, 0, sizeof(value));
+                    uncertain_weights = adapter_params(adapter);
+                    ctx->opt_reply->graph_nodes = -1; // fail the next continuation with live graph custody
+                    injected_graph_failure = true;
+                }
                 if (getenv("WALK_LIVE_GRAPH_DRAIN") && yielded == 0) {
                     GGML_ASSERT(ctx->opt_reply->graph_meta);
                     GGML_ASSERT(llama_opt_learn_drain(ctx));
@@ -918,6 +932,32 @@ int main(int argc, char ** argv) {
             }
         } while (progress == LLAMA_OPT_LEARN_MORE);
         GGML_ASSERT(yielded >= 1);
+        if (injected_graph_failure) {
+            GGML_ASSERT(progress == LLAMA_OPT_LEARN_FAILED && !ctx->opt_reply);
+            GGML_ASSERT(adapter->restore_quarantined && adapter_params(adapter) == uncertain_weights);
+            GGML_ASSERT(std::string(llama_opt_failure(ctx)).find("effects uncertain") != std::string::npos);
+            GGML_ASSERT(seq_state(ctx, 0) == want_her);
+            FILE * refused_checkpoint = tmpfile();
+            GGML_ASSERT(refused_checkpoint && !llama_opt_state_write(ctx, refused_checkpoint, "failed-graph"));
+            fclose(refused_checkpoint);
+            GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) != 0);
+            GGML_ASSERT(llama_set_adapters_lora(ctx, nullptr, 0, nullptr) == 0);
+            GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
+            decode_span(ctx, 1, neighbour + 200, 200, 1);
+            GGML_ASSERT(seq_state(ctx, 1) == want_neighbour_turn);
+            GGML_ASSERT(ctx->opt_release(adapter));
+            auto * replacement = llama_adapter_lora_init(model, init.c_str());
+            GGML_ASSERT(replacement && llama_set_adapters_lora(ctx, &replacement, 1, &scale) == 0);
+            lopt.adapter = replacement;
+            llama_opt_init(ctx, model, lopt);
+            GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
+            GGML_ASSERT(llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, nullptr));
+            llama_free(ctx);
+            llama_adapter_lora_free(replacement);
+            llama_adapter_lora_free(adapter);
+            printf("  failed continuation: quarantined, stable sequence restored, neighbour serves, optimizer released\n");
+            continue;
+        }
         if (getenv("WALK_LIVE_GRAPH_CONTINUATION")) {
             GGML_ASSERT(yielded > 100);
             if (shifted_neighbour_pending) {
