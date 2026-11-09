@@ -711,6 +711,7 @@ int main(int argc, char ** argv) {
         auto two_seq_ctx = [&]() {
             auto cp = common_context_params_to_llama(params);
             cp.n_ctx = 2*WINDOW; cp.n_batch = WINDOW; cp.n_ubatch = WINDOW; cp.n_seq_max = 2; cp.kv_unified = !streams;
+            if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS")) { cp.n_ctx = 3*WINDOW; cp.n_seq_max = 3; }
             if (getenv("WALK_LIVE_GRAPH_SMALL_UBATCH")) { cp.n_ubatch = WINDOW / 8; }
             if (getenv("WALK_LIVE_SMALL_RESTORE_BATCH")) { cp.n_batch = cp.n_ubatch = WINDOW / 8; }
             cp.flash_attn_type = streams ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
@@ -750,10 +751,31 @@ int main(int argc, char ** argv) {
         llama_context * ctl = two_seq_ctx();
         decode_span(ctl, 1, neighbour, 0, 200);
         decode_span(ctl, 0, tokens.data(), 0, r0);
+        if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS")) { decode_span(ctl, 2, neighbour, 0, 200); }
         decode_span(ctl, 0, tokens.data() + r0, r0, WINDOW - r0);
         const std::vector<uint8_t> want_her = seq_state(ctl, 0);
-        decode_span(ctl, 1, neighbour + 200, 200, 1);
+        if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS")) {
+            auto paired = llama_batch_init(2, 0, 1);
+            paired.n_tokens = 2;
+            for (int i = 0; i < 2; ++i) {
+                paired.token[i] = neighbour[200]; paired.pos[i] = 200;
+                paired.n_seq_id[i] = 1; paired.seq_id[i][0] = i + 1; paired.logits[i] = true;
+            }
+            if (getenv("WALK_LIVE_BRACKET_SPLIT_RETRY")) {
+                decode_span(ctl, 1, neighbour + 200, 200, 1);
+                decode_span(ctl, 2, neighbour + 200, 200, 1);
+            } else {
+                GGML_ASSERT(llama_decode(ctl, paired) == 0);
+            }
+            llama_batch_free(paired);
+        } else {
+            decode_span(ctl, 1, neighbour + 200, 200, 1);
+        }
         const auto want_neighbour_turn = seq_state(ctl, 1);
+        std::vector<uint8_t> want_second_neighbour;
+        if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS")) {
+            want_second_neighbour = seq_state(ctl, 2);
+        }
         llama_free(ctl);
 
         llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
@@ -763,6 +785,7 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
         decode_span(ctx, 1, neighbour, 0, 200);
         decode_span(ctx, 0, tokens.data(), 0, r0); // her context, as served
+        if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS")) { decode_span(ctx, 2, neighbour, 0, 200); }
         const std::vector<uint8_t> neighbour_before = seq_state(ctx, 1);
         struct admission_counts { size_t statics = 0, workspace = 0; bool allow_workspace = true; std::map<std::string, size_t> limits; } stale_admission, current_admission;
         llama_opt_params lopt{};
@@ -823,7 +846,7 @@ int main(int argc, char ** argv) {
         {
             const std::vector<uint8_t> her_before = seq_state(ctx, 0);
             const bool r_null = llama_opt_learn(ctx, 0, r0, tokens.data() + r0, nullptr, WINDOW - r0, nullptr);
-            const bool r_long = llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), 2*WINDOW, nullptr);
+            const bool r_long = llama_opt_learn(ctx, 0, r0, tokens.data() + r0, labels.data(), llama_n_ctx(ctx), nullptr);
             const bool r_more = llama_opt_learn(ctx, 0, r0 + 5, tokens.data() + r0, labels.data(), 10, nullptr);
             const bool same   = seq_state(ctx, 0) == her_before;
             printf("  live sequence refusals: null labels %s, past the context %s, prefix not held %s; her sequence %s\n",
@@ -883,6 +906,12 @@ int main(int argc, char ** argv) {
         // What this catches: yielding with training flags still installed, losing accumulated
         // labels between chunks, or restoring the neighbour instead of the learning sequence.
         // Neighbour inference runs at returned boundaries; learning covers the entire reply.
+        if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS")) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            decode_span(ctx, 1, neighbour, 0, 200);
+            decode_span(ctx, 0, tokens.data(), 0, r0);
+            decode_span(ctx, 2, neighbour, 0, 200);
+        }
         GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, tokens.data() + r0, WINDOW - r0, nullptr));
         // Diagnostic: change only scheduling boundaries, not the served graph/window
         // or the independent whole-reply gradient oracle. No production chunk policy.
@@ -901,6 +930,7 @@ int main(int argc, char ** argv) {
         int yielded = 0;
         int graph_neighbour_turns = 0;
         bool shifted_neighbour_pending = false;
+        bool paired_retry_after_graph = false;
         bool injected_graph_failure = false;
         std::vector<float> uncertain_weights;
         do {
@@ -909,6 +939,31 @@ int main(int argc, char ** argv) {
             }
             progress = llama_opt_learn_step(ctx);
             if (progress == LLAMA_OPT_LEARN_MORE) {
+                if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS") && yielded == 0) {
+                    auto paired = llama_batch_init(2, 0, 1);
+                    paired.n_tokens = 2;
+                    for (int i = 0; i < 2; ++i) {
+                        paired.token[i] = neighbour[200]; paired.pos[i] = 200;
+                        paired.n_seq_id[i] = 1; paired.seq_id[i][0] = i + 1; paired.logits[i] = true;
+                    }
+                    const auto held0 = seq_state(ctx, 0), held1 = seq_state(ctx, 1), held2 = seq_state(ctx, 2);
+                    const bool paired_deferred = ctx->opt_reply->recurrent != nullptr;
+                    const int decoded = llama_decode(ctx, paired);
+                    GGML_ASSERT(paired_deferred ? decoded == 1 : decoded == 0);
+                    if (paired_deferred) {
+                        GGML_ASSERT(seq_state(ctx, 0) == held0 && seq_state(ctx, 1) == held1 && seq_state(ctx, 2) == held2);
+                    }
+                    llama_batch_free(paired);
+                    if (paired_deferred && getenv("WALK_LIVE_BRACKET_SPLIT_RETRY")) {
+                        // Match the server's ret=1 retry: split serving batches, retaining the whole training graph.
+                        GGML_ASSERT(ctx->opt_reply->graph_meta);
+                        decode_span(ctx, 1, neighbour + 200, 200, 1);
+                        decode_span(ctx, 2, neighbour + 200, 200, 1);
+                        GGML_ASSERT(ctx->opt_reply->graph_meta);
+                    } else if (paired_deferred) {
+                        paired_retry_after_graph = true;
+                    }
+                }
                 if (getenv("WALK_LIVE_GRAPH_FAILURE") && !injected_graph_failure && !ctx->opt_reply->graph_preparing) {
                     GGML_ASSERT(ctx->opt_reply->graph_meta);
                     // Model a parameter write before failure; recovery must preserve and quarantine it, not invent rollback.
@@ -965,6 +1020,16 @@ int main(int argc, char ** argv) {
                 ++yielded;
             }
         } while (progress == LLAMA_OPT_LEARN_MORE);
+        if (paired_retry_after_graph) {
+            auto paired = llama_batch_init(2, 0, 1);
+            paired.n_tokens = 2;
+            for (int i = 0; i < 2; ++i) {
+                paired.token[i] = neighbour[200]; paired.pos[i] = 200;
+                paired.n_seq_id[i] = 1; paired.seq_id[i][0] = i + 1; paired.logits[i] = true;
+            }
+            GGML_ASSERT(llama_decode(ctx, paired) == 0);
+            llama_batch_free(paired);
+        }
         GGML_ASSERT(yielded >= 1);
         if (injected_graph_failure) {
             GGML_ASSERT(progress == LLAMA_OPT_LEARN_FAILED && !ctx->opt_reply);
@@ -1020,6 +1085,9 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(stale_admission.statics == 0 && stale_admission.workspace == 0);
         const std::vector<uint8_t> her_after = seq_state(ctx, 0);
         const std::vector<uint8_t> neighbour_after = seq_state(ctx, 1);
+        if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS")) {
+            GGML_ASSERT(seq_state(ctx, 2) == want_second_neighbour);
+        }
         if (learned && !streams) {
             // Generation restore must prepare both components before touching weights, preserve
             // their addresses, and keep uncertain shadow state out of serving and learning.

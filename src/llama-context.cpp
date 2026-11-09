@@ -1935,6 +1935,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // Its segmented path admits a single whole ubatch, never token partitions.
         if (!opt_serving_continuation && opt_reply && opt_reply->graph_meta) {
             opt_reply->graph_memory = std::move(mctx);
+            if (opt_reply->recurrent) {
+                opt_reply->recurrent_graph_head = opt_reply->recurrent->head;
+                opt_reply->recurrent_graph_count = opt_reply->recurrent->n;
+            }
             return 0;
         }
 

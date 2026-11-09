@@ -60,6 +60,7 @@ public:
     std::vector<llama_memory_cells> cell_usage() const override;
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
+    void protect_graph_range(uint32_t first, uint32_t count) { protected_first = first; protected_count = count; }
 
     // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
@@ -124,6 +125,7 @@ public:
     std::vector<ggml_tensor *> s_l;
 
 private:
+    uint32_t protected_first = 0, protected_count = 0;
     //const llama_model & model;
     const llama_hparams & hparams;
 

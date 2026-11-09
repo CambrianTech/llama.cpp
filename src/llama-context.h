@@ -243,7 +243,7 @@ struct llama_context {
         std::vector<llama_token> tokens, labels, restore_tokens;
         std::vector<uint8_t> snapshot;
         llama_memory_i * attention = nullptr;
-        llama_memory_i * recurrent = nullptr;
+        class llama_memory_recurrent * recurrent = nullptr;
         llama_batch batch{};
         ggml_opt_result_t result = nullptr;
         int32_t chunk_tokens = 0, cursor = 0, n_train = 0;
@@ -254,6 +254,7 @@ struct llama_context {
         bool graph_preparing = false;
         llama_ubatch graph_ubatch{};
         llama_memory_context_ptr graph_memory;
+        uint32_t recurrent_graph_head = 0, recurrent_graph_count = 0;
         std::vector<int32_t> graph_targets;
         std::vector<float> graph_weights;
         ggml_backend_sched_ptr serving_sched;

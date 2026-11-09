@@ -344,6 +344,7 @@ int llama_context::opt_decode_beside_graph(const llama_batch & batch) {
         llama_cparams params;
         bool reserve;
         ~restore_owner() {
+            if (state.recurrent) { state.recurrent->protect_graph_range(0, 0); }
             ggml_backend_sched_synchronize(ctx.sched.get());
             ctx.sched.swap(state.serving_sched);
             ctx.gf_res_prev.swap(state.serving_graph);
@@ -358,5 +359,6 @@ int llama_context::opt_decode_beside_graph(const llama_batch & batch) {
     gf_res_reserve.swap(state.serving_reserve);
     sched_need_reserve = false;
     opt_serving_continuation = true;
+    if (state.recurrent) { state.recurrent->protect_graph_range(state.recurrent_graph_head, state.recurrent_graph_count); }
     return decode(batch);
 }

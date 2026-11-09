@@ -473,6 +473,8 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     auto org_cells = cells;
     auto org_used = used;
     auto org_head = head;
+    const auto org_n = n;
+    const auto org_rs_z = rs_z;
 
     bool success = true;
 
@@ -481,12 +483,28 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
             success = false;
             break;
         }
+        if (protected_count && head < protected_first + protected_count && protected_first < head + n) {
+            success = false;
+            break;
+        }
+        if (protected_count) {
+            for (uint32_t i = head; i < head + n; ++i) {
+                const int32_t source = cells[i].src0;
+                if (source >= 0 && uint32_t(source) >= protected_first && uint32_t(source) - protected_first < protected_count) {
+                    success = false;
+                    break;
+                }
+            }
+            if (!success) { break; }
+        }
     }
 
     // restore the original state
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+    n = org_n;
+    rs_z = org_rs_z;
 
     return success;
 }
