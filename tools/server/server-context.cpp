@@ -467,8 +467,8 @@ struct server_slot {
                 (ggml_time_us() - t_start) / 1000.0, n_text, (int) prompt.tokens.size());
     }
 
-    // the backend sampler is bound to the context: a launch attaches it, a reconfigure attaches it again
-    void attach_sampler(const task_params & params) const {
+    // whether a task's sampler runs on the backend, attached to the context
+    static bool samples_on_backend(const task_params & params) {
         const bool need_pre_sample_logits = params.sampling.n_probs > 0 && !params.post_sampling_probs;
 
         bool use_backend_sampling = params.sampling.backend_sampling;
@@ -476,8 +476,13 @@ struct server_slot {
         // TODO: getting pre sampling logits is not yet supported with backend sampling
         use_backend_sampling &= !need_pre_sample_logits;
 
+        return use_backend_sampling;
+    }
+
+    // the backend sampler is bound to the context: a launch attaches it, a reconfigure attaches it again
+    void attach_sampler(const task_params & params) const {
         // TODO: tmp until backend sampling is fully implemented
-        llama_set_sampler(ctx_tgt, id, use_backend_sampling ? common_sampler_get(smpl.get()) : nullptr);
+        llama_set_sampler(ctx_tgt, id, samples_on_backend(params) ? common_sampler_get(smpl.get()) : nullptr);
     }
 
     bool need_embd() const {

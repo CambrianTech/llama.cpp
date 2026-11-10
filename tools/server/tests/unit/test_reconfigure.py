@@ -38,6 +38,9 @@ def create_server():
     server.cache_ram = 0 # a state that survives must survive in its slot, never restored from the RAM cache
     fd, server.log_path = tempfile.mkstemp(suffix=".log")
     os.close(fd)
+    yield
+    # pytest shows a test's output only when it fails: then the server's own log says why
+    print(log_text())
 
 
 def log_text() -> str:

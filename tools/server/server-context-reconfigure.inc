@@ -87,6 +87,20 @@
     void resume_after_reconfigure() {
         for (auto & slot : slots) {
             if (slot.task && slot.smpl) {
+                if (server_slot::samples_on_backend(slot.task->params)) {
+                    // a backend chain is initialized once, for the context it was first attached to
+                    // (llama_sampler_chain_backend_init): on the rebuilt context the slot samples with a
+                    // fresh chain that carries the same state (common_sampler_copy, as a rollback does)
+                    try {
+                        common_sampler_ptr fresh(common_sampler_init(model_tgt, slot.task->params.sampling));
+                        common_sampler_copy(slot.smpl.get(), fresh.get());
+                        slot.smpl = std::move(fresh);
+                    } catch (const std::exception & e) {
+                        send_error(slot, std::string("the sampler could not be made again after a reconfigure: ") + e.what());
+                        slot.release();
+                        continue;
+                    }
+                }
                 slot.attach_sampler(slot.task->params);
             }
             if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate()) {
