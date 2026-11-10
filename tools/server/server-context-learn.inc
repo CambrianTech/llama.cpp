@@ -392,8 +392,17 @@
         const bool begun = llama_opt_learn_begin(ctx_tgt, slot.id, n0, toks.data(), labels.data(), (int32_t) toks.size(),
             served_tokens.data() + n0, (int32_t) served_tokens.size() - n0, result);
         common_set_adapter_lora(ctx_tgt, slot.lora);
-        learning = std::unique_ptr<pending_learn>(new pending_learn{ &slot, cp, std::move(set), result,
-            toks[0], L.n_prefix, (int32_t) toks.size() - 1, loras[L.lora_id].ptr, t0 });
+        // value-initialized, then named field by field: every member a learn does not set keeps its default
+        learning = std::make_unique<pending_learn>();
+        learning->slot        = &slot;
+        learning->checkpoint  = cp;
+        learning->adapters    = std::move(set);
+        learning->result      = result;
+        learning->last_prompt = toks[0];
+        learning->prefix      = L.n_prefix;
+        learning->n_labels    = (int32_t) toks.size() - 1;
+        learning->shadow      = loras[L.lora_id].ptr;
+        learning->started     = t0;
         learning->began = begun;
         learning->grant = L.grant;
         learning->lora_id = L.lora_id;

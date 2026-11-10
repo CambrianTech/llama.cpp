@@ -42,8 +42,10 @@
             gguf_get_val_i64(metadata.get(), iteration) <= 0 ||
             gguf_get_val_i64(metadata.get(), iteration) - 1 != steps ||
             std::string(gguf_get_val_str(metadata.get(), bound)) != binding) { return refuse("optimizer generation mismatch"); }
-        std::unique_ptr<FILE, decltype(&fclose)> weights(fopen((path + "/adapter.gguf").c_str(), "rb"), fclose);
-        std::unique_ptr<FILE, decltype(&fclose)> optimizer(fopen((path + "/optimizer.gguf").c_str(), "rb"), fclose);
+        // a deleter type, not decltype(&fclose): fclose's attributes are dropped from a template argument (-Wignored-attributes)
+        struct file_closer { void operator()(FILE * f) const { fclose(f); } };
+        std::unique_ptr<FILE, file_closer> weights(fopen((path + "/adapter.gguf").c_str(), "rb"));
+        std::unique_ptr<FILE, file_closer> optimizer(fopen((path + "/optimizer.gguf").c_str(), "rb"));
         if (!weights || !optimizer) { return refuse("checkpoint components unreadable"); }
         const auto started = ggml_time_us();
         auto held = learn_ledger.hold_restoration(request.grant, started);
