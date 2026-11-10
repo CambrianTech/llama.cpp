@@ -59,8 +59,12 @@ def register(suffix, subject, rows):
               "subject": subject, "rows": rows, "leases": leases})["refusal"] == "none"
     return rid
 grant = prefix + "-grant"
+# An idle-only grant (no share, no period): the one authority the ledger lets learn before this
+# geometry's chunk cost is measured (server-learn-ledger.h, pending_calibration). A shared grant
+# needs a measured max_chunk_us first. Nothing else decodes while this test learns, so it is never
+# contended.
 assert ok("/learn/grants", {"id": grant, "engine": ledger["engine"],
-          "period_ms": 1000, "share_ppm": 1000000, "expires_in_ms": 120000})["refusal"] == "none"
+          "period_ms": 0, "share_ppm": 0, "expires_in_ms": 120000})["refusal"] == "none"
 baseline = complete()
 fresh_name = prefix + "-fresh.gguf"
 # Dry-run uses the real loader's placement/alignment before any adapter is seated or file written.
