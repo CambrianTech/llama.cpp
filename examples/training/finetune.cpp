@@ -77,6 +77,11 @@ int main(int argc, char ** argv) {
         /*recompute       =*/false, // keep every layer's intermediates, as before
         /*walk_exact      =*/false, // the per-chunk walk, as before
         /*walk_horizon    =*/0,
+        // an example trains under no learning residency: no allocation admission callbacks
+        /*static_admission         =*/nullptr,
+        /*static_admission_data    =*/nullptr,
+        /*workspace_admission      =*/nullptr,
+        /*workspace_admission_data =*/nullptr,
     };
     llama_opt_init(ctx, model, lopt_params);
 

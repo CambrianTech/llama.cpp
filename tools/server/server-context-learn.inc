@@ -110,7 +110,7 @@
         auto set = construct_lora_list({});
         set[id].scale = 1.0f;
         common_set_adapter_lora(ctx_tgt, set);
-        const bool ok = llama_opt_measure_shadow_graph(ctx_tgt, learning_shadow_params((int32_t) id), (uint32_t) reply_rows, [](const llama_adapter_lora *, const char * device,
+        const bool ok = llama_opt_measure_shadow(ctx_tgt, learning_shadow_params((int32_t) id), [](const llama_adapter_lora *, const char * device,
                 const char * buft, const char * kind, size_t bytes, bool host, void * data) {
             static_cast<json *>(data)->push_back({{"device", device}, {"buffer_type", buft},
                 {"kind", kind}, {"bytes", bytes}, {"host", host}});
@@ -392,8 +392,16 @@
         const bool begun = llama_opt_learn_begin(ctx_tgt, slot.id, n0, toks.data(), labels.data(), (int32_t) toks.size(),
             served_tokens.data() + n0, (int32_t) served_tokens.size() - n0, result);
         common_set_adapter_lora(ctx_tgt, slot.lora);
-        learning = std::unique_ptr<pending_learn>(new pending_learn{ &slot, cp, std::move(set), result,
-            toks[0], L.n_prefix, (int32_t) toks.size() - 1, loras[L.lora_id].ptr, t0 });
+        learning = std::make_unique<pending_learn>();
+        learning->slot = &slot;
+        learning->checkpoint = cp;
+        learning->adapters = std::move(set);
+        learning->result = result;
+        learning->last_prompt = toks[0];
+        learning->prefix = L.n_prefix;
+        learning->n_labels = (int32_t) toks.size() - 1;
+        learning->shadow = loras[L.lora_id].ptr;
+        learning->started = t0;
         learning->began = begun;
         learning->grant = L.grant;
         learning->lora_id = L.lora_id;
@@ -403,7 +411,7 @@
         }
         slot.state = SLOT_STATE_LEARNING;
         slot.learn_release_requested = false;
-        slot.learn_graph_steps = 0;
+        slot.learn_gradient_steps = 0;
         return {}; // no outcome is published until advance_learning restores the slot
     }
 
@@ -448,9 +456,11 @@
             learning_residencies.at(pending.lora_id)->restoring = !llama_opt_learn_needs_gradient(ctx_tgt) || llama_opt_learn_draining_graph(ctx_tgt);
             common_set_adapter_lora(ctx_tgt, pending.adapters);
             const auto steps_before = llama_opt_shadow_steps(ctx_tgt, pending.shadow);
-            const bool graph_step = llama_opt_learn_needs_gradient(ctx_tgt);
-            const auto status = llama_opt_learn_graph_step(ctx_tgt);
-            if (graph_step) { ++slot.learn_graph_steps; }
+            // One decode chunk, as serving's decode is: other slots decode between steps,
+            // and the workspace is one ubatch's, never the whole reply's.
+            const bool gradient_step = llama_opt_learn_needs_gradient(ctx_tgt);
+            const auto status = llama_opt_learn_step(ctx_tgt);
+            if (gradient_step) { ++slot.learn_gradient_steps; }
             const auto committed = llama_opt_shadow_steps(ctx_tgt, pending.shadow) - steps_before;
             GGML_ASSERT(committed >= 0); // optimizer custody prevents generation replacement here
             pending.committed_steps += committed;
@@ -462,7 +472,7 @@
             pending.max_chunk_us = std::max(pending.max_chunk_us, elapsed);
             // Classify the work, not its charging reservation: a revoked graph
             // still runs graph nodes under restoration custody until it commits.
-            auto & phase_max = graph_step ? pending.max_graph_us : pending.max_restore_us;
+            auto & phase_max = gradient_step ? pending.max_graph_us : pending.max_restore_us;
             phase_max = std::max(phase_max, elapsed);
             if (!reservation) {
                 pending.restoration_us += elapsed;

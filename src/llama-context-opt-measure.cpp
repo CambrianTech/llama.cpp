@@ -37,7 +37,12 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
     cparams.training = true;
     cparams.walk_active = false;
     // Shape only: attention still sees the full served memory, without token cuts.
-    const uint32_t chunk = reply_rows ? reply_rows : cparams.n_ctx_seq;
+    // A learn step is one decode ubatch, as serving's is (opt_learn_step decodes the
+    // reply in n_batch chunks that decode() splits by n_ubatch), so its workspace is
+    // priced at one ubatch, whatever the reply's length; only the whole-reply graph
+    // prices its rows.
+    const uint32_t rows = reply_rows ? reply_rows : cparams.n_ctx_seq;
+    const uint32_t chunk = phases == opt_measure_phase::whole_reply_commit ? rows : std::min(rows, cparams.n_ubatch);
     size_t max_nodes = graph_max_nodes(chunk);
     if (cparams.flash_attn && !cparams.fa_back_native) {
         max_nodes += (size_t) model.hparams.n_layer() * ggml_flash_attn_ext_back_n_nodes(opt_n_ctx_train, 0);
