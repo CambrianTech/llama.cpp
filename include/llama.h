@@ -660,6 +660,17 @@ extern "C" {
     // Get the model file type (quantization), e.g. LLAMA_FTYPE_MOSTLY_Q8_0
     LLAMA_API enum llama_ftype llama_model_ftype(const struct llama_model * model);
 
+    // Context-owned allocations only. Host buffers (including pinned host memory) are
+    // reported separately from device buffers. Buffer names are borrowed for the callback.
+    typedef void (*llama_context_memory_callback)(const char * buffer, bool host, uint64_t bytes, void * data);
+    // Build the same context layout and graph without allocating tensor payloads.
+    // Uses the loaded model's placement; never reloads or mutates its weights.
+    LLAMA_API bool llama_context_measure_memory(
+            struct llama_model * model, struct llama_context_params params,
+            llama_context_memory_callback callback, void * data);
+    LLAMA_API void llama_context_visit_memory(
+            const struct llama_context * ctx, llama_context_memory_callback callback, void * data);
+
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 

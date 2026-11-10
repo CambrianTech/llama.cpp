@@ -97,7 +97,7 @@ public:
     //       instead pass all necessary info (e.g. hparams, dev layers, arch, etc.) directly
     //       likely through `struct llama_memory_params`
     llama_kv_cache(
-            const llama_model & model,
+            bool no_alloc, const llama_model & model,
           const llama_hparams & hparams,
                     ggml_type   type_k,
                     ggml_type   type_v,
@@ -229,6 +229,7 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    const bool no_alloc;
     const llama_model & model;
     const llama_hparams & hparams;
 

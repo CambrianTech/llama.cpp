@@ -16,6 +16,7 @@ add_library(llama
             llama-batch.cpp
             llama-chat.cpp
             llama-context.cpp
+            llama-context-memory.cpp
             llama-context-opt.cpp
             llama-context-opt-measure.cpp
               llama-context-learn.cpp

@@ -2227,7 +2227,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     [&](int32_t il) { return (uint32_t) il >= hparams.n_layer_dense_lead; };
 
                 res = new llama_kv_cache_msa(
-                        *this,
+                        params.no_alloc, *this,
                         params.type_k,
                         params.type_v,
                         !cparams.flash_attn,
@@ -2253,7 +2253,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         [&](uint32_t il) { return il >= hparams.n_layer(); };
 
                     res = new llama_kv_cache(
-                            *this,
+                            params.no_alloc, *this,
                             hparams,
                             params.type_k,
                             params.type_v,
@@ -2279,7 +2279,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && (arch != LLM_ARCH_GLM_DSA || hparams.is_indexer_full(il)); };
 
                     res = new llama_kv_cache_dsa(
-                            *this,
+                            params.no_alloc, *this,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -2305,7 +2305,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         [&](uint32_t il) { return il >= hparams.n_layer(); };
 
                     res = new llama_kv_cache(
-                            *this,
+                            params.no_alloc, *this,
                             hparams,
                             params.type_k,
                             params.type_v,
@@ -2330,7 +2330,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && hparams.is_indexer_full(il); };
 
                     res = new llama_kv_cache_dsa_iswa(
-                            *this,
+                            params.no_alloc, *this,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -2356,7 +2356,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     };
 
                     res = new llama_kv_cache_iswa(
-                            *this,
+                            params.no_alloc, *this,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -2373,7 +2373,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr);
                 } else {
                     res = new llama_kv_cache_dsv4(
-                            *this,
+                            params.no_alloc, *this,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -2396,7 +2396,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
                     res = new llama_kv_cache_iswa(
-                            *this,
+                            params.no_alloc, *this,
                             params.type_k,
                             params.type_v,
                             !cparams.flash_attn,
@@ -2430,7 +2430,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
-                            *this,
+                            params.no_alloc, *this,
                             GGML_TYPE_F32,
                             GGML_TYPE_F32,
                             cparams.offload_kqv,
@@ -2476,7 +2476,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
-                            /* model             */ *this,
+                            params.no_alloc, /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
@@ -2496,7 +2496,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
-                            /* model             */ *this,
+                            params.no_alloc, /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
@@ -2516,7 +2516,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_idx        */ std::move(filter_idx));
                     } else {
                         res = new llama_memory_hybrid(
-                            /* model             */ *this,
+                            params.no_alloc, /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
@@ -2582,7 +2582,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             };
 
                             res = new llama_kv_cache_iswa(
-                                    *this,
+                                    params.no_alloc, *this,
                                     params.type_k,
                                     params.type_v,
                                     !cparams.flash_attn,
@@ -2599,7 +2599,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     share);
                         } else {
                             res = new llama_kv_cache_iswa(
-                                    *this,
+                                    params.no_alloc, *this,
                                     params.type_k,
                                     params.type_v,
                                     !cparams.flash_attn,
@@ -2619,7 +2619,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         GGML_ASSERT(!hparams.is_swa_any());
 
                         res = new llama_kv_cache(
-                                *this,
+                                params.no_alloc, *this,
                                 hparams,
                                 params.type_k,
                                 params.type_v,

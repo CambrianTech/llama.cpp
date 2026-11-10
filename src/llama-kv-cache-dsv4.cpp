@@ -893,7 +893,7 @@ static void dsv4_make_k_only(llama_hparams & hparams) {
 //
 
 llama_dsv4_comp_state::llama_dsv4_comp_state(
-        const llama_model & model,
+        bool no_alloc, const llama_model & model,
                 bool        offload,
                 bool        unified,
             uint32_t        n_seq_max,
@@ -903,6 +903,7 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
             uint32_t        n_rs_seq,
         const char    * name,
         const llama_memory_i::layer_filter_cb & filter) :
+    no_alloc(no_alloc || model.hparams.no_alloc),
     ratio(ratio),
     state_size(state_size),
     n_embd_state(n_embd_state),
@@ -984,7 +985,14 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
     }
 
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf = this->no_alloc
+            ? ggml_backend_buft_alloc_buffer(buft, 0)
+            : ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (this->no_alloc && buf) {
+            for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf;
+            }
+        }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for DSV4 compressor state");
         }
@@ -1072,9 +1080,9 @@ uint32_t llama_dsv4_comp_state::get_n_rows() const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_dsv4_comp_state::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, buf] : ctxs_bufs) {
+    for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
-        ret[buft] += ggml_backend_buffer_get_size(buf.get());
+        ret[buft] += no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) : ggml_backend_buffer_get_size(buf.get());
     }
     return ret;
 }
@@ -1198,7 +1206,7 @@ ggml_tensor * llama_dsv4_comp_state::cpy_score(ggml_context * ctx, ggml_tensor *
 size_t llama_dsv4_comp_state::total_size() const {
     size_t size = 0;
 
-    for (const auto & [_, buf] : ctxs_bufs) {
+    for (const auto & [ctx, buf] : ctxs_bufs) {
         size += ggml_backend_buffer_get_size(buf.get());
     }
 
@@ -1210,7 +1218,7 @@ size_t llama_dsv4_comp_state::total_size() const {
 //
 
 llama_kv_cache_dsv4::llama_kv_cache_dsv4(
-        const llama_model & model,
+        bool no_alloc, const llama_model & model,
                 ggml_type   type_k,
                 ggml_type   type_v,
                      bool   v_trans,
@@ -1255,7 +1263,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     dsv4_make_k_only(hparams_raw);
 
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
-            model, hparams_raw, type_k, type_v,
+            no_alloc, model, hparams_raw, type_k, type_v,
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
             nullptr, filter_raw, reuse, nullptr);
 
@@ -1292,7 +1300,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
     kv_csa = std::make_unique<llama_kv_cache>(
-            model, hparams_csa, type_k, type_v,
+            no_alloc, model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
@@ -1300,7 +1308,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
 
     kv_hca = std::make_unique<llama_kv_cache>(
-            model, hparams_hca, type_k, type_v,
+            no_alloc, model, hparams_hca, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
 
@@ -1308,26 +1316,26 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
 
     kv_lid = std::make_unique<llama_kv_cache>(
-            model, hparams_lid, type_k, type_v,
+            no_alloc, model, hparams_lid, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
     csa_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
+            no_alloc, model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
             2*model.hparams.n_embd_head_k(), n_rs_seq, "csa", filter_csa);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressor state\n", __func__);
 
     hca_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, DSV4_HCA_RATIO,
+            no_alloc, model, offload, unified_compressed, n_seq_max, DSV4_HCA_RATIO, DSV4_HCA_RATIO,
             model.hparams.n_embd_head_k(), n_rs_seq, "hca", filter_hca);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer compressor state\n", __func__);
 
     lid_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
+            no_alloc, model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
             2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
 
     // DSV4 attention reads compressed-K / compressor-state rows that the current

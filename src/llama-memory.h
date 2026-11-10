@@ -17,6 +17,7 @@ class llama_io_write_i;
 class llama_io_read_i;
 
 struct llama_memory_params {
+    bool no_alloc;
     // kv cache
     ggml_type type_k;
     ggml_type type_v;

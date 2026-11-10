@@ -17,7 +17,7 @@
 class llama_memory_recurrent : public llama_memory_i {
 public:
     llama_memory_recurrent(
-            const llama_model & model,
+            bool no_alloc, const llama_model & model,
                     ggml_type   type_r,
                     ggml_type   type_s,
                          bool   offload,
@@ -126,6 +126,7 @@ public:
     std::vector<ggml_tensor *> s_l;
 
 private:
+    const bool no_alloc;
     uint32_t protected_first = 0, protected_count = 0;
     //const llama_model & model;
     const llama_hparams & hparams;
