@@ -1,84 +1,99 @@
 #!/usr/bin/env python3
 # Every final-response format x stream mode carries exactly one learn outcome for a learn-carrying
-# request. Run against a server started with --train-dir holding shadow-05.gguf (a fresh LoRA for the
-# served model), e.g.: llama-server -m MODEL --port 58199 -np 1 --jinja --train-dir DIR
+# request. Run against an isolated server with --train-dir and --no-repack on CPU, e.g.:
+#   llama-server -m MODEL --port 58199 -np 1 --jinja --no-repack --train-dir DIR
+#   learn-every-format.py URL TRAIN_DIR [--shadow-retirement | --two-minds | --non-f32-refused |
+#                                         --template-replies | --fairness]
+# Every shadow is minted fresh through learn_fixture (its custody, grants and release), never a
+# hand-placed shadow-05.gguf.
 # what this catches: a serializer, or a request conversion (the Anthropic one dropped "learn"), that
 # loses the outcome, so a client learns with nothing on the wire
-import json, os, sys, threading, time, urllib.request
-U = os.environ.get("LLAMA_SERVER_URL", "http://localhost:58199")
-def raw(path, body):
-    req = urllib.request.Request(U + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=300) as r: return r.read().decode()
+import json, os, subprocess, sys, threading, time
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(__file__))
+from learn_fixture import Engine
+
+engine = Engine(sys.argv[1], "formats")
+train_dir = Path(sys.argv[2])
+U = engine.url
+raw = lambda path, body: engine.request(path, body)[1]
+reply = "Topeka is the capital of Kansas."
+shadow = engine.fresh()
+learn = engine.learn(shadow, reply)
 if "--shadow-retirement" in sys.argv:
-    with urllib.request.urlopen(U + "/props", timeout=300) as r:
-        props = json.load(r)
     # No competing lane: the duty gate defers only while another slot is processing.
-    assert props["total_slots"] == 1, "shadow-retirement requires an isolated single-slot server"
-sid = json.loads(raw("/lora-adapters/load", {"name": "shadow-05.gguf"}))["id"]
-learn = {"reply": "Topeka is the capital of Kansas.", "lora_id": sid, "lr": 0.001}
+    assert engine.get("/props")["total_slots"] == 1, "shadow-retirement requires an isolated single-slot server"
 
 # Isolated adapter lifetime regression, with no live persona or other clients on this server.
 if "--shadow-retirement" in sys.argv:
-    import urllib.error
-    retired = json.loads(raw("/lora-adapters/unload", {"id": sid}))
-    assert retired["success"] and retired["retired"] and retired["id"] == sid, retired
-    sid = json.loads(raw("/lora-adapters/load", {"name": "shadow-05.gguf"}))["id"]
-    learn["lora_id"] = sid
-    turn = {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0, "learn": learn}
-    first = json.loads(raw("/completion", turn))
+    status, retired = engine.unload(shadow)
+    assert status == 200 and retired["success"] and retired["retired"] and retired["id"] == shadow["id"], retired
+    shadow = engine.fresh()
+    turn = lambda learn: {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0, "learn": learn}
+    first = engine.ok("/completion", turn(engine.learn(shadow, reply)))
     assert first["learn"]["success"], first
     # a shadow that learned unloads too: its optimizer is released first (its moments go)
-    bound = json.loads(raw("/lora-adapters/unload", {"id": sid}))
-    assert bound["success"] and bound["retired"] and bound["id"] == sid, bound
-    sid = json.loads(raw("/lora-adapters/load", {"name": "shadow-05.gguf"}))["id"]
-    learn["lora_id"] = sid
-    following = json.loads(raw("/completion", turn))
+    status, bound = engine.unload(shadow)
+    assert status == 200 and bound["success"] and bound["retired"] and bound["id"] == shadow["id"], bound
+    shadow = engine.fresh()
+    following = engine.ok("/completion", turn(engine.learn(shadow, reply)))
     assert following["learn"]["success"], following
     print(json.dumps({"unbound_retired": retired, "bound_retired": bound, "next_learn": following["learn"]}))
+    engine.close()
     sys.exit(0)
 
 # Two minds on one serving context: each shadow keeps its own optimizer while the other learns in
-# between (needs shadow-05.gguf and a copy of it, shadow-06.gguf, in --train-dir).
+# between. Both are minted from the same seed, so they start as the same weights.
 if "--two-minds" in sys.argv:
-    other = json.loads(raw("/lora-adapters/load", {"name": "shadow-06.gguf"}))["id"]
+    other = engine.fresh()
     steps = []
-    for lora in [sid, other, sid, other]:
+    for adapter in [shadow, other, shadow, other]:
         turn = {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0,
-                "learn": dict(learn, lora_id=lora)}
-        out = json.loads(raw("/completion", turn))
+                "learn": engine.learn(adapter, reply)}
+        out = engine.ok("/completion", turn)
         assert out["learn"]["success"], out
-        steps.append((lora, out["learn"]["loss"]))
-    # the two shadows start from the same file, so they are independent only if their trajectories
+        steps.append((adapter["id"], out["learn"]["loss"]))
+    # the two shadows start from the same weights, so they are independent only if their trajectories
     # match: the other mind's first step is untouched by this one's step, and each second step
     # continues its own optimizer (a shared optimizer or shared weights would split them)
     assert abs(steps[0][1] - steps[1][1]) < 1e-6 and abs(steps[2][1] - steps[3][1]) < 1e-6, steps
     assert steps[2][1] < steps[0][1], steps
     print(json.dumps({"steps": steps}))
+    engine.close()
     sys.exit(0)
 
-# A learn naming an adapter that cannot train is refused by name, and serving survives it (needs
-# shadow-05.gguf and an F16 copy of it, shadow-f16.gguf, in --train-dir: make-f16-shadow.py writes
-# one). What this catches (Fable on fork #85, 2026-11-07): the F32 shadow learned, then a learn on
-# its F16 copy hit a GGML_ASSERT in opt_select and killed the serving process (exit 134).
+# A learn naming an adapter that cannot train is refused by name, and serving survives it: an F16
+# copy of a fresh shadow (make-f16-shadow.py). What this catches (Fable on fork #85, 2026-11-07):
+# the F32 shadow learned, then a learn on its F16 copy hit a GGML_ASSERT in opt_select and killed
+# the serving process (exit 134).
 if "--non-f32-refused" in sys.argv:
-    f16 = json.loads(raw("/lora-adapters/load", {"name": "shadow-f16.gguf"}))["id"]
-    turn = lambda lora: {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0,
-                         "learn": dict(learn, lora_id=lora)}
-    first = json.loads(raw("/completion", turn(sid)))
+    f16_name = engine.prefix + "-f16.gguf"
+    subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "make-f16-shadow.py"),
+                    shadow["path"], str(train_dir / f16_name)], check=True)
+    f16 = engine.load(f16_name)
+    turn = lambda learn: {"prompt": "The capital of Kansas is", "id_slot": 0, "n_predict": 1, "temperature": 0, "learn": learn}
+    first = engine.ok("/completion", turn(learn))
     assert first["learn"]["success"], first
-    refused = json.loads(raw("/completion", turn(f16)))
-    assert not refused["learn"]["success"] and "non-F32" in refused["learn"]["failure"], refused
-    with urllib.request.urlopen(U + "/health", timeout=30) as r:
-        assert json.load(r)["status"] == "ok", "the server still answers after the refusal"
-    again = json.loads(raw("/completion", turn(sid)))
+    # Refused by name at the first gate that sees the adapter: its preflight, or the learn itself.
+    status, plan = engine.post("/learn/preflight", {"engine": engine.engine, "lora_id": f16["id"], "learn": {"reply": reply}})
+    if status == 200 and plan["refusal"] == "none":
+        refused = engine.ok("/completion", turn(engine.learn(f16, reply)))["learn"]
+        assert not refused["success"] and "non-F32" in refused["failure"], refused
+        why = refused["failure"]
+    else:
+        why = json.dumps(plan)
+        assert "F32" in why, (status, plan)
+    assert engine.get("/health")["status"] == "ok", "the server still answers after the refusal"
+    again = engine.ok("/completion", turn(engine.learn(shadow, reply)))
     assert again["learn"]["success"], again
-    print(json.dumps({"refused": refused["learn"]["failure"], "after": again["learn"]["loss"]}))
+    print(json.dumps({"refused": why, "after": again["learn"]["loss"]}))
+    engine.close()
     sys.exit(0)
 
 # Isolated template/label regression; never run this shadow-adapter fixture on a persona lane.
 # Add --expect-reasoning-refusal only for a known non-reasoning template; the exact refusal must match.
 if "--template-replies" in sys.argv:
-    import urllib.error
     messages = [{"role": "user", "content": "Inspect the requested source file."}]
     tools = [{"type": "function", "function": {"name": "read_file", "description": "Read a file",
               "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}]
@@ -91,38 +106,44 @@ if "--template-replies" in sys.argv:
         request = {"messages": messages, "tools": tools, "id_slot": 0, "max_tokens": 1,
                    "chat_template_kwargs": {"enable_thinking": bool(reply.get("reasoning_content"))}}
         raw("/v1/chat/completions", request)
-        experience = dict(request, messages=messages + [reply], lora_id=sid)
         expect_refusal = bool(reply.get("reasoning_content")) and "--expect-reasoning-refusal" in sys.argv
-        try:
-            outcome = json.loads(raw("/learn", experience))
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode()
-            assert expect_refusal and error.code == 400, (error.code, detail)
+        if expect_refusal:
+            # The template refuses before any custody is consulted: rendering comes first.
+            status, detail = engine.request("/learn", dict(request, messages=messages + [reply], lora_id=shadow["id"]))
+            assert status == 400, (status, detail)
             assert "the served template does not render the reply's reasoning_content" in detail, detail
             print(json.dumps({"template_reply": "reasoning", "expected_refusal": detail}))
             continue
-        assert not expect_refusal, ("template was expected to refuse reasoning", outcome)
+        experience = engine.experience(shadow, messages + [reply],
+                                       **{k: v for k, v in request.items() if k != "messages"})
+        outcome = engine.ok("/learn", experience)
         deadline = time.monotonic() + 300
         while outcome.get("deferred"):
             assert time.monotonic() < deadline, ("deferred fixture deadline", outcome)
             assert not outcome["success"] and outcome["n_labels"] == 0, outcome
             time.sleep(outcome["retry_after_ms"] / 1000)
             # Retain and replay the whole experience; no intervening turn changes this slot.
-            outcome = json.loads(raw("/learn", experience))
+            outcome = engine.ok("/learn", experience)
         assert outcome["success"] and outcome["n_labels"] > 1, outcome
         print(json.dumps({"template_reply": "tool_calls" if "tool_calls" in reply else "reasoning" if reply.get("reasoning_content") else "text", "outcome": outcome}))
-    try:
-        raw("/learn", {"messages": messages + [{"role": "assistant", "content": ""}], "id_slot": 0, "lora_id": sid})
-        raise AssertionError("empty assistant reply was accepted")
-    except urllib.error.HTTPError as error:
-        assert error.code == 400, error
+    status, _ = engine.request("/learn", {"messages": messages + [{"role": "assistant", "content": ""}], "id_slot": 0, "lora_id": shadow["id"]})
+    assert status == 400, ("empty assistant reply was accepted", status)
+    engine.close()
     sys.exit(0)
 
 # Run with --fairness against an isolated two-slot server with --slots. This
 # exercises the shared admission in both directions, using the same model/adapter.
 if "--fairness" in sys.argv:
+    import math, urllib.request
     prompt = "Q: Which city is the capital of Kansas?\nA:"
-    turn = {"prompt": prompt, "id_slot": 0, "n_predict": 1, "temperature": 0, "learn": learn}
+    idle = {"prompt": prompt, "id_slot": 0, "n_predict": 1, "temperature": 0, "learn": learn}
+    # Calibrate under the contention this test applies: entry and restoration are measured per
+    # geometry, cold and warm, and a contended step costs several idle ones. Two idle steps measure
+    # the entries (the ledger's bootstrap), then one step under a whole-engine grant measures a
+    # contended step once the busy client runs (below).
+    cold = engine.ok("/completion", idle)["learn"]
+    warm = engine.ok("/completion", idle)["learn"]
+    measured = max(cold, warm, key=lambda o: o["max_chunk_ms"])
     started, stop = threading.Event(), threading.Event()
     progress, errors = [], []
 
@@ -148,31 +169,41 @@ if "--fairness" in sys.argv:
     try:
         assert started.wait(300) and not errors, errors
         def assert_busy():
-            with urllib.request.urlopen(U + "/slots", timeout=300) as response:
-                slots = json.load(response)
+            slots = engine.get("/slots")
             assert any(s["id"] == 1 and s["is_processing"] for s in slots), slots
 
         def assert_deferred():
             assert_busy()
-            result = json.loads(raw("/completion", turn))["learn"]
+            result = engine.ok("/completion", turn)["learn"]
             assert result["success"] is False and result["deferred"] is True, result
             assert result["retry_after_ms"] > 0 and result["n_labels"] == 0, result
             return result
 
         assert_busy()
-        first = json.loads(raw("/completion", turn))
+        whole = engine.shared_grant(measured, period_ms=engine.max_expiry_ms, share_ppm=1000000)
+        contended = engine.ok("/completion", dict(idle, learn=engine.learn(shadow, reply, grant=whole)))["learn"]
+        assert contended["success"], ("a whole-engine grant learns under contention", contended)
+        # A step is admitted on its measured entry and debited its measured time when it settles:
+        # 1.5 contended steps per period admits one and refuses the next until the period rolls.
+        # The period spans 100 contended steps so this test's own round trips cannot roll it early.
+        period_ms = math.ceil(100 * contended["t_ms"])
+        tight = engine.shared_grant(contended, period_ms=period_ms,
+                                    share_ppm=math.ceil(1.5 * contended["t_ms"] / period_ms * 1000000))
+        learn = engine.learn(shadow, reply, grant=tight)
+        turn = dict(idle, learn=learn)
+        first = engine.ok("/completion", turn)
         assert first["learn"]["success"], first
         completion_rest = assert_deferred()
         before = len(progress)
         t0 = time.monotonic()
         post_body = dict(learn, id_slot=0, n_prefix=first["tokens_evaluated"])
-        post_deferred = json.loads(raw("/learn", post_body))
+        post_deferred = engine.ok("/learn", post_body)
         assert post_deferred["success"] is False and post_deferred["deferred"] is True, post_deferred
         assert post_deferred["retry_after_ms"] > 0 and post_deferred["n_labels"] == 0, post_deferred
         # The client owns this experience during rest; the engine holds neither request nor slot.
         time.sleep(post_deferred["retry_after_ms"] / 1000)
         assert_busy()
-        post = json.loads(raw("/learn", post_body))
+        post = engine.ok("/learn", post_body)
         post_wall_ms = (time.monotonic() - t0) * 1000
         assert post["success"], post
         post_rest = assert_deferred()
@@ -182,6 +213,8 @@ if "--fairness" in sys.argv:
                           "other_slot_frames": len(progress) - before}))
     finally:
         stop.set()
+    worker.join(timeout=30)
+    engine.close()
     raise SystemExit(0)
 
 msgs = [{"role": "user", "content": "Which city is the capital of Kansas?"}]
@@ -211,4 +244,5 @@ for path, body in cases:
         fails += not ok
         print(f"{'OK ' if ok else 'BAD'} {path:22s} stream={stream!s:5s} learn outcomes={len(found)} {found[0] if found else ''}")
 print("ALL FORMATS CARRY THE LEARN OUTCOME" if fails == 0 else f"{fails} FORMAT(S) WITHOUT IT")
+engine.close()
 raise SystemExit(1 if fails else 0)

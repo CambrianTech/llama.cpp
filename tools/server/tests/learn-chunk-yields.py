@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real two-slot server test; requires an isolated server and shadow-05.gguf.
+"""Real two-slot server test; requires an isolated server. Usage: learn-chunk-yields.py URL
 
 What this catches: a reply loop that blocks the event loop until learning ends,
 or releases its slot before stable restoration. A neighbour must emit tokens
@@ -8,22 +8,28 @@ Run with -np 2 -b 128 -ub 128 -c 4096 --slots --train-dir FIXTURE.
 """
 import json
 import os
+import sys
 import threading
 import time
 import urllib.request
 
-URL = os.environ["LLAMA_SERVER_URL"]
+sys.path.insert(0, os.path.dirname(__file__))
+from learn_fixture import Engine
 
-
-def request(path, body=None):
-    data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(URL + path, data=data,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as response:
-        return json.load(response)
-
-
-shadow = request("/lora-adapters/load", {"name": "shadow-05.gguf"})["id"]
+engine = Engine(sys.argv[1], "yields", timeout=120)
+URL = engine.url
+request = lambda path, body=None: engine.get(path) if body is None else engine.ok(path, body)
+shadow = engine.fresh()
+prompt = "Remember these observed facts:"
+reply = engine.filling(prompt, "A room contains a card and a window. ")
+# The learn runs while a neighbour decodes, so it needs a share of a contended engine: calibrated
+# by two idle steps on this geometry (cold and warm entries), then a whole-engine grant.
+idle = {"prompt": prompt, "id_slot": 0, "n_predict": 8, "temperature": 0}
+cold = request("/completion", dict(idle, learn=engine.learn(shadow, reply)))["learn"]
+warm = request("/completion", dict(idle, learn=engine.learn(shadow, reply)))["learn"]
+whole = engine.shared_grant(max(cold, warm, key=lambda o: o["max_chunk_ms"]),
+                            period_ms=engine.max_expiry_ms, share_ppm=1000000)
+learn_body = dict(idle, learn=engine.learn(shadow, reply, grant=whole))
 frames, errors, result = [], [], []
 started, stop = threading.Event(), threading.Event()
 
@@ -48,12 +54,7 @@ def neighbour():
 
 def learn():
     try:
-        result.append(request("/completion", {
-            "prompt": "Remember these observed facts:", "id_slot": 0,
-            "n_predict": 8, "temperature": 0,
-            "learn": {"lora_id": shadow, "lr": 0.001,
-                      "reply": "A room contains a card and a window. " * 55},
-        }))
+        result.append(request("/completion", learn_body))
     except Exception as error:
         errors.append(str(error))
 
@@ -86,3 +87,4 @@ try:
                       "neighbour_frames_during_learning": max(observed) - min(observed)}))
 finally:
     stop.set()
+engine.close()
