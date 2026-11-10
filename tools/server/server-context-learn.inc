@@ -110,7 +110,7 @@
         auto set = construct_lora_list({});
         set[id].scale = 1.0f;
         common_set_adapter_lora(ctx_tgt, set);
-        const bool ok = llama_opt_measure_shadow_graph(ctx_tgt, learning_shadow_params((int32_t) id), (uint32_t) reply_rows, [](const llama_adapter_lora *, const char * device,
+        const bool ok = llama_opt_measure_shadow(ctx_tgt, learning_shadow_params((int32_t) id), [](const llama_adapter_lora *, const char * device,
                 const char * buft, const char * kind, size_t bytes, bool host, void * data) {
             static_cast<json *>(data)->push_back({{"device", device}, {"buffer_type", buft},
                 {"kind", kind}, {"bytes", bytes}, {"host", host}});
@@ -403,7 +403,7 @@
         }
         slot.state = SLOT_STATE_LEARNING;
         slot.learn_release_requested = false;
-        slot.learn_graph_steps = 0;
+        slot.learn_gradient_steps = 0;
         return {}; // no outcome is published until advance_learning restores the slot
     }
 
@@ -448,9 +448,11 @@
             learning_residencies.at(pending.lora_id)->restoring = !llama_opt_learn_needs_gradient(ctx_tgt) || llama_opt_learn_draining_graph(ctx_tgt);
             common_set_adapter_lora(ctx_tgt, pending.adapters);
             const auto steps_before = llama_opt_shadow_steps(ctx_tgt, pending.shadow);
-            const bool graph_step = llama_opt_learn_needs_gradient(ctx_tgt);
-            const auto status = llama_opt_learn_graph_step(ctx_tgt);
-            if (graph_step) { ++slot.learn_graph_steps; }
+            // One decode chunk, as serving's decode is: other slots decode between steps,
+            // and the workspace is one ubatch's, never the whole reply's.
+            const bool gradient_step = llama_opt_learn_needs_gradient(ctx_tgt);
+            const auto status = llama_opt_learn_step(ctx_tgt);
+            if (gradient_step) { ++slot.learn_gradient_steps; }
             const auto committed = llama_opt_shadow_steps(ctx_tgt, pending.shadow) - steps_before;
             GGML_ASSERT(committed >= 0); // optimizer custody prevents generation replacement here
             pending.committed_steps += committed;
@@ -462,7 +464,7 @@
             pending.max_chunk_us = std::max(pending.max_chunk_us, elapsed);
             // Classify the work, not its charging reservation: a revoked graph
             // still runs graph nodes under restoration custody until it commits.
-            auto & phase_max = graph_step ? pending.max_graph_us : pending.max_restore_us;
+            auto & phase_max = gradient_step ? pending.max_graph_us : pending.max_restore_us;
             phase_max = std::max(phase_max, elapsed);
             if (!reservation) {
                 pending.restoration_us += elapsed;

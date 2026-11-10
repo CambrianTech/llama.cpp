@@ -563,7 +563,7 @@ struct server_slot {
     // the outcome of the finishing task's learn (task_params::learn), for its final response
     std::optional<learn_outcome> learned;
     bool learn_release_requested = false;
-    int64_t learn_graph_steps = 0;
+    int64_t learn_gradient_steps = 0;
 
     void release() {
         if (state == SLOT_STATE_LEARNING) {
@@ -722,7 +722,7 @@ struct server_slot {
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
             {"is_learning", state == SLOT_STATE_LEARNING},
-            {"learn_graph_steps", learn_graph_steps},
+            {"learn_gradient_steps", learn_gradient_steps},
         };
 
         // The engine's own positions for this slot's sequence (Continuum fork): what its cache holds

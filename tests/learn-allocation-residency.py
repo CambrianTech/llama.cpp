@@ -154,22 +154,25 @@ assert call('/learn/residency/release', {'id': 'workspace-next'})['refusal'] == 
 assert call('/lora-adapters/unload', {'id': b['id']})['retired']
 assert call('/learn/residency/release', {'id': 'opt-b'})['refusal'] == 'none'
 assert call('/learn/residency/release', {'id': 'workspace-next'})['refusal'] == 'busy'
-# A larger actual reply must re-admit growth; the short plan is not a window cap.
+# A learn step is one decode chunk, as serving's is: a longer reply learns inside the
+# workspace a short plan priced (no growth), and the plan does not depend on the reply.
 long_reply = 'Topeka is the capital of Kansas. ' * 50
-refused_growth = call('/completion', dict(probe, learn={'grant': 'compute', 'lora_id': a['id'],
-    'reply': long_reply, 'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace-next'}))['learn']
-assert not refused_growth['success'] and refused_growth['committed_steps'] == 0, refused_growth
 long_plan = call('/learn/preflight', {'engine': engine, 'lora_id': a['id'], 'learn': {'reply': long_reply}})
 workspace = [row for row in long_plan['requirements'] if row['kind'] == 'shared_compute_required']
 register('workspace-long', {'workspace': True}, workspace)
+grown = call('/completion', dict(probe, learn={'grant': 'compute', 'lora_id': a['id'],
+    'reply': long_reply, 'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace-next'}))['learn']
+assert grown['success'] and grown['committed_steps'] >= 1, grown
+# A reply several chunks long is revoked between chunks: no gradient chunk after the
+# revocation, the stable tail restored, and nothing half-applied.
+many_chunks = 'Topeka is the capital of Kansas. ' * 400
 with concurrent.futures.ThreadPoolExecutor() as pool:
     future = pool.submit(call, '/completion', dict(probe, learn={'grant': 'compute', 'lora_id': a['id'],
-        'reply': 'Topeka is the capital of Kansas. ' * 50,
-        'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace-long'}))
+        'reply': many_chunks, 'optimizer_residency': 'opt-a', 'workspace_residency': 'workspace-long'}))
     deadline = time.monotonic() + 30
     observed = False
     while time.monotonic() < deadline and not future.done():
-        if any(slot.get('is_learning') and slot.get('learn_graph_steps', 0) >= 2 for slot in call('/slots')):
+        if any(slot.get('is_learning') and slot.get('learn_gradient_steps', 0) >= 2 for slot in call('/slots')):
             observed = True
             break
         time.sleep(0.005)
@@ -183,9 +186,8 @@ with concurrent.futures.ThreadPoolExecutor() as pool:
     assert call('/learn/residency/revoke', {'id': 'opt-a'})['refusal'] == 'none'
     assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'busy'
     outcome = future.result()['learn']
-    assert not outcome['success'] and outcome['n_labels'] > 128, outcome
-    assert outcome['committed_steps'] == 1 and not outcome['effects_uncertain'], outcome
-    print('revoked graph completed before restoration', outcome, flush=True)
+    assert not outcome['success'] and not outcome['effects_uncertain'], outcome
+    print('revoked between chunks, stable tail restored', outcome, flush=True)
     assert outcome['refusal'] == 'residency_revoked', outcome
 assert not learn(a, 'opt-a', 'workspace-long')['success']
 assert call('/learn/residency/release', {'id': 'opt-a'})['refusal'] == 'busy'
