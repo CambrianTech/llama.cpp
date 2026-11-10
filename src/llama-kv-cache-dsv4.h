@@ -15,7 +15,7 @@ public:
     stream_copy_info sc_info;
 
     llama_dsv4_comp_state(
-            const llama_model & model,
+            bool no_alloc, const llama_model & model,
             bool            offload,
             bool            unified,
             uint32_t        n_seq_max,
@@ -50,6 +50,7 @@ public:
     ggml_tensor * cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
 
 private:
+    const bool no_alloc;
     struct layer {
         uint32_t il;
 
@@ -88,7 +89,7 @@ private:
 class llama_kv_cache_dsv4 : public llama_memory_i {
 public:
     llama_kv_cache_dsv4(
-            const llama_model & model,
+            bool no_alloc, const llama_model & model,
                     ggml_type   type_k,
                     ggml_type   type_v,
                          bool   v_trans,

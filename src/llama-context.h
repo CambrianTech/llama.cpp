@@ -44,7 +44,7 @@ struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params, bool measure_only = false);
 
     ~llama_context();
 
@@ -198,6 +198,7 @@ struct llama_context {
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
+    void visit_context_memory(llama_context_memory_callback callback, void * data) const;
 
     //
     // training
@@ -380,6 +381,7 @@ private:
     // members
     //
 
+    const bool no_alloc;
     const llama_model & model;
 
     llama_cparams cparams;
@@ -506,6 +508,8 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+    size_t output_bytes = 0;
+    ggml_backend_buffer_type_t output_buft = nullptr;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
@@ -529,3 +533,5 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };
+
+llama_context * llama_context_create(llama_model * model, llama_context_params params, bool measure_only);

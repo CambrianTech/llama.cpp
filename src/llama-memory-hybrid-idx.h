@@ -18,7 +18,7 @@
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
-        const llama_model & model,
+        bool no_alloc, const llama_model & model,
                             /* attn */
                 ggml_type   type_k,
                 ggml_type   type_v,

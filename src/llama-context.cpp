@@ -78,8 +78,8 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_context::llama_context(
         const llama_model & model,
-              llama_context_params params) :
-    model(model),
+              llama_context_params params, bool measure_only) :
+    no_alloc(measure_only || model.hparams.no_alloc), model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -368,7 +368,8 @@ llama_context::llama_context(
 
         // graph outputs buffer
         {
-            if (output_reserve(params.n_seq_max) < params.n_seq_max) {
+            const uint32_t output_count = no_alloc ? cparams.n_batch : params.n_seq_max;
+            if (output_reserve(output_count) < output_count) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 
@@ -381,6 +382,7 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
+            /*.no_alloc  =*/ no_alloc,
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
             /*.swa_full  =*/ params.swa_full,
@@ -478,7 +480,7 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
-    if (!model.hparams.no_alloc) {
+    if (!no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -639,13 +641,13 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+                no_alloc, no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), no_alloc, no_alloc ? backend_buf_exp_size.data() : nullptr);
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -658,7 +660,7 @@ void llama_context::sched_reserve() {
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), no_alloc, no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -673,7 +675,7 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), no_alloc, no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -682,7 +684,7 @@ void llama_context::sched_reserve() {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-        if (!model.hparams.no_alloc) {
+        if (!no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
@@ -2211,6 +2213,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
         }
+        output_buft = buft;
+        output_bytes = new_size;
+        if (no_alloc) {
+            buf_output.reset(ggml_backend_buft_alloc_buffer(buft, 0));
+            if (!buf_output) { return 0; }
+            return n_outputs_max;
+        }
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
@@ -2546,7 +2555,9 @@ ggml_cgraph * llama_context::graph_reserve(
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+            std::vector<size_t> measured(backend_ptrs.size(), 0);
+            ggml_backend_sched_reserve_size(sched.get(), gf, measured.data());
+            for (size_t i = 0; i < measured.size(); ++i) { sizes[i] = std::max(sizes[i], measured[i]); }
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
@@ -3401,11 +3412,11 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (model.hparams.no_alloc) {
+    if (no_alloc) {
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += backend_buf_exp_size[i];
+            ret[buft].compute = std::max(ret[buft].compute, backend_buf_exp_size[i]);
         }
     } else {
         std::vector<ggml_backend_buffer_type_t> reported;
@@ -3475,9 +3486,9 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
-llama_context * llama_init_from_model(
+llama_context * llama_context_create(
                  llama_model * model,
-        llama_context_params   params) {
+        llama_context_params   params, bool measure_only) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
         return nullptr;
@@ -3562,13 +3573,17 @@ llama_context * llama_init_from_model(
     }
 
     try {
-        auto * ctx = new llama_context(*model, params);
+        auto * ctx = new llama_context(*model, params, measure_only);
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
     }
 
     return nullptr;
+}
+
+llama_context * llama_init_from_model(llama_model * model, llama_context_params params) {
+    return llama_context_create(model, params, false);
 }
 
 // deprecated
