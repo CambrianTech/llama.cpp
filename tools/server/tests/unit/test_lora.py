@@ -107,7 +107,8 @@ def test_the_adapter_report_follows_every_change_to_the_set(tmp_path):
     # an adapter active by default is retired only once its scale is 0 (the engine refuses otherwise)
     assert server.make_request("POST", "/lora-adapters", data=[{"id": 0, "scale": 0.0}, {"id": 1, "scale": 0.0}]).status_code == 200
     assert report()[0]["scale"] == 0.0
-    unloaded = server.make_request("POST", "/lora-adapters/unload", data={"id": 0})
+    # a retire names the engine incarnation it was decided against, like every lifecycle verb
+    unloaded = server.make_request("POST", "/lora-adapters/unload", data={"id": 0, "engine": engine})
     assert unloaded.status_code == 200, unloaded.body
     assert list(report()) == [1], "a retired adapter leaves the report; the ids it left stay taken"
 
