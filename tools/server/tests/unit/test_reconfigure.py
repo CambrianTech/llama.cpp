@@ -132,6 +132,8 @@ def rss_kib() -> int | None:
 
 
 def test_generations_in_progress_finish_identical_across_a_reconfigure(monkeypatch):
+    # one batch takes all four prompts, so the control and the reconfigured run group every step alike
+    server.n_batch = 512
     # a pace of 40 ms per decode step keeps 48-token generations in progress for about 2 s
     start_with_step_delay(monkeypatch, 40)
     request = {
