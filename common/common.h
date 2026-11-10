@@ -921,8 +921,17 @@ struct common_sampler;
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
+    // loads the model and, unless model_only, its adapters; the context is init_context()'s
     common_init_result(common_params & params, bool model_only = false);
     ~common_init_result();
+
+    // Continuum fork: the context is its own lifetime, apart from the model's (SERVING-ENGINE.md,
+    // S2). init_context() creates it on the loaded model with params' geometry and runs its setup
+    // (control vectors, adapters, optionally the warmup); free_context() frees it and what is bound
+    // to it. The model, its mmap, its adapters and the CPU threadpools stay, so a server changes its
+    // geometry without loading the weights again. Returns false if no context could be created.
+    bool init_context(common_params & params, bool warmup);
+    void free_context();
 
     llama_model * model();
     llama_context * context();
@@ -939,7 +948,12 @@ private:
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
+// the model and its context (model_only: the model alone)
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
+
+// Continuum fork: the model and its adapters with no context yet; the caller creates it with
+// init_context(), and may free and create it again with another geometry
+common_init_result_ptr common_load_from_params(common_params & params);
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
@@ -967,6 +981,9 @@ struct common_threadpools {
     common_threadpools & operator=(const common_threadpools &) = delete;
 
     void init(llama_context * ctx, const common_params & params);
+
+    // Continuum fork: the pools already made, attached to a context created after them
+    void attach(llama_context * ctx) const;
 
 private:
     ggml_threadpool * threadpool       = nullptr;
