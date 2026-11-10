@@ -121,10 +121,22 @@ jobs:
 
       - name: Python setup
         id: setup_python
+        # also after a failed step above, so the reconfigure tests below still run (see their note)
+        if: ${{ !cancelled() }}
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           pip-install: -r tools/server/tests/requirements.txt
+
+      # Continuum fork: the live reconfigure's validator (SERVING-ENGINE.md, S2), run on its own while
+      # pre-existing residency failures (the dream step above, unit/test_lora.py) stop the suite under -x
+      # before it; drop this step once the suite reaches test_reconfigure.py again
+      - name: Reconfigure tests
+        if: ${{ !cancelled() }}
+        run: |
+          cd tools/server/tests
+          ./tests.sh -v -x unit/test_reconfigure.py
+          LLAMA_ARG_BACKEND_SAMPLING=1 ./tests.sh -v -x unit/test_reconfigure.py
 
       - name: Tests
         id: server_integration_tests
@@ -204,6 +216,14 @@ jobs:
         with:
           python-version: '3.11'
           pip-install: -r tools/server/tests/requirements.txt
+
+      # Continuum fork: the live reconfigure's validator, on its own (see the ubuntu job's note)
+      - name: Reconfigure tests
+        shell: bash
+        run: |
+          cd tools/server/tests
+          export PYTHONIOENCODING=":replace"
+          ./tests.sh -v -x unit/test_reconfigure.py
 
       - name: Tests
         id: server_integration_tests
