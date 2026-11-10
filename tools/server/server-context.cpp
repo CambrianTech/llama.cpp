@@ -14,6 +14,8 @@
 #include "server-prefill.h"
 #include "server-learn-ledger.h"
 #include "server-learn-residency.h"
+#include "server-reconfigure.h"
+#include "server-slot-page.h"
 #include "server-test-faults.h"
 
 #include "build-info.h"
@@ -39,6 +41,7 @@
 #include <fstream>
 #include <random>
 #include <sstream>
+#include <thread>
 
 // Continuum fork: an adapter file's revision (size, mtime in ns since the epoch; (0, 0) when it
 // cannot be read), stored in a saved slot's `.lora` sidecar so a restore refuses a page computed
@@ -132,6 +135,11 @@ struct server_batch {
     }
 
     void init(int32_t n_tokens_alloc, int32_t n_embd) {
+        // Continuum fork: every context build sizes the batch again (wake from sleep, a reconfigure)
+        if (batch.pos != nullptr) {
+            clear();
+            llama_batch_free(batch);
+        }
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
         batch = llama_batch_init(n_tokens_alloc, 0, 1);
@@ -314,25 +322,42 @@ struct server_slot {
             return false;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+        const server_slot_page_size size = server_slot_page_measure(ctx_tgt, ctx_dft, id);
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+                (int) prompt.tokens.size(), size.total() / (1024.0 * 1024.0), size.drft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, lora_active(lora), cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, lora_active(lora), size.main, size.drft);
         if (cur == nullptr) {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (!server_slot_page_read(ctx_tgt, ctx_dft, id, cur->data)) {
+            prompt_cache.states.pop_back(); // alloc appended it; a short read is not this prompt's state
+            return false;
         }
 
         return true;
+    }
+
+    // Continuum fork: page out / page in for a live reconfigure (server-reconfigure.h), through the
+    // one mover (server-slot-page.h). Only the KV moves: the prompt, its checkpoints and the sampler
+    // are host memory already and stay with the slot.
+    bool page_out(server_slot_page & page) const {
+        const server_slot_page_size size = server_slot_page_measure(ctx_tgt, ctx_dft, id);
+        try {
+            page.data.main.resize(size.main);
+            page.data.drft.resize(size.drft);
+        } catch (const std::bad_alloc & e) {
+            SLT_ERR(*this, "no host memory for a %.3f MiB page: %s\n", size.total() / (1024.0 * 1024.0), e.what());
+            return false;
+        }
+        page.lora = lora_active(lora);
+        return server_slot_page_read(ctx_tgt, ctx_dft, id, page.data);
+    }
+
+    bool page_in(const server_slot_page & page) const {
+        return server_slot_page_write(ctx_tgt, ctx_dft, id, page.data);
     }
 
     // `task_lora` is the adapter list the incoming task will run under: only a state
@@ -447,6 +472,19 @@ struct server_slot {
 
         SLT_TRC(*this, "init sampler, took %0.2f ms, tokens: text = %d, total = %d\n",
                 (ggml_time_us() - t_start) / 1000.0, n_text, (int) prompt.tokens.size());
+    }
+
+    // the backend sampler is bound to the context: a launch attaches it, a reconfigure attaches it again
+    void attach_sampler(const task_params & params) const {
+        const bool need_pre_sample_logits = params.sampling.n_probs > 0 && !params.post_sampling_probs;
+
+        bool use_backend_sampling = params.sampling.backend_sampling;
+
+        // TODO: getting pre sampling logits is not yet supported with backend sampling
+        use_backend_sampling &= !need_pre_sample_logits;
+
+        // TODO: tmp until backend sampling is fully implemented
+        llama_set_sampler(ctx_tgt, id, use_backend_sampling ? common_sampler_get(smpl.get()) : nullptr);
     }
 
     bool need_embd() const {
@@ -916,6 +954,16 @@ public:
         return lora_report;
     }
 
+    // the live geometry and the reconfigure counters as the main loop last published them
+    // (publish_geometry): /props reads them here, never through the task queue
+    json geometry_report_snapshot() const {
+        std::lock_guard<std::mutex> lock(geometry_report_mutex);
+        return geometry_report;
+    }
+    int32_t live_n_seq() const {
+        return n_seq_live.load();
+    }
+
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
@@ -1110,18 +1158,199 @@ private:
         lora_report = std::move(report);
     }
 
+    // LIVE RECONFIGURE (server-reconfigure.h): the weights loaded since start (a reconfigure never adds
+    // one), the parked slots' host state (their pages are reconfigure_state's), and the geometry as
+    // /props reports it, republished by the main loop after every load and reconfigure
+    int64_t n_weight_loads = 0;
+    server_reconfigure_state reconfigure_state;
+    std::map<int, server_slot> parked_slots;
+    mutable std::mutex geometry_report_mutex;
+    json geometry_report = json::object();
+    std::atomic<int32_t> n_seq_live{0};
+
+    bool kv_pool_unified() const {
+        // measured from the context, not the flag: one pool when a sequence may hold all of it
+        return llama_n_seq_max(ctx_tgt) <= 1 || llama_n_ctx_seq(ctx_tgt) >= llama_n_ctx(ctx_tgt);
+    }
+
+    void publish_geometry() {
+        json parked = json::array();
+        for (const auto & [id, p] : reconfigure_state.parked) {
+            parked.push_back({ { "slot", id }, { "tokens_held", p.tokens_held }, { "busy", p.busy } });
+        }
+        json report = {
+            { "n_ctx",          llama_n_ctx(ctx_tgt) },
+            { "n_seq",          (int32_t) slots.size() },
+            { "n_ctx_seq",      get_slot_n_ctx() },
+            { "kv_unified",     kv_pool_unified() },
+            { "n_weight_loads", n_weight_loads },
+            { "n_applied",      reconfigure_state.n_applied },
+            { "n_refused",      reconfigure_state.n_refused },
+            { "parked",         parked },
+            // the same keys /props' load-time context_geometry has, read from the live context
+            { "context_geometry", {
+                { "allocated_tokens",        llama_n_ctx(ctx_tgt) },
+                { "max_tokens_per_sequence", llama_n_ctx_seq(ctx_tgt) },
+                { "sequence_capacity",       llama_n_seq_max(ctx_tgt) },
+            } },
+            { "last",           reconfigure_state.last ? server_reconfigure_to_json(*reconfigure_state.last) : json(nullptr) },
+        };
+        n_seq_live.store((int32_t) slots.size());
+        std::lock_guard<std::mutex> lock(geometry_report_mutex);
+        geometry_report = std::move(report);
+    }
+
+    // a slot leaves service whole and a fresh, empty slot takes its id
+    void park_slot(int id) {
+        GGML_ASSERT(parked_slots.find(id) == parked_slots.end());
+        parked_slots.emplace(id, std::move(slots[id]));
+        slots[id] = server_slot();
+        bind_slot(slots[id]);
+        init_slot(slots[id], id);
+    }
+
+    // the parked slot takes its id back (the reconfigure pages its KV in)
+    void unpark_slot(int id) {
+        auto it = parked_slots.find(id);
+        GGML_ASSERT(it != parked_slots.end());
+        slots[id] = std::move(it->second);
+        parked_slots.erase(it);
+        bind_slot(slots[id]);
+    }
+
+    // a parked slot's work ends without its state ever returning: its client is told why. Its sampler
+    // was attached to a context since freed, so it is dropped, never released (release resets it there).
+    void drop_parked_slot(int id, const std::string & why) {
+        auto it = parked_slots.find(id);
+        if (it == parked_slots.end()) {
+            return;
+        }
+        if (it->second.task && !why.empty()) {
+            send_error(it->second, why, ERROR_TYPE_UNAVAILABLE);
+        }
+        parked_slots.erase(it);
+        reconfigure_state.parked.erase(id);
+    }
+
+    void drop_parked(const std::string & why) {
+        while (!parked_slots.empty()) {
+            drop_parked_slot(parked_slots.begin()->first, why);
+        }
+        reconfigure_state.parked.clear();
+    }
+
+    // after a reconfigure placed the states: each live sampler on the new context, drafting begun again on
+    // the rebuilt speculative state, and the queued work offered the free slots (a grow adds some)
+    void resume_after_reconfigure() {
+        for (auto & slot : slots) {
+            if (slot.task && slot.smpl) {
+                slot.attach_sampler(slot.task->params);
+            }
+            if (slot.state == SLOT_STATE_GENERATING && slot.can_speculate()) {
+                common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+            }
+        }
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                queue_tasks.pop_deferred_task(slot.id);
+            }
+        }
+        publish_busy_slots();
+    }
+
+    // what a live reconfigure needs of this server: its contexts' lifetime and its slots
+    struct reconfigure_engine final : server_reconfigure_engine {
+        server_context_impl & s;
+        explicit reconfigure_engine(server_context_impl & owner) : s(owner) {}
+
+        server_geometry live() const override {
+            // the geometry as asked for (fit's choice when the launch named none), so asking again is a no-op
+            const int32_t n_ctx = s.params_base.n_ctx > 0 ? s.params_base.n_ctx : (int32_t) llama_n_ctx(s.ctx_tgt);
+            return { n_ctx, (int32_t) s.slots.size() };
+        }
+        int32_t n_ctx_seq()  const override { return s.get_slot_n_ctx(); }
+        int32_t n_cells()    const override { return (int32_t) llama_n_ctx(s.ctx_tgt); }
+        bool    kv_unified() const override { return s.kv_pool_unified(); }
+
+        std::optional<server_reconfigure_refused> blocked() const override {
+            if (auto learn = s.learning_blocks_reconfigure()) {
+                return learn;
+            }
+            for (const auto & slot : s.slots) {
+                if (slot.state == SLOT_STATE_WAIT_OTHER) {
+                    return server_reconfigure_refused { SERVER_RECONFIGURE_FAN_OUT,
+                        "a parent prompt is being copied into its child slots (n_cmpl > 1)", slot.id };
+                }
+            }
+            return std::nullopt;
+        }
+
+        int32_t tokens_held(int32_t id) const override {
+            llama_memory_t mem = llama_get_memory(s.ctx_tgt);
+            if (mem == nullptr) {
+                return 0; // a context with no memory module (an embedding model) holds no state between tasks
+            }
+            const llama_pos pos_max = llama_memory_seq_pos_max(mem, id);
+            if (pos_max < 0) {
+                return 0;
+            }
+            return std::max<int32_t>(s.slots[id].prompt.n_tokens(), pos_max + 1);
+        }
+        bool busy(int32_t id) const override { return s.slots[id].is_processing(); }
+
+        bool page_out(int32_t id, server_slot_page & page) override { return s.slots[id].page_out(page); }
+        bool page_in (int32_t id, const server_slot_page & page) override { return s.slots[id].page_in(page); }
+
+        void park  (int32_t id) override { s.park_slot(id); }
+        void unpark(int32_t id) override { s.unpark_slot(id); }
+
+        void destroy_contexts() override { s.destroy_contexts(); }
+        bool build_contexts(const server_geometry & g) override {
+            s.params_base.n_ctx      = g.n_ctx;
+            s.params_base.n_parallel = g.n_seq;
+            // no warmup: the weights are already resident, and the warmup would only clear the new memory
+            return s.build_contexts(false);
+        }
+
+        void resume() override { s.resume_after_reconfigure(); }
+    };
+
     int64_t t_last_load_progress_ms = 0;
 
+    // Continuum fork: the weights and the contexts are two lifetimes (SERVING-ENGINE.md, S2).
+    // destroy = destroy_contexts + free_weights; load_model = load_weights + build_contexts; a live
+    // reconfigure (server-reconfigure.h) is page out, destroy_contexts, build_contexts, page in, so the
+    // model and its mmap are never freed for a new geometry.
     void destroy() {
-        spec.reset();
-        spec_init.reset();
+        destroy_contexts();
+        free_weights();
+        // a slot's prompt describes KV that is gone with its context; the next load starts the slots empty
+        slots.clear();
+    }
 
-        ctx_dft   = nullptr;
+    // the target and draft contexts and the speculative state; the slots keep their host state
+    void destroy_contexts() {
+        spec.reset();
+
+        if (spec_init) {
+            spec_init->free_context();
+        }
+        ctx_dft = nullptr;
+        params_base.speculative.draft.ctx_tgt = nullptr;
+        params_base.speculative.draft.ctx_dft = nullptr;
+
+        if (llama_init) {
+            llama_init->free_context();
+        }
+        ctx_tgt = nullptr;
+    }
+
+    // the target model with its adapters, the draft model, the multimodal projector
+    void free_weights() {
+        spec_init.reset();
         model_dft = nullptr;
 
         llama_init.reset();
-
-        ctx_tgt = nullptr;
         model_tgt = nullptr;
 
         mtmd_free(mctx);
@@ -1136,6 +1365,8 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            // sleep frees the weights a parked slot's sampler was made on: its work ends, by name
+            drop_parked("the server went to sleep while this slot was paged out by a reconfigure");
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1188,9 +1419,6 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
-        const auto output_limits = server_output_limits(params_base);
-        params_base.n_outputs_max = output_limits.total;
-        params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -1218,6 +1446,116 @@ private:
 
         SRV_INF("loading model '%s'\n", params.model.get_name().c_str());
         SRV_TRC("local path '%s'\n", params.model.path.c_str());
+
+        if (!load_weights(load_progress_text, load_progress_mmproj, load_progress_spec)) {
+            return false;
+        }
+
+        if (!build_contexts(params_base.warmup)) {
+            return false;
+        }
+
+        {
+            const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
+            trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
+
+            if (trace) {
+                SRV_WRN("LLAMA_TRACE = %d\n", trace);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_SLOTS_DEBUG = getenv("LLAMA_SERVER_SLOTS_DEBUG");
+            slots_debug = LLAMA_SERVER_SLOTS_DEBUG ? atoi(LLAMA_SERVER_SLOTS_DEBUG) : 0;
+
+            if (slots_debug) {
+                SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_SLOTS_N_DIFF = getenv("LLAMA_SERVER_SLOTS_N_DIFF");
+            slots_n_diff = LLAMA_SERVER_SLOTS_N_DIFF ? atoi(LLAMA_SERVER_SLOTS_N_DIFF) : 0;
+
+            if (slots_n_diff) {
+                SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        if constexpr (server_test_faults::enabled) {
+            test_faults = server_test_faults::from_env();
+            if (test_faults.any()) {
+                SRV_WRN("test faults: prompt checkpoints = %d, speculative checkpoints = %d, prompt fills = %d, step delay = %d ms\n",
+                        test_faults.prompt_checkpoints, test_faults.spec_checkpoints, test_faults.prompt_fills, test_faults.step_delay_ms);
+            }
+        }
+
+        if (params_base.cache_ram_mib != 0) {
+            if (params_base.cache_ram_mib < 0) {
+                SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
+            } else {
+                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+            }
+            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+        } else {
+            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+        SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        if (params_base.n_ctx_checkpoints > 0) {
+            if (params_base.checkpoint_min_step < 0) {
+                SRV_TRC("context checkpoints enabled, max = %d, min spacing = each prompt over %d\n",
+                        params_base.n_ctx_checkpoints, params_base.n_ctx_checkpoints);
+            } else {
+                SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
+                        params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            }
+        } else {
+            SRV_TRC("%s", "context checkpoints disabled\n");
+        }
+
+        if (!params_base.model_alias.empty()) {
+            // backward compat: use first alias as model name
+            model_name = *params_base.model_alias.begin();
+        } else if (!params_base.model.get_name().empty()) {
+            model_name = params_base.model.get_name();
+        } else {
+            // fallback: derive model name from file name
+            auto model_path = std::filesystem::path(params_base.model.path);
+            model_name = model_path.filename().string();
+        }
+
+        model_aliases = params_base.model_alias;
+        model_tags    = params_base.model_tags;
+
+        // propagate new defaults back to caller
+        params = params_base;
+
+        publish_lora_report();
+        publish_geometry();
+
+        if (!is_resume) {
+            return init();
+        }
+
+        if (callback_state) {
+            callback_state(SERVER_STATE_READY, {});
+        }
+
+        return true;
+    }
+
+    // THE WEIGHTS, which survive a reconfigure: the target model with its adapters, the draft model,
+    // the multimodal projector. No context is created here (build_contexts).
+    bool load_weights(load_progress_data & load_progress_text, load_progress_data & load_progress_mmproj, load_progress_data & load_progress_spec) {
+        const bool has_mmproj = !params_base.mmproj.path.empty();
+        const bool has_draft = params_base.speculative.has_dft();
+        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                        params_base.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const bool has_spec = has_draft || spec_mtp;
 
         std::string & mmproj_path = params_base.mmproj.path;
         mtmd_context_params mparams = mtmd_context_params_default();
@@ -1273,24 +1611,18 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        llama_init = common_load_from_params(params_base);
 
         model_tgt = llama_init->model();
-        ctx_tgt   = llama_init->context();
 
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
             return false;
         }
 
-        if (ctx_tgt == nullptr) {
-            SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
-            return false;
-        }
+        n_weight_loads++;
 
         vocab = llama_model_get_vocab(model_tgt);
-
-        n_ctx = llama_n_ctx(ctx_tgt);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1306,22 +1638,13 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+                spec_init = std::make_unique<common_speculative_init_result>(params_dft);
                 model_dft = spec_init->model();
-                ctx_dft   = spec_init->context();
 
                 if (has_draft && model_dft == nullptr) {
                     SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
                     return false;
                 }
-
-                if (ctx_dft == nullptr) {
-                    SRV_ERR("%s", "failed to create MTP context\n");
-                    return false;
-                }
-
-                params_base.speculative.draft.ctx_tgt = ctx_tgt;
-                params_base.speculative.draft.ctx_dft = ctx_dft;
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
@@ -1332,7 +1655,7 @@ private:
                 callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
             }
 
-            if (!is_resume) {
+            if (!sleeping) {
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
 
@@ -1354,18 +1677,6 @@ private:
             }
         }
 
-        if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
-            if (params_base.ctx_shift) {
-                params_base.ctx_shift = false;
-                SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
-            }
-
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by this context, it will be disabled");
-            }
-        }
-
         if (llama_model_n_swa(model_tgt) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
@@ -1378,6 +1689,59 @@ private:
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
 
+        return true;
+    }
+
+    // THE CONTEXTS, which a reconfigure rebuilds on the same weights: the target and draft contexts,
+    // the speculative state, the slots and the batch, for params_base's n_ctx and n_parallel. On
+    // failure nothing of them is left, so the caller may build again (the previous geometry).
+    bool build_contexts(bool warmup) {
+        if (!build_contexts_impl(warmup)) {
+            destroy_contexts();
+            return false;
+        }
+        return true;
+    }
+
+    bool build_contexts_impl(bool warmup) {
+        const auto output_limits = server_output_limits(params_base);
+        params_base.n_outputs_max = output_limits.total;
+        params_base.n_outputs_max_per_seq = output_limits.per_seq;
+
+        if (!llama_init->init_context(params_base, warmup)) {
+            SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
+            return false;
+        }
+
+        ctx_tgt = llama_init->context();
+
+        n_ctx = llama_n_ctx(ctx_tgt);
+
+        if (spec_init) {
+            common_params params_dft = common_base_params_to_speculative(params_base);
+
+            if (!spec_init->init_context(params_dft, model_tgt, ctx_tgt) || spec_init->context() == nullptr) {
+                SRV_ERR("%s", "failed to create MTP context\n");
+                return false;
+            }
+            ctx_dft = spec_init->context();
+
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = ctx_dft;
+        }
+
+        if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
+            if (params_base.ctx_shift) {
+                params_base.ctx_shift = false;
+                SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
+            }
+
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported by this context, it will be disabled");
+            }
+        }
+
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
@@ -1385,8 +1749,6 @@ private:
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
             n_ctx_slot = n_ctx_train;
         }
-
-        slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1400,11 +1762,6 @@ private:
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
-
-        // initialize slots
-        for (int i = 0; i < params_base.n_parallel; i++) {
-            slots.emplace_back();
-        }
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1427,69 +1784,7 @@ private:
             model_dft = nullptr;
         }
 
-        for (int i = 0; i < params_base.n_parallel; i++) {
-            server_slot & slot = slots[i];
-
-            slot.id      = i;
-            slot.ctx_tgt = ctx_tgt;
-            slot.ctx_dft = ctx_dft;
-            slot.mem.init(ctx_tgt, ctx_dft);
-            slot.spec    = spec.get();
-            slot.n_ctx   = n_ctx_slot;
-
-            slot.mctx                   = mctx;
-            slot.prompt.tokens.has_mtmd = mctx != nullptr;
-
-            SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
-
-            slot.callback_on_release = [this](int id_slot) {
-                queue_tasks.pop_deferred_task(id_slot);
-            };
-
-            slot.callback_on_reset = [this](const server_slot & slot) {
-                // flush the generated token stats before reset()
-                if (slot.stats.n_gen > 0) {
-                    metrics_on_prediction(slot);
-                }
-            };
-
-            slot.reset();
-        }
-
-        {
-            const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
-            trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
-
-            if (trace) {
-                SRV_WRN("LLAMA_TRACE = %d\n", trace);
-            }
-        }
-
-        {
-            const char * LLAMA_SERVER_SLOTS_DEBUG = getenv("LLAMA_SERVER_SLOTS_DEBUG");
-            slots_debug = LLAMA_SERVER_SLOTS_DEBUG ? atoi(LLAMA_SERVER_SLOTS_DEBUG) : 0;
-
-            if (slots_debug) {
-                SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
-            }
-        }
-
-        {
-            const char * LLAMA_SERVER_SLOTS_N_DIFF = getenv("LLAMA_SERVER_SLOTS_N_DIFF");
-            slots_n_diff = LLAMA_SERVER_SLOTS_N_DIFF ? atoi(LLAMA_SERVER_SLOTS_N_DIFF) : 0;
-
-            if (slots_n_diff) {
-                SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
-            }
-        }
-
-        if constexpr (server_test_faults::enabled) {
-            test_faults = server_test_faults::from_env();
-            if (test_faults.any()) {
-                SRV_WRN("test faults: prompt checkpoints = %d, speculative checkpoints = %d, prompt fills = %d\n",
-                        test_faults.prompt_checkpoints, test_faults.spec_checkpoints, test_faults.prompt_fills);
-            }
-        }
+        bind_slots(n_ctx_slot);
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
@@ -1499,60 +1794,62 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
-                SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
-            } else {
-                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
-            }
-            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
-
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
-        } else {
-            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
-        }
-        SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
-
-        if (params_base.n_ctx_checkpoints > 0) {
-            if (params_base.checkpoint_min_step < 0) {
-                SRV_TRC("context checkpoints enabled, max = %d, min spacing = each prompt over %d\n",
-                        params_base.n_ctx_checkpoints, params_base.n_ctx_checkpoints);
-            } else {
-                SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
-                        params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
-            }
-        } else {
-            SRV_TRC("%s", "context checkpoints disabled\n");
-        }
-
-        if (!params_base.model_alias.empty()) {
-            // backward compat: use first alias as model name
-            model_name = *params_base.model_alias.begin();
-        } else if (!params_base.model.get_name().empty()) {
-            model_name = params_base.model.get_name();
-        } else {
-            // fallback: derive model name from file name
-            auto model_path = std::filesystem::path(params_base.model.path);
-            model_name = model_path.filename().string();
-        }
-
-        model_aliases = params_base.model_alias;
-        model_tags    = params_base.model_tags;
-
-        // propagate new defaults back to caller
-        params = params_base;
-
-        publish_lora_report();
-
-        if (!is_resume) {
-            return init();
-        }
-
-        if (callback_state) {
-            callback_state(SERVER_STATE_READY, {});
+        if (prompt_cache) {
+            prompt_cache->limit_tokens = n_ctx; // the cache's token limit follows the context (server_prompt_cache)
         }
 
         return true;
+    }
+
+    // the slots on the contexts just built: their count follows params_base.n_parallel (the highest
+    // ids go, a new id comes in empty) and every slot is bound to the new contexts. A slot's host state
+    // (prompt, checkpoints, task, sampler) is untouched: its KV is paged in by the caller.
+    int32_t n_ctx_slot_live = 0;
+
+    void bind_slots(int32_t n_ctx_slot) {
+        n_ctx_slot_live = n_ctx_slot;
+
+        const size_t n_before = slots.size();
+        slots.resize(params_base.n_parallel);
+
+        for (int i = 0; i < params_base.n_parallel; i++) {
+            server_slot & slot = slots[i];
+            bind_slot(slot);
+            if ((size_t) i >= n_before) {
+                init_slot(slot, i);
+            }
+        }
+    }
+
+    void bind_slot(server_slot & slot) const {
+        slot.ctx_tgt = ctx_tgt;
+        slot.ctx_dft = ctx_dft;
+        slot.mem.init(ctx_tgt, ctx_dft);
+        slot.spec    = spec.get();
+        slot.n_ctx   = n_ctx_slot_live;
+    }
+
+    // a new, empty slot (bound first: its reset detaches the context's sampler for its sequence)
+    void init_slot(server_slot & slot, int id) {
+        slot.id = id;
+
+        slot.mctx                   = mctx;
+        slot.prompt.tokens.has_mtmd = mctx != nullptr;
+
+        SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+
+        slot.callback_on_release = [this](int id_slot) {
+            queue_tasks.pop_deferred_task(id_slot);
+        };
+
+        slot.callback_on_reset = [this](const server_slot & slot) {
+            // flush the generated token stats before reset()
+            if (slot.stats.n_gen > 0) {
+                metrics_on_prediction(slot);
+            }
+        };
+
+        slot.reset();
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -1939,19 +2236,7 @@ private:
                 return false;
             }
 
-            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
-
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
-
-            // TODO: getting pre sampling logits is not yet supported with backend sampling
-            use_backend_sampling &= !need_pre_sample_logits;
-
-            // TODO: tmp until backend sampling is fully implemented
-            if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
-            } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
-            }
+            slot.attach_sampler(task.params);
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
@@ -2664,6 +2949,14 @@ private:
                             break;
                         }
                     }
+                    // or drop it where a reconfigure parked it (its client is gone: nobody to tell)
+                    for (auto & [id, slot] : parked_slots) {
+                        if (slot.task && slot.task->id == task.id_target) {
+                            drop_parked_slot(id, "");
+                            publish_geometry();
+                            break;
+                        }
+                    }
                 } break;
             case SERVER_TASK_TYPE_CONTROL:
                 {
@@ -2780,6 +3073,19 @@ private:
                     res->n_cached = std::min(slot->prompt.tokens.get_common_prefix(task.tokens), (size_t) std::max<llama_pos>(held, 0));
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_RECONFIGURE:
+                {
+                    // Continuum fork: grow or shrink the contexts live (server-reconfigure.h). In the task
+                    // phase no llama_decode is in flight and every sequence's KV is at an inter-batch
+                    // boundary: the safe point SLOT_SAVE argues for below. Generations in progress are
+                    // paged out and continue; new work waits in the queue behind this task.
+                    reconfigure_engine engine(*this);
+                    auto res = std::make_unique<server_task_result_reconfigure>();
+                    res->id      = task.id;
+                    res->outcome = server_reconfigure(engine, reconfigure_state, task.reconfigure);
+                    publish_geometry();
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -2858,25 +3164,9 @@ private:
                                     kept_checkpoints.size(), n, kept_at.c_str(), view_end, end_from);
                         }
                     }
+                    // the page format's one owner (server-slot-page.h)
                     auto write_checkpoints = [&](auto && put) {
-                        const uint32_t magic   = 0x434B5054u; // 'CKPT'
-                        const uint32_t version = 1;
-                        const uint32_t n_ckpt  = (uint32_t) kept_checkpoints.size();
-                        put(&magic, sizeof(magic)); put(&version, sizeof(version)); put(&n_ckpt, sizeof(n_ckpt));
-                        for (const auto * kept : kept_checkpoints) {
-                            const auto & c = *kept;
-                            const int64_t  n_tokens = c.n_tokens;
-                            const int32_t  pos_min  = c.pos_min;
-                            const int32_t  pos_max  = c.pos_max;
-                            const uint64_t sz_tgt   = c.data_tgt.size();
-                            const uint64_t sz_dft   = c.data_dft.size();
-                            const uint64_t sz_spec  = c.data_spec.size();
-                            put(&n_tokens, sizeof(n_tokens)); put(&pos_min, sizeof(pos_min)); put(&pos_max, sizeof(pos_max));
-                            put(&sz_tgt, sizeof(sz_tgt)); put(&sz_dft, sizeof(sz_dft)); put(&sz_spec, sizeof(sz_spec));
-                            put(c.data_tgt.data(), c.data_tgt.size());
-                            put(c.data_dft.data(), c.data_dft.size());
-                            put(c.data_spec.data(), c.data_spec.size());
-                        }
+                        server_slot_page_put_checkpoints(kept_checkpoints, put);
                     };
                     auto write_adapters = [&](auto && put) {
                         const uint32_t magic   = 0x4C4F5241u; // 'LORA'
@@ -3088,36 +3378,18 @@ private:
                                 }
                             }
                             std::list<common_prompt_checkpoint> loaded;
-                            bool ok = (bool) in;
                             auto get = [&](void * ptr, size_t n) {
                                 if (progress && progress->cancel_requested.load(std::memory_order_relaxed)) {
                                     throw std::runtime_error("Restore operation cancelled");
                                 }
                                 in.read(reinterpret_cast<char *>(ptr), n);
-                                ok = ok && (bool) in;
                                 if (progress && in.gcount() > 0) progress->sidecar_bytes.fetch_add(uint64_t(in.gcount()), std::memory_order_relaxed);
+                                return (bool) in;
                             };
-                            if (ok) {
-                                uint32_t magic = 0, version = 0, n_ckpt = 0;
-                                get(&magic, sizeof(magic)); get(&version, sizeof(version)); get(&n_ckpt, sizeof(n_ckpt));
-                                ok = ok && magic == 0x434B5054u && version == 1 && n_ckpt <= 4096;
-                                for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
-                                    int64_t n_tokens = 0; int32_t pos_min = 0, pos_max = 0;
-                                    uint64_t sz_tgt = 0, sz_dft = 0, sz_spec = 0;
-                                    get(&n_tokens, sizeof(n_tokens)); get(&pos_min, sizeof(pos_min)); get(&pos_max, sizeof(pos_max));
-                                    get(&sz_tgt, sizeof(sz_tgt)); get(&sz_dft, sizeof(sz_dft)); get(&sz_spec, sizeof(sz_spec));
-                                    // a checkpoint is at most one sequence state; refuse absurd sizes
-                                    ok = ok && sz_tgt < (1ull << 36) && sz_dft < (1ull << 36) && sz_spec < (1ull << 30);
-                                    if (!ok) break;
-                                    auto & c = loaded.emplace_back();
-                                    c.update_pos(n_tokens, pos_min, pos_max);
-                                    c.id_task = -1;
-                                    c.data_tgt.resize(sz_tgt);   get(c.data_tgt.data(),  sz_tgt);
-                                    c.data_dft.resize(sz_dft);   get(c.data_dft.data(),  sz_dft);
-                                    c.data_spec.resize(sz_spec); get(c.data_spec.data(), sz_spec);
-                                    if (progress && ok) progress->checkpoints.fetch_add(1, std::memory_order_relaxed);
-                                }
-                            }
+                            // the page format's one owner (server-slot-page.h)
+                            const bool ok = in && server_slot_page_get_checkpoints(get, loaded, [&]() {
+                                if (progress) progress->checkpoints.fetch_add(1, std::memory_order_relaxed);
+                            });
                             if (ok) {
                                 slot->prompt.checkpoints = std::move(loaded);
                                 SLT_INF(*slot, "restored %zu context checkpoints from the sidecar: %s\n", slot->prompt.checkpoints.size(), ckpt_path.c_str());
@@ -3638,6 +3910,12 @@ private:
         // preparation is already one measured blocking segment; do not append a
         // graph segment before the queued NEXT_RESPONSE lets serving run again.
         if (learning_at_start) { advance_learning(); }
+
+        if constexpr (server_test_faults::enabled) {
+            if (test_faults.step_delay_ms > 0 && batch.size() > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(test_faults.step_delay_ms));
+            }
+        }
     }
 
     void pre_decode() {
@@ -5740,8 +6018,44 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_props);
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            json props = get_res_props(*meta, params, false);
+            // Continuum fork: the geometry is live (POST /reconfigure); meta is the load's snapshot
+            const json geometry = ctx_server.geometry_report_snapshot();
+            if (!geometry.empty()) {
+                props["reconfigure"]      = geometry;
+                props["context_geometry"] = geometry.at("context_geometry");
+                props["total_slots"]      = geometry.at("n_seq");
+                props["default_generation_settings"]["n_ctx"] = geometry.at("n_ctx_seq");
+            }
+            res->ok(props);
         }
+        return res;
+    };
+
+    // POST /reconfigure (Continuum fork): grow or shrink the serving contexts live while the weights stay
+    // loaded (server-reconfigure.h). {"n_ctx": int, "n_seq": int}; the outcome names every slot paged out.
+    this->post_reconfigure = [this](const server_http_req & req) {
+        auto res = create_response();
+        const auto parsed = server_reconfigure_from_json(json::parse(req.body),
+            ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v));
+        if (const auto * refused = std::get_if<server_reconfigure_refused>(&parsed)) {
+            res->error(server_reconfigure_to_json(*refused));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_RECONFIGURE);
+        task.id          = res->rd.get_new_id();
+        task.reconfigure = std::get<server_geometry>(parsed);
+        res->rd.post_task(std::move(task), true); // high-priority task
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
         return res;
     };
 
@@ -6847,7 +7161,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
             valid = (i == 8 || i == 13 || i == 18 || i == 23) ? id[i] == '-'
                 : ((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f'));
         }
-        if (!valid || id_slot < 0 || id_slot >= params.n_parallel) {
+        if (!valid || id_slot < 0 || id_slot >= ctx_server.live_n_seq()) {
             res->error(format_error_response("Invalid restore operation identity or slot", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }

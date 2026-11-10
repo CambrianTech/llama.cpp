@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-slot-page.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1885,39 +1886,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & l
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
-                return false;
-            }
-
-            data.clear();
-            data.shrink_to_fit();
+        // the one state mover (server-slot-page.h)
+        if (!server_slot_page_write(ctx_tgt, ctx_dft, id_slot, it_best->data)) {
+            return false;
         }
 
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
-        }
+        it_best->data.main.clear();
+        it_best->data.main.shrink_to_fit();
+        it_best->data.drft.clear();
+        it_best->data.drft.shrink_to_fit();
 
         prompt = std::move(it_best->prompt);
 

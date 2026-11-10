@@ -591,3 +591,41 @@
         slot.learned = learn_on_slot(slot, L, ggml_time_us());
     }
 
+
+    // Continuum fork: what of learning cannot cross a live reconfigure (server-reconfigure.h), owned here
+    // beside the learn duties. A learn in progress holds its graph and accumulators in the serving context
+    // until its restoration ends. Each shadow's optimizer (its moments) lives in the context as well, and
+    // the fork moves it only through llama_opt_shadow_state_write and, on the other side,
+    // llama_opt_prepare_restore + llama_opt_state_restore, whose preparation needs the shadow's retained
+    // labelled experience on a fresh context: a reconfigure holds no such experience, so the moments
+    // cannot be paged with the slots' state and the rebuild is refused while any exist.
+    std::optional<server_reconfigure_refused> learning_blocks_reconfigure() const {
+        if (learning) {
+            const int32_t id = learning->slot->id;
+            return server_reconfigure_refused { SERVER_RECONFIGURE_LEARN_IN_PROGRESS,
+                "a learn is in progress on slot " + std::to_string(id) + "; retry when its restoration finishes", id };
+        }
+        struct held_optimizers {
+            size_t bytes = 0;
+            std::set<const llama_adapter_lora *> shadows;
+        } held;
+        llama_opt_visit_memory(ctx_tgt, [](const llama_adapter_lora * shadow, const char *, const char *, const char *,
+                                           size_t bytes, bool, void * user_data) {
+            auto & h = *static_cast<held_optimizers *>(user_data);
+            h.bytes += bytes;
+            if (bytes > 0) {
+                h.shadows.insert(shadow);
+            }
+        }, &held);
+        if (held.bytes > 0) {
+            return server_reconfigure_refused { SERVER_RECONFIGURE_LEARNING_BOUND,
+                "the serving context holds the optimizer of " + std::to_string(held.shadows.size()) + " shadow(s), " +
+                std::to_string(held.bytes >> 20) + " MiB; their moments do not cross a rebuild (snapshot and unload them first)", -1 };
+        }
+        if (!learning_workspace_residency.empty()) {
+            return server_reconfigure_refused { SERVER_RECONFIGURE_LEARNING_BOUND,
+                "the training workspace still replaces the serving scheduler (residency " + learning_workspace_residency +
+                "); it is reclaimed when the last shadow is released", -1 };
+        }
+        return std::nullopt;
+    }
