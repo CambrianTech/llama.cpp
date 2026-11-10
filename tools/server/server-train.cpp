@@ -1055,6 +1055,10 @@ void server_trainer::run(json req, examples_data ex) {
         // the single-context gradient): one step per window on the window's whole loss
         /*walk_exact      =*/ req.value("exact", false),
         /*walk_horizon    =*/ (uint32_t) req.value("walk_horizon", (int64_t) 0),
+        /*static_admission =*/ nullptr,
+        /*static_admission_data =*/ nullptr,
+        /*workspace_admission =*/ nullptr,
+        /*workspace_admission_data =*/ nullptr,
     };
     // THE BUDGET COVERS THE WHOLE RUN (continuum, the 5090, 2026-10-11): the training context's own
     // memory (its Q8_0 K/V for the whole window, and any recurrent state) is allocated when it is
