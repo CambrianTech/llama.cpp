@@ -48,6 +48,16 @@ def get(route):
 
 
 ledger = get("/learn/grants")
+def register(suffix, subject, rows):
+    # The engine seats an adapter only inside a residency the core registered for its exact
+    # subject, with the leases that charge its rows (server-learn-residency.h).
+    rid = prefix + suffix
+    leases = [{"kind": kind, "lease_id": rid + kind,
+               "bytes": sum(row["bytes"] for row in rows if row["host"] == host)}
+              for kind, host in (("vram", False), ("ram", True))]
+    assert ok("/learn/residency", {"id": rid, "engine": ledger["engine"], "owner": prefix,
+              "subject": subject, "rows": rows, "leases": leases})["refusal"] == "none"
+    return rid
 grant = prefix + "-grant"
 assert ok("/learn/grants", {"id": grant, "engine": ledger["engine"],
           "period_ms": 1000, "share_ppm": 1000000, "expires_in_ms": 120000})["refusal"] == "none"
@@ -59,8 +69,8 @@ plan = ok("/lora-adapters/fresh", dict(fresh_spec, dry_run=True))
 assert not plan["reserved"] and plan["weights"]
 assert not (train_dir / fresh_name).exists(), "dry run published an adapter"
 assert complete() == baseline, "dry run changed serving"
-fresh = ok("/lora-adapters/fresh", {"name": fresh_name, "rank": 8,
-           "alpha": 16, "targets": "attn_q,attn_v", "top_layers": 1, "seed": 42})
+fresh_weights = register("-fresh", {"fresh": fresh_spec}, [dict(row, kind="weights") for row in plan["weights"]])
+fresh = ok("/lora-adapters/fresh", dict(fresh_spec, residency=fresh_weights))
 assert fresh["weights"] == plan["weights"], ("allocated weights differ from dry plan", fresh, plan)
 file_plan = ok("/lora-adapters/load", {"name": fresh_name, "dry_run": True})
 assert file_plan["weights"] == plan["weights"]
@@ -101,7 +111,9 @@ snapshot = ok("/lora-adapters/save", {"id": fresh["id"], "name": snapshot_name})
 assert snapshot["steps"] == 2, ("two whole replies learned are two committed steps", snapshot)
 after = hashlib.sha256((train_dir / snapshot_name).read_bytes()).hexdigest()
 assert after != before, "successful learn did not change saved adapter weights"
-loaded = ok("/lora-adapters/load", {"name": snapshot_name})
+snapshot_plan = ok("/lora-adapters/load", {"name": snapshot_name, "dry_run": True})
+snapshot_weights = register("-snapshot", {"load": {"name": snapshot_name}}, [dict(row, kind="weights") for row in snapshot_plan["weights"]])
+loaded = ok("/lora-adapters/load", {"name": snapshot_name, "residency": snapshot_weights})
 assert complete(loaded["id"]) == trained_text, "trained snapshot reload changed output"
 assert post("/lora-adapters/save", {"id": fresh["id"], "name": snapshot_name})[0] >= 400
 assert post("/lora-adapters/fresh", {"name": fresh_name})[0] >= 400

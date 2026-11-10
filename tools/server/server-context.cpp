@@ -996,6 +996,13 @@ private:
         return p;
     }
     struct pending_learn {
+        // The step's identity; every other field starts at its stated default (an aggregate with
+        // only these set trips -Wmissing-field-initializers on the ARM CI build).
+        pending_learn(server_slot * slot, const common_prompt_checkpoint * checkpoint, std::vector<common_adapter_lora_info> adapters,
+                      ggml_opt_result_t result, llama_token last_prompt, int32_t prefix, int32_t n_labels,
+                      const llama_adapter_lora * shadow, int64_t started)
+            : slot(slot), checkpoint(checkpoint), adapters(std::move(adapters)), result(result), last_prompt(last_prompt),
+              prefix(prefix), n_labels(n_labels), shadow(shadow), started(started) {}
         server_slot * slot;
         const common_prompt_checkpoint * checkpoint;
         std::vector<common_adapter_lora_info> adapters;
