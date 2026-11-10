@@ -10,6 +10,7 @@
     mutable std::mutex geometry_report_mutex;
     json geometry_report = json::object();
     std::atomic<int32_t> n_seq_live{0};
+    std::atomic<int32_t> n_ctx_seq_live{0};
 
     bool kv_pool_unified() const {
         // measured from the context, not the flag: one pool when a sequence may hold all of it
@@ -37,10 +38,28 @@
                 { "sequence_capacity",       llama_n_seq_max(ctx_tgt) },
             } },
             { "last",           reconfigure_state.last ? server_reconfigure_to_json(*reconfigure_state.last) : json(nullptr) },
+            { "cost",           [&] {
+                json cost = server_reconfigure_cost_json(reconfigure_state);
+                // where the paged state lives now: the contexts' own buffers, per buffer type (the backend's
+                // name), so the price is read per backend
+                json buffers = json::array();
+                for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) {
+                    if (mb.context > 0) {
+                        buffers.push_back({ { "buffer_type", ggml_backend_buft_name(buft) }, { "context_bytes", mb.context } });
+                    }
+                }
+                cost["context_buffers"] = buffers;
+                return cost;
+            }() },
         };
         n_seq_live.store((int32_t) slots.size());
+        n_ctx_seq_live.store(get_slot_n_ctx());
         std::lock_guard<std::mutex> lock(geometry_report_mutex);
         geometry_report = std::move(report);
+    }
+
+    bool slot_id_is_parked(int id) const {
+        return parked_slots.find(id) != parked_slots.end();
     }
 
     // a slot leaves service whole and a fresh, empty slot takes its id

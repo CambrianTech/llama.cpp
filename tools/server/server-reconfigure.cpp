@@ -208,8 +208,34 @@ server_reconfigure_outcome server_reconfigure(server_reconfigure_engine & e, ser
             out.paged_out.size(), out.paged_in.size(), out.parked.size());
 
     st.n_applied++;
+    if (out.rebuilt) {
+        st.n_rebuilt++;
+        st.pause_ms_total    += out.pause_ms;
+        st.pause_ms_max       = std::max(st.pause_ms_max, out.pause_ms);
+        st.tokens_held_total += out.tokens_held;
+        st.bytes_paged_total += out.bytes_paged;
+    }
     st.last = out;
     return out;
+}
+
+json server_reconfigure_cost_json(const server_reconfigure_state & st) {
+    json last = nullptr;
+    if (st.last) {
+        if (const auto * a = std::get_if<server_reconfigure_applied>(&*st.last)) {
+            last = { { "pause_ms", a->pause_ms }, { "tokens_held", a->tokens_held }, { "bytes_paged", a->bytes_paged }, { "rebuilt", a->rebuilt } };
+        }
+    }
+    return json {
+        { "n_rebuilt",         st.n_rebuilt },
+        { "pause_ms_total",    st.pause_ms_total },
+        { "pause_ms_max",      st.pause_ms_max },
+        { "tokens_held_total", st.tokens_held_total },
+        { "bytes_paged_total", st.bytes_paged_total },
+        // pause per thousand tokens held, over every rebuild that held any (null until one did)
+        { "pause_ms_per_1k_tokens", st.tokens_held_total > 0 ? json(st.pause_ms_total * 1000.0 / st.tokens_held_total) : json(nullptr) },
+        { "last_applied",      last },
+    };
 }
 
 std::variant<server_geometry, server_reconfigure_refused> server_reconfigure_from_json(

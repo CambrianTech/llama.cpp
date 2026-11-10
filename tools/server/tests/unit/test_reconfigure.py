@@ -316,3 +316,65 @@ def test_a_cache_type_change_and_a_bad_geometry_are_refused_by_name():
     same = reconfigure(N_CTX, N_SLOTS, cache_type_k="f16", cache_type_v="f16")
     assert same.status_code == 200, same.body
     assert same.body["rebuilt"] is False
+
+
+def test_a_request_for_a_parked_slot_waits_for_it_and_never_runs_on_another():
+    # the upstream wrap-around (id % n_slots) ran a request for slot 3 on slot 1 after a shrink to 2:
+    # another mind's state, silently. Now it waits for its own slot; an id no slot has is refused
+    server.start()
+    n_held = 24
+    control = continuations(hold_states(n_held), 8)
+    held = hold_states(n_held)
+
+    applied(N_CTX, 2)
+    slot1_before = [s for s in server.make_request("GET", "/slots").body if s["id"] == 1][0]["kv_pos_max"]
+
+    results = {}
+    def run():
+        results["res"] = complete(held[3], 3, 8)
+    thread = threading.Thread(target=run)
+    thread.start()
+    time.sleep(1.0)
+    assert thread.is_alive() # waiting for slot 3, not served by slot 1
+    slot1_after = [s for s in server.make_request("GET", "/slots").body if s["id"] == 1][0]["kv_pos_max"]
+    assert slot1_after == slot1_before
+
+    unknown = server.make_request("POST", "/completion", data={"prompt": "hello", "id_slot": 9, "n_predict": 1})
+    assert unknown.status_code == 400
+
+    grown = applied(N_CTX, N_SLOTS)
+    assert 3 in grown["paged_in"]
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    res = results["res"]
+    # it ran on slot 3, from slot 3's own state: the control's tokens and reuse
+    assert (res["tokens"], res["timings"]["cache_n"]) == control[3]
+
+
+def test_n_cmpl_is_bounded_by_the_live_slot_count():
+    server.start()
+    # n_cmpl children each take a slot: the bound is the slots served now, not the launch's
+    request = {"prompt": PROMPTS[0], "n_predict": 4, "temperature": 0.0}
+    applied(N_CTX * 2, N_SLOTS + 2)
+    wide = server.make_request("POST", "/completion", data={**request, "n_cmpl": N_SLOTS + 2})
+    assert wide.status_code == 200, wide.body
+    applied(N_CTX, 2)
+    narrow = server.make_request("POST", "/completion", data={**request, "n_cmpl": 3})
+    assert narrow.status_code == 400, narrow.body
+
+
+def test_props_report_the_measured_cost_of_a_reconfigure():
+    server.start()
+    hold_states(24)
+    applied(2 * N_CTX, N_SLOTS)
+    applied(N_CTX, N_SLOTS)
+    applied(N_CTX, N_SLOTS) # already live: no rebuild, no cost
+    cost = server.make_request("GET", "/props").body["reconfigure"]["cost"]
+    assert cost["n_rebuilt"] == 2
+    assert cost["pause_ms_total"] > 0
+    assert cost["pause_ms_max"] <= cost["pause_ms_total"]
+    assert cost["tokens_held_total"] > 0
+    assert cost["bytes_paged_total"] > 0
+    assert cost["pause_ms_per_1k_tokens"] > 0
+    assert cost["last_applied"]["rebuilt"] is False
+    assert len(cost["context_buffers"]) > 0

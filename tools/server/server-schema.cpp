@@ -8,7 +8,7 @@ namespace server_schema {
 // llama.cpp-specific completion schema
 //
 
-std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params & params_base, task_params & params) {
+std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params & params_base, int32_t n_seq_live, task_params & params) {
     std::vector<std::unique_ptr<field>> fields;
     auto add = [&](field * f) {
         fields.emplace_back(f);
@@ -60,7 +60,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Number of tokens after n_keep that may be discarded when shifting context (0 = half context)"));
 
     add((new field_num("n_cmpl", params.n_cmpl))
-        ->set_hard_limits(1, params_base.n_parallel)
+        ->set_hard_limits(1, n_seq_live)
         ->add_alias("n") // alias "n" as fallback (OpenAI completions API)
         ->set_desc("Number of completions to generate. If the input has multiple prompts, total outputs will be N prompts times n_cmpl"));
 
@@ -515,6 +515,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 task_params eval_llama_cmpl_schema(
                 const llama_vocab * vocab,
                 const common_params & params_base,
+                int32_t n_seq_live,
                 const std::vector<llama_logit_bias> & logit_bias_eog,
                 const json & data) {
     task_params params;
@@ -539,7 +540,7 @@ task_params eval_llama_cmpl_schema(
     ctx.vocab          = vocab;
     ctx.logit_bias_eog = &logit_bias_eog;
 
-    auto schema = make_llama_cmpl_schema(params_base, params);
+    auto schema = make_llama_cmpl_schema(params_base, n_seq_live, params);
 
     // eval all fields in the schema
     for (const auto & f : schema) {

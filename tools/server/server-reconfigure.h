@@ -112,7 +112,18 @@ struct server_reconfigure_state {
     int64_t n_applied = 0;
     int64_t n_refused = 0;
     std::optional<server_reconfigure_outcome> last;
+
+    // THE COST, measured over every reconfigure that rebuilt the contexts, so the core can price the next
+    // one: how long serving paused, against the state that crossed (server_reconfigure_cost_json)
+    int64_t  n_rebuilt         = 0;
+    double   pause_ms_total    = 0.0;
+    double   pause_ms_max      = 0.0;
+    int64_t  tokens_held_total = 0;
+    uint64_t bytes_paged_total = 0;
 };
+
+// the measured cost as /props reports it (the server adds the buffers the contexts hold now)
+json server_reconfigure_cost_json(const server_reconfigure_state & state);
 
 server_reconfigure_outcome server_reconfigure(server_reconfigure_engine & engine, server_reconfigure_state & state, const server_geometry & target);
 

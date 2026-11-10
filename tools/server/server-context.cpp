@@ -968,6 +968,9 @@ public:
     int32_t live_n_seq() const {
         return n_seq_live.load();
     }
+    int32_t live_n_ctx_seq() const {
+        return n_ctx_seq_live.load();
+    }
 
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -1812,8 +1815,12 @@ private:
     }
 
     server_slot * get_slot_by_id(int id_slot) {
-        // note: allow id_slot to be out of bounds (wrap around)
-        id_slot = id_slot % slots.size();
+        // Continuum fork: an id addresses exactly its slot. The upstream wrap-around (id % n_slots) sent a
+        // request for a slot a reconfigure parked to another mind's live slot; an id out of range is now
+        // no slot, and the caller refuses it (or, for a parked id, waits for it: slot_id_is_parked)
+        if (id_slot < 0 || id_slot >= (int) slots.size()) {
+            return nullptr;
+        }
 
         for (server_slot & slot : slots) {
             if (slot.id == id_slot) {
@@ -1848,6 +1855,9 @@ private:
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+            } else {
+                // a parked slot (server-reconfigure.h): the task waits for its own slot, never another's
+                return nullptr;
             }
         }
 
@@ -2733,6 +2743,13 @@ private:
                     }
 
                     const int id_task = task.id;
+
+                    // Continuum fork: a slot id that is neither live nor parked by a reconfigure names no slot
+                    if (task.id_slot != -1 && get_slot_by_id(task.id_slot) == nullptr && !slot_id_is_parked(task.id_slot)) {
+                        send_error(task, "Invalid slot ID " + std::to_string(task.id_slot) + ": the server has " +
+                                   std::to_string(slots.size()) + " slots", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
 
                     server_slot * slot = get_available_slot(task);
 
@@ -5317,6 +5334,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params = server_schema::eval_llama_cmpl_schema(
                     ctx_server.vocab,
                     params,
+                    ctx_server.live_n_seq(),
                     meta->logit_bias_eog,
                     data);
 
@@ -5985,7 +6003,7 @@ void server_routes::init_routes() {
             data.at("input_extra"),
             params.n_batch,
             params.n_predict,
-            meta->slot_n_ctx,
+            ctx_server.live_n_ctx_seq(), // the live window (POST /reconfigure), not the load's
             params.spm_infill,
             tokenized_prompts[0].get_tokens() // TODO: this could maybe be multimodal.
         );
@@ -6717,7 +6735,7 @@ void server_routes::init_routes() {
                 rows = render_learn_example(body).reply.size();
             } else if (body.contains("learn")) {
                 // Completion-attached corrections share the completion schema, including EOT.
-                rows = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog,
+                rows = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, ctx_server.live_n_seq(), meta->logit_bias_eog,
                     json{{"learn", body.at("learn")}}).learn->reply.size();
             } else {
                 throw std::invalid_argument("preflight requires messages or a completion learn example");
@@ -6795,7 +6813,7 @@ void server_routes::init_routes() {
             // prefill path, one learn path; the slot is the caller's choice (whose cache it replaces).
             server_task serve(SERVER_TASK_TYPE_COMPLETION);
             serve.tokens = server_tokens(task.learn.prompt, false);
-            serve.params = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog,
+            serve.params = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, ctx_server.live_n_seq(), meta->logit_bias_eog,
                 json { { "n_predict", 1 }, { "temperature", 0.0 }, { "cache_prompt", true } });
             serve.params.learn      = task.learn;
             serve.params.learn_only = true;
