@@ -996,15 +996,15 @@ private:
         return p;
     }
     struct pending_learn {
-        server_slot * slot;
-        const common_prompt_checkpoint * checkpoint;
+        server_slot * slot = nullptr;
+        const common_prompt_checkpoint * checkpoint = nullptr;
         std::vector<common_adapter_lora_info> adapters;
-        ggml_opt_result_t result;
-        llama_token last_prompt;
-        int32_t prefix, n_labels;
+        ggml_opt_result_t result = nullptr;
+        llama_token last_prompt = 0;
+        int32_t prefix = 0, n_labels = 0;
         // the shadow this learn trains: held by the optimizer from begin through restoration
         const llama_adapter_lora * shadow = nullptr;
-        int64_t started;
+        int64_t started = 0;
         int64_t compute_us = 0;
         bool separate_request = false;
         bool began = false;
