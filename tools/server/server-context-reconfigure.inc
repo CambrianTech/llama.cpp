@@ -92,7 +92,8 @@
                     // (llama_sampler_chain_backend_init): on the rebuilt context the slot samples with a
                     // fresh chain that carries the same state (common_sampler_copy, as a rollback does)
                     try {
-                        common_sampler_ptr fresh(common_sampler_init(model_tgt, slot.task->params.sampling));
+                        common_params_sampling sampling = slot.task->params.sampling; // init takes them mutable; the task's are const
+                        common_sampler_ptr fresh(common_sampler_init(model_tgt, sampling));
                         common_sampler_copy(slot.smpl.get(), fresh.get());
                         slot.smpl = std::move(fresh);
                     } catch (const std::exception & e) {
