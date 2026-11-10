@@ -88,16 +88,30 @@ before = hashlib.sha256((train_dir / before_name).read_bytes()).hexdigest()
 repeat_name = prefix + "-repeat.gguf"
 ok("/lora-adapters/save", {"id": fresh["id"], "name": repeat_name})
 assert hashlib.sha256((train_dir / repeat_name).read_bytes()).hexdigest() == before, "save bytes are unstable without learning"
+optimizer_rid = None
+def learning(reply, suffix):
+    # A learn runs only inside custody the core registered from the engine's own preflight of this
+    # example: her optimizer (persistent per shadow, registered once) and the engine-wide step
+    # workspace sized to this reply (server-context-learn-residency.inc admit_learning_residency).
+    global optimizer_rid
+    plan = ok("/learn/preflight", {"engine": ledger["engine"], "lora_id": fresh["id"], "learn": {"reply": reply}})
+    assert plan["refusal"] == "none", plan
+    rows = [row for row in plan["requirements"] if row["kind"] != "shared_compute_held"]
+    if optimizer_rid is None:
+        optimizer_rid = register("-optimizer", {"loaded": {"lora_id": fresh["id"], "path": fresh["path"]}},
+                                 [row for row in rows if row["kind"] != "shared_compute_required"])
+    workspace = register("-workspace" + suffix, {"workspace": True},
+                         [row for row in rows if row["kind"] == "shared_compute_required"])
+    return {"reply": reply, "lora_id": fresh["id"], "grant": grant, "lr": 0.001,
+            "optimizer_residency": optimizer_rid, "workspace_residency": workspace}
 learned = ok("/completion", {"prompt": "The capital of Kansas is", "id_slot": 0,
              "n_predict": 1, "temperature": 0,
-             "learn": {"reply": "Topeka is the capital of Kansas.",
-                       "lora_id": fresh["id"], "grant": grant, "lr": 0.001}})
+             "learn": learning("Topeka is the capital of Kansas.", "-short")})
 assert learned["learn"]["success"], learned
 # A queued save must refuse the active shadow even between resumable chunks.
 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
     future = pool.submit(ok, "/completion", {"prompt": "The capital of Kansas is", "id_slot": 0,
-        "n_predict": 1, "temperature": 0, "learn": {"grant": grant, "lora_id": fresh["id"],
-        "lr": 0.001, "reply": "A room contains a card and a window. " * 55}})
+        "n_predict": 1, "temperature": 0, "learn": learning("A room contains a card and a window. " * 55, "-long")})
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         if get("/slots")[0]["is_learning"]:
