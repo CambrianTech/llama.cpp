@@ -108,10 +108,22 @@ learned = ok("/completion", {"prompt": "The capital of Kansas is", "id_slot": 0,
              "n_predict": 1, "temperature": 0,
              "learn": learning("Topeka is the capital of Kansas.", "-short")})
 assert learned["learn"]["success"], learned
+# The long reply spans as many resumable chunks as this engine's window holds: sized from its own
+# slot window and tokenizer (the reply's tokens plus its end of turn, after the served prompt),
+# never a fixed repeat count, since preflight refuses an example past the served window.
+def rows(text, special):
+    return len(ok("/tokenize", {"content": text, "add_special": special})["tokens"])
+long_prompt = "The capital of Kansas is"
+room = get("/slots")[0]["n_ctx"] - rows(long_prompt, True) - 1
+unit = "A room contains a card and a window. "
+repeats = room // rows(unit, False)
+while repeats > 1 and rows(unit * repeats, False) > room:
+    repeats -= 1
+assert repeats > 1, ("the served window holds no multi-sentence reply", room)
 # A queued save must refuse the active shadow even between resumable chunks.
 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-    future = pool.submit(ok, "/completion", {"prompt": "The capital of Kansas is", "id_slot": 0,
-        "n_predict": 1, "temperature": 0, "learn": learning("A room contains a card and a window. " * 55, "-long")})
+    future = pool.submit(ok, "/completion", {"prompt": long_prompt, "id_slot": 0,
+        "n_predict": 1, "temperature": 0, "learn": learning(unit * repeats, "-long")})
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         if get("/slots")[0]["is_learning"]:
