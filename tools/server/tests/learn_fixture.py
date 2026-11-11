@@ -37,6 +37,7 @@ class Engine:
         self.references, self.grants, self.shadows = [], [], []
         self.optimizers = {}
         self.minted = 0  # adapter names are immutable files: never reuse one
+        self.workspace_rows = []  # the rows the current workspace reference was registered with
         # A failed assertion must not leave custody bound for the next script on this server.
         atexit.register(self.close)
         self.grant = self.idle_grant()
@@ -139,8 +140,20 @@ class Engine:
                 "-optimizer-%d" % adapter["id"],
                 {"loaded": {"lora_id": adapter["id"], "path": adapter["path"]}},
                 [row for row in rows if row["kind"] != "shared_compute_required"])
-        workspace = self.register("-workspace-%d" % len(self.references), {"workspace": True},
-                                  [row for row in rows if row["kind"] == "shared_compute_required"])
+        # The step workspace is engine-wide and its custody passes from one reference to the
+        # next: a replacement must cover every row the previous reference was registered with
+        # (claim_plan), which can exceed what the scheduler holds now. So it covers the union of
+        # the previous registration, what is held (shared_compute_held) and this example's need,
+        # each buffer at the largest of them.
+        workspace_rows = {}
+        for row in self.workspace_rows + plan["requirements"]:
+            if row["kind"] not in ("shared_compute_required", "shared_compute_held"):
+                continue
+            key = (row["device"], row["buffer_type"], row["host"])
+            bytes_ = max(row["bytes"], workspace_rows[key]["bytes"]) if key in workspace_rows else row["bytes"]
+            workspace_rows[key] = dict(row, kind="shared_compute_required", bytes=bytes_)
+        self.workspace_rows = [row for row in workspace_rows.values() if row["bytes"] > 0]
+        workspace = self.register("-workspace-%d" % len(self.references), {"workspace": True}, self.workspace_rows)
         return {"optimizer_residency": self.optimizers[adapter["id"]], "workspace_residency": workspace}
 
     def learn(self, adapter, reply, grant=None, lr=0.001):
