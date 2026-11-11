@@ -1573,8 +1573,15 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
+            // the loop's own per-step continuation changes the ledger only through it (revision);
+            // every other task (a request, a ledger or adapter operation) publishes at its boundary
+            const bool continuation = task.type == SERVER_TASK_TYPE_NEXT_RESPONSE;
             auto handled = process_single_task(std::move(task), is_yielding);
-            publish_ledger(); // a task boundary: what it changed is readable off the loop
+            if (continuation) {
+                publish_ledger_if_changed();
+            } else {
+                publish_ledger();
+            }
             return handled;
         });
         queue_tasks.on_update_slots([this]() {
