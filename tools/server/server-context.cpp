@@ -6603,10 +6603,12 @@ void server_routes::init_routes() {
     this->post_prompt_cache_limit = [this](const server_http_req & req) {
         auto res = create_response();
         const json body = req.body.empty() ? json::object() : json::parse(req.body, nullptr, false);
+        // 0 would mean "no limit" to the cache itself, so a release to nothing is 1 MiB, never 0; and the
+        // limit in bytes must fit a size_t, so a value past it is refused, never wrapped (Cormac on #110).
+        constexpr int64_t max_mib = (int64_t) (SIZE_MAX >> 20) < INT64_MAX ? (int64_t) (SIZE_MAX >> 20) : INT64_MAX;
         if (!body.is_object() || !body.contains("limit_mib") || !body.at("limit_mib").is_number_integer()
-                || body.at("limit_mib").get<int64_t>() < 1) {
-            // 0 would mean "no limit" to the cache itself, so a release to nothing is 1 MiB, never 0.
-            res->error(format_error_response("limit_mib must be an integer of at least 1", ERROR_TYPE_INVALID_REQUEST));
+                || body.at("limit_mib").get<int64_t>() < 1 || body.at("limit_mib").get<int64_t>() > max_mib) {
+            res->error(format_error_response("limit_mib must be an integer from 1 to the bytes a size_t holds, in MiB", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         server_task task(SERVER_TASK_TYPE_PROMPT_CACHE_LIMIT);

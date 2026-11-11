@@ -23,6 +23,9 @@ for prompt in ("Describe a lighthouse at dawn in one sentence:", "List three use
 status, refused = engine.post("/prompt-cache/limit", {"limit_mib": 0})
 assert status == 400, ("0 means 'no limit' to the cache, so it is refused, never taken as unlimited", status, refused)
 
+status, overflow = engine.post("/prompt-cache/limit", {"limit_mib": 2**62})
+assert status == 400, ("a limit whose bytes overflow a size_t is refused, never wrapped", status, overflow)
+
 lowered = engine.ok("/prompt-cache/limit", {"limit_mib": 1})
 assert lowered["refusal"] == "none", lowered
 assert lowered["freed_bytes"] > 0, ("the filled cache gave bytes back", lowered)
