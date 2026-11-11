@@ -28,18 +28,23 @@ seen = engine.get("/learn/grants")
 assert seen["sequence"] > first["sequence"], ("a boundary publishes again", first["sequence"], seen["sequence"])
 assert any(g["id"] == gid for g in seen["grants"]), ("the registered grant is in the next read", gid, seen["grants"])
 
-# a read answers while a completion holds the loop
+# a read answers while a completion holds the loop: the completion fills its slot's window
+# (ignore_eos), the read is taken only once /slots reports it processing, and the completion must
+# still be running when the read returns
 done = threading.Event()
+budget = engine.get("/slots")[0]["n_ctx"] // 2
 def complete():
-    engine.ok("/completion", {"prompt": "Count the windows in the room:", "n_predict": 256, "temperature": 0})
+    engine.ok("/completion", {"prompt": "Count the windows in the room:", "n_predict": budget,
+                              "temperature": 0, "ignore_eos": True, "id_slot": 0})
     done.set()
 worker = threading.Thread(target=complete)
 worker.start()
+while not any(slot.get("is_processing") for slot in engine.get("/slots")):
+    assert not done.is_set(), "the completion ended before it was ever seen processing"
 during = engine.get("/learn/grants")
-answered_while_busy = not done.is_set()
+assert not done.is_set(), "the ledger read waited for the completion it ran beside"
 worker.join()
 assert during["sequence"] >= seen["sequence"], during
-print("read during a completion, before it ended:", answered_while_busy)
 
 engine.close()
 print("ok: ledger reads answer from the loop's publication")

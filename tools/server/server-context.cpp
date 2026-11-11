@@ -1579,7 +1579,7 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
-            publish_ledger(); // a chunk boundary
+            publish_ledger_if_changed(); // a chunk boundary: a learn chunk moved the ledger
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);

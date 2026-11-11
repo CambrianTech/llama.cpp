@@ -263,9 +263,19 @@
         uint64_t sequence = 0;
     };
     mutable ledger_publication ledger_published;
+    uint64_t ledger_published_revision = 0; // loop-owned: the ledger revision the last publication holds
+
+    // ON THE LOOP, at a slot-update boundary: publish only when the ledger changed since the last
+    // publication (a task boundary, below, always publishes).
+    void publish_ledger_if_changed() {
+        if (learn_ledger.revision() != ledger_published_revision) {
+            publish_ledger();
+        }
+    }
 
     // ON THE LOOP, at a boundary.
     void publish_ledger() {
+        ledger_published_revision = learn_ledger.revision();
         const auto now = ggml_time_us();
         json receipt = ledger_receipt(now);
         receipt["clock_us"] = now;
