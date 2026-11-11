@@ -7,32 +7,18 @@ bad ids, path confinement, and competing publication of the same name.
 import concurrent.futures
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import time
-import urllib.error
-import urllib.request
-import uuid
 
-url = sys.argv[1].rstrip("/")
+sys.path.insert(0, os.path.dirname(__file__))
+from learn_fixture import Engine
+
+engine = Engine(sys.argv[1], "d1", timeout=120)
 train_dir = Path(sys.argv[2])
-prefix = "d1-" + uuid.uuid4().hex
-
-
-def post(route, body):
-    req = urllib.request.Request(url + route, json.dumps(body).encode(),
-                                 {"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=120) as response:
-            return response.status, json.load(response)
-    except urllib.error.HTTPError as error:
-        return error.code, json.load(error)
-
-
-def ok(route, body):
-    status, result = post(route, body)
-    assert status == 200, (route, status, result)
-    return result
+prefix = engine.prefix
+post, ok, get = engine.post, engine.ok, engine.get
 
 
 def complete(adapter=None):
@@ -42,29 +28,6 @@ def complete(adapter=None):
     return ok("/completion", body)["content"]
 
 
-def get(route):
-    with urllib.request.urlopen(url + route, timeout=120) as response:
-        return json.load(response)
-
-
-ledger = get("/learn/grants")
-def register(suffix, subject, rows):
-    # The engine seats an adapter only inside a residency the core registered for its exact
-    # subject, with the leases that charge its rows (server-learn-residency.h).
-    rid = prefix + suffix
-    leases = [{"kind": kind, "lease_id": rid + kind,
-               "bytes": sum(row["bytes"] for row in rows if row["host"] == host)}
-              for kind, host in (("vram", False), ("ram", True))]
-    assert ok("/learn/residency", {"id": rid, "engine": ledger["engine"], "owner": prefix,
-              "subject": subject, "rows": rows, "leases": leases})["refusal"] == "none"
-    return rid
-grant = prefix + "-grant"
-# An idle-only grant (no share, no period): the one authority the ledger lets learn before this
-# geometry's chunk cost is measured (server-learn-ledger.h, pending_calibration). A shared grant
-# needs a measured max_chunk_us first. Nothing else decodes while this test learns, so it is never
-# contended.
-assert ok("/learn/grants", {"id": grant, "engine": ledger["engine"],
-          "period_ms": 0, "share_ppm": 0, "expires_in_ms": 120000})["refusal"] == "none"
 baseline = complete()
 fresh_name = prefix + "-fresh.gguf"
 # Dry-run uses the real loader's placement/alignment before any adapter is seated or file written.
@@ -73,8 +36,7 @@ plan = ok("/lora-adapters/fresh", dict(fresh_spec, dry_run=True))
 assert not plan["reserved"] and plan["weights"]
 assert not (train_dir / fresh_name).exists(), "dry run published an adapter"
 assert complete() == baseline, "dry run changed serving"
-fresh_weights = register("-fresh", {"fresh": fresh_spec}, [dict(row, kind="weights") for row in plan["weights"]])
-fresh = ok("/lora-adapters/fresh", dict(fresh_spec, residency=fresh_weights))
+fresh = engine.fresh(**fresh_spec)
 assert fresh["weights"] == plan["weights"], ("allocated weights differ from dry plan", fresh, plan)
 file_plan = ok("/lora-adapters/load", {"name": fresh_name, "dry_run": True})
 assert file_plan["weights"] == plan["weights"]
@@ -88,42 +50,17 @@ before = hashlib.sha256((train_dir / before_name).read_bytes()).hexdigest()
 repeat_name = prefix + "-repeat.gguf"
 ok("/lora-adapters/save", {"id": fresh["id"], "name": repeat_name})
 assert hashlib.sha256((train_dir / repeat_name).read_bytes()).hexdigest() == before, "save bytes are unstable without learning"
-optimizer_rid = None
-def learning(reply, suffix):
-    # A learn runs only inside custody the core registered from the engine's own preflight of this
-    # example: her optimizer (persistent per shadow, registered once) and the engine-wide step
-    # workspace sized to this reply (server-context-learn-residency.inc admit_learning_residency).
-    global optimizer_rid
-    plan = ok("/learn/preflight", {"engine": ledger["engine"], "lora_id": fresh["id"], "learn": {"reply": reply}})
-    assert plan["refusal"] == "none", plan
-    rows = [row for row in plan["requirements"] if row["kind"] != "shared_compute_held"]
-    if optimizer_rid is None:
-        optimizer_rid = register("-optimizer", {"loaded": {"lora_id": fresh["id"], "path": fresh["path"]}},
-                                 [row for row in rows if row["kind"] != "shared_compute_required"])
-    workspace = register("-workspace" + suffix, {"workspace": True},
-                         [row for row in rows if row["kind"] == "shared_compute_required"])
-    return {"reply": reply, "lora_id": fresh["id"], "grant": grant, "lr": 0.001,
-            "optimizer_residency": optimizer_rid, "workspace_residency": workspace}
 learned = ok("/completion", {"prompt": "The capital of Kansas is", "id_slot": 0,
              "n_predict": 1, "temperature": 0,
-             "learn": learning("Topeka is the capital of Kansas.", "-short")})
+             "learn": engine.learn(fresh, "Topeka is the capital of Kansas.")})
 assert learned["learn"]["success"], learned
-# The long reply spans as many resumable chunks as this engine's window holds: sized from its own
-# slot window and tokenizer (the reply's tokens plus its end of turn, after the served prompt),
-# never a fixed repeat count, since preflight refuses an example past the served window.
-def rows(text, special):
-    return len(ok("/tokenize", {"content": text, "add_special": special})["tokens"])
+# The long reply spans as many resumable chunks as this engine's window holds.
 long_prompt = "The capital of Kansas is"
-room = get("/slots")[0]["n_ctx"] - rows(long_prompt, True) - 1
-unit = "A room contains a card and a window. "
-repeats = room // rows(unit, False)
-while repeats > 1 and rows(unit * repeats, False) > room:
-    repeats -= 1
-assert repeats > 1, ("the served window holds no multi-sentence reply", room)
+long_reply = engine.filling(long_prompt, "A room contains a card and a window. ")
 # A queued save must refuse the active shadow even between resumable chunks.
 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
     future = pool.submit(ok, "/completion", {"prompt": long_prompt, "id_slot": 0,
-        "n_predict": 1, "temperature": 0, "learn": learning(unit * repeats, "-long")})
+        "n_predict": 1, "temperature": 0, "learn": engine.learn(fresh, long_reply)})
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         if get("/slots")[0]["is_learning"]:
@@ -141,9 +78,7 @@ snapshot = ok("/lora-adapters/save", {"id": fresh["id"], "name": snapshot_name})
 assert snapshot["steps"] == 2, ("two whole replies learned are two committed steps", snapshot)
 after = hashlib.sha256((train_dir / snapshot_name).read_bytes()).hexdigest()
 assert after != before, "successful learn did not change saved adapter weights"
-snapshot_plan = ok("/lora-adapters/load", {"name": snapshot_name, "dry_run": True})
-snapshot_weights = register("-snapshot", {"load": {"name": snapshot_name}}, [dict(row, kind="weights") for row in snapshot_plan["weights"]])
-loaded = ok("/lora-adapters/load", {"name": snapshot_name, "residency": snapshot_weights})
+loaded = engine.load(snapshot_name)
 assert complete(loaded["id"]) == trained_text, "trained snapshot reload changed output"
 assert post("/lora-adapters/save", {"id": fresh["id"], "name": snapshot_name})[0] >= 400
 assert post("/lora-adapters/fresh", {"name": fresh_name})[0] >= 400
@@ -157,3 +92,4 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
 assert sorted(status == 200 for status in results) == [False, True], results
 print(json.dumps({"gate": "D1", "fresh": fresh, "snapshot": snapshot,
                   "before_sha256": before, "after_sha256": after, "passed": True}))
+engine.close()
