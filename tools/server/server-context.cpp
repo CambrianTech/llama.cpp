@@ -910,6 +910,8 @@ public:
         catch (const std::exception &) { return "invalid"; }
     }
     const std::string & learning_engine_identity() const { return learn_engine; }
+    // the ledger as the loop last published it; readable from any thread (card 7fc7e2ce)
+    json ledger_as_published() const { return published_ledger(); }
 
     json lora_report_snapshot() const {
         std::lock_guard<std::mutex> lock(lora_report_mutex);
@@ -1571,16 +1573,20 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
-            return process_single_task(std::move(task), is_yielding);
+            auto handled = process_single_task(std::move(task), is_yielding);
+            publish_ledger(); // a task boundary: what it changed is readable off the loop
+            return handled;
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+            publish_ledger(); // a chunk boundary
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
 
         metrics.init();
+        publish_ledger(); // readable before the loop's first boundary
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -6577,7 +6583,12 @@ void server_routes::init_routes() {
     this->post_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_register"); };
     this->release_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_release"); };
     this->revoke_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_revoke"); };
-    this->get_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "list"); };
+    // a read answers from the loop's last publication, never queued behind the chunk it reports on
+    this->get_learn_grants = [this](const server_http_req &) {
+        auto res = create_response();
+        res->ok(ctx_server.ledger_as_published());
+        return res;
+    };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
     this->revoke_learn_grant = [grant_route](const server_http_req & req) { return grant_route(req, "revoke"); };
 
