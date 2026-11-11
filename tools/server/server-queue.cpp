@@ -481,6 +481,14 @@ void server_response::send(server_task_result_ptr && result) {
     RES_DBG("sending result for task id = %d\n", result->id);
 
     std::unique_lock<std::mutex> lock(mutex_results);
+    if (ticketed_ids.erase(result->id) > 0) {
+        // stored before the notify, under the same lock the stream waits with (no lost wakeup)
+        if (ticket_subscribers > 0) {
+            ticket_results.emplace_back(std::move(result));
+            condition_results.notify_all();
+        }
+        return;
+    }
     for (const auto & id_task : waiting_task_ids) {
         if (result->id == id_task) {
             RES_DBG("task id = %d pushed to result queue\n", result->id);
@@ -618,4 +626,33 @@ void server_response_reader::stop() {
     } else {
         SRV_DBG("%s", "all tasks already finished, no need to cancel\n");
     }
+}
+
+void server_response::add_ticket(int id_task) {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    ticketed_ids.insert(id_task);
+}
+
+void server_response::subscribe_tickets() {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    ++ticket_subscribers;
+}
+
+void server_response::unsubscribe_tickets() {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    if (--ticket_subscribers <= 0) {
+        ticket_subscribers = 0;
+        ticket_results.clear(); // nobody is listening: undelivered results are gone
+    }
+}
+
+server_task_result_ptr server_response::next_ticket(int timeout) {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    condition_results.wait_for(lock, std::chrono::seconds(timeout), [&] { return !running || !ticket_results.empty(); });
+    if (!running || ticket_results.empty()) {
+        return nullptr;
+    }
+    server_task_result_ptr res = std::move(ticket_results.front());
+    ticket_results.erase(ticket_results.begin());
+    return res;
 }

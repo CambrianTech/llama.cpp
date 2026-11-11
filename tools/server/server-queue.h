@@ -164,7 +164,24 @@ private:
     std::mutex mutex_results;
     std::condition_variable condition_results;
 
+    // Continuum fork (card 7fc7e2ce): ticketed loop mutations. A ticketed task's result goes to the
+    // learning event stream's subscriber, then it is gone (delivery is the drop); with no subscriber
+    // it is dropped, and a core that (re)connects reads the physical state, never a replay.
+    std::unordered_set<int> ticketed_ids;
+    std::vector<server_task_result_ptr> ticket_results;
+    int ticket_subscribers = 0;
+
 public:
+    // register `id_task` as ticketed: its result is delivered on the event stream, not to a waiter
+    void add_ticket(int id_task);
+
+    // the learning event stream opens / closes; the last close drops anything undelivered
+    void subscribe_tickets();
+    void unsubscribe_tickets();
+
+    // blocks until a ticketed result arrives (returned) or `timeout` seconds pass (nullptr: keepalive)
+    server_task_result_ptr next_ticket(int timeout);
+
     // add the id_task to the list of tasks waiting for response
     void add_waiting_task_id(int id_task);
 
