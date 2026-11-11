@@ -54,6 +54,9 @@ engine.grants.remove(gid_unseen)
 unseen = ticketed("/learn/grants/revoke", {"id": gid_unseen})
 
 stream, events = subscribe()
+# a second open stream, as a reconnecting core leaves its predecessor's until its socket fails: each
+# stream gets every result, so a stale one can never take the result a live core waits for
+other, other_events = subscribe()
 
 # a ticketed grant revoke: its terminal result arrives on the stream under its ticket
 gid = engine.register_grant("-revoked")
@@ -63,6 +66,9 @@ event = events.get(timeout=engine.timeout)
 assert event["ticket"] != unseen, ("a result made while nobody listened is never replayed", event)
 assert event["ticket"] == ticket and not event["error"], event
 assert event["result"]["revoked"] is True, event
+copy = other_events.get(timeout=engine.timeout)
+assert copy["ticket"] == ticket, ("every open stream gets the result, never just one of them", copy)
+other.close()
 
 # a ticketed unload: the adapter's retirement arrives the same way
 shadow = engine.fresh()
