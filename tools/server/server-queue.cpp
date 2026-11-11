@@ -482,9 +482,13 @@ void server_response::send(server_task_result_ptr && result) {
 
     std::unique_lock<std::mutex> lock(mutex_results);
     if (ticketed_ids.erase(result->id) > 0) {
-        // stored before the notify, under the same lock the stream waits with (no lost wakeup)
-        if (ticket_subscribers > 0) {
-            ticket_results.emplace_back(std::move(result));
+        // stored before the notify, under the same lock the streams wait with (no lost wakeup)
+        if (!ticket_queues.empty()) {
+            const std::string event = "data: " + safe_json_to_str({
+                {"ticket", result->id}, {"error", result->is_error()}, {"result", result->to_json()}}) + "\n\n";
+            for (auto & [subscriber, queue] : ticket_queues) {
+                queue.push_back(event);
+            }
             condition_results.notify_all();
         }
         return;
@@ -633,26 +637,29 @@ void server_response::add_ticket(int id_task) {
     ticketed_ids.insert(id_task);
 }
 
-void server_response::subscribe_tickets() {
+int server_response::subscribe_tickets() {
     std::unique_lock<std::mutex> lock(mutex_results);
-    ++ticket_subscribers;
+    const int subscriber = next_ticket_subscriber++;
+    ticket_queues[subscriber];
+    return subscriber;
 }
 
-void server_response::unsubscribe_tickets() {
+void server_response::unsubscribe_tickets(int subscriber) {
     std::unique_lock<std::mutex> lock(mutex_results);
-    if (--ticket_subscribers <= 0) {
-        ticket_subscribers = 0;
-        ticket_results.clear(); // nobody is listening: undelivered results are gone
-    }
+    ticket_queues.erase(subscriber); // what it never read is gone with it
 }
 
-server_task_result_ptr server_response::next_ticket(int timeout) {
+std::string server_response::next_ticket(int subscriber, int timeout) {
     std::unique_lock<std::mutex> lock(mutex_results);
-    condition_results.wait_for(lock, std::chrono::seconds(timeout), [&] { return !running || !ticket_results.empty(); });
-    if (!running || ticket_results.empty()) {
-        return nullptr;
+    condition_results.wait_for(lock, std::chrono::seconds(timeout), [&] {
+        auto it = ticket_queues.find(subscriber);
+        return !running || it == ticket_queues.end() || !it->second.empty();
+    });
+    auto it = ticket_queues.find(subscriber);
+    if (!running || it == ticket_queues.end() || it->second.empty()) {
+        return {};
     }
-    server_task_result_ptr res = std::move(ticket_results.front());
-    ticket_results.erase(ticket_results.begin());
-    return res;
+    std::string event = std::move(it->second.front());
+    it->second.pop_front();
+    return event;
 }

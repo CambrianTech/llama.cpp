@@ -6605,12 +6605,12 @@ void server_routes::init_routes() {
     this->get_learn_events = [this](const server_http_req & req) {
         struct ticket_stream : server_res_generator {
             server_response & results;
+            const int subscriber;
             ticket_stream(server_queue & tasks, server_response & results, int sleep_idle_seconds)
-                : server_res_generator(tasks, results, sleep_idle_seconds, true), results(results) {
-                results.subscribe_tickets();
-            }
+                : server_res_generator(tasks, results, sleep_idle_seconds, true), results(results),
+                  subscriber(results.subscribe_tickets()) {}
             void on_complete() override {
-                results.unsubscribe_tickets();
+                results.unsubscribe_tickets(subscriber);
                 server_res_generator::on_complete();
             }
         };
@@ -6629,12 +6629,10 @@ void server_routes::init_routes() {
                 res_this->data.clear();
                 return true;
             }
-            auto result = res_this->results.next_ticket(keepalive);
-            if (!result) {
+            output = res_this->results.next_ticket(res_this->subscriber, keepalive);
+            if (output.empty()) {
                 output = ":\n\n"; // keepalive
-                return true;
             }
-            output = "data: " + safe_json_to_str({{"ticket", result->id}, {"error", result->is_error()}, {"result", result->to_json()}}) + "\n\n";
             return true;
         });
         return res;

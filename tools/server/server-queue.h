@@ -8,6 +8,8 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 // struct for managing server tasks
@@ -164,23 +166,27 @@ private:
     std::mutex mutex_results;
     std::condition_variable condition_results;
 
-    // Continuum fork (card 7fc7e2ce): ticketed loop mutations. A ticketed task's result goes to the
-    // learning event stream's subscriber, then it is gone (delivery is the drop); with no subscriber
-    // it is dropped, and a core that (re)connects reads the physical state, never a replay.
+    // Continuum fork (card 7fc7e2ce): ticketed loop mutations. A ticketed task's result goes to EVERY
+    // open learning event stream, each through its own queue, then it is gone (delivery is the drop);
+    // with no subscriber it is dropped, and a core that (re)connects reads the physical state, never a
+    // replay. One shared queue let a stale stream (its client gone, its socket not yet failed) take the
+    // result a live core was waiting for, and that core waited forever (the IntelMac, 2026-11-11 19:58Z).
+    // The core matches by ticket id, so a copy on a stale stream costs nothing.
     std::unordered_set<int> ticketed_ids;
-    std::vector<server_task_result_ptr> ticket_results;
-    int ticket_subscribers = 0;
+    std::unordered_map<int, std::deque<std::string>> ticket_queues; // per subscriber: formatted events
+    int next_ticket_subscriber = 0;
 
 public:
     // register `id_task` as ticketed: its result is delivered on the event stream, not to a waiter
     void add_ticket(int id_task);
 
-    // the learning event stream opens / closes; the last close drops anything undelivered
-    void subscribe_tickets();
-    void unsubscribe_tickets();
+    // a learning event stream opens (returns its subscriber id) / closes (drops what it never read)
+    int subscribe_tickets();
+    void unsubscribe_tickets(int subscriber);
 
-    // blocks until a ticketed result arrives (returned) or `timeout` seconds pass (nullptr: keepalive)
-    server_task_result_ptr next_ticket(int timeout);
+    // blocks until an event for `subscriber` arrives (returned, SSE-ready) or `timeout` seconds pass
+    // (empty: keepalive)
+    std::string next_ticket(int subscriber, int timeout);
 
     // add the id_task to the list of tasks waiting for response
     void add_waiting_task_id(int id_task);
