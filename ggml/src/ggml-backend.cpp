@@ -2711,6 +2711,10 @@ bool ggml_backend_sched_graph_pending(ggml_backend_sched_t sched) {
     return sched->continuation_graph != nullptr;
 }
 
+bool ggml_backend_sched_graph_pending_for(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
+    return graph != nullptr && sched->continuation_graph == graph;
+}
+
 void ggml_backend_sched_graph_discard(ggml_backend_sched_t sched) {
     ggml_backend_sched_synchronize(sched);
     sched->continuation_graph = nullptr;
