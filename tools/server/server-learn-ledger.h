@@ -76,8 +76,13 @@ public:
 
     explicit server_learn_ledger(std::string engine) : engine(std::move(engine)) {}
 
+    // Bumped by every mutation: the loop publishes the ledger at a slot-update boundary only when
+    // this moved since its last publication (card 7fc7e2ce; Fable on fork #109: no JSON per batch).
+    uint64_t revision() const { return revision_; }
+
     // The authority registers (or re-confirms) a grant.
     server_learn_refusal register_grant(const server_learn_grant & g, int64_t now_us) {
+        ++revision_; // every mutation is a new ledger the loop must publish
         if (!in_clock(now_us) || g.id.empty() || (g.period_ms < 0 || (g.period_ms == 0 && g.share_ppm != 0)) || g.period_ms > kMaxPeriodMs || g.share_ppm < 0 ||
                 g.share_ppm > 1000000 || g.max_chunk_us < 0 || g.max_chunk_us > kMaxCostUs || g.expires_at_us <= now_us || !in_clock(g.expires_at_us)) {
             return server_learn_refusal::invalid;
@@ -102,6 +107,7 @@ public:
 
     // The authority ends a grant. Its account goes once its last reservation settles.
     void revoke(const std::string & id, int64_t now_us) {
+        ++revision_; // every mutation is a new ledger the loop must publish
         if (!in_clock(now_us)) {
             return;
         }
@@ -116,6 +122,7 @@ public:
     // serving at admission, so the step's time is debited; an uncontended step is admitted
     // without a debit but is still a live reservation.
     server_learn_admission admit(const std::string & grant, int64_t est_us, int64_t now_us, bool contended) {
+        ++revision_; // every mutation is a new ledger the loop must publish
         server_learn_admission out;
         if (est_us < 0 || est_us > kMaxCostUs || !in_clock(now_us)) {
             out.refusal = server_learn_refusal::invalid;
@@ -155,6 +162,7 @@ public:
     // Latency admission is separate from duty and restoration custody. A new
     // serving arrival may wait for this segment even when admission is idle.
     server_learn_admission admit_chunk(const std::string & grant, int64_t measured_us, int64_t now_us, bool contended) {
+        ++revision_; // every mutation is a new ledger the loop must publish
         if (measured_us < 0 || measured_us > kMaxCostUs || !in_clock(now_us)) {
             return {server_learn_refusal::invalid};
         }
@@ -179,6 +187,7 @@ public:
     // Restoration is an obligation, not permission for a gradient. Keep its
     // measured debit even on an idle-only grant and after revocation.
     server_learn_admission hold_restoration(const std::string & grant, int64_t now_us) {
+        ++revision_; // every mutation is a new ledger the loop must publish
         auto out = admit(grant, 0, now_us, false);
         if (out.refusal == server_learn_refusal::none) {
             reservations.at(out.reservation).contended = true;
@@ -190,6 +199,7 @@ public:
     // grant was revoked or expired after admission (unknown_grant): the reservation stays held, so
     // the caller cancels it (it never ran) and nothing is erased silently.
     server_learn_refusal start(uint64_t id, int64_t now_us) {
+        ++revision_; // every mutation is a new ledger the loop must publish
         if (!in_clock(now_us)) {
             return server_learn_refusal::invalid;
         }
@@ -211,6 +221,7 @@ public:
     // The step quiesced after measured_us with committed_steps optimizer steps: debit the measured
     // time (when it was admitted contended) and release the rest of its reservation.
     server_learn_refusal finish(uint64_t id, int64_t measured_us, int64_t committed_steps, int64_t now_us) {
+        ++revision_; // every mutation is a new ledger the loop must publish
         if (measured_us < 0 || measured_us > kMaxCostUs || committed_steps < 0 || committed_steps > kMaxStepsPerSettle ||
                 !in_clock(now_us)) {
             return server_learn_refusal::invalid;
@@ -220,6 +231,7 @@ public:
 
     // The step never ran: its whole reservation returns. Refused once it started.
     server_learn_refusal cancel(uint64_t id, int64_t now_us) {
+        ++revision_; // every mutation is a new ledger the loop must publish
         if (!in_clock(now_us)) {
             return server_learn_refusal::invalid;
         }
@@ -263,6 +275,7 @@ public:
     }
 
 private:
+    uint64_t revision_ = 0;
     struct account {
         server_learn_grant grant;
         int64_t            period_start_us;
