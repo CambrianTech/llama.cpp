@@ -388,6 +388,9 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_sched_graph_step(ggml_backend_sched_t sched,
             struct ggml_cgraph * graph, int max_nodes, bool * complete);
     GGML_API bool ggml_backend_sched_graph_pending(ggml_backend_sched_t sched);
+    // True when `graph` itself is the one the scheduler is part-way through (graph_step): a caller
+    // that owns `graph` must not free its tensors yet. Another caller's pending graph is not this one.
+    GGML_API bool ggml_backend_sched_graph_pending_for(ggml_backend_sched_t sched, const struct ggml_cgraph * graph);
     GGML_API void ggml_backend_sched_graph_discard(ggml_backend_sched_t sched);
 
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);

@@ -177,6 +177,10 @@ extern "C" {
     // No optimizer or scheduler buffers are allocated. Caller serializes scheduler use.
     // Consumes the metadata optimizer and rewrites graph inputs: free it and discard the
     // graph after reading sizes; rebuild and revalidate admission before real allocation.
+    // Optional metadata boundary before measure_alloc. Caller retains the graph,
+    // tensors and scheduler, restores its serving context before yielding, and
+    // resumes with the same backward phase. No tensor buffers or compute are needed.
+    GGML_API bool ggml_opt_measure_prepare(ggml_opt_context_t opt_ctx, bool backward);
     GGML_API bool ggml_opt_measure_alloc(ggml_opt_context_t opt_ctx, bool backward,
             size_t * static_bytes, size_t * host_bytes, size_t * graph_sizes);
 

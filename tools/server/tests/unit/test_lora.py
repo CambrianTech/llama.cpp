@@ -89,14 +89,26 @@ def test_the_adapter_report_follows_every_change_to_the_set(tmp_path):
     assert server.make_request("POST", "/lora-adapters", data=[{"id": 0, "scale": 0.25}]).status_code == 200
     assert report()[0]["scale"] == 0.25
 
-    loaded = server.make_request("POST", "/lora-adapters/load", data={"name": "second.gguf"})
+    # A runtime load is seated only inside a residency registered for its exact subject, as the core
+    # registers one (server-learn-residency.h): measure, register its rows and leases, then load.
+    measured = server.make_request("POST", "/lora-adapters/load", data={"name": "second.gguf", "dry_run": True})
+    assert measured.status_code == 200, measured.body
+    engine = server.make_request("GET", "/learn/grants").body["engine"]
+    rows = [dict(row, kind="weights") for row in measured.body["weights"]]
+    leases = [{"kind": kind, "lease_id": "second-" + kind, "bytes": sum(row["bytes"] for row in rows if row["host"] == host)}
+              for kind, host in (("vram", False), ("ram", True))]
+    registered = server.make_request("POST", "/learn/residency", data={"id": "second-weights", "engine": engine, "owner": "test",
+                                      "subject": {"load": {"name": "second.gguf"}}, "rows": rows, "leases": leases})
+    assert registered.status_code == 200 and registered.body["refusal"] == "none", registered.body
+    loaded = server.make_request("POST", "/lora-adapters/load", data={"name": "second.gguf", "residency": "second-weights"})
     assert loaded.status_code == 200, loaded.body
     assert sorted(report()) == [0, 1]
 
     # an adapter active by default is retired only once its scale is 0 (the engine refuses otherwise)
     assert server.make_request("POST", "/lora-adapters", data=[{"id": 0, "scale": 0.0}, {"id": 1, "scale": 0.0}]).status_code == 200
     assert report()[0]["scale"] == 0.0
-    unloaded = server.make_request("POST", "/lora-adapters/unload", data={"id": 0})
+    # a retire names the engine incarnation it was decided against, like every lifecycle verb
+    unloaded = server.make_request("POST", "/lora-adapters/unload", data={"id": 0, "engine": engine})
     assert unloaded.status_code == 200, unloaded.body
     assert list(report()) == [1], "a retired adapter leaves the report; the ids it left stay taken"
 

@@ -14,6 +14,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <vector>
+#if defined(__unix__) || defined(__APPLE__)
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
 
@@ -34,7 +40,7 @@ static ggml_opt_optimizer_params adam_pars(void *) {
     return p;
 }
 
-static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false, bool test_measurement = false, int graph_nodes = 0, bool use_gpu = false, bool adam = false) {
+static void run(int32_t opt_period, bool test_residency_gate = false, bool refuse_host = false, bool test_measurement = false, int graph_nodes = 0, bool use_gpu = false, bool adam = false, bool staged_measurement = false) {
     // by type, not ggml_backend_cpu_init: in a dynamically loaded backend build (CI) the CPU
     // backend is its own library
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
@@ -72,9 +78,11 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
 
 
     bool measured_once = false;
+    bool cancelled_measurement = false;
     bool cancelled_preparation = false;
     bool cancelled_checkpoint = false;
-    size_t measured_static = 0, measured_host = 0, measured_graph = 0;
+    size_t measured_static = 0, measured_host = 0;
+    std::vector<size_t> measured_graph(ggml_backend_sched_get_n_backends(sched), 0);
     const int n_evals = 3 * opt_period;
     for (int i = 0; i < n_evals; ++i) {
         ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
@@ -88,10 +96,45 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
             // allocates, then a rebuilt graph must allocate exactly the reported bytes.
             auto probe = ggml_opt_init(params);
             ggml_opt_prepare_alloc(probe, ctx_compute, gf, x, out);
-            const size_t held = ggml_backend_sched_get_buffer_size(sched, cpu);
-            CHECK(ggml_opt_measure_alloc(probe, true, &measured_static, &measured_host, &measured_graph));
-            CHECK(measured_static > 0 && measured_host > 0 && measured_graph > 0);
-            CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == held);
+            std::vector<size_t> held(measured_graph.size());
+            for (size_t b = 0; b < held.size(); ++b) {
+                held[b] = ggml_backend_sched_get_buffer_size(sched, backends[b]);
+            }
+            auto check_held = [&]() {
+                for (size_t b = 0; b < held.size(); ++b) {
+                    CHECK(ggml_backend_sched_get_buffer_size(sched, backends[b]) == held[b]);
+                }
+            };
+            if (staged_measurement) {
+                CHECK(ggml_opt_measure_prepare(probe, true));
+                check_held();
+                CHECK(!ggml_opt_alloc(probe, true));
+                float unchanged = 0;
+                ggml_backend_tensor_get(w, &unchanged, 0, sizeof(unchanged));
+                CHECK(unchanged == w_now);
+                size_t prepared_owned = 0;
+                ggml_opt_visit_owned_buffers(probe, [](ggml_backend_buffer_t b, const char *, void * data) {
+                    *static_cast<size_t *>(data) += ggml_backend_buffer_get_size(b);
+                }, &prepared_owned);
+                CHECK(prepared_owned == 0);
+                if (!cancelled_measurement) {
+                    ggml_opt_free(probe);
+                    ggml_free(ctx_compute);
+                    check_held();
+                    ggml_backend_tensor_get(w, &unchanged, 0, sizeof(unchanged));
+                    CHECK(unchanged == w_now);
+                    cancelled_measurement = true;
+                    --i;
+                    continue;
+                }
+                CHECK(!ggml_opt_measure_prepare(probe, true));
+                CHECK(!ggml_opt_measure_alloc(probe, false, &measured_static, &measured_host, measured_graph.data()));
+            }
+            CHECK(ggml_opt_measure_alloc(probe, true, &measured_static, &measured_host, measured_graph.data()));
+            CHECK(ggml_opt_refusal(probe)[0] == '\0');
+            CHECK(!ggml_opt_measure_alloc(probe, true, &measured_static, &measured_host, measured_graph.data()));
+            CHECK(measured_static > 0 && measured_host > 0 && measured_graph[0] > 0);
+            check_held();
             size_t owned = 0;
             ggml_opt_visit_owned_buffers(probe, [](ggml_backend_buffer_t b, const char *, void * data) {
                 *static_cast<size_t *>(data) += ggml_backend_buffer_get_size(b);
@@ -157,7 +200,9 @@ static void run(int32_t opt_period, bool test_residency_gate = false, bool refus
                 (strcmp(kind, "optimizer_static") == 0 ? actual.device : actual.host) += ggml_backend_buffer_get_size(b);
             }, &actual);
             CHECK(actual.device == measured_static && actual.host == measured_host);
-            CHECK(ggml_backend_sched_get_buffer_size(sched, cpu) == measured_graph);
+            for (size_t b = 0; b < measured_graph.size(); ++b) {
+                CHECK(ggml_backend_sched_get_buffer_size(sched, backends[b]) == measured_graph[b]);
+            }
         }
         if (test_residency_gate) {
             size_t allocated = 0;
@@ -505,7 +550,7 @@ static void run_label_projection(bool projected) {
 // clamp, a view with no backward) must refuse ggml_opt_alloc by the op's name, not abort: the
 // abort took the M5's serving engine down on the 35B-A3B's first /train (2026-11-01). The same
 // context then trains a graph it can differentiate.
-static void run_refuses_graph_without_backward() {
+static void run_refuses_graph_without_backward(bool measurement = false) {
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     CHECK(cpu != nullptr);
     ggml_backend_t backends[] = { cpu };
@@ -534,8 +579,18 @@ static void run_refuses_graph_without_backward() {
         ggml_build_forward_expand(gf, out);
         ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, x, out);
         if (!differentiable) {
-            CHECK(!ggml_opt_alloc(opt_ctx, true));
+            CHECK(!(measurement ? ggml_opt_measure_prepare(opt_ctx, true) : ggml_opt_alloc(opt_ctx, true)));
             CHECK(std::strstr(ggml_opt_refusal(opt_ctx), "no backward through CLAMP") != nullptr);
+            if (measurement) {
+                size_t device = 0, host = 0, graph = 0;
+                CHECK(!ggml_opt_measure_alloc(opt_ctx, true, &device, &host, &graph));
+                CHECK(!ggml_opt_alloc(opt_ctx, true));
+                ggml_opt_free(opt_ctx);
+                opt_ctx = ggml_opt_init(params);
+                float unchanged = 0;
+                ggml_backend_tensor_get(w, &unchanged, 0, sizeof(unchanged));
+                CHECK(unchanged == w0);
+            }
         } else {
             CHECK(ggml_opt_alloc(opt_ctx, true));
             ggml_backend_tensor_set(x, &X, 0, sizeof(float));
@@ -639,6 +694,136 @@ static void run_refuses_misshaped_gradient() {
     ggml_free(ctx);
 }
 
+// One mind's trainable weight and optimizer on a SHARED scheduler, the way a serving context keeps
+// one optimizer per shadow (llama_context::opt_minds).
+struct mind {
+    ggml_context       * ctx_static = nullptr;
+    ggml_tensor        * w          = nullptr;
+    ggml_backend_buffer_t buf       = nullptr;
+    ggml_opt_context_t   opt        = nullptr;
+    ggml_opt_result_t    result     = nullptr;
+    ggml_context       * ctx_compute = nullptr;
+};
+
+static mind mind_on(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    mind m;
+    ggml_init_params sp = { 8 * ggml_tensor_overhead(), nullptr, true };
+    m.ctx_static = ggml_init(sp);
+    m.w = ggml_new_tensor_1d(m.ctx_static, GGML_TYPE_F32, 1);
+    ggml_set_name(m.w, "weight");
+    ggml_set_param(m.w);
+    m.buf = ggml_backend_alloc_ctx_tensors(m.ctx_static, backend);
+    const float one = 1.0f;
+    ggml_backend_tensor_set(m.w, &one, 0, sizeof(float));
+    ggml_opt_params params = ggml_opt_default_params(sched, GGML_OPT_LOSS_TYPE_SUM);
+    params.optimizer    = GGML_OPT_OPTIMIZER_TYPE_SGD;
+    params.get_opt_pars = sgd_pars;
+    m.opt    = ggml_opt_init(params);
+    m.result = ggml_opt_result_init();
+    return m;
+}
+
+// Prepare and allocate this mind's next step, then run one graph node of it: the step is left
+// part-way, the shared scheduler pending on this mind's graph. Returns whether it completed.
+static bool begin_step(mind & m) {
+    ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
+    m.ctx_compute = ggml_init(cp);
+    ggml_tensor * x   = ggml_new_tensor_1d(m.ctx_compute, GGML_TYPE_F32, 1);
+    ggml_tensor * out = ggml_mul(m.ctx_compute, m.w, x);
+    ggml_cgraph * gf  = ggml_new_graph_custom(m.ctx_compute, GGML_DEFAULT_GRAPH_SIZE, true);
+    ggml_build_forward_expand(gf, out);
+    ggml_opt_prepare_alloc(m.opt, m.ctx_compute, gf, x, out);
+    CHECK(ggml_opt_alloc(m.opt, true));
+    ggml_backend_tensor_set(x, &X, 0, sizeof(float));
+    bool complete = false;
+    CHECK(ggml_opt_eval_step(m.opt, m.result, 1, &complete) == GGML_STATUS_SUCCESS);
+    return complete;
+}
+
+static void finish_step(mind & m) {
+    bool complete = false;
+    int calls = 0;
+    do {
+        CHECK(++calls < 1000);
+        CHECK(ggml_opt_eval_step(m.opt, m.result, 1, &complete) == GGML_STATUS_SUCCESS);
+    } while (!complete);
+    ggml_free(m.ctx_compute);
+    m.ctx_compute = nullptr;
+}
+
+static float weight(const mind & m) {
+    float w = 0;
+    ggml_backend_tensor_get(m.w, &w, 0, sizeof(w));
+    return w;
+}
+
+static void release(mind & m) {
+    if (m.opt) { ggml_opt_free(m.opt); }
+    ggml_opt_result_free(m.result);
+    ggml_backend_buffer_free(m.buf);
+    ggml_free(m.ctx_static);
+}
+
+// what this catches (fork #106 reproducer, learn-unload-during-learn.py): freeing an IDLE mind's
+// optimizer while another mind's graph is part-way through the shared scheduler aborted the engine,
+// because ggml_opt_free asserted the whole scheduler had no pending graph. Freeing touches only the
+// idle mind's own buffers, so the other mind's step must finish with exactly the update it would
+// make alone. Built with -fsanitize=address, a freed buffer the live graph still read fails loudly.
+static void run_frees_idle_mind_while_another_steps() {
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    GGML_ASSERT(cpu != nullptr);
+    ggml_backend_t backends[] = { cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    mind a = mind_on(sched, cpu);
+    mind b = mind_on(sched, cpu);
+    // B learns a whole step first, so it holds optimizer buffers and a graph copy of its own
+    if (!begin_step(b)) { finish_step(b); } else { ggml_free(b.ctx_compute); b.ctx_compute = nullptr; }
+    CHECK(std::fabs(weight(b) - (1.0f - LR * X)) < 1e-6f);
+    CHECK(!ggml_backend_sched_graph_pending(sched));
+    // A starts and stops part-way: the scheduler is now pending on A's graph, not B's
+    CHECK(!begin_step(a));
+    CHECK(ggml_backend_sched_graph_pending(sched));
+    CHECK(!ggml_backend_sched_graph_pending_for(sched, nullptr));
+    ggml_opt_free(b.opt); // the idle mind unloads mid-way through A's step
+    b.opt = nullptr;
+    CHECK(ggml_backend_sched_graph_pending(sched));
+    finish_step(a);
+    CHECK(!ggml_backend_sched_graph_pending(sched));
+    CHECK(std::fabs(weight(a) - (1.0f - LR * X)) < 1e-6f);
+    release(a);
+    release(b);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+    printf("PASS an idle mind's optimizer frees while another mind's step is in flight\n");
+}
+
+// what this catches: the narrowed guard widening into no guard. A context whose OWN graph is
+// part-way through the scheduler must still refuse to be freed (it would free tensors the
+// scheduler reads next), so ggml_opt_free must abort. Observed in a child process.
+static void run_free_own_pending_graph_aborts() {
+#if defined(__unix__) || defined(__APPLE__)
+    fflush(stdout);
+    fflush(stderr);
+    const pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        ggml_backend_t backends[] = { cpu };
+        ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+        mind a = mind_on(sched, cpu);
+        if (begin_step(a)) { _exit(2); } // the step must be left part-way for this case to mean anything
+        ggml_opt_free(a.opt);            // must abort: A's own graph is in flight
+        _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(child, &status, 0) == child);
+    CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    printf("PASS freeing a context whose own graph is in flight still aborts\n");
+#else
+    printf("SKIP freeing a context whose own graph is in flight: needs fork() to observe the abort\n");
+#endif
+}
+
 int main() {
     ggml_backend_load_all();
     for (int period : {1, 2, 3}) { run(period, false, false, false, 1); }
@@ -646,6 +831,9 @@ int main() {
     if (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
         for (int period : {1, 2, 3}) { run(period, false, false, false, 1, true); }
         for (int period : {1, 2, 3}) { run(period, false, false, false, 1, true, true); }
+        run(1, false, false, true, 0, true, false, true);
+        run(1, false, false, true, 0, true, true, true);
+        printf("PASS CUDA staged measurement matches both backend allocations\n");
         printf("PASS CUDA optimizer continuation commits once across periods 1/2/3\n");
     }
     run(1);
@@ -654,9 +842,11 @@ int main() {
     // Static admission alone must not allocate when the host lease is refused.
     run(1, true, true);
     run(1, false, false, true);
+    run(1, false, false, true, 0, false, false, true);
     run_manual();
     run_manual(true);
     run_refuses_graph_without_backward();
+    run_refuses_graph_without_backward(true);
     run_trains_through_broadcast_divisor();
     run_refuses_misshaped_gradient();
     run_label_projection(false);
@@ -666,6 +856,8 @@ int main() {
         run_out_prod_broadcast(type, false);
         run_out_prod_broadcast(type, true);
     }
+    run_frees_idle_mind_while_another_steps();
+    run_free_own_pending_graph_aborts();
     printf("test-opt-dynamic-accum: OK\n");
     return 0;
 }

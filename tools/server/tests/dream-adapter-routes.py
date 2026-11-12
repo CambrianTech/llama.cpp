@@ -7,32 +7,18 @@ bad ids, path confinement, and competing publication of the same name.
 import concurrent.futures
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 import time
-import urllib.error
-import urllib.request
-import uuid
 
-url = sys.argv[1].rstrip("/")
+sys.path.insert(0, os.path.dirname(__file__))
+from learn_fixture import Engine
+
+engine = Engine(sys.argv[1], "d1", timeout=120)
 train_dir = Path(sys.argv[2])
-prefix = "d1-" + uuid.uuid4().hex
-
-
-def post(route, body):
-    req = urllib.request.Request(url + route, json.dumps(body).encode(),
-                                 {"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=120) as response:
-            return response.status, json.load(response)
-    except urllib.error.HTTPError as error:
-        return error.code, json.load(error)
-
-
-def ok(route, body):
-    status, result = post(route, body)
-    assert status == 200, (route, status, result)
-    return result
+prefix = engine.prefix
+post, ok, get = engine.post, engine.ok, engine.get
 
 
 def complete(adapter=None):
@@ -42,15 +28,6 @@ def complete(adapter=None):
     return ok("/completion", body)["content"]
 
 
-def get(route):
-    with urllib.request.urlopen(url + route, timeout=120) as response:
-        return json.load(response)
-
-
-ledger = get("/learn/grants")
-grant = prefix + "-grant"
-assert ok("/learn/grants", {"id": grant, "engine": ledger["engine"],
-          "period_ms": 1000, "share_ppm": 1000000, "expires_in_ms": 120000})["refusal"] == "none"
 baseline = complete()
 fresh_name = prefix + "-fresh.gguf"
 # Dry-run uses the real loader's placement/alignment before any adapter is seated or file written.
@@ -59,8 +36,7 @@ plan = ok("/lora-adapters/fresh", dict(fresh_spec, dry_run=True))
 assert not plan["reserved"] and plan["weights"]
 assert not (train_dir / fresh_name).exists(), "dry run published an adapter"
 assert complete() == baseline, "dry run changed serving"
-fresh = ok("/lora-adapters/fresh", {"name": fresh_name, "rank": 8,
-           "alpha": 16, "targets": "attn_q,attn_v", "top_layers": 1, "seed": 42})
+fresh = engine.fresh(**fresh_spec)
 assert fresh["weights"] == plan["weights"], ("allocated weights differ from dry plan", fresh, plan)
 file_plan = ok("/lora-adapters/load", {"name": fresh_name, "dry_run": True})
 assert file_plan["weights"] == plan["weights"]
@@ -76,14 +52,15 @@ ok("/lora-adapters/save", {"id": fresh["id"], "name": repeat_name})
 assert hashlib.sha256((train_dir / repeat_name).read_bytes()).hexdigest() == before, "save bytes are unstable without learning"
 learned = ok("/completion", {"prompt": "The capital of Kansas is", "id_slot": 0,
              "n_predict": 1, "temperature": 0,
-             "learn": {"reply": "Topeka is the capital of Kansas.",
-                       "lora_id": fresh["id"], "grant": grant, "lr": 0.001}})
+             "learn": engine.learn(fresh, "Topeka is the capital of Kansas.")})
 assert learned["learn"]["success"], learned
+# The long reply spans as many resumable chunks as this engine's window holds.
+long_prompt = "The capital of Kansas is"
+long_reply = engine.filling(long_prompt, "A room contains a card and a window. ")
 # A queued save must refuse the active shadow even between resumable chunks.
 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-    future = pool.submit(ok, "/completion", {"prompt": "The capital of Kansas is", "id_slot": 0,
-        "n_predict": 1, "temperature": 0, "learn": {"grant": grant, "lora_id": fresh["id"],
-        "lr": 0.001, "reply": "A room contains a card and a window. " * 55}})
+    future = pool.submit(ok, "/completion", {"prompt": long_prompt, "id_slot": 0,
+        "n_predict": 1, "temperature": 0, "learn": engine.learn(fresh, long_reply)})
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         if get("/slots")[0]["is_learning"]:
@@ -101,7 +78,7 @@ snapshot = ok("/lora-adapters/save", {"id": fresh["id"], "name": snapshot_name})
 assert snapshot["steps"] == 2, ("two whole replies learned are two committed steps", snapshot)
 after = hashlib.sha256((train_dir / snapshot_name).read_bytes()).hexdigest()
 assert after != before, "successful learn did not change saved adapter weights"
-loaded = ok("/lora-adapters/load", {"name": snapshot_name})
+loaded = engine.load(snapshot_name)
 assert complete(loaded["id"]) == trained_text, "trained snapshot reload changed output"
 assert post("/lora-adapters/save", {"id": fresh["id"], "name": snapshot_name})[0] >= 400
 assert post("/lora-adapters/fresh", {"name": fresh_name})[0] >= 400
@@ -115,3 +92,4 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
 assert sorted(status == 200 for status in results) == [False, True], results
 print(json.dumps({"gate": "D1", "fresh": fresh, "snapshot": snapshot,
                   "before_sha256": before, "after_sha256": after, "passed": True}))
+engine.close()

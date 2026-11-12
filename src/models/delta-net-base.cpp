@@ -493,7 +493,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                     (s_slot * mem_size + kv_head) * row_size);
         cb(conv_state_update, "conv_state_update", il);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+        if (inp->s_write_main) {
+            auto rows = ggml_reshape_2d(ctx0, ggml_cont(ctx0, conv_state_last), row_count, n_seqs);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, conv_states_all, rows, inp->s_write_main));
+        } else {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+        }
         build_walk_state_exit(conv_states_all, conv_state_last);
     } else {
         GGML_ASSERT(!cparams.walk_exact && "a training graph keeps one recurrent state per sequence (rs_keep)");
@@ -554,10 +559,15 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
+        if (inp->s_write_main) {
+            auto rows = ggml_reshape_2d(ctx0, ggml_cont(ctx0, new_state), hparams.n_embd_s(), n_seqs);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, ssm_states_all, rows, inp->s_write_main));
+        } else {
         ggml_build_forward_expand(gf,
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
                         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        }
         build_walk_state_exit(ssm_states_all, new_state);
 
         return output;
