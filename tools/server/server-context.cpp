@@ -916,6 +916,8 @@ public:
         catch (const std::exception &) { return "invalid"; }
     }
     const std::string & learning_engine_identity() const { return learn_engine; }
+    // the ledger as the loop last published it; readable from any thread (card 7fc7e2ce)
+    json ledger_as_published() const { return published_ledger(); }
 
     json lora_report_snapshot() const {
         std::lock_guard<std::mutex> lock(lora_report_mutex);
@@ -1577,16 +1579,27 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
-            return process_single_task(std::move(task), is_yielding);
+            // the loop's own per-step continuation changes the ledger only through it (revision);
+            // every other task (a request, a ledger or adapter operation) publishes at its boundary
+            const bool continuation = task.type == SERVER_TASK_TYPE_NEXT_RESPONSE;
+            auto handled = process_single_task(std::move(task), is_yielding);
+            if (continuation) {
+                publish_ledger_if_changed();
+            } else {
+                publish_ledger();
+            }
+            return handled;
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+            publish_ledger_if_changed(); // a chunk boundary: a learn chunk moved the ledger
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
 
         metrics.init();
+        publish_ledger(); // readable before the loop's first boundary
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -6547,6 +6560,15 @@ void server_routes::init_routes() {
             }
         }
         task.learn_grants["op"] = op;
+        if (task.learn_grants.value("ticket", false)) {
+            // a ticketed mutation answers at once; its result arrives on GET /learn/events (card 7fc7e2ce)
+            task.id = queue_tasks.get_new_id();
+            const int ticket = task.id;
+            queue_results.add_ticket(ticket);
+            queue_tasks.post(std::move(task));
+            res->ok({{"ticket", ticket}});
+            return res;
+        }
         auto & rd = res->rd;
         task.id = rd.get_new_id();
         rd.post_task(std::move(task));
@@ -6583,7 +6605,51 @@ void server_routes::init_routes() {
     this->post_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_register"); };
     this->release_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_release"); };
     this->revoke_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_revoke"); };
-    this->get_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "list"); };
+    // The learning event stream (card 7fc7e2ce): every ticketed mutation's terminal result, pushed to
+    // the one live subscriber, then gone. Opened once per engine incarnation by the core; its end is
+    // the incarnation gate (the stream drops with the engine). Idle, it sends SSE keepalives.
+    this->get_learn_events = [this](const server_http_req & req) {
+        struct ticket_stream : server_res_generator {
+            server_response & results;
+            const int subscriber;
+            ticket_stream(server_queue & tasks, server_response & results, int sleep_idle_seconds)
+                : server_res_generator(tasks, results, sleep_idle_seconds, true), results(results),
+                  subscriber(results.subscribe_tickets()) {}
+            void on_complete() override {
+                results.unsubscribe_tickets(subscriber);
+                server_res_generator::on_complete();
+            }
+        };
+        auto res = std::make_unique<ticket_stream>(queue_tasks, queue_results, params.sleep_idle_seconds);
+        res->set_req(&req); // its connection ends the stream (should_stop)
+        res->status = 200;
+        res->content_type = "text/event-stream";
+        res->data = "data: " + safe_json_to_str({{"engine", ctx_server.learning_engine_identity()}, {"subscribed", true}}) + "\n\n";
+        const int keepalive = params.sse_ping_interval > 0 ? params.sse_ping_interval : 1;
+        res->set_next([res_this = res.get(), keepalive](std::string & output) -> bool {
+            if (res_this->should_stop()) {
+                return false;
+            }
+            if (!res_this->data.empty()) {
+                output = std::move(res_this->data);
+                res_this->data.clear();
+                return true;
+            }
+            output = res_this->results.next_ticket(res_this->subscriber, keepalive);
+            if (output.empty()) {
+                output = ":\n\n"; // keepalive
+            }
+            return true;
+        });
+        return res;
+    };
+
+    // a read answers from the loop's last publication, never queued behind the chunk it reports on
+    this->get_learn_grants = [this](const server_http_req &) {
+        auto res = create_response();
+        res->ok(ctx_server.ledger_as_published());
+        return res;
+    };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
     this->revoke_learn_grant = [grant_route](const server_http_req & req) { return grant_route(req, "revoke"); };
 
@@ -6694,6 +6760,18 @@ void server_routes::init_routes() {
         }
         if (!body.contains("id") || !body.at("id").is_number_integer()) {
             res->error(format_error_response("\"id\" (an integer adapter id) is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (body.value("ticket", false)) {
+            // a ticketed unload answers at once; its result arrives on GET /learn/events (card 7fc7e2ce)
+            server_task task(SERVER_TASK_TYPE_UNLOAD_LORA);
+            task.id          = queue_tasks.get_new_id();
+            task.unload_lora = body.at("id").get<int32_t>();
+            task.unload_engine = body.at("engine").get<std::string>();
+            const int ticket = task.id;
+            queue_results.add_ticket(ticket);
+            queue_tasks.post(std::move(task));
+            res->ok({{"ticket", ticket}});
             return res;
         }
         auto & rd = res->rd;

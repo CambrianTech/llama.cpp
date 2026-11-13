@@ -481,6 +481,18 @@ void server_response::send(server_task_result_ptr && result) {
     RES_DBG("sending result for task id = %d\n", result->id);
 
     std::unique_lock<std::mutex> lock(mutex_results);
+    if (ticketed_ids.erase(result->id) > 0) {
+        // stored before the notify, under the same lock the streams wait with (no lost wakeup)
+        if (!ticket_queues.empty()) {
+            const std::string event = "data: " + safe_json_to_str({
+                {"ticket", result->id}, {"error", result->is_error()}, {"result", result->to_json()}}) + "\n\n";
+            for (auto & [subscriber, queue] : ticket_queues) {
+                queue.push_back(event);
+            }
+            condition_results.notify_all();
+        }
+        return;
+    }
     for (const auto & id_task : waiting_task_ids) {
         if (result->id == id_task) {
             RES_DBG("task id = %d pushed to result queue\n", result->id);
@@ -618,4 +630,36 @@ void server_response_reader::stop() {
     } else {
         SRV_DBG("%s", "all tasks already finished, no need to cancel\n");
     }
+}
+
+void server_response::add_ticket(int id_task) {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    ticketed_ids.insert(id_task);
+}
+
+int server_response::subscribe_tickets() {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    const int subscriber = next_ticket_subscriber++;
+    ticket_queues[subscriber];
+    return subscriber;
+}
+
+void server_response::unsubscribe_tickets(int subscriber) {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    ticket_queues.erase(subscriber); // what it never read is gone with it
+}
+
+std::string server_response::next_ticket(int subscriber, int timeout) {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    condition_results.wait_for(lock, std::chrono::seconds(timeout), [&] {
+        auto it = ticket_queues.find(subscriber);
+        return !running || it == ticket_queues.end() || !it->second.empty();
+    });
+    auto it = ticket_queues.find(subscriber);
+    if (!running || it == ticket_queues.end() || it->second.empty()) {
+        return {};
+    }
+    std::string event = std::move(it->second.front());
+    it->second.pop_front();
+    return event;
 }
