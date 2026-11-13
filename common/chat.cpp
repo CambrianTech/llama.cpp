@@ -117,6 +117,7 @@ json common_chat_msg_delimiters::to_json() const {
         result.push_back({
             { "role",      common_chat_role_to_string(d.role) },
             { "delimiter", d.delimiter                        },
+            { "groups_consecutive", d.groups_consecutive      },
         });
     }
     return result;
@@ -137,6 +138,8 @@ common_chat_msg_delimiters common_chat_msg_delimiters_parse(const json & delimit
         result.delimiters.push_back({
             common_chat_role_from_string(d.value("role", std::string())),
             d.value("delimiter", std::string()),
+            {},
+            d.at("groups_consecutive").get<bool>(),
         });
     }
 
@@ -150,7 +153,7 @@ void common_chat_msg_delimiters::tokenize(const llama_vocab * vocab) {
 }
 
 common_chat_msg_spans common_chat_msg_delimiters::split(const llama_tokens & tokens, const std::map<size_t, size_t> & skips) const {
-    std::vector<std::pair<common_chat_role, size_t>> matches;
+    std::vector<common_chat_msg_span> matches;
 
     auto skip = skips.begin();
     for (size_t i = 0; i < tokens.size();) {
@@ -164,20 +167,20 @@ common_chat_msg_spans common_chat_msg_delimiters::split(const llama_tokens & tok
                 continue;
             }
             if (std::equal(d.tokens.begin(), d.tokens.end(), tokens.begin() + i)) {
-                matches.emplace_back(d.role, i);
+                matches.push_back({ d.role, i, 0, d.groups_consecutive });
                 break;
             }
         }
         i++;
     }
 
-    matches.emplace_back(COMMON_CHAT_ROLE_UNKNOWN, tokens.size());
+    matches.push_back({ COMMON_CHAT_ROLE_UNKNOWN, tokens.size(), 0 });
 
     common_chat_msg_spans spans;
     for (size_t i = 0; i + 1 < matches.size(); i++) {
         const auto & curr = matches[i];
         const auto & next = matches[i + 1];
-        spans.add(curr.first, curr.second, next.second - curr.second);
+        spans.add(curr.role, curr.pos, next.pos - curr.pos, curr.groups_consecutive);
     }
 
     return spans;
@@ -1189,8 +1192,8 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
     data.message_delimiters = {
         { COMMON_CHAT_ROLE_ASSISTANT, "<|im_start|>assistant"             },
-        { COMMON_CHAT_ROLE_TOOL,      "<|im_start|>user\n<tool_response>" }, // Qwen3-Coder, Qwen3.5, Nemotron Nano 3
-        { COMMON_CHAT_ROLE_TOOL,      "<|im_start|>tool_response"         }, // StepFun-3.5-Flash
+        { COMMON_CHAT_ROLE_TOOL,      "<|im_start|>user\n<tool_response>", {}, true }, // Qwen3-Coder, Qwen3.5, Nemotron Nano 3: one header per tool run
+        { COMMON_CHAT_ROLE_TOOL,      "<|im_start|>tool_response", {}, true }, // StepFun-3.5-Flash: one header per tool run
         { COMMON_CHAT_ROLE_USER,      "<|im_start|>user"                  },
         { COMMON_CHAT_ROLE_SYSTEM,    "<|im_start|>system"                },
     };

@@ -774,7 +774,14 @@ int32_t view_end_position(const json & messages, int64_t n_view, const common_ch
         } else if (role == "assistant") {
             span = COMMON_CHAT_ROLE_ASSISTANT;
         } else if (role == "tool") {
-            span = declared(COMMON_CHAT_ROLE_TOOL) ? COMMON_CHAT_ROLE_TOOL
+            // The matched delimiter, not merely the existence of a TOOL role,
+            // owns whether this template renders a whole run in one span.
+            const bool grouped = previous == "tool" && !expected.empty() &&
+                expected.size() <= spans.spans.size() &&
+                spans.spans[expected.size() - 1].role == COMMON_CHAT_ROLE_TOOL &&
+                spans.spans[expected.size() - 1].groups_consecutive;
+            span = grouped ? COMMON_CHAT_ROLE_UNKNOWN
+                 : declared(COMMON_CHAT_ROLE_TOOL) ? COMMON_CHAT_ROLE_TOOL
                  : previous == "tool"               ? COMMON_CHAT_ROLE_UNKNOWN
                                                     : COMMON_CHAT_ROLE_USER;
         } else {
