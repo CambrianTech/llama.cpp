@@ -211,15 +211,32 @@ bool llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
     GGML_ASSERT(!opt_configured());
     // The training window lives on this context, not the shared model (a serving context may
-    // be running on the same weights).
-    opt_n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
+    // be running on the same weights). The window is walked in whole chunks of one batch, so it
+    // is a multiple of the batch. A window the request NAMES must already be one: a request
+    // that does not divide is refused like any untrainable ask, never an abort (one learn
+    // request asserted the M5's serving engine down on 2026-11-13 20:58Z, with four minds on
+    // it). A window taken from the context's own size (n_ctx, sized live from memory, e.g.
+    // 136,192 = 66.5 batches) keeps its whole chunks: the remainder, under one batch, is no
+    // chunk the walk could train.
+    const uint32_t window = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
+    const uint32_t n_batch  = std::min(this->n_batch(), window);
+    if (n_batch == 0) {
+        opt_failure = "the training window is empty";
+        return false;
+    }
+    const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
+    if (n_batch % n_ubatch != 0) {
+        opt_failure = "this context's batch is not a whole number of ubatches: a chunk's backward needs all of its K/V in one ubatch";
+        return false;
+    }
+    if (lopt_params.n_ctx_train > 0 && window % n_batch != 0) {
+        opt_failure = "the requested training window is not a whole number of batches";
+        return false;
+    }
+    opt_n_ctx_train = window - window % n_batch;
     opt_walk_exact   = lopt_params.walk_exact;
     opt_walk_horizon_req = lopt_params.walk_horizon;
     opt_walk_horizon     = lopt_params.walk_horizon;
-    const uint32_t n_batch     = std::min(this->n_batch(),  opt_n_ctx_train);
-    const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
-    GGML_ASSERT(opt_n_ctx_train % n_batch  == 0);
-    GGML_ASSERT(n_batch                    % n_ubatch == 0);
     // A training graph cannot backprop through the KV cache (SET_ROWS writes in place and
     // attention reads the cache as a leaf), so attention consumes this chunk's K/V directly
     // and the context before it from the cache as a constant (build_attn); opt_epoch_iter
