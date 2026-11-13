@@ -6669,7 +6669,8 @@ void server_routes::init_routes() {
     // active consumer (a learner's step), and raises it again after (card 494c99f1).
     this->post_prompt_cache_limit = [this](const server_http_req & req) {
         auto res = create_response();
-        const json body = req.body.empty() ? json::object() : json::parse(req.body, nullptr, false);
+        // A malformed body throws common_json_error, which this route's ex_wrapper answers as an error.
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
         // 0 would mean "no limit" to the cache itself, so a release to nothing is 1 MiB, never 0; and the
         // limit in bytes must fit a size_t, so a value past it is refused, never wrapped (Cormac on #110).
         constexpr int64_t max_mib = (int64_t) (SIZE_MAX >> 20) < INT64_MAX ? (int64_t) (SIZE_MAX >> 20) : INT64_MAX;
