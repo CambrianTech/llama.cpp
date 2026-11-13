@@ -157,6 +157,7 @@ struct common_chat_msg_span {
     common_chat_role role = COMMON_CHAT_ROLE_UNKNOWN;
     std::size_t pos = 0;
     std::size_t len = 0;
+    bool groups_consecutive = false;
 
     bool valid() const {
         return role != COMMON_CHAT_ROLE_UNKNOWN;
@@ -166,8 +167,8 @@ struct common_chat_msg_span {
 struct common_chat_msg_spans {
     std::vector<common_chat_msg_span> spans;
 
-    void add(common_chat_role role, size_t pos, size_t len) {
-        spans.push_back({ role, pos, len });
+    void add(common_chat_role role, size_t pos, size_t len, bool groups_consecutive = false) {
+        spans.push_back({ role, pos, len, groups_consecutive });
     }
 
     bool is_user_start(int32_t pos) const {
@@ -193,6 +194,8 @@ struct common_chat_msg_delimiter {
     common_chat_role role = COMMON_CHAT_ROLE_UNKNOWN;
     std::string      delimiter;
     llama_tokens     tokens = {};
+    // One rendered span contains a run of consecutive messages with this role.
+    bool groups_consecutive = false;
 };
 
 struct common_chat_msg_delimiters {

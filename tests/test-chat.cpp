@@ -1795,6 +1795,28 @@ static void test_view_end_position() {
     // no generation-prompt span: the end of the prompt
     const llama_tokens closed(tokens.begin(), tokens.end() - 2);
     assert_equals<int32_t>((int32_t) closed.size(), view_end_position(messages, 6, delims, delims.split(closed), closed.size(), refusal));
+
+    // Qwen's declared TOOL delimiter opens one span for consecutive tool replies.
+    // A separate-tool template must retain one span per reply instead.
+    const json replies = json::array({
+        {{"role", "assistant"}}, {{"role", "tool"}},
+        {{"role", "tool"}}, {{"role", "user"}},
+    });
+    common_chat_msg_delimiters grouped = {
+        {COMMON_CHAT_ROLE_ASSISTANT, "assistant", {10, 12}},
+        {COMMON_CHAT_ROLE_TOOL, "tool-run", {10, 13}, true},
+        {COMMON_CHAT_ROLE_USER, "user", {10, 11}},
+    };
+    const llama_tokens grouped_tokens = {10, 12, 100, 10, 13, 200, 201, 10, 11, 300, 10, 12};
+    const auto grouped_spans = grouped.split(grouped_tokens);
+    assert_equals<int32_t>(7, view_end_position(replies, 3, grouped, grouped_spans, grouped_tokens.size(), refusal));
+    assert_equals<int32_t>(3, view_end_position(replies, 2, grouped, grouped_spans, grouped_tokens.size(), refusal));
+    const auto decoded = common_chat_msg_delimiters_parse(grouped.to_json());
+    assert_equals(true, decoded.delimiters[1].groups_consecutive);
+    assert_equals(false, decoded.delimiters[0].groups_consecutive);
+    grouped.delimiters[1].groups_consecutive = false;
+    const llama_tokens separate_tokens = {10, 12, 100, 10, 13, 200, 10, 13, 201, 10, 11, 300, 10, 12};
+    assert_equals<int32_t>(9, view_end_position(replies, 3, grouped, grouped.split(separate_tokens), separate_tokens.size(), refusal));
 }
 
 static void test_tools_oaicompat_json_conversion() {
