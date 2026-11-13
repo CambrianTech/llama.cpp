@@ -3342,6 +3342,26 @@ private:
             case SERVER_TASK_TYPE_LEARN_GRANTS:
                 process_learn_grants(task);
                 break;
+            case SERVER_TASK_TYPE_PROMPT_CACHE_LIMIT:
+                {
+                    // The host prompt cache gives its bytes back: a cache is never need (card 494c99f1).
+                    // The limit is lowered or raised, and update() evicts the oldest states until the
+                    // cache fits it. The reply is what the cache holds now, so the core frees exactly
+                    // what it measured, never what it hoped.
+                    auto result = std::make_unique<server_task_result_learn_grants>();
+                    result->id = task.id;
+                    if (!prompt_cache) {
+                        result->receipt = {{"refusal", "prompt_cache_disabled"}};
+                    } else {
+                        const size_t before = prompt_cache->size();
+                        prompt_cache->limit_size = 1024ull * 1024ull * (size_t) task.prompt_cache_limit_mib;
+                        prompt_cache->update();
+                        result->receipt = {{"refusal", "none"}, {"limit_mib", task.prompt_cache_limit_mib},
+                            {"held_bytes", prompt_cache->size()}, {"freed_bytes", before - std::min(before, prompt_cache->size())},
+                            {"states", prompt_cache->states.size()}};
+                    }
+                    queue_results.send(std::move(result));
+                } break;
             case SERVER_TASK_TYPE_LEARN:
                 {
                     if (!task.restore_checkpoint.is_null()) {
@@ -6648,6 +6668,30 @@ void server_routes::init_routes() {
     this->get_learn_grants = [this](const server_http_req &) {
         auto res = create_response();
         res->ok(ctx_server.ledger_as_published());
+        return res;
+    };
+
+    // A cache is never need: the core lowers the host prompt cache's limit to give its bytes to an
+    // active consumer (a learner's step), and raises it again after (card 494c99f1).
+    this->post_prompt_cache_limit = [this](const server_http_req & req) {
+        auto res = create_response();
+        // A malformed body throws common_json_error, which this route's ex_wrapper answers as an error.
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        // 0 would mean "no limit" to the cache itself, so a release to nothing is 1 MiB, never 0; and the
+        // limit in bytes must fit a size_t, so a value past it is refused, never wrapped (Cormac on #110).
+        constexpr int64_t max_mib = (int64_t) (SIZE_MAX >> 20) < INT64_MAX ? (int64_t) (SIZE_MAX >> 20) : INT64_MAX;
+        if (!body.is_object() || !body.contains("limit_mib") || !body.at("limit_mib").is_number_integer()
+                || body.at("limit_mib").get<int64_t>() < 1 || body.at("limit_mib").get<int64_t>() > max_mib) {
+            res->error(format_error_response("limit_mib must be an integer from 1 to the bytes a size_t holds, in MiB", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_PROMPT_CACHE_LIMIT);
+        task.prompt_cache_limit_mib = body.at("limit_mib").get<int64_t>();
+        auto & rd = res->rd;
+        task.id = rd.get_new_id();
+        rd.post_task(std::move(task));
+        auto result = rd.next(req.should_stop);
+        if (result) { res->ok(result->to_json()); }
         return res;
     };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
