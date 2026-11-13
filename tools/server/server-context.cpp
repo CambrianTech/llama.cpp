@@ -884,6 +884,12 @@ public:
     // serving slots working right now, refreshed by the loop at the start and end of every
     // update_slots pass; the trainer reads it between batches (see server-train.h)
     std::atomic<int> n_busy_slots{0};
+
+    // The most one sequence may hold: llama_n_ctx_seq capped at the model's training context.
+    // ONE value, set at load: every slot is sized from it and context_geometry reports it, so
+    // the report never names a size the slots refuse (it said 524288 while each slot capped at
+    // 262144, the M5 2026-11-11).
+    int n_ctx_slot = 0;
     void publish_busy_slots() {
         int n = 0;
         for (const auto & slot : slots) {
@@ -1389,7 +1395,7 @@ private:
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
-        int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
+        n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
             n_ctx_slot = n_ctx_train;
@@ -5104,7 +5110,7 @@ server_context_meta server_context::get_meta() const {
         }(),
         /* context_geometry       */ json {
             { "allocated_tokens",        llama_n_ctx(impl->ctx_tgt) },
-            { "max_tokens_per_sequence", llama_n_ctx_seq(impl->ctx_tgt) },
+            { "max_tokens_per_sequence", impl->n_ctx_slot },
             { "sequence_capacity",       llama_n_seq_max(impl->ctx_tgt) },
         },
     };
