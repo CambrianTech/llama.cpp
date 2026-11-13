@@ -966,7 +966,11 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     if (opt_ctx == nullptr) {
         return;
     }
-    GGML_ASSERT(!opt_ctx->allocation_pending && !ggml_backend_sched_graph_pending(opt_ctx->backend_sched));
+    // Freeing releases only this context's own buffers and metadata, never the shared scheduler,
+    // so another context's graph may be mid-step (an idle mind unloads while another learns,
+    // llama_context::opt_release). This context's OWN graph must not be the one in flight.
+    GGML_ASSERT(!opt_ctx->allocation_pending &&
+                !ggml_backend_sched_graph_pending_for(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy));
     ggml_backend_buffer_free(opt_ctx->buf_static);
     ggml_backend_buffer_free(opt_ctx->buf_cpu);
     ggml_free(opt_ctx->ctx_static);
