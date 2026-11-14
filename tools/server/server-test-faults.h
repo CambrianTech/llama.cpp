@@ -20,6 +20,10 @@ struct server_test_faults {
     int32_t prompt_checkpoints = 0; // LLAMA_SERVER_TEST_FAIL_CHECKPOINTS: the next N prompt checkpoint copies fail to allocate
     int32_t spec_checkpoints   = 0; // LLAMA_SERVER_TEST_FAIL_SPEC_CHECKPOINTS: the next N speculative checkpoint copies fail to allocate
     int32_t prompt_fills       = 0; // LLAMA_SERVER_TEST_FAIL_PROMPT_FILLS: the next N prompt fills throw after adding their tokens
+    // LLAMA_SERVER_TEST_STEP_DELAY_MS: every decode step that ran a batch then waits N ms, so a test
+    // can act while generations are in progress on a model that would otherwise finish in milliseconds
+    // (the reconfigure test); a pace, not a failure
+    int32_t step_delay_ms      = 0;
 
     static server_test_faults from_env() {
         server_test_faults faults;
@@ -27,12 +31,13 @@ struct server_test_faults {
         faults.prompt_checkpoints = read("LLAMA_SERVER_TEST_FAIL_CHECKPOINTS");
         faults.spec_checkpoints   = read("LLAMA_SERVER_TEST_FAIL_SPEC_CHECKPOINTS");
         faults.prompt_fills       = read("LLAMA_SERVER_TEST_FAIL_PROMPT_FILLS");
+        faults.step_delay_ms      = read("LLAMA_SERVER_TEST_STEP_DELAY_MS");
 #endif
         return faults;
     }
 
     bool any() const {
-        return prompt_checkpoints || spec_checkpoints || prompt_fills;
+        return prompt_checkpoints || spec_checkpoints || prompt_fills || step_delay_ms;
     }
 
     // true when this occurrence is one to fail, counting it
