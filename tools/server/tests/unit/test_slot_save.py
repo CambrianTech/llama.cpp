@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import IO
 
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
 STATE_FILE_HEADER_SIZE = 12
@@ -242,6 +243,10 @@ def test_deferred_restore_is_bound_to_its_slot():
     assert res.status_code == 200
     res = server.make_request("POST", "/slots/0?action=save", data={"filename": "page.bin"})
     assert res.status_code == 200 and res.body["n_saved"] > 0
+    # Room for both restores' pages at once, as the core sets it from its host room: binding, not the
+    # page IO budget, is what this test is about (unset, the budget admits one switch at a time).
+    page_bytes = sum((Path(server.slot_save_path) / ("page.bin" + suffix)).stat().st_size for suffix in ("", ".ckpt", ".lora"))
+    assert server.make_request("POST", "/page-io/budget", data={"budget_bytes": 2 * page_bytes}).status_code == 200
 
     done0 = threading.Event()
     done1 = threading.Event()
@@ -794,3 +799,151 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert res.body["content"] == content
+
+
+# Continuum fork: a page switch's file IO runs on a worker, off the task loop (server-page-io.h).
+# LLAMA_SERVER_TEST_PAGE_IO_GATE names a FIFO each switch's IO reads one byte from before it starts:
+# opening the FIFO's write end returns once that IO is waiting, and the byte written releases it, so
+# these tests hold IO in flight without sleeping.
+
+class HeldPageIo:
+    def __init__(self, gate: str, request):
+        self.result: dict = {}
+        self.writer: IO[bytes] | None = None
+        either = threading.Event()
+
+        def run():
+            self.result["res"] = request()
+            either.set()
+
+        def open_gate():
+            self.writer = open(gate, "wb")  # returns once the switch's IO opened the read end
+            either.set()
+
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+        threading.Thread(target=open_gate, daemon=True).start()
+        assert either.wait(DEFAULT_HTTP_TIMEOUT), "the page switch neither reached the gate nor answered"
+        if self.writer is None:
+            # answered without waiting at the gate: the server was built without the test faults
+            os.close(os.open(gate, os.O_RDONLY | os.O_NONBLOCK))  # unblock the opener
+            pytest.skip("llama-server was built without -DLLAMA_SERVER_TEST_FAULTS=ON")
+
+    def release(self):
+        assert self.writer is not None
+        self.writer.write(b"\x01")
+        self.writer.close()
+        self.thread.join(timeout=DEFAULT_HTTP_TIMEOUT)
+        assert not self.thread.is_alive(), "the page switch never answered after its IO was released"
+        return self.result["res"]
+
+
+def start_with_page_io_gate(monkeypatch, tmp_path) -> str:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("the page IO gate is a FIFO")
+    gate = str(tmp_path / "page-io-gate")
+    os.mkfifo(gate)
+    monkeypatch.setenv("LLAMA_SERVER_TEST_PAGE_IO_GATE", gate)
+    server.server_slots = True
+    server.start()
+    return gate
+
+
+def test_decode_continues_while_a_save_is_written(monkeypatch, tmp_path):
+    # what this catches (the M5 2026-11-14): a save's disk write stalling every other slot's decode.
+    # Slot 0's save is held in its file write; slot 1 runs a whole completion meanwhile, and the save
+    # answers once released, with the loop's copy and the worker's IO timed apart.
+    gate = start_with_page_io_gate(monkeypatch, tmp_path)
+    assert server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?", "id_slot": 0, "cache_prompt": True,
+    }).status_code == 200
+
+    held = HeldPageIo(gate, lambda: server.make_request("POST", "/slots/0?action=save", data={"filename": "held.bin"}))
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Tell me a story about a cat.", "id_slot": 1, "n_predict": 16, "cache_prompt": True,
+    })
+    assert res.status_code == 200 and res.body["timings"]["predicted_n"] > 0
+    assert held.thread.is_alive(), "the save answered before its file was written"
+
+    saved = held.release()
+    assert saved.status_code == 200 and saved.body["n_saved"] == 84
+    assert saved.body["page_io"]["io_bytes"] > 0 and saved.body["page_io"]["io_budget_bytes"] == 0
+    assert saved.body["page_io"]["io_bytes_in_flight"] == 0, "a written save returns its bytes before its receipt"
+    timings = saved.body["timings"]
+    assert timings["copy_ms"] >= 0 and timings["io_ms"] >= 0
+    assert abs(timings["save_ms"] - (timings["copy_ms"] + timings["io_ms"])) < 1e-6
+    # the file it wrote is the library's own page: it restores
+    restore = HeldPageIo(gate, lambda: server.make_request("POST", "/slots/1?action=restore", data={"filename": "held.bin"}))
+    restored = restore.release()
+    assert restored.status_code == 200 and restored.body["n_restored"] == 84
+    assert "copy_ms" in restored.body["timings"] and "io_ms" in restored.body["timings"]
+
+
+def test_a_restore_into_a_slot_given_another_task_meanwhile_is_refused(monkeypatch, tmp_path):
+    # what this catches: a restore read on a worker applied over a slot that was given another task
+    # while the page was read, destroying that task's KV. It is refused, typed, and the occupant's
+    # cache is kept.
+    gate = start_with_page_io_gate(monkeypatch, tmp_path)
+    assert server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of France?", "id_slot": 1, "cache_prompt": True,
+    }).status_code == 200
+    saved = HeldPageIo(gate, lambda: server.make_request("POST", "/slots/1?action=save", data={"filename": "page.bin"})).release()
+    assert saved.status_code == 200
+
+    restore = HeldPageIo(gate, lambda: server.make_request("POST", "/slots/0?action=restore", data={"filename": "page.bin"}))
+    held = server.make_request("GET", "/page-io")
+    assert held.status_code == 200 and held.body["in_flight_bytes"] > 0, "the restore holds its page's bytes"
+    occupant = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Germany?", "id_slot": 0, "cache_prompt": True,
+    })
+    assert occupant.status_code == 200
+    # Fable on #118: the slot was given another task, so the restore's bytes return at once, while its
+    # read is still held, not when it completes
+    dropped = server.make_request("GET", "/page-io")
+    assert dropped.body["in_flight_bytes"] == 0 and dropped.body["waiting"] == 0
+
+    refused = restore.release()
+    assert refused.status_code == 400
+    assert refused.body["error"]["type"] == "invalid_request_error"
+    assert refused.body["error"]["refusal"] == "slot_reassigned"
+
+    again = server.make_request("POST", "/completion", data={
+        "prompt": "What is the capital of Germany?", "id_slot": 0, "cache_prompt": True,
+    })
+    assert again.status_code == 200
+    assert again.body["timings"]["prompt_n"] == 1, "the occupant's cache was kept, not overwritten by the page"
+
+
+def test_page_io_budget_admits_a_waiting_switch_when_room_is_made(monkeypatch, tmp_path):
+    # what this catches (Fable on #118, the M5 at 0.1 GB free): page switches allocating without a
+    # bound. Unset, the budget admits one switch at a time: a second save waits, holding nothing,
+    # until the first returns its bytes; the core's budget is set at runtime and reported.
+    gate = start_with_page_io_gate(monkeypatch, tmp_path)
+    for slot in (0, 1):
+        assert server.make_request("POST", "/completion", data={
+            "prompt": "What is the capital of France?", "id_slot": slot, "cache_prompt": True,
+        }).status_code == 200
+    assert server.make_request("GET", "/page-io").body == {"budget_bytes": 0, "in_flight_bytes": 0, "waiting": 0}
+
+    first = HeldPageIo(gate, lambda: server.make_request("POST", "/slots/0?action=save", data={"filename": "first.bin"}))
+    second_result: dict = {}
+    second = threading.Thread(target=lambda: second_result.update(
+        res=server.make_request("POST", "/slots/1?action=save", data={"filename": "second.bin"})), daemon=True)
+    second.start()
+    # the second save reaches the budget before the first's IO is released: it waits, holding nothing
+    # beyond the first's bytes (GET /page-io is answered off the task loop)
+    status = server.make_request("GET", "/page-io").body
+    held_bytes = status["in_flight_bytes"]
+    assert held_bytes > 0
+    assert server.make_request("POST", "/page-io/budget", data={"budget_bytes": -1}).status_code == 400
+
+    saved = first.release()
+    assert saved.status_code == 200
+    # the first's release admitted the second; its IO now waits at the gate in turn
+    with open(gate, "wb") as release:
+        release.write(b"\x01")
+    second.join(timeout=DEFAULT_HTTP_TIMEOUT)
+    assert second_result["res"].status_code == 200 and second_result["res"].body["n_saved"] == 84
+
+    raised = server.make_request("POST", "/page-io/budget", data={"budget_bytes": 4 * held_bytes})
+    assert raised.status_code == 200 and raised.body == {"budget_bytes": 4 * held_bytes, "in_flight_bytes": 0, "waiting": 0}

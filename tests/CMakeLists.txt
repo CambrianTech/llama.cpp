@@ -18,6 +18,14 @@ target_compile_features(test-server-page-adapters PRIVATE cxx_std_17)
 add_test(NAME test-server-page-adapters COMMAND test-server-page-adapters)
 set_tests_properties(test-server-page-adapters PROPERTIES LABELS "main")
 
+# Model-free validator: KV page file IO off the task loop (a worker pool, one switch per file at a time).
+add_executable(test-server-page-io test-server-page-io.cpp)
+target_compile_features(test-server-page-io PRIVATE cxx_std_17)
+find_package(Threads REQUIRED)
+target_link_libraries(test-server-page-io PRIVATE Threads::Threads)
+add_test(NAME test-server-page-io COMMAND test-server-page-io)
+set_tests_properties(test-server-page-io PROPERTIES LABELS "main")
+
 # Model-free learning-budget validator: the ledger every learning step debits.
 add_executable(test-server-learn-ledger test-server-learn-ledger.cpp)
 target_compile_features(test-server-learn-ledger PRIVATE cxx_std_17)
