@@ -3765,8 +3765,17 @@ private:
 
         // one batch wears one adapter set: the longest-unserved slot's set holds it, so no set
         // starves another (server-adapter-turn.h). The holder is stamped even if it adds nothing
-        // this batch, so a slot that cannot progress yields the turn instead of keeping it.
+        // this batch, so a slot that cannot progress yields the turn instead of keeping it. It only
+        // decides compatibility: `slot_batched` is still the first slot that adds tokens, so a
+        // holder released mid-batch (a prompt over its context) is never the batch's slot.
         const int64_t t_batch_us = ggml_time_us();
+        server_slot * holder = nullptr;
+        // the slot a candidate must batch with: the batch's own slot once one added tokens, else the holder
+        const auto batches_with = [&](server_slot & slot) {
+            const server_slot * reference = slot_batched ? slot_batched
+                : (holder && holder->is_processing() ? holder : nullptr);
+            return reference == nullptr || reference->can_batch_with(slot);
+        };
         {
             std::vector<server_batch_claim> claims;
             claims.reserve(slots.size());
@@ -3777,8 +3786,8 @@ private:
                 claims.push_back({ waiting, slot.t_last_batched_us });
             }
             if (const auto turn = server_adapter_turn(claims)) {
-                slot_batched = &slots[*turn];
-                slot_batched->t_last_batched_us = t_batch_us;
+                holder = &slots[*turn];
+                holder->t_last_batched_us = t_batch_us;
             }
         }
 
@@ -3791,11 +3800,12 @@ private:
                 return;
             }
 
-            // check if we can batch this slot with the previous one
+            // check if we can batch this slot with the previous one (or the holder's set)
+            if (!batches_with(slot)) {
+                return;
+            }
             if (!slot_batched) {
                 slot_batched = &slot;
-            } else if (!slot_batched->can_batch_with(slot)) {
-                return;
             }
 
             generating.push_back(&slot);
@@ -3931,8 +3941,8 @@ private:
                     return;
                 }
 
-                // check if we can batch this slot with the previous one
-                if (slot_batched && !slot_batched->can_batch_with(slot)) {
+                // check if we can batch this slot with the previous one (or the holder's set)
+                if (!batches_with(slot)) {
                     return;
                 }
 
