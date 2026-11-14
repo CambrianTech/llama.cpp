@@ -64,6 +64,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_UNLOAD_LORA,
     SERVER_TASK_TYPE_LEARN,
     SERVER_TASK_TYPE_LEARN_GRANTS,
+    SERVER_TASK_TYPE_PROMPT_CACHE_LIMIT,
     SERVER_TASK_TYPE_RECONFIGURE, // Continuum fork: grow or shrink the contexts live (server-reconfigure.h)
 };
 
@@ -290,6 +291,9 @@ struct server_task {
     std::string unload_engine;
 
     json learn_grants; // authority operation, processed on the serving queue
+    // Continuum fork: the host prompt cache's new limit in MiB (POST /prompt-cache/limit). A cache is
+    // never need: the core gives its bytes back when an active consumer needs them (card 494c99f1).
+    int64_t prompt_cache_limit_mib = -1;
 
     // used by SERVER_TASK_TYPE_LEARN
     learn_request learn;

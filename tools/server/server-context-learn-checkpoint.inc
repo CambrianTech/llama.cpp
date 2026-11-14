@@ -42,8 +42,8 @@
             gguf_get_val_i64(metadata.get(), iteration) <= 0 ||
             gguf_get_val_i64(metadata.get(), iteration) - 1 != steps ||
             std::string(gguf_get_val_str(metadata.get(), bound)) != binding) { return refuse("optimizer generation mismatch"); }
-        // a deleter type, not decltype(&fclose): fclose's attributes are dropped from a template argument (-Wignored-attributes)
-        struct file_closer { void operator()(FILE * f) const { fclose(f); } };
+        // a closer type, not decltype(&fclose): fclose's attributes are dropped in a template argument (-Wignored-attributes)
+        struct file_closer { void operator()(FILE * file) const { if (file) { fclose(file); } } };
         std::unique_ptr<FILE, file_closer> weights(fopen((path + "/adapter.gguf").c_str(), "rb"));
         std::unique_ptr<FILE, file_closer> optimizer(fopen((path + "/optimizer.gguf").c_str(), "rb"));
         if (!weights || !optimizer) { return refuse("checkpoint components unreadable"); }

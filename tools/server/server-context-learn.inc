@@ -226,9 +226,18 @@
             learn_ledger.revoke(body.value("id", std::string()), now);
             out["revoked"] = true; // idempotent: this id can admit no new work
         }
-        out["max_period_ms"] = server_learn_ledger::kMaxPeriodMs;
-        out["max_expiry_ms"] = server_learn_ledger::kMaxPeriodMs;
-        out["grants"] = json::array();
+        const json receipt = ledger_receipt(now);
+        for (const auto & entry : receipt.items()) { out[entry.key()] = entry.value(); }
+        out["residencies"] = residency_snapshot();
+        result->receipt = std::move(out);
+        queue_results.send(std::move(result));
+    }
+
+    // The loop-owned half of the ledger (grants, their use, the memory the optimizer holds), read
+    // ON THE LOOP: the reply to a mutation, and the snapshot every boundary publishes.
+    json ledger_receipt(int64_t now) const {
+        json out = {{"max_period_ms", server_learn_ledger::kMaxPeriodMs}, {"max_expiry_ms", server_learn_ledger::kMaxPeriodMs},
+            {"grants", json::array()}};
         for (const auto & a : learn_ledger.snapshot()) {
             out["grants"].push_back({{"id", a.grant.id}, {"period_ms", a.grant.period_ms},
                 {"max_chunk_us", a.grant.max_chunk_us}, {"share_ppm", a.grant.share_ppm}, {"expires_at_us", a.grant.expires_at_us},
@@ -240,9 +249,55 @@
             }
         }
         out["memory"] = learn_memory_receipt();
+        return out;
+    }
+
+    // A control read never queues behind the work it reports on (card 7fc7e2ce, Fable's design):
+    // the loop publishes its half of the ledger at every task and slot-update boundary, stamped,
+    // and a reader on any thread takes the last publication plus the residency mirror (its own
+    // mutex). At most one boundary stale, and the stamp says when.
+    struct ledger_publication {
+        std::mutex mutex;
+        std::condition_variable published; // signalled at every publication: the wait-on-ticket wake
+        json receipt;
+        uint64_t sequence = 0;
+    };
+    mutable ledger_publication ledger_published;
+    uint64_t ledger_published_revision = 0; // loop-owned: the ledger revision the last publication holds
+
+    // ON THE LOOP, at a slot-update boundary: publish only when the ledger changed since the last
+    // publication (a task boundary, below, always publishes).
+    void publish_ledger_if_changed() {
+        if (learn_ledger.revision() != ledger_published_revision) {
+            publish_ledger();
+        }
+    }
+
+    // ON THE LOOP, at a boundary.
+    void publish_ledger() {
+        ledger_published_revision = learn_ledger.revision();
+        const auto now = ggml_time_us();
+        json receipt = ledger_receipt(now);
+        receipt["clock_us"] = now;
+        {
+            std::lock_guard<std::mutex> lock(ledger_published.mutex);
+            receipt["sequence"] = ++ledger_published.sequence;
+            ledger_published.receipt = std::move(receipt);
+        }
+        ledger_published.published.notify_all();
+    }
+
+    // ANY THREAD: the last publication, the live residency mirror and the engine identity (const).
+    json published_ledger() const {
+        json out;
+        {
+            std::lock_guard<std::mutex> lock(ledger_published.mutex);
+            out = ledger_published.receipt;
+        }
+        out["engine"] = learn_engine;
+        out["refusal"] = "none";
         out["residencies"] = residency_snapshot();
-        result->receipt = std::move(out);
-        queue_results.send(std::move(result));
+        return out;
     }
 
 
@@ -392,17 +447,8 @@
         const bool begun = llama_opt_learn_begin(ctx_tgt, slot.id, n0, toks.data(), labels.data(), (int32_t) toks.size(),
             served_tokens.data() + n0, (int32_t) served_tokens.size() - n0, result);
         common_set_adapter_lora(ctx_tgt, slot.lora);
-        // value-initialized, then named field by field: every member a learn does not set keeps its default
-        learning = std::make_unique<pending_learn>();
-        learning->slot        = &slot;
-        learning->checkpoint  = cp;
-        learning->adapters    = std::move(set);
-        learning->result      = result;
-        learning->last_prompt = toks[0];
-        learning->prefix      = L.n_prefix;
-        learning->n_labels    = (int32_t) toks.size() - 1;
-        learning->shadow      = loras[L.lora_id].ptr;
-        learning->started     = t0;
+        learning = std::make_unique<pending_learn>(&slot, cp, std::move(set), result,
+            toks[0], L.n_prefix, (int32_t) toks.size() - 1, loras[L.lora_id].ptr, t0);
         learning->began = begun;
         learning->grant = L.grant;
         learning->lora_id = L.lora_id;

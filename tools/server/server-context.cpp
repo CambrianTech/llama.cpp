@@ -12,6 +12,7 @@
 #include "server-stream.h"
 #include "server-page-adapters.h"
 #include "server-prefill.h"
+#include "server-adapter-turn.h"
 #include "server-learn-ledger.h"
 #include "server-learn-residency.h"
 #include "server-reconfigure.h"
@@ -384,6 +385,8 @@ struct server_slot {
 
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
+    // when its tokens last entered a batch, or its task arrived: who holds the batch (server-adapter-turn.h)
+    int64_t t_last_batched_us = 0;
 
     // sampling
     json json_schema;
@@ -927,6 +930,12 @@ public:
     // serving slots working right now, refreshed by the loop at the start and end of every
     // update_slots pass; the trainer reads it between batches (see server-train.h)
     std::atomic<int> n_busy_slots{0};
+
+    // The most one sequence may hold: llama_n_ctx_seq capped at the model's training context.
+    // ONE value, set at load: every slot is sized from it and context_geometry reports it, so
+    // the report never names a size the slots refuse (it said 524288 while each slot capped at
+    // 262144, the M5 2026-11-11).
+    int n_ctx_slot = 0;
     void publish_busy_slots() {
         int n = 0;
         for (const auto & slot : slots) {
@@ -953,6 +962,8 @@ public:
         catch (const std::exception &) { return "invalid"; }
     }
     const std::string & learning_engine_identity() const { return learn_engine; }
+    // the ledger as the loop last published it; readable from any thread (card 7fc7e2ce)
+    json ledger_as_published() const { return published_ledger(); }
 
     json lora_report_snapshot() const {
         std::lock_guard<std::mutex> lock(lora_report_mutex);
@@ -1052,6 +1063,13 @@ private:
         return p;
     }
     struct pending_learn {
+        // The step's identity; every other field starts at its stated default (an aggregate with
+        // only these set trips -Wmissing-field-initializers on the ARM CI build).
+        pending_learn(server_slot * slot, const common_prompt_checkpoint * checkpoint, std::vector<common_adapter_lora_info> adapters,
+                      ggml_opt_result_t result, llama_token last_prompt, int32_t prefix, int32_t n_labels,
+                      const llama_adapter_lora * shadow, int64_t started)
+            : slot(slot), checkpoint(checkpoint), adapters(std::move(adapters)), result(result), last_prompt(last_prompt),
+              prefix(prefix), n_labels(n_labels), shadow(shadow), started(started) {}
         server_slot * slot;
         const common_prompt_checkpoint * checkpoint;
         std::vector<common_adapter_lora_info> adapters;
@@ -1597,7 +1615,7 @@ private:
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
-        int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
+        n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
             SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
             n_ctx_slot = n_ctx_train;
@@ -1714,16 +1732,27 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
-            return process_single_task(std::move(task), is_yielding);
+            // the loop's own per-step continuation changes the ledger only through it (revision);
+            // every other task (a request, a ledger or adapter operation) publishes at its boundary
+            const bool continuation = task.type == SERVER_TASK_TYPE_NEXT_RESPONSE;
+            auto handled = process_single_task(std::move(task), is_yielding);
+            if (continuation) {
+                publish_ledger_if_changed();
+            } else {
+                publish_ledger();
+            }
+            return handled;
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+            publish_ledger_if_changed(); // a chunk boundary: a learn chunk moved the ledger
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
 
         metrics.init();
+        publish_ledger(); // readable before the loop's first boundary
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -2115,6 +2144,9 @@ private:
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
+
+        // its wait for a batch starts now (server-adapter-turn.h)
+        slot.t_last_batched_us = ggml_time_us();
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
@@ -3455,6 +3487,26 @@ private:
             case SERVER_TASK_TYPE_LEARN_GRANTS:
                 process_learn_grants(task);
                 break;
+            case SERVER_TASK_TYPE_PROMPT_CACHE_LIMIT:
+                {
+                    // The host prompt cache gives its bytes back: a cache is never need (card 494c99f1).
+                    // The limit is lowered or raised, and update() evicts the oldest states until the
+                    // cache fits it. The reply is what the cache holds now, so the core frees exactly
+                    // what it measured, never what it hoped.
+                    auto result = std::make_unique<server_task_result_learn_grants>();
+                    result->id = task.id;
+                    if (!prompt_cache) {
+                        result->receipt = {{"refusal", "prompt_cache_disabled"}};
+                    } else {
+                        const size_t before = prompt_cache->size();
+                        prompt_cache->limit_size = 1024ull * 1024ull * (size_t) task.prompt_cache_limit_mib;
+                        prompt_cache->update();
+                        result->receipt = {{"refusal", "none"}, {"limit_mib", task.prompt_cache_limit_mib},
+                            {"held_bytes", prompt_cache->size()}, {"freed_bytes", before - std::min(before, prompt_cache->size())},
+                            {"states", prompt_cache->states.size()}};
+                    }
+                    queue_results.send(std::move(result));
+                } break;
             case SERVER_TASK_TYPE_LEARN:
                 {
                     if (!task.restore_checkpoint.is_null()) {
@@ -3856,6 +3908,34 @@ private:
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
+        // one batch wears one adapter set: the longest-unserved slot's set holds it, so no set
+        // starves another (server-adapter-turn.h). The holder is stamped even if it adds nothing
+        // this batch, so a slot that cannot progress yields the turn instead of keeping it. It only
+        // decides compatibility: `slot_batched` is still the first slot that adds tokens, so a
+        // holder released mid-batch (a prompt over its context) is never the batch's slot.
+        const int64_t t_batch_us = ggml_time_us();
+        server_slot * holder = nullptr;
+        // the slot a candidate must batch with: the batch's own slot once one added tokens, else the holder
+        const auto batches_with = [&](server_slot & slot) {
+            const server_slot * reference = slot_batched ? slot_batched
+                : (holder && holder->is_processing() ? holder : nullptr);
+            return reference == nullptr || reference->can_batch_with(slot);
+        };
+        {
+            std::vector<server_batch_claim> claims;
+            claims.reserve(slots.size());
+            for (const auto & slot : slots) {
+                const bool waiting = slot.state == SLOT_STATE_GENERATING
+                    || slot.state == SLOT_STATE_STARTED
+                    || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+                claims.push_back({ waiting, slot.t_last_batched_us });
+            }
+            if (const auto turn = server_adapter_turn(claims)) {
+                holder = &slots[*turn];
+                holder->t_last_batched_us = t_batch_us;
+            }
+        }
+
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
@@ -3865,14 +3945,16 @@ private:
                 return;
             }
 
-            // check if we can batch this slot with the previous one
+            // check if we can batch this slot with the previous one (or the holder's set)
+            if (!batches_with(slot)) {
+                return;
+            }
             if (!slot_batched) {
                 slot_batched = &slot;
-            } else if (!slot_batched->can_batch_with(slot)) {
-                return;
             }
 
             generating.push_back(&slot);
+            slot.t_last_batched_us = t_batch_us;
 
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
@@ -4004,8 +4086,8 @@ private:
                     return;
                 }
 
-                // check if we can batch this slot with the previous one
-                if (slot_batched && !slot_batched->can_batch_with(slot)) {
+                // check if we can batch this slot with the previous one (or the holder's set)
+                if (!batches_with(slot)) {
                     return;
                 }
 
@@ -4579,6 +4661,9 @@ private:
                 }
 
                 prefill_order.served(size_t(&slot - slots.data()), batch_before, batch.size());
+                if (batch.size() > batch_before) {
+                    slot.t_last_batched_us = t_batch_us;
+                }
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
@@ -5229,7 +5314,7 @@ server_context_meta server_context::get_meta() const {
         }(),
         /* context_geometry       */ json {
             { "allocated_tokens",        llama_n_ctx(impl->ctx_tgt) },
-            { "max_tokens_per_sequence", llama_n_ctx_seq(impl->ctx_tgt) },
+            { "max_tokens_per_sequence", impl->n_ctx_slot },
             { "sequence_capacity",       llama_n_seq_max(impl->ctx_tgt) },
         },
     };
@@ -6716,6 +6801,15 @@ void server_routes::init_routes() {
             }
         }
         task.learn_grants["op"] = op;
+        if (task.learn_grants.value("ticket", false)) {
+            // a ticketed mutation answers at once; its result arrives on GET /learn/events (card 7fc7e2ce)
+            task.id = queue_tasks.get_new_id();
+            const int ticket = task.id;
+            queue_results.add_ticket(ticket);
+            queue_tasks.post(std::move(task));
+            res->ok({{"ticket", ticket}});
+            return res;
+        }
         auto & rd = res->rd;
         task.id = rd.get_new_id();
         rd.post_task(std::move(task));
@@ -6752,7 +6846,75 @@ void server_routes::init_routes() {
     this->post_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_register"); };
     this->release_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_release"); };
     this->revoke_learn_residency = [grant_route](const server_http_req & req) { return grant_route(req, "residency_revoke"); };
-    this->get_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "list"); };
+    // The learning event stream (card 7fc7e2ce): every ticketed mutation's terminal result, pushed to
+    // the one live subscriber, then gone. Opened once per engine incarnation by the core; its end is
+    // the incarnation gate (the stream drops with the engine). Idle, it sends SSE keepalives.
+    this->get_learn_events = [this](const server_http_req & req) {
+        struct ticket_stream : server_res_generator {
+            server_response & results;
+            const int subscriber;
+            ticket_stream(server_queue & tasks, server_response & results, int sleep_idle_seconds)
+                : server_res_generator(tasks, results, sleep_idle_seconds, true), results(results),
+                  subscriber(results.subscribe_tickets()) {}
+            void on_complete() override {
+                results.unsubscribe_tickets(subscriber);
+                server_res_generator::on_complete();
+            }
+        };
+        auto res = std::make_unique<ticket_stream>(queue_tasks, queue_results, params.sleep_idle_seconds);
+        res->set_req(&req); // its connection ends the stream (should_stop)
+        res->status = 200;
+        res->content_type = "text/event-stream";
+        res->data = "data: " + safe_json_to_str({{"engine", ctx_server.learning_engine_identity()}, {"subscribed", true}}) + "\n\n";
+        const int keepalive = params.sse_ping_interval > 0 ? params.sse_ping_interval : 1;
+        res->set_next([res_this = res.get(), keepalive](std::string & output) -> bool {
+            if (res_this->should_stop()) {
+                return false;
+            }
+            if (!res_this->data.empty()) {
+                output = std::move(res_this->data);
+                res_this->data.clear();
+                return true;
+            }
+            output = res_this->results.next_ticket(res_this->subscriber, keepalive);
+            if (output.empty()) {
+                output = ":\n\n"; // keepalive
+            }
+            return true;
+        });
+        return res;
+    };
+
+    // a read answers from the loop's last publication, never queued behind the chunk it reports on
+    this->get_learn_grants = [this](const server_http_req &) {
+        auto res = create_response();
+        res->ok(ctx_server.ledger_as_published());
+        return res;
+    };
+
+    // A cache is never need: the core lowers the host prompt cache's limit to give its bytes to an
+    // active consumer (a learner's step), and raises it again after (card 494c99f1).
+    this->post_prompt_cache_limit = [this](const server_http_req & req) {
+        auto res = create_response();
+        // A malformed body throws common_json_error, which this route's ex_wrapper answers as an error.
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        // 0 would mean "no limit" to the cache itself, so a release to nothing is 1 MiB, never 0; and the
+        // limit in bytes must fit a size_t, so a value past it is refused, never wrapped (Cormac on #110).
+        constexpr int64_t max_mib = (int64_t) (SIZE_MAX >> 20) < INT64_MAX ? (int64_t) (SIZE_MAX >> 20) : INT64_MAX;
+        if (!body.is_object() || !body.contains("limit_mib") || !body.at("limit_mib").is_number_integer()
+                || body.at("limit_mib").get<int64_t>() < 1 || body.at("limit_mib").get<int64_t>() > max_mib) {
+            res->error(format_error_response("limit_mib must be an integer from 1 to the bytes a size_t holds, in MiB", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_task task(SERVER_TASK_TYPE_PROMPT_CACHE_LIMIT);
+        task.prompt_cache_limit_mib = body.at("limit_mib").get<int64_t>();
+        auto & rd = res->rd;
+        task.id = rd.get_new_id();
+        rd.post_task(std::move(task));
+        auto result = rd.next(req.should_stop);
+        if (result) { res->ok(result->to_json()); }
+        return res;
+    };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
     this->revoke_learn_grant = [grant_route](const server_http_req & req) { return grant_route(req, "revoke"); };
 
@@ -6863,6 +7025,18 @@ void server_routes::init_routes() {
         }
         if (!body.contains("id") || !body.at("id").is_number_integer()) {
             res->error(format_error_response("\"id\" (an integer adapter id) is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (body.value("ticket", false)) {
+            // a ticketed unload answers at once; its result arrives on GET /learn/events (card 7fc7e2ce)
+            server_task task(SERVER_TASK_TYPE_UNLOAD_LORA);
+            task.id          = queue_tasks.get_new_id();
+            task.unload_lora = body.at("id").get<int32_t>();
+            task.unload_engine = body.at("engine").get<std::string>();
+            const int ticket = task.id;
+            queue_results.add_ticket(ticket);
+            queue_tasks.post(std::move(task));
+            res->ok({{"ticket", ticket}});
             return res;
         }
         auto & rd = res->rd;
