@@ -1033,6 +1033,17 @@ extern "C" {
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
 
+    // Continuum fork: a sequence state file's BODY (the bytes llama_state_seq_save_file writes after
+    // its framing and tokens) moved between the context and host memory, so the caller can write or
+    // read the file on another thread while this context keeps decoding. get copies the sequence's
+    // state out into `dst` (size from file_body_size); set loads a body read from such a file into
+    // `dest_seq_id`. Each returns the bytes copied, 0 on failure (a failed set leaves the sequence empty).
+    LLAMA_API size_t llama_state_seq_file_body_size(struct llama_context * ctx, llama_seq_id seq_id);
+    LLAMA_API size_t llama_state_seq_get_file_body(
+            struct llama_context * ctx, llama_seq_id seq_id, uint8_t * dst, size_t size);
+    LLAMA_API size_t llama_state_seq_set_file_body(
+            struct llama_context * ctx, llama_seq_id dest_seq_id, const uint8_t * src, size_t size);
+
     // Completed state-file IO bytes; returning false cancels the load. The callback
     // must be cheap and must not call back into the context. Existing API is unchanged.
     typedef bool (*llama_state_io_progress_callback)(uint64_t completed, uint64_t total, void * user_data);

@@ -14,6 +14,8 @@
 #include "server-common.h"
 
 
+struct server_page_job; // server-page-job.h: one page switch between the task loop and its file IO
+
 // One immutable operation identity with cheap counters. The route holds at most
 // one snapshot per configured slot; task ownership keeps an in-flight one alive.
 struct server_restore_progress {
@@ -57,6 +59,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_PAGE_IO_DONE, // Continuum fork: a save's or restore's file IO finished on its worker
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,
     SERVER_TASK_TYPE_SAVE_LORA,
@@ -266,6 +269,8 @@ struct server_task {
         // checkpoint it holds, which is already a page's subset.
         bool keep_view_checkpoints = false;
         std::shared_ptr<server_restore_progress> progress;
+        // SERVER_TASK_TYPE_SLOT_PAGE_IO_DONE: the switch whose file IO finished
+        std::shared_ptr<server_page_job> page;
     };
     slot_action slot_action;
 
@@ -601,6 +606,8 @@ struct server_task_result_rerank : server_task_result {
 struct server_task_result_error : server_task_result {
     error_type err_type = ERROR_TYPE_SERVER;
     std::string err_msg;
+    // Continuum fork: a refusal the caller matches on, never by message (e.g. "slot_reassigned")
+    std::string refusal;
 
     // for ERROR_TYPE_EXCEED_CONTEXT_SIZE
     int32_t n_prompt_tokens = 0;
@@ -664,6 +671,10 @@ struct server_task_result_slot_save_load : server_task_result {
     size_t n_tokens;
     size_t n_bytes;
     double t_ms;
+    // Continuum fork: the task loop's share (the state copied out or in) and the IO worker's (the
+    // files written or read); t_ms is their sum, the engine's work without any wait for the slot
+    double copy_ms = 0;
+    double io_ms   = 0;
 
     virtual json to_json() override;
 };

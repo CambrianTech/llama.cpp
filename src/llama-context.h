@@ -184,6 +184,11 @@ struct llama_context {
 
     size_t state_seq_file_size(llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count);
 
+    // Continuum fork: the file body (state_seq_write_data at flags 0) through host memory
+    size_t state_seq_file_body_size(llama_seq_id seq_id);
+    size_t state_seq_get_file_body(llama_seq_id seq_id, uint8_t * dst, size_t size);
+    size_t state_seq_set_file_body(llama_seq_id seq_id, const uint8_t * src, size_t size);
+
     size_t state_seq_save_file(
           llama_seq_id   seq_id,
             const char * filepath,

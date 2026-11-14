@@ -92,10 +92,10 @@ jobs:
           cmake -B build \
             -DGGML_SCHED_NO_REALLOC=ON \
             -DLLAMA_SERVER_TEST_FAULTS=ON
-          cmake --build build --config Release -j $(nproc) --target llama-server test-server-prefill
+          cmake --build build --config Release -j $(nproc) --target llama-server test-server-prefill test-server-page-io
 
-      - name: Prefill scheduling test
-        run: ctest --test-dir build -C Release -R ^test-server-prefill$ --output-on-failure --no-tests=error
+      - name: Model-free server validators (prefill scheduling, page IO)
+        run: ctest --test-dir build -C Release -R "^test-server-(prefill|page-io)$" --output-on-failure --no-tests=error
 
       - name: Dream adapter creation and snapshot parity
         timeout-minutes: 5
@@ -193,10 +193,10 @@ jobs:
             -DGGML_SCHED_NO_REALLOC=ON ^
             -DLLAMA_SERVER_TEST_FAULTS=ON
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS% --target llama-server test-server-prefill
+          cmake --build build --config Release -j %NINJA_JOBS% --target llama-server test-server-prefill test-server-page-io
 
-      - name: Prefill scheduling test
-        run: ctest --test-dir build -C Release -R ^test-server-prefill$ --output-on-failure --no-tests=error
+      - name: Model-free server validators (prefill scheduling, page IO)
+        run: ctest --test-dir build -C Release -R "^test-server-(prefill|page-io)$" --output-on-failure --no-tests=error
 
       - name: Python setup
         id: setup_python

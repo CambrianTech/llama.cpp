@@ -1529,6 +1529,9 @@ json server_task_result_rerank::to_json() {
 //
 json server_task_result_error::to_json() {
     json res = format_error_response(err_msg, err_type);
+    if (!refusal.empty()) {
+        res["refusal"] = refusal;
+    }
     if (err_type == ERROR_TYPE_EXCEED_CONTEXT_SIZE) {
         res["n_prompt_tokens"] = n_prompt_tokens;
         res["n_ctx"]           = n_ctx;
@@ -1668,7 +1671,9 @@ json server_task_result_slot_save_load::to_json() {
             { "n_saved",   n_tokens },
             { "n_written", n_bytes },
             { "timings", {
-                { "save_ms", t_ms }
+                { "save_ms", t_ms },
+                { "copy_ms", copy_ms },
+                { "io_ms",   io_ms },
             }},
         };
     }
@@ -1679,7 +1684,9 @@ json server_task_result_slot_save_load::to_json() {
         { "n_restored", n_tokens },
         { "n_read",     n_bytes },
         { "timings", {
-            { "restore_ms", t_ms }
+            { "restore_ms", t_ms },
+            { "copy_ms",    copy_ms },
+            { "io_ms",      io_ms },
         }},
     };
 }
