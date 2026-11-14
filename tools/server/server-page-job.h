@@ -3,6 +3,7 @@
 #include "server-page-adapters.h"
 #include "server-task.h"
 
+#include <atomic>
 #include <list>
 #include <memory>
 #include <string>
