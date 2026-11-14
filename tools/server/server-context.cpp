@@ -937,6 +937,11 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // the host bytes in-flight KV page switches hold, admitted against the budget the core sets at
+    // runtime (POST /page-io/budget; server-page-io.h); thread-safe, read by the routes directly.
+    // Declared before queue_tasks so it outlives every task holding a reservation.
+    server_page_admission page_io_bytes;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -950,6 +955,10 @@ public:
     }
 
     ~server_context_impl() {
+        // page IO first: its last jobs release into the budget and post to the live queue; then no
+        // waiting switch is admitted into a queue being torn down
+        page_io.reset();
+        page_io_bytes.close();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -1073,8 +1082,11 @@ private:
     server_test_faults test_faults; // the server test build only (LLAMA_SERVER_TEST_FAULTS)
 
     // KV page file IO off the task loop (server-page-io.h), a worker per slot so every slot's page
-    // can move at once. Declared after queue_tasks so it is destroyed first: its jobs post there.
+    // can move at once within the page IO budget. Declared after queue_tasks and page_io_bytes so it
+    // is destroyed first: its jobs post to the one and release into the other.
     std::unique_ptr<server_page_io_pool> page_io;
+    // the restores read for each slot and not yet applied, which a later task or erase on it drops
+    std::map<int, std::vector<std::weak_ptr<server_page_job>>> pending_restores;
 
     int n_empty_consecutive = 0;
 
@@ -1899,7 +1911,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
-        ++slot.n_occupancy; // a restore read before this task is not applied over it (server-context-page.inc)
+        page_slot_reassigned(slot); // a restore buffered for this slot is dropped, never applied over it (server-context-page.inc)
         // process per-request lora adapters
         // Continuum fork: a task with no per-request adapters runs the server's own, and goes through
         // the SAME change check: upstream assigned them without it, so a slot whose KV was computed
@@ -2860,7 +2872,7 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear();
-                    ++slot->n_occupancy; // a restore read before this erase is not applied over it
+                    page_slot_reassigned(*slot); // a restore buffered for this slot is dropped, never applied over it
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -6390,6 +6402,29 @@ void server_routes::init_routes() {
         rd.post_task(std::move(task));
         auto result = rd.next(req.should_stop);
         if (result) { res->ok(result->to_json()); }
+        return res;
+    };
+    // The host bytes in-flight KV page switches may hold (server-page-io.h): the core sets it from its
+    // live host room, one memory budget; raising it admits waiting switches at once. Read and set here,
+    // never through the task loop: the budget is thread-safe and a waiting switch must not wait on decode.
+    auto page_io_snapshot = [this]() {
+        const auto b = ctx_server.page_io_bytes.snapshot();
+        return json {{"budget_bytes", b.budget}, {"in_flight_bytes", b.in_flight}, {"waiting", b.waiting}};
+    };
+    this->get_page_io = [this, page_io_snapshot](const server_http_req &) {
+        auto res = create_response(true);
+        res->ok(page_io_snapshot());
+        return res;
+    };
+    this->post_page_io_budget = [this, page_io_snapshot](const server_http_req & req) {
+        auto res = create_response(true);
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        if (!body.is_object() || !body.contains("budget_bytes") || !body.at("budget_bytes").is_number_unsigned()) {
+            res->error(format_error_response("budget_bytes must be an unsigned integer: the host bytes in-flight page switches may hold", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        ctx_server.page_io_bytes.set_budget(body.at("budget_bytes").get<uint64_t>());
+        res->ok(page_io_snapshot());
         return res;
     };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };

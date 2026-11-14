@@ -93,6 +93,11 @@
     // ~30k-token turn tripped the client's 10 s timeout. The snapshot is taken here, on the loop; the
     // files are written on a worker.
     void page_save(server_task && task) {
+        auto job = std::make_shared<server_page_job>();
+        if (task.slot_action.page_reserved > 0) {
+            // admitted after it waited: it holds its bytes, returned on any refusal below
+            job->reservation.hold(&page_io_bytes, task.slot_action.page_reserved);
+        }
         const int id_slot = task.slot_action.id_slot;
         server_slot * slot = get_slot_by_id(id_slot);
         if (slot == nullptr) {
@@ -150,25 +155,49 @@
             }
         }
 
+        // The bytes this switch will hold, admitted against the page IO budget before any is allocated.
+        const size_t n_body = llama_state_seq_file_body_size(ctx_tgt, slot->id);
+        if (n_body == 0) {
+            send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+            return;
+        }
+        size_t n_ckpt = 0, n_lora = 0;
+        page_write_checkpoints(kept, [&](const void *, size_t n) { n_ckpt += n; });
+        page_write_adapters(slot->lora, [&](const void *, size_t n) { n_lora += n; });
+        const uint64_t bytes = (uint64_t) n_body + packed.size() + n_ckpt + n_lora;
+        if (task.slot_action.page_reserved == 0) {
+            task.slot_action.page_asked_us = ggml_time_us();
+            auto parked = std::make_shared<server_task>(std::move(task));
+            parked->slot_action.page_reserved = bytes;
+            // admitted later: the release that made room posts it back to this loop, holding its bytes
+            if (!page_io_bytes.admit_or_park(bytes, [this, parked]() { queue_tasks.post(std::move(*parked)); })) {
+                SRV_DBG("slot %d: save of %" PRIu64 " bytes waits for the page IO budget, id_task = %d\n", id_slot, bytes, parked->id);
+                return;
+            }
+            task = std::move(*parked);
+            job->reservation.hold(&page_io_bytes, bytes);
+        } else {
+            job->reservation.resize(bytes); // decode may have grown the slot since it was admitted
+        }
+        job->bytes    = bytes;
+        job->admit_ms = (ggml_time_us() - task.slot_action.page_asked_us) / 1000.0;
+
         // The loop's share: the slot's state, tokens and sidecars copied into the switch. Each buffer
         // is sized once, so the copy is one pass over the bytes.
         const int64_t t_copy = ggml_time_us();
-        auto job = std::make_shared<server_page_job>();
         job->is_save  = true;
+        job->id_task  = task.id;
         job->id_slot  = id_slot;
         job->filename = task.slot_action.filename;
         job->filepath = task.slot_action.filepath;
         job->n_tokens = slot->prompt.tokens.size();
-        const size_t n_body = llama_state_seq_file_body_size(ctx_tgt, slot->id);
         job->body.resize(n_body);
-        if (n_body == 0 || llama_state_seq_get_file_body(ctx_tgt, slot->id, job->body.data(), n_body) != n_body) {
+        if (llama_state_seq_get_file_body(ctx_tgt, slot->id, job->body.data(), n_body) != n_body) {
             send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
             return;
         }
         job->tokens.resize(packed.size() / sizeof(llama_token));
         std::memcpy(job->tokens.data(), packed.data(), packed.size());
-        size_t n_ckpt = 0;
-        page_write_checkpoints(kept, [&](const void *, size_t n) { n_ckpt += n; });
         job->ckpt_sidecar.reserve(n_ckpt);
         page_write_checkpoints(kept, [&](const void * p, size_t n) { server_page_put(job->ckpt_sidecar, p, n); });
         page_write_adapters(slot->lora, [&](const void * p, size_t n) { server_page_put(job->lora_sidecar, p, n); });
@@ -190,9 +219,11 @@
         if (!server_page_write_bytes(job.filepath + ".lora", job.lora_sidecar)) {
             SRV_WRN("slot %d: adapter sidecar could not be written: %s (this page will not restore)\n", job.id_slot, job.filepath.c_str());
         }
-        // on disk now: the copy is freed here, not when the loop takes the completion
+        // on disk now: the copy is freed here, and its bytes returned to the budget, not when the loop
+        // takes the completion
         std::vector<uint8_t>().swap(job.body);
         std::vector<uint8_t>().swap(job.ckpt_sidecar);
+        job.reservation.release();
     }
 
     // A restore reads its page on a worker at once, even while its slot finishes another turn (the
@@ -216,12 +247,79 @@
         }
         auto job = std::make_shared<server_page_job>();
         job->is_save   = false;
+        job->id_task   = task.id;
         job->id_slot   = id_slot;
         job->filename  = task.slot_action.filename;
         job->filepath  = task.slot_action.filepath;
         job->occupancy = slot->n_occupancy;
         job->progress  = std::move(progress);
-        page_io_submit(task.id, std::move(job), page_read);
+        // the bytes it will hold: the page and its sidecars as they are on disk (a missing file holds
+        // none and fails its read)
+        for (const char * suffix : { "", ".ckpt", ".lora" }) {
+            std::error_code ec;
+            const auto n = std::filesystem::file_size(job->filepath + suffix, ec);
+            job->bytes += ec ? 0 : (uint64_t) n;
+        }
+        // a later task or erase on this slot drops it (page_slot_reassigned)
+        auto & pending = pending_restores[id_slot];
+        pending.erase(std::remove_if(pending.begin(), pending.end(), [](const auto & w) { return w.expired(); }), pending.end());
+        pending.push_back(job);
+
+        const int64_t asked = ggml_time_us();
+        auto start = [this, job, asked]() {
+            job->reservation.hold(&page_io_bytes, job->bytes);
+            job->admit_ms = (ggml_time_us() - asked) / 1000.0;
+            page_io_submit(job->id_task, job, page_read);
+        };
+        if (page_io_bytes.admit_or_park(job->bytes, start)) {
+            start();
+        } else {
+            SRV_DBG("slot %d: restore of %" PRIu64 " bytes waits for the page IO budget, id_task = %d\n", id_slot, job->bytes, task.id);
+        }
+    }
+
+    // A slot was given another task or erased: count it, and drop every restore buffered for it.
+    void page_slot_reassigned(server_slot & slot) {
+        ++slot.n_occupancy;
+        auto it = pending_restores.find(slot.id);
+        if (it == pending_restores.end()) {
+            return;
+        }
+        for (const auto & w : it->second) {
+            if (auto job = w.lock()) {
+                page_drop_restore(*job);
+            }
+        }
+        pending_restores.erase(it);
+    }
+
+    // The restore's bytes return to the budget at once. A read in flight stops at its next part and
+    // frees its own buffers; a read already done is freed here and answered now, so a completion
+    // deferred behind the slot's new task never holds it.
+    void page_drop_restore(server_page_job & job) {
+        if (job.dropped.exchange(true)) {
+            return;
+        }
+        job.reservation.release();
+        if (!job.io_done.load()) {
+            return;
+        }
+        page_free_buffers(job);
+        if (job.progress) {
+            job.progress->phase.store(server_restore_progress::failed, std::memory_order_relaxed);
+        }
+        send_page_refusal(job.id_task, page_reassigned_message, "slot_reassigned");
+        job.answered = true;
+    }
+
+    static constexpr const char * page_reassigned_message =
+        "Unable to restore slot: it was given another task or erased while its page was read; "
+        "its occupant is kept, the page is not applied";
+
+    static void page_free_buffers(server_page_job & job) {
+        std::vector<uint8_t>().swap(job.body);
+        std::vector<int32_t>().swap(job.tokens);
+        job.checkpoints.clear();
     }
 
     // The worker's share of a restore: the adapter identity, the page and its checkpoints read. The
@@ -255,8 +353,9 @@
         }
 
         const server_page_file file { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION };
-        auto page = file.read(job.filepath, [progress](uint64_t done, uint64_t total) {
-            return progress == nullptr || server_restore_progress::on_state_io(done, total, progress);
+        auto page = file.read(job.filepath, [&job, progress](uint64_t done, uint64_t total) {
+            return !job.dropped.load(std::memory_order_relaxed)
+                && (progress == nullptr || server_restore_progress::on_state_io(done, total, progress));
         }, job.error);
         if (!page) {
             return;
@@ -277,7 +376,8 @@
         }
         bool cancelled = false;
         auto get = [&](void * ptr, size_t n) {
-            if (progress && progress->cancel_requested.load(std::memory_order_relaxed)) {
+            if (job.dropped.load(std::memory_order_relaxed)
+                    || (progress && progress->cancel_requested.load(std::memory_order_relaxed))) {
                 cancelled = true;
                 in.ok = false;
             }
@@ -334,11 +434,18 @@
             }
             const int64_t t_io = ggml_time_us();
             try {
-                io(*job);
+                if (!job->dropped.load()) {
+                    io(*job);
+                }
             } catch (const std::exception & err) {
                 job->error = err.what();
             }
             job->io_ms = (ggml_time_us() - t_io) / 1000.0;
+            if (job->dropped.load()) {
+                page_free_buffers(*job); // dropped while it read: nothing it read is applied
+                job->reservation.release();
+            }
+            job->io_done.store(true);
             server_task done(SERVER_TASK_TYPE_SLOT_PAGE_IO_DONE);
             done.id                  = id_task;
             done.id_slot             = job->id_slot; // a deferred restore is serviced when ITS slot releases
@@ -376,8 +483,12 @@
             res->copy_ms  = job->copy_ms;
             res->io_ms    = job->io_ms;
             res->t_ms     = job->copy_ms + job->io_ms;
+            page_io_receipt(*res, *job);
             queue_results.send(std::move(res));
             return;
+        }
+        if (job->answered) {
+            return; // dropped after its read and answered then (page_drop_restore)
         }
         page_apply_restore(std::move(task), *job);
     }
@@ -401,12 +512,11 @@
             fail(job.error); // the read failed: the slot was never touched
             return;
         }
-        if (slot->n_occupancy != job.occupancy) {
+        if (slot->n_occupancy != job.occupancy || job.dropped.load()) {
             if (progress) {
                 progress->phase.store(server_restore_progress::failed, std::memory_order_relaxed);
             }
-            send_page_refusal(task.id, "Unable to restore slot: it was given another task or erased while its page was read; "
-                                       "its occupant is kept, the page is not applied", "slot_reassigned");
+            send_page_refusal(task.id, page_reassigned_message, "slot_reassigned");
             return;
         }
         if (slot->is_processing()) {
@@ -475,6 +585,7 @@
             SLT_WRN(*slot, "no usable checkpoint sidecar (%s): the restore is cold — the next divergence re-prefills from the head\n", job.ckpt_path.c_str());
         }
         job.copy_ms = (ggml_time_us() - t_copy) / 1000.0;
+        job.reservation.release(); // its state is the slot's now: nothing of it is in flight
 
         if (progress) {
             progress->phase.store(server_restore_progress::completed, std::memory_order_relaxed);
@@ -489,5 +600,15 @@
         res->copy_ms  = job.copy_ms;
         res->io_ms    = job.io_ms;
         res->t_ms     = job.copy_ms + job.io_ms;
+        page_io_receipt(*res, job);
         queue_results.send(std::move(res));
+    }
+
+    // The page IO budget as this switch's receipt reports it.
+    void page_io_receipt(server_task_result_slot_save_load & res, const server_page_job & job) const {
+        const auto budget = page_io_bytes.snapshot();
+        res.admit_ms           = job.admit_ms;
+        res.io_bytes           = job.bytes;
+        res.io_bytes_in_flight = budget.in_flight;
+        res.io_budget_bytes    = budget.budget;
     }

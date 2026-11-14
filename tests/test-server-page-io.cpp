@@ -231,12 +231,80 @@ static void stopping_runs_every_submitted_switch() {
     require(ran.load() == 16, "every submitted switch ran before the pool stopped");
 }
 
+// what this catches (Fable on #118: the M5 at 0.1 GB free): in-flight page bytes unbounded against
+// host memory. Switches are admitted against one budget before they allocate; one that does not fit
+// waits, in order, and the release that makes room admits it in that release's own call (an event).
+static void page_bytes_are_admitted_against_one_budget() {
+    server_page_admission budget;
+    std::vector<int> admitted;
+    auto later = [&](int id) { return [&admitted, id] { admitted.push_back(id); }; };
+
+    // unset (0): one switch at a time, however large; nothing ever starves
+    require(budget.admit_or_park(1600, later(1)), "with nothing in flight a switch is admitted, whatever its size");
+    require(!budget.admit_or_park(10, later(2)), "with no budget a second switch waits");
+    budget.release(1600);
+    require(admitted == std::vector<int>({ 2 }), "the release admits the waiter at once");
+    budget.release(10);
+
+    // the core's budget: switches that fit run together
+    budget.set_budget(1000);
+    require(budget.admit_or_park(600, later(3)) && budget.admit_or_park(400, later(4)), "switches that fit are admitted together");
+    require(!budget.admit_or_park(300, later(5)), "a switch past the budget waits");
+    require(!budget.admit_or_park(1, later(6)), "and one behind it waits its turn, never jumps the queue");
+    require(budget.snapshot().in_flight == 1000 && budget.snapshot().waiting == 2, "the budget counts what is held and waiting");
+    budget.release(400);
+    require(admitted == std::vector<int>({ 2, 5, 6 }), "one release admits every waiter that now fits, in order");
+    budget.release(600 + 300 + 1);
+
+    // a switch larger than the whole budget runs alone once the others are done
+    require(budget.admit_or_park(1, later(7)), "a small switch is admitted");
+    require(!budget.admit_or_park(5000, later(8)), "a switch larger than the budget waits for an empty pipe");
+    budget.release(1);
+    require(admitted.back() == 8 && budget.snapshot().in_flight == 5000, "then runs alone");
+    budget.release(5000);
+
+    // raising the budget admits at once; a re-measured reservation counts its new size
+    require(budget.admit_or_park(1000, later(9)), "a full budget");
+    require(!budget.admit_or_park(500, later(10)), "waits");
+    budget.set_budget(1500);
+    require(admitted.back() == 10, "raising the budget admits the waiter in the raise");
+    budget.resize(1000, 1100);
+    require(budget.snapshot().in_flight == 1600, "a reservation re-measured when its switch runs counts its new size");
+    budget.release(1100);
+    budget.release(500);
+    require(budget.snapshot().in_flight == 0 && budget.snapshot().waiting == 0, "everything returned");
+}
+
+// what this catches (Fable on #118): a restore buffered for a slot that is then given a different
+// page (the mind left) holding its bytes until that slot's new turn ends. Dropping it returns its
+// bytes at once, admitting the switch waiting behind it; the later release of the same reservation
+// (its completion, its destructor) returns nothing twice.
+static void a_dropped_restore_returns_its_bytes_at_once() {
+    server_page_admission budget;
+    budget.set_budget(1000);
+    bool next_admitted = false;
+    {
+        server_page_reservation restore;
+        require(budget.admit_or_park(900, [] {}), "the restore is admitted");
+        restore.hold(&budget, 900);
+        require(!budget.admit_or_park(500, [&] { next_admitted = true; }), "the next switch waits behind the buffered restore");
+        restore.release(); // its slot was given another task: dropped
+        require(next_admitted, "the drop admits the waiter at once, not when the slot frees");
+        require(budget.snapshot().in_flight == 500, "only the admitted switch is held");
+        restore.release(); // the completion arrives later and releases again
+    } // and the destructor
+    require(budget.snapshot().in_flight == 500, "a reservation is returned once");
+    budget.release(500);
+}
+
 int main() {
     saves_of_different_files_overlap();
     one_file_has_one_writer_or_reader_at_a_time();
     decode_progresses_while_a_save_is_in_flight();
     a_page_file_round_trips_and_refuses_defects();
     stopping_runs_every_submitted_switch();
+    page_bytes_are_admitted_against_one_budget();
+    a_dropped_restore_returns_its_bytes_at_once();
     std::cout << "server page io: ok\n";
     return 0;
 }

@@ -271,6 +271,9 @@ struct server_task {
         std::shared_ptr<server_restore_progress> progress;
         // SERVER_TASK_TYPE_SLOT_PAGE_IO_DONE: the switch whose file IO finished
         std::shared_ptr<server_page_job> page;
+        // a save the page IO budget admitted after it waited: the bytes it holds, and when it asked
+        uint64_t page_reserved = 0;
+        int64_t  page_asked_us = 0;
     };
     slot_action slot_action;
 
@@ -675,6 +678,12 @@ struct server_task_result_slot_save_load : server_task_result {
     // files written or read); t_ms is their sum, the engine's work without any wait for the slot
     double copy_ms = 0;
     double io_ms   = 0;
+    // the page IO budget (server-page-io.h): this switch's admitted bytes, the wait to admit them, and
+    // the bytes all switches held and the budget when this receipt was made
+    double   admit_ms           = 0;
+    uint64_t io_bytes           = 0;
+    uint64_t io_bytes_in_flight = 0;
+    uint64_t io_budget_bytes    = 0;
 
     virtual json to_json() override;
 };

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "server-page-adapters.h"
+#include "server-page-io.h"
 #include "server-task.h"
 
 #include <atomic>
@@ -36,6 +37,19 @@ struct server_page_job {
     std::list<common_prompt_checkpoint> checkpoints;
     bool                                checkpoints_ok = false;
     std::string                         ckpt_path;
+
+    int id_task = -1; // the switch's HTTP waiter
+
+    // the host bytes this switch holds, admitted against the one page IO budget (server-page-io.h)
+    server_page_reservation reservation;
+    uint64_t                bytes    = 0; // what it was admitted for
+    double                  admit_ms = 0; // asked to admitted
+
+    // a restore whose slot was given another task or erased while it was buffered: its bytes are
+    // returned at once and its read stops (server-context-page.inc page_drop_restore)
+    std::atomic<bool> dropped{false};
+    std::atomic<bool> io_done{false}; // the worker is done with the buffers; the loop owns them
+    bool              answered = false; // its waiter already has its receipt
 
     std::string error;       // the IO's failure; empty when it succeeded
     size_t      n_bytes = 0; // the page file's bytes, written or read

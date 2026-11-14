@@ -1664,16 +1664,23 @@ json server_task_result_slot_save_load::to_json() {
     if (size_only) {
         return json {{"id_slot", id_slot}, {"filename", filename}, {"projected_bytes", n_bytes}};
     }
+    const json page_io = {
+        { "io_bytes",           io_bytes },
+        { "io_bytes_in_flight", io_bytes_in_flight },
+        { "io_budget_bytes",    io_budget_bytes },
+    };
     if (is_save) {
         return json {
             { "id_slot",   id_slot },
             { "filename",  filename },
             { "n_saved",   n_tokens },
             { "n_written", n_bytes },
+            { "page_io",   page_io },
             { "timings", {
-                { "save_ms", t_ms },
-                { "copy_ms", copy_ms },
-                { "io_ms",   io_ms },
+                { "save_ms",  t_ms },
+                { "copy_ms",  copy_ms },
+                { "io_ms",    io_ms },
+                { "admit_ms", admit_ms },
             }},
         };
     }
@@ -1683,10 +1690,12 @@ json server_task_result_slot_save_load::to_json() {
         { "filename",   filename },
         { "n_restored", n_tokens },
         { "n_read",     n_bytes },
+        { "page_io",    page_io },
         { "timings", {
             { "restore_ms", t_ms },
             { "copy_ms",    copy_ms },
             { "io_ms",      io_ms },
+            { "admit_ms",   admit_ms },
         }},
     };
 }

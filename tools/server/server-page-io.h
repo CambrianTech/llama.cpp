@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -144,6 +145,142 @@ struct server_page_reader {
             at += n;
         }
     }
+};
+
+// The bytes page switches hold in host memory, from their copy until their IO ends (a restore's
+// until it is applied), admitted against ONE budget the core sets at runtime from its live host room
+// (POST /page-io/budget). A switch is admitted before it allocates: at once when its bytes fit beside
+// those in flight, or when nothing is in flight (a switch larger than the whole budget runs alone and
+// never starves); otherwise it waits, in the order asked, and the release that makes room admits it
+// (an event, never a poll). Until the core sets a budget it is 0: one switch's bytes at a time, still
+// off the task loop. No number here is a guess: the budget is the core's measurement.
+class server_page_admission {
+public:
+    struct snapshot_t {
+        uint64_t budget    = 0;
+        uint64_t in_flight = 0;
+        size_t   waiting   = 0;
+    };
+
+    // Admits `bytes` now (true: the caller proceeds, `admitted` is dropped) or parks `admitted`, which
+    // the release that makes room runs on its own thread, outside this lock.
+    bool admit_or_park(uint64_t bytes, std::function<void()> admitted) {
+        std::lock_guard<std::mutex> lock(m);
+        if (waiting.empty() && fits(bytes)) {
+            in_flight += bytes;
+            return true;
+        }
+        if (!closed) {
+            waiting.push_back({ bytes, std::move(admitted) });
+        }
+        return false;
+    }
+
+    void release(uint64_t bytes) {
+        std::vector<std::function<void()>> run;
+        {
+            std::lock_guard<std::mutex> lock(m);
+            in_flight -= std::min(bytes, in_flight);
+            drain(run);
+        }
+        for (auto & f : run) {
+            f();
+        }
+    }
+
+    // A held reservation re-measured when its switch runs (decode may have grown the slot since).
+    void resize(uint64_t from, uint64_t to) {
+        std::vector<std::function<void()>> run;
+        {
+            std::lock_guard<std::mutex> lock(m);
+            in_flight = in_flight - std::min(from, in_flight) + to;
+            drain(run);
+        }
+        for (auto & f : run) {
+            f();
+        }
+    }
+
+    void set_budget(uint64_t bytes) {
+        std::vector<std::function<void()>> run;
+        {
+            std::lock_guard<std::mutex> lock(m);
+            budget = bytes;
+            drain(run);
+        }
+        for (auto & f : run) {
+            f();
+        }
+    }
+
+    // At shutdown: waiting switches are dropped unrun, and no later release admits anything.
+    void close() {
+        std::deque<parked> dropped;
+        {
+            std::lock_guard<std::mutex> lock(m);
+            closed = true;
+            dropped.swap(waiting);
+        }
+    }
+
+    snapshot_t snapshot() const {
+        std::lock_guard<std::mutex> lock(m);
+        return { budget, in_flight, waiting.size() };
+    }
+
+private:
+    struct parked {
+        uint64_t              bytes;
+        std::function<void()> admitted;
+    };
+
+    bool fits(uint64_t bytes) const { return in_flight == 0 || bytes <= budget - std::min(budget, in_flight); }
+
+    void drain(std::vector<std::function<void()>> & run) {
+        while (!closed && !waiting.empty() && fits(waiting.front().bytes)) {
+            in_flight += waiting.front().bytes;
+            run.push_back(std::move(waiting.front().admitted));
+            waiting.pop_front();
+        }
+    }
+
+    mutable std::mutex m;
+    uint64_t           budget    = 0;
+    uint64_t           in_flight = 0;
+    std::deque<parked> waiting;
+    bool               closed    = false;
+};
+
+// The bytes one admitted switch holds, returned to the budget once, by whichever owner is done with
+// them first (the worker after a write, the loop after an apply or a drop, or the destructor).
+class server_page_reservation {
+public:
+    server_page_reservation() = default;
+    server_page_reservation(const server_page_reservation &) = delete;
+    server_page_reservation & operator=(const server_page_reservation &) = delete;
+    ~server_page_reservation() { release(); }
+
+    void hold(server_page_admission * a, uint64_t bytes) {
+        admission = a;
+        held.store(bytes);
+    }
+    void resize(uint64_t to) {
+        const uint64_t from = held.exchange(to);
+        if (admission != nullptr) {
+            admission->resize(from, to);
+        }
+    }
+    void release() {
+        const uint64_t bytes = held.exchange(0);
+        if (bytes > 0 && admission != nullptr) {
+            admission->release(bytes);
+        }
+    }
+    uint64_t bytes() const { return held.load(); }
+
+private:
+    server_page_admission * admission = nullptr;
+    std::atomic<uint64_t>   held{0};
 };
 
 // A sequence state file: magic, version, token count, the tokens, then the state body (the bytes
