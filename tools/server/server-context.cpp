@@ -16,6 +16,8 @@
 #include "server-learn-ledger.h"
 #include "server-learn-residency.h"
 #include "server-test-faults.h"
+#include "server-page-io.h"
+#include "server-page-job.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -32,6 +34,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -279,6 +282,10 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+
+    // Continuum fork: counts every task given to this slot and every erase; a page restore records
+    // it when asked and is refused, typed, if it moved before the page was read (server-context-page.inc)
+    uint64_t n_occupancy = 0;
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -930,6 +937,11 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // the host bytes in-flight KV page switches hold, admitted against the budget the core sets at
+    // runtime (POST /page-io/budget; server-page-io.h); thread-safe, read by the routes directly.
+    // Declared before queue_tasks so it outlives every task holding a reservation.
+    server_page_admission page_io_bytes;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -943,6 +955,10 @@ public:
     }
 
     ~server_context_impl() {
+        // page IO first: its last jobs release into the budget and post to the live queue; then no
+        // waiting switch is admitted into a queue being torn down
+        page_io.reset();
+        page_io_bytes.close();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -1064,6 +1080,13 @@ private:
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
     server_test_faults test_faults; // the server test build only (LLAMA_SERVER_TEST_FAULTS)
+
+    // KV page file IO off the task loop (server-page-io.h), a worker per slot so every slot's page
+    // can move at once within the page IO budget. Declared after queue_tasks and page_io_bytes so it
+    // is destroyed first: its jobs post to the one and release into the other.
+    std::unique_ptr<server_page_io_pool> page_io;
+    // the restores read for each slot and not yet applied, which a later task or erase on it drops
+    std::map<int, std::vector<std::weak_ptr<server_page_job>>> pending_restores;
 
     int n_empty_consecutive = 0;
 
@@ -1423,6 +1446,9 @@ private:
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
         }
+        if (!page_io) {
+            page_io = std::make_unique<server_page_io_pool>((size_t) params_base.n_parallel);
+        }
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1504,8 +1530,9 @@ private:
         if constexpr (server_test_faults::enabled) {
             test_faults = server_test_faults::from_env();
             if (test_faults.any()) {
-                SRV_WRN("test faults: prompt checkpoints = %d, speculative checkpoints = %d, prompt fills = %d\n",
-                        test_faults.prompt_checkpoints, test_faults.spec_checkpoints, test_faults.prompt_fills);
+                SRV_WRN("test faults: prompt checkpoints = %d, speculative checkpoints = %d, prompt fills = %d, page io gate = '%s'\n",
+                        test_faults.prompt_checkpoints, test_faults.spec_checkpoints, test_faults.prompt_fills,
+                        test_faults.page_io_gate.c_str());
             }
         }
 
@@ -1884,6 +1911,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        page_slot_reassigned(slot); // a restore buffered for this slot is dropped, never applied over it (server-context-page.inc)
         // process per-request lora adapters
         // Continuum fork: a task with no per-request adapters runs the server's own, and goes through
         // the SAME change check: upstream assigned them without it, so a slot whose KV was computed
@@ -2266,6 +2294,7 @@ private:
 #include "server-context-learn-residency.inc"
 #include "server-context-learn.inc"
 #include "server-context-learn-checkpoint.inc"
+#include "server-context-page.inc"
 
     void send_final_response(server_slot & slot) {
         if (slot.task->params.learn_only) {
@@ -2814,374 +2843,15 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    const int id_slot = task.slot_action.id_slot;
-                    server_slot * slot = get_slot_by_id(id_slot);
-                    if (slot == nullptr) {
-                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    // NOTE (Continuum fork): SLOT_SAVE does NOT defer on a live slot.
-                    // Upstream defers save/restore/erase alike when is_processing(),
-                    // out of conservatism — but for SAVE that defer is both needless
-                    // and harmful. Reaching this arm already guarantees is_yielding ==
-                    // false (the whitelist at the top of process_single_task declines
-                    // every task but METRICS/SLOT_GET while a decode is yielding), so
-                    // we are on the main thread in the task phase with NO llama_decode
-                    // in flight and the sequence's KV at a consistent inter-batch
-                    // boundary. is_processing() here means only "this slot has an
-                    // assigned turn", not "decode is executing". A save is READ-ONLY
-                    // against that KV, so snapshotting a mid-turn slot is safe — and it
-                    // is exactly the warm-restore we want ("don't miss a beat": resume
-                    // mid-thought). Deferring instead bounced the save for the whole
-                    // multi-second generation, so a ~30k-token turn always tripped the
-                    // client's 10s timeout and the KV page was never captured. RESTORE
-                    // and ERASE MUTATE KV a subsequent decode would then read, so THEY
-                    // keep the is_processing() defer.
-
-                    const int64_t t_start = ggml_time_us();
-
-                    std::string filename = task.slot_action.filename;
-                    std::string filepath = task.slot_action.filepath;
-
-                    std::vector<char> packed;
-                    try {
-                        packed = slot->prompt.tokens.serialize();
-                    } catch (const std::exception & err) {
-                        send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
-                        break;
-                    }
-
-                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-                    // The checkpoints this page carries: the oldest (the head of the first user
-                    // turn) and the newest `keep_newest_checkpoints`, in list order, or all of them
-                    // when the caller asked for no subset. With `keep_view_checkpoints`, also the
-                    // newest at or before the last prompt's view end (where its next prompt
-                    // diverges) and those made for that prompt's end (a next prompt that resends it
-                    // whole); a slot that has run no prompt since a restore keeps them all. The quote
-                    // and the write share this list.
-                    std::vector<const common_prompt_checkpoint *> kept_checkpoints;
-                    {
-                        const auto & all  = slot->prompt.checkpoints;
-                        const int32_t keep = task.slot_action.keep_newest_checkpoints;
-                        const bool by_view = task.slot_action.keep_view_checkpoints;
-                        const int32_t view_end = slot->prompt.view_end;
-                        const int32_t end_from = slot->prompt.end_from;
-                        const bool keep_all = by_view ? end_from < 0 : keep < 0;
-                        const common_prompt_checkpoint * at_view_end = nullptr;
-                        for (const auto & c : all) {
-                            if (by_view && view_end >= 0 && c.n_tokens <= view_end) {
-                                at_view_end = &c;
-                            }
-                        }
-                        const size_t  n    = all.size();
-                        size_t i = 0;
-                        std::string kept_at;
-                        for (const auto & c : all) {
-                            const bool newest = keep > 0 && i + (size_t) keep >= n;
-                            const bool viewed = by_view && (&c == at_view_end || c.n_tokens >= end_from);
-                            if (keep_all || i == 0 || newest || viewed) {
-                                kept_checkpoints.push_back(&c);
-                                kept_at += (kept_at.empty() ? "" : ", ") + std::to_string(c.n_tokens);
-                            }
-                            ++i;
-                        }
-                        if (by_view && !task.slot_action.size_only) {
-                            SLT_INF(*slot, "page keeps %zu of %zu checkpoints at n_tokens = [%s] (view end = %d, prompt end from = %d)\n",
-                                    kept_checkpoints.size(), n, kept_at.c_str(), view_end, end_from);
-                        }
-                    }
-                    auto write_checkpoints = [&](auto && put) {
-                        const uint32_t magic   = 0x434B5054u; // 'CKPT'
-                        const uint32_t version = 1;
-                        const uint32_t n_ckpt  = (uint32_t) kept_checkpoints.size();
-                        put(&magic, sizeof(magic)); put(&version, sizeof(version)); put(&n_ckpt, sizeof(n_ckpt));
-                        for (const auto * kept : kept_checkpoints) {
-                            const auto & c = *kept;
-                            const int64_t  n_tokens = c.n_tokens;
-                            const int32_t  pos_min  = c.pos_min;
-                            const int32_t  pos_max  = c.pos_max;
-                            const uint64_t sz_tgt   = c.data_tgt.size();
-                            const uint64_t sz_dft   = c.data_dft.size();
-                            const uint64_t sz_spec  = c.data_spec.size();
-                            put(&n_tokens, sizeof(n_tokens)); put(&pos_min, sizeof(pos_min)); put(&pos_max, sizeof(pos_max));
-                            put(&sz_tgt, sizeof(sz_tgt)); put(&sz_dft, sizeof(sz_dft)); put(&sz_spec, sizeof(sz_spec));
-                            put(c.data_tgt.data(), c.data_tgt.size());
-                            put(c.data_dft.data(), c.data_dft.size());
-                            put(c.data_spec.data(), c.data_spec.size());
-                        }
-                    };
-                    auto write_adapters = [&](auto && put) {
-                        const uint32_t magic   = 0x4C4F5241u; // 'LORA'
-                        const uint32_t version = 2;
-                        const uint32_t n_lora  = (uint32_t) slot->lora.size();
-                        put(&magic, sizeof(magic)); put(&version, sizeof(version)); put(&n_lora, sizeof(n_lora));
-                        for (const auto & l : slot->lora) {
-                            const uint32_t n_path = (uint32_t) l.path.size();
-                            const auto     rev    = lora_file_revision(l.path);
-                            put(&n_path, sizeof(n_path));
-                            put(l.path.data(), n_path);
-                            put(&l.scale, sizeof(l.scale));
-                            put(&rev.first, sizeof(rev.first)); put(&rev.second, sizeof(rev.second));
-                        }
-                    };
-                    if (task.slot_action.size_only || task.slot_action.has_byte_ceiling) {
-                        size_t projected_bytes = llama_state_seq_file_size(
-                            ctx_tgt, slot->id, reinterpret_cast<const llama_token *>(packed.data()),
-                            packed.size() / sizeof(llama_token));
-                        if (projected_bytes == 0) {
-                            send_error(task, "Unable to size slot state", ERROR_TYPE_SERVER);
-                            break;
-                        }
-                        bool size_overflow = false;
-                        auto count = [&](const void *, size_t n) {
-                            if (n > std::numeric_limits<size_t>::max() - projected_bytes) {
-                                size_overflow = true;
-                            } else {
-                                projected_bytes += n;
-                            }
-                        };
-                        write_checkpoints(count);
-                        write_adapters(count);
-                        if (size_overflow) {
-                            send_error(task, "Slot file size overflow", ERROR_TYPE_SERVER);
-                            break;
-                        }
-                        if (task.slot_action.size_only) {
-                            auto res = std::make_unique<server_task_result_slot_save_load>();
-                            res->id = task.id;
-                            res->id_slot = id_slot;
-                            res->filename = filename;
-                            res->is_save = true;
-                            res->size_only = true;
-                            res->n_bytes = projected_bytes;
-                            queue_results.send(std::move(res));
-                            break;
-                        }
-                        // Recheck at this task boundary: decode may have advanced after the quote.
-                        if (task.slot_action.has_byte_ceiling && projected_bytes > task.slot_action.byte_ceiling) {
-                            send_error(task, "Slot state exceeds admitted file bytes", ERROR_TYPE_INVALID_REQUEST);
-                            break;
-                        }
-                    }
-                    const size_t nwrite = llama_state_seq_save_file(
-                        ctx_tgt, filepath.c_str(), slot->id,
-                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-                    if (nwrite == 0) {
-                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
-                        break;
-                    }
-                    // Companion serialization is shared with the pre-write size quote.
-                    {
-                        std::ofstream out(filepath + ".ckpt", std::ios::binary | std::ios::trunc);
-                        write_checkpoints([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
-                        if (!out) {
-                            SLT_WRN(*slot, "checkpoint sidecar could not be written: %s (the restore will be cold)\n", filepath.c_str());
-                        }
-                    }
-                    {
-                        std::ofstream out(filepath + ".lora", std::ios::binary | std::ios::trunc);
-                        write_adapters([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
-                        if (!out) {
-                            SLT_WRN(*slot, "adapter sidecar could not be written: %s (this page will not restore)\n", filepath.c_str());
-                        }
-                    }
-
-                    const int64_t t_end = ggml_time_us();
-                    const double t_save_ms = (t_end - t_start) / 1000.0;
-
-                    auto res = std::make_unique<server_task_result_slot_save_load>();
-                    res->id       = task.id;
-                    res->id_slot  = id_slot;
-                    res->filename = filename;
-                    res->is_save  = true;
-                    res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite;
-                    res->t_ms     = t_save_ms;
-                    queue_results.send(std::move(res));
+                    page_save(std::move(task)); // server-context-page.inc
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    const int id_slot = task.slot_action.id_slot;
-                    server_slot * slot = get_slot_by_id(id_slot);
-                    if (slot == nullptr) {
-                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    if (slot->is_processing()) {
-                        // if requested slot is unavailable, we defer this task for processing later
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
-                        queue_tasks.defer(std::move(task));
-                        break;
-                    }
-
-                    auto progress = task.slot_action.progress;
-                    if (progress) {
-                        auto expected = server_restore_progress::queued;
-                        if (!progress->phase.compare_exchange_strong(expected, server_restore_progress::state)) {
-                            send_error(task, "Restore operation cancelled", ERROR_TYPE_INVALID_REQUEST);
-                            break;
-                        }
-                    }
-                    const int64_t t_start = ggml_time_us();
-
-                    std::string filename = task.slot_action.filename;
-                    std::string filepath = task.slot_action.filepath;
-
-                    size_t nread = 0;
-                    try {
-                        // Continuum fork: the adapters the state was computed under (see SLOT_SAVE), read
-                        // FIRST so a page whose identity is unknown or foreign never touches the KV. A page
-                        // without them cannot be reused safely, so it is refused: the caller's cold prefill
-                        // is correct; a mislabelled reuse is not. Its identity is its ACTIVE adapters
-                        // (server-page-adapters.h): an adapter it carried at 0.0 never refuses it.
-                        std::vector<common_adapter_lora_info> page_lora = params_base.lora_adapters; // copy: ptr, task_name, prompt_prefix
-                        {
-                            const std::string lora_path = filepath + ".lora";
-                            std::ifstream in(lora_path, std::ios::binary);
-                            bool ok = (bool) in;
-                            auto get = [&](void * ptr, size_t n) { in.read(reinterpret_cast<char *>(ptr), n); ok = ok && (bool) in; };
-                            uint32_t magic = 0, version = 0, n_lora = 0;
-                            get(&magic, sizeof(magic)); get(&version, sizeof(version)); get(&n_lora, sizeof(n_lora));
-                            ok = ok && magic == 0x4C4F5241u && version == 2 && n_lora <= 4096;
-                            std::vector<server_page_adapter> recorded;
-                            for (uint32_t i = 0; ok && i < n_lora; ++i) {
-                                uint32_t n_path = 0;
-                                get(&n_path, sizeof(n_path));
-                                ok = ok && n_path <= 4096;
-                                if (!ok) break;
-                                server_page_adapter a { std::string(n_path, '\0'), 0.0f, 0, 0 };
-                                get(a.path.data(), n_path);
-                                get(&a.scale, sizeof(a.scale));
-                                get(&a.size, sizeof(a.size)); get(&a.mtime, sizeof(a.mtime));
-                                recorded.push_back(std::move(a));
-                            }
-                            if (!ok) {
-                                throw std::runtime_error("the page's adapter identity is missing or unreadable: " + lora_path);
-                            }
-                            // the same file AS LOADED: a gene adopted in place (same path, new weights) is
-                            // another adapter, and KV computed under the old weights is not its own; an
-                            // unreadable file proves nothing, so it refuses (BigMama on #54)
-                            std::vector<server_loaded_adapter> loaded;
-                            loaded.reserve(page_lora.size());
-                            for (const auto & l : page_lora) {
-                                const auto rev = lora_file_revision(l.path);
-                                loaded.push_back({ l.path, rev.first, rev.second });
-                            }
-                            std::string why;
-                            const auto scales = server_page_adapter_scales(recorded, loaded, why);
-                            if (!scales) {
-                                throw std::runtime_error("the page's adapter identity does not match the loaded adapters (" + why + "): " + lora_path);
-                            }
-                            for (size_t i = 0; i < page_lora.size(); ++i) {
-                                page_lora[i].scale = (*scales)[i];
-                            }
-                        }
-
-                        size_t n_packed = 0;
-                        llama_tokens packed;
-                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
-                        if (nread != 0) {
-                            packed.resize(std::max<size_t>(1, n_packed));
-                            nread = llama_state_seq_load_file_with_progress(ctx_tgt, filepath.c_str(), slot->id,
-                                packed.data(), packed.size(), &n_packed,
-                                progress ? server_restore_progress::on_state_io : nullptr, progress.get());
-                        }
-                        if (nread == 0) {
-                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
-                        }
-                        packed.resize(n_packed);
-
-                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
-
-                        if (restored.size() > (size_t) slot->n_ctx) {
-                            throw std::runtime_error("Restored prompt does not fit in the slot context");
-                        }
-
-                        if (!restored.validate(ctx_tgt)) {
-                            throw std::runtime_error("Invalid tokens in slot save file");
-                        }
-
-                        slot->prompt.clear();
-                        slot->prompt.tokens = std::move(restored);
-                        slot->lora = std::move(page_lora);
-                        // Continuum fork: bring the context checkpoints back with the state (see
-                        // SLOT_SAVE). Any defect in the sidecar leaves the slot exactly as a
-                        // pre-fork restore left it — valid tokens + state, no checkpoints.
-                        {
-                            const std::string ckpt_path = filepath + ".ckpt";
-                            std::ifstream in(ckpt_path, std::ios::binary);
-                            if (progress) {
-                                progress->phase.store(server_restore_progress::sidecar, std::memory_order_relaxed);
-                                if (in) {
-                                    in.seekg(0, std::ios::end);
-                                    const auto total = in.tellg();
-                                    if (total >= 0) progress->sidecar_total.store(uint64_t(total), std::memory_order_relaxed);
-                                    in.seekg(0);
-                                }
-                            }
-                            std::list<common_prompt_checkpoint> loaded;
-                            bool ok = (bool) in;
-                            auto get = [&](void * ptr, size_t n) {
-                                if (progress && progress->cancel_requested.load(std::memory_order_relaxed)) {
-                                    throw std::runtime_error("Restore operation cancelled");
-                                }
-                                in.read(reinterpret_cast<char *>(ptr), n);
-                                ok = ok && (bool) in;
-                                if (progress && in.gcount() > 0) progress->sidecar_bytes.fetch_add(uint64_t(in.gcount()), std::memory_order_relaxed);
-                            };
-                            if (ok) {
-                                uint32_t magic = 0, version = 0, n_ckpt = 0;
-                                get(&magic, sizeof(magic)); get(&version, sizeof(version)); get(&n_ckpt, sizeof(n_ckpt));
-                                ok = ok && magic == 0x434B5054u && version == 1 && n_ckpt <= 4096;
-                                for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
-                                    int64_t n_tokens = 0; int32_t pos_min = 0, pos_max = 0;
-                                    uint64_t sz_tgt = 0, sz_dft = 0, sz_spec = 0;
-                                    get(&n_tokens, sizeof(n_tokens)); get(&pos_min, sizeof(pos_min)); get(&pos_max, sizeof(pos_max));
-                                    get(&sz_tgt, sizeof(sz_tgt)); get(&sz_dft, sizeof(sz_dft)); get(&sz_spec, sizeof(sz_spec));
-                                    // a checkpoint is at most one sequence state; refuse absurd sizes
-                                    ok = ok && sz_tgt < (1ull << 36) && sz_dft < (1ull << 36) && sz_spec < (1ull << 30);
-                                    if (!ok) break;
-                                    auto & c = loaded.emplace_back();
-                                    c.update_pos(n_tokens, pos_min, pos_max);
-                                    c.id_task = -1;
-                                    c.data_tgt.resize(sz_tgt);   get(c.data_tgt.data(),  sz_tgt);
-                                    c.data_dft.resize(sz_dft);   get(c.data_dft.data(),  sz_dft);
-                                    c.data_spec.resize(sz_spec); get(c.data_spec.data(), sz_spec);
-                                    if (progress && ok) progress->checkpoints.fetch_add(1, std::memory_order_relaxed);
-                                }
-                            }
-                            if (ok) {
-                                slot->prompt.checkpoints = std::move(loaded);
-                                SLT_INF(*slot, "restored %zu context checkpoints from the sidecar: %s\n", slot->prompt.checkpoints.size(), ckpt_path.c_str());
-                            } else {
-                                slot->prompt.checkpoints.clear();
-                                SLT_WRN(*slot, "no usable checkpoint sidecar (%s): the restore is cold — the next divergence re-prefills from the head\n", ckpt_path.c_str());
-                            }
-                        }
-                        if (progress && progress->cancel_requested.load(std::memory_order_relaxed)) {
-                            throw std::runtime_error("Restore operation cancelled");
-                        }
-                    } catch (const std::exception & err) {
-                        if (progress) progress->phase.store(progress->cancel_requested.load(std::memory_order_relaxed)
-                            ? server_restore_progress::cancelled : server_restore_progress::failed, std::memory_order_relaxed);
-                        slot->prompt_clear();
-                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-
-                    if (progress) progress->phase.store(server_restore_progress::completed, std::memory_order_relaxed);
-                    const int64_t t_end = ggml_time_us();
-                    const double t_restore_ms = (t_end - t_start) / 1000.0;
-
-                    auto res = std::make_unique<server_task_result_slot_save_load>();
-                    res->id       = task.id;
-                    res->id_slot  = id_slot;
-                    res->filename = filename;
-                    res->is_save  = false;
-                    res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nread;
-                    res->t_ms     = t_restore_ms;
-                    queue_results.send(std::move(res));
+                    page_restore(std::move(task));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_PAGE_IO_DONE:
+                {
+                    page_io_done(std::move(task));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
@@ -3202,6 +2872,7 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear();
+                    page_slot_reassigned(*slot); // a restore buffered for this slot is dropped, never applied over it
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -6731,6 +6402,29 @@ void server_routes::init_routes() {
         rd.post_task(std::move(task));
         auto result = rd.next(req.should_stop);
         if (result) { res->ok(result->to_json()); }
+        return res;
+    };
+    // The host bytes in-flight KV page switches may hold (server-page-io.h): the core sets it from its
+    // live host room, one memory budget; raising it admits waiting switches at once. Read and set here,
+    // never through the task loop: the budget is thread-safe and a waiting switch must not wait on decode.
+    auto page_io_snapshot = [this]() {
+        const auto b = ctx_server.page_io_bytes.snapshot();
+        return json {{"budget_bytes", b.budget}, {"in_flight_bytes", b.in_flight}, {"waiting", b.waiting}};
+    };
+    this->get_page_io = [this, page_io_snapshot](const server_http_req &) {
+        auto res = create_response(true);
+        res->ok(page_io_snapshot());
+        return res;
+    };
+    this->post_page_io_budget = [this, page_io_snapshot](const server_http_req & req) {
+        auto res = create_response(true);
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        if (!body.is_object() || !body.contains("budget_bytes") || !body.at("budget_bytes").is_number_unsigned()) {
+            res->error(format_error_response("budget_bytes must be an unsigned integer: the host bytes in-flight page switches may hold", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        ctx_server.page_io_bytes.set_budget(body.at("budget_bytes").get<uint64_t>());
+        res->ok(page_io_snapshot());
         return res;
     };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };

@@ -179,6 +179,7 @@ struct server_routes {
     server_http_context::handler_t get_learn_grants, post_learn_grants, revoke_learn_grant, post_learn_preflight;
     server_http_context::handler_t get_learn_events;
     server_http_context::handler_t post_prompt_cache_limit;
+    server_http_context::handler_t get_page_io, post_page_io_budget; // the KV page IO budget (server-page-io.h)
     server_http_context::handler_t get_train;
     server_http_context::handler_t post_train;
     server_http_context::handler_t post_train_cancel;

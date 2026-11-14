@@ -3304,6 +3304,46 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     return written;
 }
 
+size_t llama_context::state_seq_file_body_size(llama_seq_id seq_id) {
+    llama_io_write_dummy io(false);
+    try {
+        return state_seq_write_data(io, seq_id, 0);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error sizing sequence state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_get_file_body(llama_seq_id seq_id, uint8_t * dst, size_t size) {
+    try {
+        size_t n = 0;
+        {
+            // the host writer copies the tensors out when it goes out of scope
+            llama_io_write_host io(dst, size);
+            n = state_seq_write_data(io, seq_id, 0);
+        }
+        return n;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error copying sequence state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_set_file_body(llama_seq_id seq_id, const uint8_t * src, size_t size) {
+    try {
+        size_t n = 0;
+        {
+            // the host reader copies the tensors in when it goes out of scope
+            llama_io_read_host io(src, size);
+            n = state_seq_read_data(io, seq_id, 0);
+        }
+        return n;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading sequence state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
@@ -4034,6 +4074,24 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+
+size_t llama_state_seq_file_body_size(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->synchronize();
+
+    return ctx->state_seq_file_body_size(seq_id);
+}
+
+size_t llama_state_seq_get_file_body(llama_context * ctx, llama_seq_id seq_id, uint8_t * dst, size_t size) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_file_body(seq_id, dst, size);
+}
+
+size_t llama_state_seq_set_file_body(llama_context * ctx, llama_seq_id dest_seq_id, const uint8_t * src, size_t size) {
+    ctx->synchronize();
+
+    return ctx->state_seq_set_file_body(dest_seq_id, src, size);
 }
 
 size_t llama_state_seq_file_size(llama_context * ctx, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
