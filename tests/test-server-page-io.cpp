@@ -52,43 +52,43 @@ struct gate {
 
 // what this catches: page switches on different files serialized behind each other (the pinned
 // fork: one task loop, so four residents' saves cost the ~13.5 s sum, dyno 11b). Each job waits
-// until all N are running at once, so if the pool ran them one at a time none could finish: with a
-// lane per job the wall is one job's time and the sum of their times is N of them.
+// until all N are running at once, so a pool that ran them one at a time could never finish one:
+// every save's interval contains the instant all N were in flight, so the wall time is one save's
+// span and not the sum of N spans. Proven by the ordering of events, not by comparing durations
+// (a clock's resolution and thread start-up made `wall < sum` flaky on Windows runners).
 static void saves_of_different_files_overlap() {
     const int n = 4;
     server_page_io_pool pool(n);
     gate all_running;
     std::atomic<int> running{0}, peak{0};
-    std::vector<double> took_ms(n, 0.0);
+    std::vector<clock_type::time_point> started(n), ended(n);
     std::mutex done_m;
     std::condition_variable done_cv;
     int done = 0;
-    const auto t0 = clock_type::now();
     for (int i = 0; i < n; ++i) {
         pool.submit("slot" + std::to_string(i) + ".bin", [&, i] {
-            const auto start = clock_type::now();
+            started[i] = clock_type::now();
             const int now = ++running;
             for (int p = peak.load(); now > p && !peak.compare_exchange_weak(p, now);) {}
             all_running.wait();
             --running;
-            took_ms[i] = std::chrono::duration<double, std::milli>(clock_type::now() - start).count();
+            ended[i] = clock_type::now();
             { std::lock_guard<std::mutex> lock(done_m); ++done; }
             done_cv.notify_all();
         });
     }
     all_running.wait_for_waiting(n); // all four are inside their IO at once
+    const auto all_in_flight = clock_type::now();
     all_running.release();
     {
         std::unique_lock<std::mutex> lock(done_m);
         require(done_cv.wait_for(lock, deadline, [&] { return done == n; }), "the saves never completed");
     }
-    const double wall = std::chrono::duration<double, std::milli>(clock_type::now() - t0).count();
-    double sum = 0;
-    for (double ms : took_ms) {
-        sum += ms;
-    }
     require(peak.load() == n, "every save's IO ran at once");
-    require(wall < sum, "concurrent saves take less wall time than the sum of their times");
+    for (int i = 0; i < n; ++i) {
+        require(started[i] <= all_in_flight && all_in_flight <= ended[i],
+                "every save was in flight at one instant: the wall is one span, not the sum of them");
+    }
 }
 
 // what this catches: a restore reading a page file a save is still writing. Jobs naming one file run
