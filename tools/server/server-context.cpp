@@ -5300,18 +5300,7 @@ server_context_meta server_context::get_meta() const {
             }
             return bufs;
         }(),
-        /* memory_breakdown       */ [&] {
-            json out = json::array();
-            for (const auto & [buft, mb] : llama_get_memory_breakdown(impl->ctx_tgt)) {
-                out.push_back(json {
-                    { "buffer_type",   ggml_backend_buft_name(buft) },
-                    { "model_bytes",   mb.model },
-                    { "context_bytes", mb.context },
-                    { "compute_bytes", mb.compute },
-                });
-            }
-            return out;
-        }(),
+        /* memory_breakdown       */ impl->memory_breakdown_report(),
         /* context_geometry       */ json {
             { "allocated_tokens",        llama_n_ctx(impl->ctx_tgt) },
             { "max_tokens_per_sequence", impl->n_ctx_slot },
@@ -5977,6 +5966,7 @@ void server_routes::init_routes() {
             if (!geometry.empty()) {
                 props["reconfigure"]      = geometry;
                 props["context_geometry"] = geometry.at("context_geometry");
+                props["memory_breakdown"] = geometry.at("memory_breakdown");
                 props["total_slots"]      = geometry.at("n_seq");
                 props["default_generation_settings"]["n_ctx"] = geometry.at("n_ctx_seq");
             }
