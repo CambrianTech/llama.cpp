@@ -17,6 +17,23 @@
         return llama_n_seq_max(ctx_tgt) <= 1 || llama_n_ctx_seq(ctx_tgt) >= llama_n_ctx(ctx_tgt);
     }
 
+    // what the live contexts hold, per buffer type (the backend's name), read from the allocator: the KV
+    // pool (context) and the graph (compute) both follow the geometry, so a shrink's freed bytes and a
+    // grow's taken bytes are read here, never inferred from the process. The load's /props snapshot and
+    // every published geometry both come from this one reader.
+    json memory_breakdown_report() const {
+        json out = json::array();
+        for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) {
+            out.push_back({
+                { "buffer_type",   ggml_backend_buft_name(buft) },
+                { "model_bytes",   mb.model },
+                { "context_bytes", mb.context },
+                { "compute_bytes", mb.compute },
+            });
+        }
+        return out;
+    }
+
     void publish_geometry() {
         json parked = json::array();
         for (const auto & [id, p] : reconfigure_state.parked) {
@@ -34,23 +51,13 @@
             // the same keys /props' load-time context_geometry has, read from the live context
             { "context_geometry", {
                 { "allocated_tokens",        llama_n_ctx(ctx_tgt) },
-                { "max_tokens_per_sequence", llama_n_ctx_seq(ctx_tgt) },
+                { "max_tokens_per_sequence", n_ctx_slot }, // the one size the slots enforce (capped at n_ctx_train)
                 { "sequence_capacity",       llama_n_seq_max(ctx_tgt) },
             } },
             { "last",           reconfigure_state.last ? server_reconfigure_to_json(*reconfigure_state.last) : json(nullptr) },
-            { "cost",           [&] {
-                json cost = server_reconfigure_cost_json(reconfigure_state);
-                // where the paged state lives now: the contexts' own buffers, per buffer type (the backend's
-                // name), so the price is read per backend
-                json buffers = json::array();
-                for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx_tgt)) {
-                    if (mb.context > 0) {
-                        buffers.push_back({ { "buffer_type", ggml_backend_buft_name(buft) }, { "context_bytes", mb.context } });
-                    }
-                }
-                cost["context_buffers"] = buffers;
-                return cost;
-            }() },
+            { "cost",           server_reconfigure_cost_json(reconfigure_state) },
+            // /props' memory_breakdown: the load's snapshot went stale at the first reconfigure
+            { "memory_breakdown", memory_breakdown_report() },
         };
         n_seq_live.store((int32_t) slots.size());
         n_ctx_seq_live.store(get_slot_n_ctx());

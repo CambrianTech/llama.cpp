@@ -122,6 +122,19 @@ def assert_never_reloaded():
     assert log_text().count("loading model '") <= 1
 
 
+def held_bytes() -> dict:
+    """what the live contexts hold, summed over every buffer type, as the allocator reports it on /props"""
+    props = server.make_request("GET", "/props").body
+    breakdown = props["memory_breakdown"]
+    assert breakdown == props["reconfigure"]["memory_breakdown"] # one reader, one report
+    return {
+        "context": sum(b["context_bytes"] for b in breakdown),
+        "compute": sum(b["compute_bytes"] for b in breakdown),
+        "model":   sum(b["model_bytes"] for b in breakdown),
+        "cells":   props["context_geometry"]["allocated_tokens"],
+    }
+
+
 def rss_kib() -> int | None:
     # the footprint, where the platform shows it (Linux); a measurement printed, not a gate
     try:
@@ -195,6 +208,7 @@ def test_many_grow_and_shrink_cycles_keep_every_state_and_never_reload():
     # the same states again, then 100 cycles alternating grow and shrink of both n_ctx and n_seq
     held = hold_states(n_held)
     rss_before = rss_kib()
+    held_before = held_bytes()
     geometries = [(3 * N_CTX, N_SLOTS + 2), (N_CTX, N_SLOTS)]
     for cycle in range(100):
         n_ctx, n_seq = geometries[cycle % 2]
@@ -208,6 +222,8 @@ def test_many_grow_and_shrink_cycles_keep_every_state_and_never_reload():
     assert props["reconfigure"]["n_applied"] == 100
     assert props["total_slots"] == N_SLOTS
     assert_never_reloaded()
+    # the footprint is flat: back at the start's geometry, the contexts hold what they held before the cycles
+    assert held_bytes() == held_before
 
     # each state came back byte for byte: the same reuse and the same next tokens as the control
     assert continuations(held, 8) == control
@@ -377,4 +393,36 @@ def test_props_report_the_measured_cost_of_a_reconfigure():
     assert cost["bytes_paged_total"] > 0
     assert cost["pause_ms_per_1k_tokens"] > 0
     assert cost["last_applied"]["rebuilt"] is False
-    assert len(cost["context_buffers"]) > 0
+
+
+def test_a_shrink_gives_the_kv_memory_back_and_a_grow_takes_it_again():
+    # the engine's KV pool and graph are allocated for the geometry, so a shrink must free them while
+    # serving: the allocator's own bytes fall in proportion to the cells, every held state survives
+    # bit-identical, and a grow takes the bytes back. A reconfigure that rebuilt at the old size, kept
+    # the old buffers beside the new ones, or reported the load's stale breakdown fails here.
+    server.kv_unified = True # one pool of cells every sequence draws on, as the live engine serves
+    server.start()
+    n_held = 24
+    control = continuations(hold_states(n_held), 8)
+    held = hold_states(n_held)
+    before = held_bytes()
+    assert before["cells"] == N_CTX
+    assert before["context"] > 0
+
+    # 256 cells (the context's padding unit) still hold all four ~34-token states
+    shrunk = applied(256, N_SLOTS)
+    assert shrunk["paged_out"] == [], shrunk
+    small = held_bytes()
+    print(f"shrink {N_CTX} -> 256 cells: context {before['context']} -> {small['context']} B, "
+          f"compute {before['compute']} -> {small['compute']} B, rss {rss_kib()} KiB")
+    assert small["cells"] == 256
+    assert small["model"] == before["model"] # the weights stay loaded
+    # KV bytes are cells times the bytes one cell holds: the pool shrank to exactly its new cells
+    assert small["context"] * N_CTX == before["context"] * 256
+    assert small["context"] + small["compute"] < before["context"] + before["compute"]
+
+    grown = applied(N_CTX, N_SLOTS)
+    assert grown["paged_out"] == []
+    assert held_bytes() == before
+    assert continuations(held, 8) == control
+    assert_never_reloaded()
