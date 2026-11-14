@@ -12,6 +12,7 @@
 #include "server-stream.h"
 #include "server-page-adapters.h"
 #include "server-prefill.h"
+#include "server-adapter-turn.h"
 #include "server-learn-ledger.h"
 #include "server-learn-residency.h"
 #include "server-test-faults.h"
@@ -359,6 +360,8 @@ struct server_slot {
 
     std::vector<common_adapter_lora_info> lora;
     int32_t alora_invocation_start = -1;
+    // when its tokens last entered a batch, or its task arrived: who holds the batch (server-adapter-turn.h)
+    int64_t t_last_batched_us = 0;
 
     // sampling
     json json_schema;
@@ -1996,6 +1999,9 @@ private:
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
+
+        // its wait for a batch starts now (server-adapter-turn.h)
+        slot.t_last_batched_us = ggml_time_us();
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
@@ -3757,6 +3763,34 @@ private:
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
+        // one batch wears one adapter set: the longest-unserved slot's set holds it, so no set
+        // starves another (server-adapter-turn.h). The holder is stamped even if it adds nothing
+        // this batch, so a slot that cannot progress yields the turn instead of keeping it. It only
+        // decides compatibility: `slot_batched` is still the first slot that adds tokens, so a
+        // holder released mid-batch (a prompt over its context) is never the batch's slot.
+        const int64_t t_batch_us = ggml_time_us();
+        server_slot * holder = nullptr;
+        // the slot a candidate must batch with: the batch's own slot once one added tokens, else the holder
+        const auto batches_with = [&](server_slot & slot) {
+            const server_slot * reference = slot_batched ? slot_batched
+                : (holder && holder->is_processing() ? holder : nullptr);
+            return reference == nullptr || reference->can_batch_with(slot);
+        };
+        {
+            std::vector<server_batch_claim> claims;
+            claims.reserve(slots.size());
+            for (const auto & slot : slots) {
+                const bool waiting = slot.state == SLOT_STATE_GENERATING
+                    || slot.state == SLOT_STATE_STARTED
+                    || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+                claims.push_back({ waiting, slot.t_last_batched_us });
+            }
+            if (const auto turn = server_adapter_turn(claims)) {
+                holder = &slots[*turn];
+                holder->t_last_batched_us = t_batch_us;
+            }
+        }
+
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
@@ -3766,14 +3800,16 @@ private:
                 return;
             }
 
-            // check if we can batch this slot with the previous one
+            // check if we can batch this slot with the previous one (or the holder's set)
+            if (!batches_with(slot)) {
+                return;
+            }
             if (!slot_batched) {
                 slot_batched = &slot;
-            } else if (!slot_batched->can_batch_with(slot)) {
-                return;
             }
 
             generating.push_back(&slot);
+            slot.t_last_batched_us = t_batch_us;
 
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
@@ -3905,8 +3941,8 @@ private:
                     return;
                 }
 
-                // check if we can batch this slot with the previous one
-                if (slot_batched && !slot_batched->can_batch_with(slot)) {
+                // check if we can batch this slot with the previous one (or the holder's set)
+                if (!batches_with(slot)) {
                     return;
                 }
 
@@ -4480,6 +4516,9 @@ private:
                 }
 
                 prefill_order.served(size_t(&slot - slots.data()), batch_before, batch.size());
+                if (batch.size() > batch_before) {
+                    slot.t_last_batched_us = t_batch_us;
+                }
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
