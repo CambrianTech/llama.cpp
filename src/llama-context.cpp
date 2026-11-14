@@ -110,6 +110,10 @@ llama_context::llama_context(
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
+    if (params.embeddings_only && (!params.embeddings || params.pooling_type == LLAMA_POOLING_TYPE_NONE || params.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED)) {
+        throw std::runtime_error("embeddings_only requires embeddings and explicit sequence pooling");
+    }
+    cparams.embeddings_only         = params.embeddings_only;
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
@@ -2137,7 +2141,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = true;
+    bool has_logits     = !cparams.embeddings_only;
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
@@ -3460,6 +3464,7 @@ llama_context_params llama_context_default_params() {
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
+        /*.embeddings_only             =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,

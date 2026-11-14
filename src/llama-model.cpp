@@ -38,6 +38,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -2663,6 +2664,45 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // TODO: move reranking logic here and generalize
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
+    if (params.cparams.embeddings_only) {
+        if (params.cparams.training || params.cparams.embeddings_nextn || !params.samplers.empty() ||
+                std::any_of(params.cparams.embeddings_layer_inp.begin(), params.cparams.embeddings_layer_inp.end(), [](bool enabled) { return enabled; })) {
+            throw std::runtime_error("embeddings_only cannot train, sample, or extract auxiliary outputs");
+        }
+        GGML_ASSERT(llm->res->t_embd_pooled != nullptr);
+        // Cache writes are explicit graph roots, not dependencies of cache reads.
+        // Preserve those roots and their original ordering when pruning logits.
+        const auto ancestors = [](ggml_tensor * root) {
+            std::unordered_set<ggml_tensor *> seen;
+            std::vector<ggml_tensor *> pending { root };
+            while (!pending.empty()) {
+                auto * node = pending.back();
+                pending.pop_back();
+                if (!node || !seen.insert(node).second) {
+                    continue;
+                }
+                for (auto * src : node->src) {
+                    pending.push_back(src);
+                }
+            }
+            return seen;
+        };
+        const auto logits = ancestors(llm->res->t_logits);
+        const auto pooled = ancestors(llm->res->t_embd_pooled);
+        auto * gf = llm->res->get_gf();
+        std::vector<ggml_tensor *> roots;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            auto * node = ggml_graph_node(gf, i);
+            if (!logits.count(node) || pooled.count(node)) {
+                roots.push_back(node);
+            }
+        }
+        llm->res->t_logits = nullptr;
+        ggml_graph_clear(gf);
+        for (auto * root : roots) {
+            ggml_build_forward_expand(gf, root);
+        }
+    }
     llm->res->set_outputs(params);
 
     return llm->res->get_gf();
