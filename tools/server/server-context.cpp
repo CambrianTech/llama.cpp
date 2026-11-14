@@ -6419,7 +6419,7 @@ void server_routes::init_routes() {
     this->post_page_io_budget = [this, page_io_snapshot](const server_http_req & req) {
         auto res = create_response(true);
         const json body = req.body.empty() ? json::object() : json::parse(req.body);
-        if (!body.is_object() || !body.contains("budget_bytes") || !body.at("budget_bytes").is_number_unsigned()) {
+        if (!body.is_object() || !body.contains("budget_bytes") || !body.at("budget_bytes").is_number_integer() || body.at("budget_bytes").get<int64_t>() < 0) {
             res->error(format_error_response("budget_bytes must be an unsigned integer: the host bytes in-flight page switches may hold", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
