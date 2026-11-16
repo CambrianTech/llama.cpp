@@ -661,8 +661,11 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        // cur / cur_p are per-sample SCRATCH (set_logits rebuilds them before any read): a save point
+        // carries state, never the scratch (on the full path that was a 248k-entry, ~3 MB copy per
+        // speculative verify step; measured 42 us per clone, 39 us per restore on the 0.8B)
+        /* .cur     = */ {},
+        /* .cur_p   = */ { nullptr, 0, -1, false },
         /* .coarse_cap    = */ gsmpl->coarse_cap, // a clone (speculative verify) keeps the ballpark path
         /* .coarse_raised = */ gsmpl->coarse_raised,
         /* .coarse_ids    = */ {},
@@ -690,9 +693,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
 
     dst->params     = src->params;
     dst->prev       = src->prev;
-    dst->cur        = src->cur;
-    dst->cur_p      = src->cur_p;
-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    // cur / cur_p are scratch, rebuilt by set_logits before any read: never copied (see common_sampler_clone)
+    dst->cur_p      = { nullptr, 0, -1, false };
     dst->t_total_us = src->t_total_us;
     dst->coarse_cap    = src->coarse_cap;
     dst->coarse_raised = src->coarse_raised;
