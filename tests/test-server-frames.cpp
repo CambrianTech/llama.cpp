@@ -119,7 +119,7 @@ private:
         while (!stop.stop_requested() || work_.pushed() != work_.taken()) {
             const size_t n = work_.drain(batch);
             for (size_t i = 0; i < n; ++i) {
-                complete(0, batch[i].ticket, transfer_status::moved); // the engine's one completion context
+                complete(0, batch[i].ticket, transfer_status::moved, transfer_done_frame::NO_SLOT); // its one context
             }
             if (n == 0) {
                 if (work_.closed()) break;
@@ -137,9 +137,9 @@ static void a_mover_streams_moves_without_waiting() {
     std::map<uint64_t, transfer_status> done;
     {
         test_mover mover(in, 1024);
-        const buffer_ref disk{ memory_domain::disk, 1, 7, 0, 4096 };
-        const buffer_ref host{ memory_domain::host, 0, 3, 0, 4096 };
-        const buffer_ref dev{ memory_domain::device, 2, 9, 0, 4096 };
+        const buffer_ref disk{ memory_domain::disk, 1, 7, 0, 0, 4096 };
+        const buffer_ref host{ memory_domain::host, 0, 3, 0, 0, 4096 };
+        const buffer_ref dev{ memory_domain::device, 2, 9, 0, 0, 4096 };
         uint64_t ticket = 0;
         for (int i = 0; i < 300; ++i) {
             require(in.push({ ++ticket, disk, host }), "a page read is queued");   // moved later
@@ -180,7 +180,8 @@ static void run_copies(size_t lanes, size_t chunk, size_t n_transfers, size_t by
     // pool 0 = sources, pool 1 = destinations; buffer = index
     auto resolve = [&](const buffer_ref & r) -> std::byte * {
         auto & v = r.pool == 0 ? src : dst;
-        return r.buffer < v.size() ? v[r.buffer].data() + r.offset : nullptr;
+        // the custody contract: a live generation (0 here) and in bounds, else refused
+        return r.generation == 0 && r.buffer < v.size() && r.offset + r.bytes <= v[r.buffer].size() ? v[r.buffer].data() + r.offset : nullptr;
     };
     frame_ring<transfer_frame> in(n_transfers + 8);
     std::map<uint64_t, transfer_status> done;
@@ -188,14 +189,14 @@ static void run_copies(size_t lanes, size_t chunk, size_t n_transfers, size_t by
     {
         parallel_copier mover(in, resolve, lanes, chunk, 64);
         for (size_t i = 0; i < n_transfers; ++i) {
-            const buffer_ref s{ memory_domain::host, 0, (uint32_t) i, 0, bytes_each };
-            const buffer_ref d{ memory_domain::host, 1, (uint32_t) i, 0, bytes_each };
+            const buffer_ref s{ memory_domain::host, 0, (uint32_t) i, 0, 0, bytes_each };
+            const buffer_ref d{ memory_domain::host, 1, (uint32_t) i, 0, 0, bytes_each };
             require(in.push({ i + 1, s, d }), "queued");
         }
-        const buffer_ref bad_s{ memory_domain::host, 0, 0, 0, bytes_each };
-        const buffer_ref bad_d{ memory_domain::host, 1, 0, 0, bytes_each - 1 };
+        const buffer_ref bad_s{ memory_domain::host, 0, 0, 0, 0, bytes_each };
+        const buffer_ref bad_d{ memory_domain::host, 1, 0, 0, 0, bytes_each - 1 };
         require(in.push({ n_transfers + 1, bad_s, bad_d }), "queued");                     // size mismatch
-        require(in.push({ n_transfers + 2, bad_s, { memory_domain::disk, 9, 0, 0, bytes_each } }), "queued"); // disk pair
+        require(in.push({ n_transfers + 2, bad_s, { memory_domain::disk, 9, 0, 0, 0, bytes_each } }), "queued"); // disk pair
         while (done.size() < n_transfers + 2) {
             const uint64_t bell = mover.doorbell();
             mover.pump(); // starts what the lanes have room for and returns: never waits
@@ -217,6 +218,95 @@ static void run_copies(size_t lanes, size_t chunk, size_t n_transfers, size_t by
     require(done[n_transfers + 2] == transfer_status::refused, "a disk pair is refused by the host copier");
 }
 
+// Codex's #134 review, one regression each.
+using done_map = std::map<uint64_t, transfer_status>;
+static void drain_all(memory_mover & mover, done_map & done, size_t want) {
+    while (done.size() < want) {
+        const uint64_t bell = mover.doorbell();
+        mover.pump();
+        transfer_done_frame batch[4];
+        const size_t n = mover.drain_done(batch);
+        for (size_t i = 0; i < n; ++i) {
+            require(done.emplace(batch[i].ticket, batch[i].status).second, "each ticket has exactly one terminal frame");
+        }
+        if (n == 0) mover.wait_done(bell);
+    }
+}
+
+// what this catches: settlements published into a full completion ring slept inside pump, while the same
+// caller could only drain after pump returned (capacity 2 + 3 aliases deadlocked)
+static void a_full_completion_ring_is_backpressure_not_a_deadlock() {
+    std::vector<std::byte> a(4096), b(4096);
+    auto resolve = [&](const buffer_ref & r) -> std::byte * {
+        auto & v = r.buffer == 0 ? a : b;
+        return r.generation == 0 && r.offset + r.bytes <= v.size() ? v.data() + r.offset : nullptr;
+    };
+    frame_ring<transfer_frame> in(16);
+    parallel_copier mover(in, resolve, 2, 4096, 2);
+    const buffer_ref x{ memory_domain::host, 0, 0, 0, 0, 4096 };
+    for (uint64_t t = 1; t <= 5; ++t) require(in.push({ t, x, x }), "queued");
+    mover.pump(); // must return with settlements held, never sleep
+    require(mover.blocked(), "unsettled frames are reported as backpressure");
+    done_map done;
+    drain_all(mover, done, 5);
+    for (auto & [t, s] : done) require(s == transfer_status::aliased, "each alias settles once");
+}
+
+// what this catches: an alias succeeded before validation (unequal lengths, a stale generation), and
+// overlapping ranges in one buffer reached parallel memcpy (UB)
+static void invalid_aliases_and_overlaps_are_refused() {
+    std::vector<std::byte> a(1 << 16);
+    auto resolve = [&](const buffer_ref & r) -> std::byte * {
+        return r.generation == 0 && r.offset + r.bytes <= a.size() ? a.data() + r.offset : nullptr;
+    };
+    frame_ring<transfer_frame> in(16);
+    parallel_copier mover(in, resolve, 4, 4096, 8);
+    const auto ref = [](uint32_t gen, uint64_t off, uint64_t n) { return buffer_ref{ memory_domain::host, 0, 0, gen, off, n }; };
+    require(in.push({ 1, ref(0, 0, 4096), ref(0, 0, 8192) }), "q");   // same start, unequal lengths
+    require(in.push({ 2, ref(1, 0, 4096), ref(1, 0, 4096) }), "q");   // stale generation named twice
+    require(in.push({ 3, ref(0, 0, 8192), ref(0, 4096, 8192) }), "q"); // overlapping ranges
+    require(in.push({ 4, ref(0, 0, 4096), ref(0, 1 << 16, 4096) }), "q"); // out of bounds
+    require(in.push({ 5, ref(0, 0, 4096), ref(0, 8192, 4096) }), "q");  // disjoint: a real copy
+    done_map done;
+    drain_all(mover, done, 5);
+    require(done[1] == transfer_status::refused && done[2] == transfer_status::refused, "an alias is never unvalidated");
+    require(done[3] == transfer_status::refused, "overlap is refused, never raced");
+    require(done[4] == transfer_status::refused, "out of bounds is refused");
+    require(done[5] == transfer_status::moved, "a disjoint copy in one buffer moves");
+}
+
+// what this catches: the destructor joined lanes blocked on full completion rings, and tickets never handed
+// to a lane had no terminal outcome
+static void teardown_with_work_outstanding_ends_every_ticket() {
+    const size_t n = 64, bytes = 1 << 20;
+    std::vector<std::vector<std::byte>> src(n, std::vector<std::byte>(bytes)), dst(n, std::vector<std::byte>(bytes));
+    auto resolve = [&](const buffer_ref & r) -> std::byte * {
+        auto & v = r.pool == 0 ? src : dst;
+        return r.generation == 0 && r.buffer < v.size() && r.offset + r.bytes <= v[r.buffer].size() ? v[r.buffer].data() + r.offset : nullptr;
+    };
+    frame_ring<transfer_frame> in(n);
+    {
+        parallel_copier mover(in, resolve, 3, 64 * 1024, 2); // two slots: most transfers stay queued
+        for (uint64_t i = 0; i < n; ++i) {
+            require(in.push({ i + 1, { memory_domain::host, 0, (uint32_t) i, 0, 0, bytes }, { memory_domain::host, 1, (uint32_t) i, 0, 0, bytes } }), "q");
+        }
+        mover.pump();
+        mover.shutdown();
+        done_map done;
+        drain_all(mover, done, n); // every ticket ends: moved/failed by a lane, or cancelled unhanded
+        size_t cancelled = 0;
+        for (auto & [t, s] : done) {
+            require(s == transfer_status::moved || s == transfer_status::failed || s == transfer_status::cancelled, "a terminal status");
+            cancelled += s == transfer_status::cancelled;
+        }
+        require(cancelled > 0, "transfers no lane took are cancelled, typed");
+        require(!in.push({ n + 1, {}, {} }), "a shut-down mover takes nothing more");
+    } // the destructor joins without hanging
+    {
+        parallel_copier mover(in, resolve, 3, 64 * 1024, 2);
+    } // and a fresh mover over the closed ring tears down at once
+}
+
 static void the_parallel_copier_moves_many_at_once() {
     run_copies(/*lanes=*/6, /*chunk=*/64 * 1024, /*transfers=*/200, /*bytes=*/1 << 20, nullptr);
 }
@@ -236,6 +326,9 @@ int main(int argc, char ** argv) {
     a_full_ring_is_backpressure();
     close_wakes_a_waiting_consumer();
     a_mover_streams_moves_without_waiting();
+    a_full_completion_ring_is_backpressure_not_a_deadlock();
+    invalid_aliases_and_overlaps_are_refused();
+    teardown_with_work_outstanding_ends_every_ticket();
     the_parallel_copier_moves_many_at_once();
     std::cout << "test-server-frames: ok\n";
     return 0;
