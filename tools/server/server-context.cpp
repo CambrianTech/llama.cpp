@@ -736,6 +736,16 @@ struct server_slot {
             res["kv_pos_max"] = llama_memory_seq_pos_max(mem, id);
         }
 
+        // The slot's context checkpoints as they sit in host memory now (Continuum fork): their count
+        // and their bytes, so the core prices the checkpoint store from what it holds, not a guess.
+        {
+            size_t bytes = 0;
+            for (const auto & ckpt : prompt.checkpoints) {
+                bytes += ckpt.size();
+            }
+            res["checkpoints"] = { {"count", prompt.checkpoints.size()}, {"bytes", bytes} };
+        }
+
         const auto & ptask = task ? task : task_prev;
 
         if (ptask) {
