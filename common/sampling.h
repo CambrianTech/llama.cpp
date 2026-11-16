@@ -71,6 +71,28 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
+// One output row's sampling input, gathered from the context by the thread that owns it. Sampling from a
+// row reads no context state, so the rows of one decode step sample on many lanes at once (continuum
+// CONTINUUM-ENGINE 4.7.14). common_sampler_row_ith synchronizes the context first.
+struct common_sampler_row {
+    const float *       logits           = nullptr;
+    const float *       sampled_probs    = nullptr;
+    const float *       sampled_logits   = nullptr;
+    const llama_token * sampled_ids      = nullptr;
+    uint32_t            n_sampled_probs  = 0;
+    uint32_t            n_sampled_logits = 0;
+    llama_token         sampled_token    = LLAMA_TOKEN_NULL; // a backend sampler's choice, if any
+    int32_t             n_vocab          = 0;
+};
+
+common_sampler_row common_sampler_row_ith(struct llama_context * ctx, int idx);
+
+// common_sampler_sample over a gathered row: touches only `gsmpl`
+llama_token common_sampler_sample_row(struct common_sampler * gsmpl, const common_sampler_row & row, bool grammar_first = false);
+
+// common_sampler_sample_and_accept_n over gathered rows (rows.size() == draft.size() + 1): touches only `gsmpl`
+std::vector<llama_token> common_sampler_sample_and_accept_rows(struct common_sampler * gsmpl, const std::vector<common_sampler_row> & rows, const llama_tokens & draft, bool grammar_first = false);
+
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match

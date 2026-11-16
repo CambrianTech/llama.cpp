@@ -128,6 +128,38 @@ int main(int argc, char ** argv) {
         run_case("logit biases", sp, false, "");
     }
 
+    // NaN logits (Codex on #122): the widening loop must end and the step must sample exactly as the full
+    // array does, whether every logit is NaN, all but a few are, or a few are
+    {
+        const int n_v = llama_vocab_n_tokens(vocab);
+        std::vector<float> logits(n_v);
+        for (const int finite : { 0, 100, n_v - 1000 }) {
+            for (int i = 0; i < n_v; ++i) {
+                // distinct finite values (7919 is prime, so i*7919 mod finite permutes them): with ties, top-k's
+                // order among equals is unspecified on both paths and "the same token" means nothing
+                logits[i] = i < finite ? 10.0f * (float) (((int64_t) i * 7919) % finite) / (float) finite : NAN;
+            }
+            common_sampler_row row;
+            row.logits  = logits.data();
+            row.n_vocab = n_v;
+            common_sampler * coarse = common_sampler_init(model, base);
+            common_params_sampling full_params = base;
+            full_params.n_probs = 1; // not ballpark-eligible: the full array
+            common_sampler * full = common_sampler_init(model, full_params);
+            for (int step = 0; step < 8; ++step) {
+                const llama_token a = common_sampler_sample_row(coarse, row);
+                const llama_token b = common_sampler_sample_row(full, row);
+                if (a != b) {
+                    std::fprintf(stderr, "FAILED: NaN logits (%d finite): ballpark %d, full %d\n", finite, a, b);
+                    return 1;
+                }
+            }
+            common_sampler_free(coarse);
+            common_sampler_free(full);
+            std::printf("%-18s %d finite of %d: the ballpark step ended and matched the full array\n", "NaN logits", finite, n_v);
+        }
+    }
+
     // speculative verify: the ballpark side samples through a clone every step
     run_case("clone each step", base, true, "");
 
