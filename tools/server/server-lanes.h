@@ -34,25 +34,27 @@ inline void server_lane_priority() {
 
 class server_lanes {
 public:
-    explicit server_lanes(size_t n_workers) : lanes(n_workers) {
-        for (size_t i = 0; i < n_workers; ++i) {
-            lanes[i].thread = std::thread([this, i] { work(lanes[i]); });
+    // `spawn` starts one lane's thread (std::thread by default; a test injects a failure). If starting any
+    // lane throws, the lanes already started are stopped and joined before the exception leaves, so no
+    // joinable std::thread is ever destroyed (Codex on #129: that is std::terminate).
+    using spawn_fn = std::function<std::thread(std::function<void()>)>;
+
+    explicit server_lanes(size_t n_workers, const spawn_fn & spawn = [](std::function<void()> f) { return std::thread(std::move(f)); })
+        : lanes(n_workers) {
+        try {
+            for (size_t i = 0; i < n_workers; ++i) {
+                lanes[i].thread = spawn([this, i] { work(lanes[i]); });
+            }
+        } catch (...) {
+            shutdown();
+            throw;
         }
     }
 
     server_lanes(const server_lanes &)             = delete;
     server_lanes & operator=(const server_lanes &) = delete;
 
-    ~server_lanes() {
-        stop.store(true, std::memory_order_release);
-        for (auto & lane : lanes) {
-            lane.wake.fetch_add(1, std::memory_order_release);
-            lane.wake.notify_one();
-        }
-        for (auto & lane : lanes) {
-            lane.thread.join();
-        }
-    }
+    ~server_lanes() { shutdown(); }
 
     size_t size() const { return lanes.size() + 1; }
 
@@ -94,6 +96,20 @@ public:
     }
 
 private:
+    // stop every started lane, wake it, and join it; lanes never started have no thread
+    void shutdown() {
+        stop.store(true, std::memory_order_release);
+        for (auto & lane : lanes) {
+            lane.wake.fetch_add(1, std::memory_order_release);
+            lane.wake.notify_one();
+        }
+        for (auto & lane : lanes) {
+            if (lane.thread.joinable()) {
+                lane.thread.join();
+            }
+        }
+    }
+
     struct lane {
         std::thread           thread;
         std::atomic<uint64_t> wake{0};

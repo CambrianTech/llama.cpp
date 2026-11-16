@@ -10,6 +10,7 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <system_error>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -73,7 +74,27 @@ static void lanes_never_hang_and_never_cross_runs() {
     }
 }
 
+// what this catches: a lane thread that fails to start after others did destroyed joinable threads
+// (std::terminate); the started lanes must be stopped and joined and the error reach the caller
+static void lanes_failed_start_joins_the_started() {
+    size_t started = 0;
+    bool   threw   = false;
+    try {
+        server_lanes lanes(4, [&](std::function<void()> f) {
+            if (started == 2) {
+                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+            }
+            ++started;
+            return std::thread(std::move(f));
+        });
+    } catch (const std::system_error &) {
+        threw = true;
+    }
+    require(threw && started == 2, "a failed lane start reaches the caller after the started lanes are joined");
+}
+
 int main(int argc, char ** argv) {
+    lanes_failed_start_joins_the_started();
     lanes_run_every_job_once();
     lanes_never_hang_and_never_cross_runs();
 
