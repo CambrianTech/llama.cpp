@@ -160,31 +160,50 @@ static void the_owners_capacity_bounds_the_ring() {
     require(a == 1 && b == 3 && c == 0, "the queued jobs ran; the refused one never did");
 }
 
-// what this catches (Codex on #135): a run or cancel call that threw escaped the worker (std::terminate) and
-// left later tickets unfinished
-static void a_throwing_job_is_a_typed_fault_and_the_worker_lives() {
+// what this catches (Codex on #135): a run or cancel call that threw escaped the worker (std::terminate), one
+// "last fault" slot overwrote earlier failures, and recording the text allocated inside the catch. Now each job
+// ends in a typed outcome in its OWNER's storage, and the worker lives on.
+static void a_throwing_job_ends_typed_in_its_owners_storage() {
     adder module(8);
-    auto bad = module.submit([](job_state) { throw std::runtime_error("job failed"); });
+    std::atomic<job_outcome> first{job_outcome::pending}, second{job_outcome::pending}, after{job_outcome::pending};
+    auto bad1 = module.submit([](job_state) { throw std::runtime_error("job failed"); }, &first);
+    auto bad2 = module.submit([](job_state) { throw 7; }, &second);
     int64_t out = 0;
-    auto good = module.add(7, &out);
-    require(bad.has_value() && good.has_value(), "both queued");
+    auto good = module.submit([&out](job_state s) { if (s == job_state::run) out = 7; }, &after);
+    require(bad1.has_value() && bad2.has_value() && good.has_value(), "all queued");
     module.wait(*good);
-    require(out == 7, "the job after a fault still runs");
-    require(module.completed() >= *bad, "the faulted ticket completed");
-    const auto f = module.last_fault();
-    require(module.stats().faulted == 1 && f.ticket == *bad && f.during == job_state::run && f.what == "job failed",
-            "the fault is typed and named by its ticket");
+    require(out == 7 && after.load() == job_outcome::ran, "the job after two faults still runs");
+    require(first.load() == job_outcome::run_faulted && second.load() == job_outcome::run_faulted,
+            "each fault is kept in its own owner's storage: none overwritten");
+    require(module.stats().faulted == 2, "and counted");
 
     // a cancel call that throws, during stop
     std::atomic<bool> release{false};
+    std::atomic<job_outcome> doomed_out{job_outcome::pending};
     auto blocker = module.submit([&](job_state) { while (!release.load()) { std::this_thread::yield(); } });
-    auto doomed  = module.submit([](job_state s) { if (s == job_state::cancelled) throw std::logic_error("cancel failed"); });
+    auto doomed  = module.submit([](job_state s) { if (s == job_state::cancelled) throw std::logic_error("cancel failed"); }, &doomed_out);
     require(blocker.has_value() && doomed.has_value(), "queued");
     std::thread stopper([&] { module.stop(); });
+    while (!module.stopping()) std::this_thread::yield(); // the blocker still runs: `doomed` can only be cancelled
     release = true;
     stopper.join();
     require(module.completed() >= *doomed, "no waiter hangs on a ticket whose cancel threw");
-    require(module.stats().faulted == 2 && module.last_fault().during == job_state::cancelled, "a cancel fault is typed too");
+    require(doomed_out.load() == job_outcome::cancel_faulted, "a cancel fault is typed too");
+}
+
+// what this catches (Codex on #135): an empty or moved-from job was accepted, then called through null ops
+static void an_empty_job_is_refused_typed() {
+    adder module(4);
+    adder::job empty;
+    auto r = module.submit(std::move(empty));
+    require(!r.has_value() && r.error() == module_refusal::empty, "an empty job is refused, never queued");
+    adder::job real([](job_state) {});
+    adder::job moved = std::move(real);
+    auto r2 = module.submit(std::move(real)); // NOLINT: deliberately the moved-from one
+    require(!r2.has_value() && r2.error() == module_refusal::empty, "a moved-from job is refused");
+    auto r3 = module.submit(std::move(moved));
+    require(r3.has_value(), "the moved-to job queues");
+    module.wait(*r3);
 }
 
 // what this catches (Codex on #135): std::function required a copyable target; a job owning a move-only
@@ -226,7 +245,8 @@ int main() {
     a_snapshot_never_waits_on_work();
     a_stop_cancels_queued_jobs_and_no_waiter_hangs();
     the_owners_capacity_bounds_the_ring();
-    a_throwing_job_is_a_typed_fault_and_the_worker_lives();
+    a_throwing_job_ends_typed_in_its_owners_storage();
+    an_empty_job_is_refused_typed();
     a_move_only_job_runs_once_and_releases_its_capture();
     a_snapshot_read_is_never_torn();
     std::cout << "test-server-module: ok\n";
