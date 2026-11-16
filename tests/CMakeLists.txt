@@ -32,6 +32,12 @@ target_compile_features(test-server-learn-ledger PRIVATE cxx_std_17)
 add_test(NAME test-server-learn-ledger COMMAND test-server-learn-ledger)
 set_tests_properties(test-server-learn-ledger PROPERTIES LABELS "main")
 
+# Model-free engine-module validator: own thread, move-only jobs, typed refusals, snapshots that never wait.
+add_executable(test-server-module test-server-module.cpp)
+target_compile_features(test-server-module PRIVATE cxx_std_20)
+add_test(NAME test-server-module COMMAND test-server-module)
+set_tests_properties(test-server-module PROPERTIES LABELS "main")
+
 # Model-free validator: streams of frames and moving bytes by reference (rings, doorbell, memory_mover).
 add_executable(test-server-frames test-server-frames.cpp)
 target_compile_features(test-server-frames PRIVATE cxx_std_20)
