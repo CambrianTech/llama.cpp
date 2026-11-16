@@ -113,6 +113,9 @@ struct learn_outcome {
     bool        effects_uncertain = false;
     std::string refusal = "none";
     bool        ok       = false;
+    // continuum: where it learned, typed. side_sequence: her live sequence was never touched (preserved whatever
+    // the outcome); slot: on her own sequence (cut back to the learned turn's prefix)
+    enum class learned_on_kind : uint8_t { slot, side_sequence } learned_on = learned_on_kind::slot;
     bool        deferred = false;
     int64_t     retry_after_ms = 0;
     std::string failure;

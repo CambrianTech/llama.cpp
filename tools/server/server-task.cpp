@@ -1740,6 +1740,8 @@ json learn_outcome::to_json() const {
     if (!ok) {
         res["failure"] = failure;
     }
+    res["learned_on"]              = learned_on == learned_on_kind::side_sequence ? "side_sequence" : "slot";
+    res["live_sequence_preserved"] = learned_on == learned_on_kind::side_sequence;
     return res;
 }
 

@@ -482,21 +482,26 @@
             if (cp != nullptr) {
                 cp->load_tgt(ctx_tgt, learn_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             }
-            if (side_from < n0) {
-                llama_batch b = llama_batch_init(n0 - side_from, 0, 1);
-                for (int32_t i = side_from; i < n0; ++i) {
+            // the served prompt's own tokens [side_from, n0), decoded in batches the context accepts
+            const int32_t chunk = (int32_t) llama_n_batch(ctx_tgt);
+            int rc = 0;
+            for (int32_t at = side_from; at < n0 && rc == 0; at += chunk) {
+                const int32_t n = std::min(chunk, n0 - at);
+                llama_batch b = llama_batch_init(n, 0, 1);
+                for (int32_t i = at; i < at + n; ++i) {
                     common_batch_add(b, L.prompt[i], i, { learn_seq }, false);
                 }
-                const int rc = llama_decode(ctx_tgt, b);
+                rc = llama_decode(ctx_tgt, b);
                 llama_batch_free(b);
-                if (rc != 0) {
-                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), learn_seq, -1, -1);
-                    park_free.push_back(learn_seq);
-                    common_set_adapter_lora(ctx_tgt, slot.lora);
-                    settle_learning_residency(L.lora_id);
-                    return refused("the served prompt's last " + std::to_string(n0 - side_from)
-                        + " tokens could not be decoded on the side sequence");
-                }
+            }
+            if (rc != 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx_tgt), learn_seq, -1, -1);
+                park_free.push_back(learn_seq);
+                ggml_opt_result_free(result);
+                common_set_adapter_lora(ctx_tgt, slot.lora);
+                settle_learning_residency(L.lora_id);
+                return refused("the served prompt's last " + std::to_string(n0 - side_from)
+                    + " tokens could not be decoded on the side sequence");
             }
             n_restore = 1;
         } else if (cp != nullptr) {
@@ -618,12 +623,15 @@
         // Target KV, token metadata and the untouched draft therefore still name the same tail.
         // If begin refused after loading the recurrent prefix, retain only that proven prefix.
         if (pending.side >= 0) {
-            // learned on a side sequence: it goes, her own sequence was never touched; the pin is released
+            // learned on a side sequence: it goes, her own sequence was never touched. The pin is released only
+            // when the learn committed; an abandoned or failed one keeps it, so a retry still finds it.
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), pending.side, -1, -1);
             park_free.push_back(pending.side);
-            for (auto & c : slot.prompt.checkpoints) {
-                if (c.n_tokens == n0) {
-                    c.pinned = false;
+            if (pending.began && ok && !pending.drained) {
+                for (auto & c : slot.prompt.checkpoints) {
+                    if (c.pinned && c.n_tokens == n0) {
+                        c.pinned = false;
+                    }
                 }
             }
         } else if (!pending.began || !ok) {
@@ -637,6 +645,7 @@
             slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & c) { return c.n_tokens > n0; });
         }
         learn_outcome out;
+        out.learned_on = pending.side >= 0 ? learn_outcome::learned_on_kind::side_sequence : learn_outcome::learned_on_kind::slot;
         out.ok       = ok && !pending.drained;
         out.refusal = pending.refusal;
         out.deferred = pending.drained;
