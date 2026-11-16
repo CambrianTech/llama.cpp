@@ -13,7 +13,8 @@
 //
 // A job is called exactly once: with `job_state::run` to do its work, or with `job_state::cancelled`
 // when a stop dropped it, so it can mark its owner's slot. A call that throws is contained: the fault is
-// recorded typed against its ticket, the ticket still completes, and the worker lives on. Stop cancels:
+// written as the job's typed terminal outcome into its owner's storage, the ticket still completes, and the
+// worker lives on. Stop cancels:
 // the job in flight finishes, every queued job is called cancelled and destroyed (its captures released),
 // and the counter still advances past every ticket, so no waiter waits forever. The worker sleeps until
 // there is work or a stop: never a poll, never a timer. Jobs capture a pointer to their owner's storage,
@@ -39,10 +40,11 @@
 #include <utility>
 #include <vector>
 
-// A value published by one writer and read by many, with no lock anywhere (Codex on #135: a mutex let a
-// reader wait on a publication). A seqlock over atomic words: the writer never waits; a reader copies the
-// words and retries only when a publish overlapped its copy. A snapshot is counters and ids, so it is
-// trivially copyable, enforced.
+// A value published by one writer and read by many, with no lock (Codex on #135: a mutex let a reader wait on
+// a publication). A seqlock over atomic words: the writer never waits on readers; a reader copies the words
+// and retries when a publish overlapped its copy, so a reader is NOT wait-free: a writer descheduled mid-
+// publish stalls readers until it resumes (they yield, never spin hot). A snapshot is counters and ids, so it
+// is trivially copyable, enforced.
 template <typename T>
 class snapshot_cell {
     static_assert(std::is_trivially_copyable_v<T>, "a snapshot is counters and ids, copied by value");
@@ -53,10 +55,13 @@ public:
 
     T read() const {
         uint64_t buf[WORDS];
-        while (true) {
+        for (uint32_t attempt = 0;; ++attempt) {
+            if (attempt >= 4) {
+                std::this_thread::yield(); // a publish keeps overlapping: let the writer finish
+            }
             const uint64_t before = seq_.load(std::memory_order_acquire);
             if (before & 1) {
-                continue; // a publish is mid-copy: read again, never wait on it
+                continue; // a publish is mid-copy
             }
             for (size_t i = 0; i < WORDS; ++i) {
                 buf[i] = words_[i].load(std::memory_order_relaxed);
@@ -160,6 +165,7 @@ private:
 enum class module_refusal : uint8_t {
     stopping, // the module is shutting down: the job was not queued
     full,     // the owner's capacity is reached: the job was not queued
+    empty,    // the job holds no callable (default-constructed or moved-from): never queued, never called
 };
 
 // How a job is called: once, either to run or because a stop dropped it.
@@ -179,13 +185,27 @@ struct module_stats {
     uint64_t max_job_us = 0; // the longest single job since start
 };
 
-// The most recent call that threw (Codex on #135: a throwing job terminated the worker and left tickets
-// unfinished). The worker survives; the fault is typed and named by its ticket.
-struct module_fault {
-    job_ticket  ticket = 0; // 0: none yet
-    job_state   during = job_state::run;
-    std::string what;
+// How a job ended, written by the module into storage its OWNER passed with the job (Codex on #135: one
+// "last fault" slot lost earlier failures, and recording what() allocated a string inside the catch). Typed,
+// one per job, no text: a name is rendered only at an export edge (job_outcome_name).
+enum class job_outcome : uint8_t {
+    pending        = 0, // not ended yet
+    ran            = 1,
+    run_faulted    = 2, // its run call threw: contained
+    cancelled      = 3,
+    cancel_faulted = 4, // its cancel call threw: contained
 };
+
+inline const char * job_outcome_name(job_outcome o) {
+    switch (o) {
+        case job_outcome::pending:        return "pending";
+        case job_outcome::ran:            return "ran";
+        case job_outcome::run_faulted:    return "run_faulted";
+        case job_outcome::cancelled:      return "cancelled";
+        case job_outcome::cancel_faulted: return "cancel_faulted";
+    }
+    return "unknown";
+}
 
 // `JobBytes`: the inline capture size of every job of this module, fixed at compile time.
 template <typename Snapshot, size_t JobBytes = 64>
@@ -213,9 +233,15 @@ public:
 
     const std::string & name() const { return name_; }
 
-    // Queue `j`; its ticket is complete once completed() reaches it.
-    std::expected<job_ticket, module_refusal> submit(job j) {
+    // Queue `j`; its ticket is complete once completed() reaches it. `outcome`, when given, is the owner's
+    // storage for how the job ended; it must outlive the ticket's completion.
+    std::expected<job_ticket, module_refusal> submit(job j, std::atomic<job_outcome> * outcome = nullptr) {
         job_ticket ticket;
+        if (!j) {
+            std::scoped_lock lock(mutex_);
+            stats_.refused++;
+            return std::unexpected(module_refusal::empty);
+        }
         {
             std::scoped_lock lock(mutex_);
             if (worker_.get_stop_token().stop_requested()) {
@@ -227,13 +253,16 @@ public:
                 return std::unexpected(module_refusal::full);
             }
             ticket = ++submitted_;
-            ring_[(head_ + count_) % ring_.size()] = slot{ std::move(j), ticket };
+            ring_[(head_ + count_) % ring_.size()] = slot{ std::move(j), ticket, outcome };
             count_++;
             stats_.queued = count_;
         }
         wake_.notify_one();
         return ticket;
     }
+
+    // A stop was requested: no job is taken from here on.
+    bool stopping() const { return worker_.get_stop_token().stop_requested(); }
 
     // How many jobs have finished (run or cancelled), in submission order.
     uint64_t completed() const { return completed_.load(std::memory_order_acquire); }
@@ -250,12 +279,9 @@ public:
 
     module_stats stats() const {
         std::scoped_lock lock(mutex_);
-        return stats_;
-    }
-
-    module_fault last_fault() const {
-        std::scoped_lock lock(mutex_);
-        return fault_;
+        module_stats out = stats_;
+        out.faulted      = faulted_.load(std::memory_order_relaxed);
+        return out;
     }
 
 protected:
@@ -278,8 +304,9 @@ protected:
 
 private:
     struct slot {
-        job        fn;
-        job_ticket ticket = 0;
+        job                       fn;
+        job_ticket                ticket  = 0;
+        std::atomic<job_outcome> * outcome = nullptr; // the owner's storage, or none
     };
 
     void finish_one() {
@@ -287,21 +314,23 @@ private:
         completed_.notify_all();
     }
 
-    // A job's call, contained: whatever it throws is recorded typed against its ticket; the worker lives on.
-    void call(job & j, job_state s, job_ticket ticket) {
+    // A job's call, contained: whatever it throws ends it as a typed fault in its owner's storage (nothing is
+    // allocated, nothing can throw here); the worker lives on.
+    void call(slot & s, job_state state) {
+        bool faulted = false;
         try {
-            j(s);
-        } catch (const std::exception & e) {
-            record_fault(ticket, s, e.what());
+            s.fn(state);
         } catch (...) {
-            record_fault(ticket, s, "a non-standard exception");
+            faulted = true;
         }
-    }
-
-    void record_fault(job_ticket ticket, job_state s, const char * what) {
-        std::scoped_lock lock(mutex_);
-        stats_.faulted++;
-        fault_ = module_fault{ ticket, s, what };
+        if (faulted) {
+            faulted_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (s.outcome != nullptr) {
+            const job_outcome o = state == job_state::run ? (faulted ? job_outcome::run_faulted : job_outcome::ran)
+                                                          : (faulted ? job_outcome::cancel_faulted : job_outcome::cancelled);
+            s.outcome->store(o, std::memory_order_release);
+        }
     }
 
     void run(std::stop_token stop) {
@@ -320,7 +349,7 @@ private:
                 stats_.queued = count_;
             }
             const auto started = std::chrono::steady_clock::now();
-            call(s.fn, job_state::run, s.ticket);
+            call(s, job_state::run);
             s.fn.reset(); // its captures are released before completion is announced
             const auto us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - started).count();
@@ -350,7 +379,7 @@ private:
                 count_--;
                 stats_.cancelled++;
             }
-            call(s.fn, job_state::cancelled, s.ticket);
+            call(s, job_state::cancelled);
             s.fn.reset();
             finish_one();
         }
@@ -366,6 +395,6 @@ private:
     job_ticket                   submitted_ = 0;
     std::atomic<uint64_t>        completed_{0};
     module_stats                 stats_;
-    module_fault                 fault_;
+    std::atomic<uint64_t>        faulted_{0};
     std::jthread                 worker_; // last: started after every member it uses exists
 };
