@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <clocale>
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -187,6 +188,70 @@ int main(int argc, char ** argv) {
         }
         common_sampler_free(coarse);
         std::printf("%-18s 40 +inf tokens on the seed's sample positions: the step ended on a maximal token\n", "+inf seed");
+    }
+
+    // Codex on #122, to keep the identity claim precise:
+    // (a) finite ties: which tied token wins is unspecified on both paths, so with greedy sampling both must
+    //     pick a token holding the maximum logit;
+    // (b) +inf then finite on ONE sampler: the degenerate step ends on a maximal token, and the threshold it
+    //     leaves behind never skews the finite steps after it (exact identity, step by step)
+    {
+        const int n_v = llama_vocab_n_tokens(vocab);
+        std::vector<float> tied(n_v);
+        for (int i = 0; i < n_v; ++i) {
+            tied[i] = (float) ((i * 7919) % 1000) / 100.0f; // 1,000 distinct values: every value ~248 times
+        }
+        common_params_sampling greedy = base;
+        greedy.temp = 0.0f;
+        common_params_sampling greedy_full = greedy;
+        greedy_full.n_probs = 1;
+        common_sampler_row tied_row;
+        tied_row.logits  = tied.data();
+        tied_row.n_vocab = n_v;
+        common_sampler * gc = common_sampler_init(model, greedy);
+        common_sampler * gf = common_sampler_init(model, greedy_full);
+        const float top = *std::max_element(tied.begin(), tied.end());
+        for (int step = 0; step < 8; ++step) {
+            const llama_token a = common_sampler_sample_row(gc, tied_row);
+            const llama_token b = common_sampler_sample_row(gf, tied_row);
+            if (tied[a] != top || tied[b] != top) {
+                std::fprintf(stderr, "FAILED: finite ties: ballpark %d (%.2f), full %d (%.2f), max %.2f\n", a, tied[a], b, tied[b], top);
+                return 1;
+            }
+        }
+        common_sampler_free(gc);
+        common_sampler_free(gf);
+        std::printf("%-18s 1,000 values over %d tokens, greedy: both paths pick a maximal token\n", "finite ties", n_v);
+
+        std::vector<float> spiked(n_v), clean(n_v);
+        for (int i = 0; i < n_v; ++i) {
+            clean[i]  = 10.0f * (float) (((int64_t) i * 7919) % n_v) / (float) n_v; // distinct
+            spiked[i] = (i % 16 == 0 && i < 16 * 40) ? INFINITY : clean[i];
+        }
+        common_sampler_row spiked_row, clean_row;
+        spiked_row.logits = spiked.data(); spiked_row.n_vocab = n_v;
+        clean_row.logits  = clean.data();  clean_row.n_vocab  = n_v;
+        common_params_sampling full_params = base;
+        full_params.n_probs = 1;
+        common_sampler * c = common_sampler_init(model, base);
+        common_sampler * f = common_sampler_init(model, full_params);
+        const llama_token a0 = common_sampler_sample_row(c, spiked_row);
+        const llama_token b0 = common_sampler_sample_row(f, spiked_row);
+        if (!std::isinf(spiked[a0]) || !std::isinf(spiked[b0])) {
+            std::fprintf(stderr, "FAILED: +inf then finite: the +inf step picked %d / %d, not maximal\n", a0, b0);
+            return 1;
+        }
+        for (int step = 1; step <= 8; ++step) {
+            const llama_token a = common_sampler_sample_row(c, clean_row);
+            const llama_token b = common_sampler_sample_row(f, clean_row);
+            if (a != b) {
+                std::fprintf(stderr, "FAILED: +inf then finite: step %d ballpark %d, full %d\n", step, a, b);
+                return 1;
+            }
+        }
+        common_sampler_free(c);
+        common_sampler_free(f);
+        std::printf("%-18s one sampler: the +inf step ends on a maximal token, then 8 finite steps identical\n", "+inf then finite");
     }
 
     // speculative verify: the ballpark side samples through a clone every step
