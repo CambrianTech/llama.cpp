@@ -1087,7 +1087,8 @@ extern "C" {
         LLAMA_SNAPSHOT_COPY_FAILED  = 4, // the copy itself failed
     };
 
-    // The device bytes a snapshot of `seq_id` would hold, so the pool reserves BEFORE anything allocates.
+    // The bytes a snapshot of `seq_id` would hold PHYSICALLY (device buffers at their alignment, ggml
+    // metadata, host header), so the pool reserves BEFORE anything allocates; save reports the same.
     LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_bytes(
             struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, size_t * device_bytes);
 
@@ -1096,15 +1097,18 @@ extern "C" {
     LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_save(
             struct llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags, size_t * device_bytes);
 
-    // Validated before the live sequence is touched: refused (INCOMPATIBLE) on a flags or layout mismatch.
+    // Validated before the live sequence is touched: refused (INCOMPATIBLE) on a flags or layout mismatch. A
+    // failure after the read began quarantines the target (cleared whole) and returns COPY_FAILED.
     LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_load(
             struct llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags);
 
     // Synchronizes first: no submitted step can still read the buffers being freed.
     LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_free(struct llama_context * ctx, uint64_t snapshot_id);
 
-    // Test-only fault injection: the next `n` snapshot device allocations fail.
+    // Test-only fault injection: the next `n` snapshot device allocations fail; the next `n` load commits
+    // fail after the read (the target is then quarantined: cleared whole, COPY_FAILED).
     LLAMA_API void llama_state_seq_snapshot_test_fail_next_allocs(int n);
+    LLAMA_API void llama_state_seq_snapshot_test_fail_next_load_commits(int n);
 
     //
     // Decoding
