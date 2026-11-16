@@ -114,6 +114,20 @@ int main(int argc, char ** argv) {
         run_case("lazy tool grammar", sp, false, "");
     }
 
+    // logit biases (Codex on #122): ids outside the vocabulary are ignored on both paths (never read out of
+    // bounds), two biases on one token sum on both paths, and a raised token joins the candidates
+    {
+        common_params_sampling sp = base;
+        const llama_token the = common_tokenize(vocab, " the", false, false).at(0);
+        const llama_token n_v = llama_vocab_n_tokens(vocab);
+        sp.logit_bias = {
+            { -1, 5.0f }, { n_v, 5.0f }, { n_v + 1000, -5.0f }, // outside the vocabulary
+            { the, 3.0f }, { the, 4.0f },                        // duplicates: +7 on both paths
+            { the + 1, -2.0f },
+        };
+        run_case("logit biases", sp, false, "");
+    }
+
     // speculative verify: the ballpark side samples through a clone every step
     run_case("clone each step", base, true, "");
 

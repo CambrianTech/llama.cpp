@@ -555,7 +555,13 @@ struct common_sampler * common_sampler_init(
                         params.penalty_repeat >= 1.0f && params.penalty_freq >= 0.0f && params.penalty_present >= 0.0f;
         size_t lowered = params.penalty_last_n > 0 ? (size_t) params.penalty_last_n : 0;
         std::vector<llama_token> raised;
+        const llama_token n_vocab = llama_vocab_n_tokens(vocab);
         for (const auto & b : params.logit_bias) {
+            // a bias on an id outside the vocabulary moves nothing on the full path either: never a candidate
+            // (Codex on #122: -1 or >= n_vocab indexed logits out of bounds); duplicates collapse with the scan's
+            if (b.token < 0 || b.token >= n_vocab) {
+                continue;
+            }
             if (b.bias > 0.0f) raised.push_back(b.token); else lowered++;
         }
         bool has_top_k = false;

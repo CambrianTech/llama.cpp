@@ -3961,12 +3961,13 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
         return;
     }
 
-    // search for the remaining candidates that were not found in the previous step
+    // search for the remaining candidates that were not found in the previous step. Every matching bias
+    // applies, as on the in-place path above: two biases on one token sum on both paths (Continuum fork:
+    // the subset path stopped at the first, which ballpark sampling exposed; Codex on #122)
     for (size_t i = 0; i < cur_p->size; ++i) {
         for (const auto & lb : ctx->to_search) {
             if (cur_p->data[i].id == lb.token) {
                 cur_p->data[i].logit += lb.bias;
-                break;
             }
         }
     }
