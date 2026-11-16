@@ -2987,6 +2987,26 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         }
     }
 
+    // a candidate SUBSET still in token-id order (e.g. a ballpark cut, common/sampling.cpp): find each
+    // history token by binary search, O(history x log n), instead of a hash lookup per candidate
+    if (cur_p->size > 1) {
+        bool by_id = true;
+        for (size_t i = 1; i < cur_p->size; ++i) {
+            if (cur_p->data[i].id <= cur_p->data[i - 1].id) { by_id = false; break; }
+        }
+        if (by_id) {
+            const auto first = cur_p->data, last = cur_p->data + cur_p->size;
+            for (const auto & [id, count] : ctx->token_count) {
+                const auto it = std::lower_bound(first, last, id, [](const llama_token_data & d, llama_token v) { return d.id < v; });
+                if (it != last && it->id == id) {
+                    penalize(*it, count);
+                }
+            }
+            cur_p->sorted = false;
+            return;
+        }
+    }
+
     // candidates reordered or truncated by an earlier sampler: the array is the smaller side
     for (size_t i = 0; i < cur_p->size; ++i) {
         const auto token_iter = ctx->token_count.find(cur_p->data[i].id);

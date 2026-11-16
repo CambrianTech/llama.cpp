@@ -46,6 +46,10 @@ void common_sampler_free(struct common_sampler * gsmpl);
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
+
+// Continuum fork: the ballpark sampling path's counters (CONTINUUM-ENGINE 4.7.13)
+void common_sampler_coarse_stats(const struct common_sampler * gsmpl, size_t * cap, uint64_t * calls,
+                                 uint64_t * reseeds, uint64_t * widens, uint64_t * candidates);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 
