@@ -533,6 +533,7 @@ public:
     llama_snapshot_status snapshot_bytes(llama_seq_id seq_id, llama_state_seq_flags flags, size_t * device_bytes);
     llama_snapshot_status snapshot_save(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags, size_t * device_bytes);
     llama_snapshot_status snapshot_load(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags);
+    bool quarantine(llama_seq_id seq_id); // clear a failed restore; true only when the sequence is empty after
     llama_snapshot_status snapshot_free(uint64_t snapshot_id);
     llama_snapshot_status snapshot_write_file(uint64_t snapshot_id, const char * filepath, const llama_token * tokens, size_t n_tokens);
 private:
