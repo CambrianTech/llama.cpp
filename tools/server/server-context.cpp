@@ -740,10 +740,12 @@ struct server_slot {
         // and their bytes, so the core prices the checkpoint store from what it holds, not a guess.
         {
             size_t bytes = 0;
+            json at = json::array();
             for (const auto & ckpt : prompt.checkpoints) {
                 bytes += ckpt.size();
+                at.push_back({ {"n_tokens", ckpt.n_tokens}, {"bytes", ckpt.size()} });
             }
-            res["checkpoints"] = { {"count", prompt.checkpoints.size()}, {"bytes", bytes} };
+            res["checkpoints"] = { {"count", prompt.checkpoints.size()}, {"bytes", bytes}, {"at", at} };
         }
 
         const auto & ptask = task ? task : task_prev;
