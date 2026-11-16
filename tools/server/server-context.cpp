@@ -898,6 +898,57 @@ public:
     // update_slots pass; the trainer reads it between batches (see server-train.h)
     std::atomic<int> n_busy_slots{0};
 
+    // The host bytes every slot's context checkpoints may hold together, as the core last granted
+    // them in its one memory allocation (continuum CONTINUUM-ENGINE 4.10, the checkpoint store);
+    // -1 is unbounded, today's behaviour. Set by POST /engine/checkpoint-budget.
+    std::atomic<int64_t> checkpoint_budget_bytes{-1};
+
+    // Keep every slot's checkpoints within the granted budget: past it, the oldest checkpoint of the
+    // slot holding the most checkpoint bytes goes first (its oldest is the least likely restore
+    // point), never `keep`, the checkpoint just made. Returns whether `keep` itself fits.
+    bool keep_checkpoints_within_budget(const common_prompt_checkpoint * keep) {
+        const int64_t budget = checkpoint_budget_bytes.load(std::memory_order_relaxed);
+        if (budget < 0) {
+            return true;
+        }
+        auto held = [&]() {
+            int64_t bytes = 0;
+            for (const auto & slot : slots) {
+                for (const auto & ckpt : slot.prompt.checkpoints) {
+                    bytes += (int64_t) ckpt.size();
+                }
+            }
+            return bytes;
+        };
+        while (held() > budget) {
+            server_slot * largest = nullptr;
+            int64_t largest_bytes = -1;
+            for (auto & slot : slots) {
+                int64_t bytes = 0;
+                for (const auto & ckpt : slot.prompt.checkpoints) {
+                    if (&ckpt != keep) {
+                        bytes += (int64_t) ckpt.size();
+                    }
+                }
+                if (bytes > largest_bytes && !slot.prompt.checkpoints.empty() && !(slot.prompt.checkpoints.size() == 1 && &slot.prompt.checkpoints.front() == keep)) {
+                    largest = &slot;
+                    largest_bytes = bytes;
+                }
+            }
+            if (largest == nullptr || largest_bytes <= 0) {
+                return false; // only the new checkpoint is left and it alone exceeds the budget
+            }
+            auto victim = largest->prompt.checkpoints.begin();
+            if (&*victim == keep) {
+                ++victim;
+            }
+            SLT_INF(*largest, "erasing context checkpoint over the checkpoint budget (%" PRId64 " bytes; pos_min = %d, pos_max = %d, size = %.3f MiB)\n",
+                    budget, victim->pos_min, victim->pos_max, (float) victim->size() / 1024 / 1024);
+            largest->prompt.checkpoints.erase(victim);
+        }
+        return true;
+    }
+
     // The most one sequence may hold: llama_n_ctx_seq capped at the model's training context.
     // ONE value, set at load: every slot is sized from it and context_geometry reports it, so
     // the report never names a size the slots refuse (it said 524288 while each slot capped at
@@ -2610,6 +2661,12 @@ private:
         }
 
         const auto & kept = slot.prompt.checkpoints.emplace_back(std::move(cur));
+        if (!keep_checkpoints_within_budget(&kept)) {
+            SLT_WRN(slot, "a context checkpoint of %.3f MiB alone exceeds the checkpoint budget: not kept (a restore from here will be cold)\n",
+                    (float) kept.size() / 1024 / 1024);
+            slot.prompt.checkpoints.pop_back();
+            return;
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -6714,6 +6771,29 @@ void server_routes::init_routes() {
     };
 
     // a read answers from the loop's last publication, never queued behind the chunk it reports on
+    // The checkpoint store's host byte budget (continuum 4.10), granted by the core in its one memory
+    // allocation. {"bytes": n} with n >= 0 sets it (checkpoints past it are erased oldest-first at the
+    // next checkpoint); {"bytes": null} returns to unbounded.
+    this->post_checkpoint_budget = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        if (!body.contains("bytes")) {
+            res->error(format_error_response("\"bytes\" is required (a count of at least 0, or null for unbounded)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const json & bytes = body.at("bytes");
+        if (bytes.is_null()) {
+            ctx_server.checkpoint_budget_bytes.store(-1);
+        } else if (bytes.is_number_integer() && bytes.get<int64_t>() >= 0) {
+            ctx_server.checkpoint_budget_bytes.store(bytes.get<int64_t>());
+        } else {
+            res->error(format_error_response("\"bytes\" must be at least 0, or null", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok({ { "bytes", bytes } });
+        return res;
+    };
+
     this->get_learn_grants = [this](const server_http_req &) {
         auto res = create_response();
         res->ok(ctx_server.ledger_as_published());
