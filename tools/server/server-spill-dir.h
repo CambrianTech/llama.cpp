@@ -20,18 +20,10 @@
 #include <system_error>
 #include <vector>
 
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/file.h>
-#include <unistd.h>
-#endif
 
-// An exclusive, non-blocking lock on one file, released when this object or its process ends.
+// An exclusive, non-blocking lock on one file, released when this object or its process ends. The OS calls
+// live in server-spill-dir.cpp: this header includes no platform header (Codex on #124: windows.h here
+// pulled winsock.h in ahead of Winsock2 for every includer).
 class server_owner_lock {
 public:
     server_owner_lock() = default;
@@ -41,49 +33,15 @@ public:
 
     // true when this process now holds the lock on `path`. `create`: make the file (exclusively: it
     // must not exist yet); otherwise open only an existing file, never creating a marker for anyone.
-    bool try_take(const std::filesystem::path & path, bool create) {
-        release();
-#if defined(_WIN32)
-        // no read/write sharing: a second open of a file another process holds open fails (delete
-        // sharing lets the owner rename its own marker)
-        handle = CreateFileW(path.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_DELETE, nullptr,
-                             create ? CREATE_NEW : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        return handle != INVALID_HANDLE_VALUE;
-#else
-        fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC | (create ? (O_CREAT | O_EXCL) : 0), 0600);
-        if (fd < 0) {
-            return false;
-        }
-        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
-            ::close(fd);
-            fd = -1;
-            return false;
-        }
-        return true;
-#endif
-    }
-
-    void release() {
-#if defined(_WIN32)
-        if (handle != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle);
-            handle = INVALID_HANDLE_VALUE;
-        }
-#else
-        if (fd >= 0) {
-            ::close(fd); // closing releases the flock
-            fd = -1;
-        }
-#endif
-    }
+    bool try_take(const std::filesystem::path & path, bool create);
+    void release();
 
 private:
-#if defined(_WIN32)
-    HANDLE handle = INVALID_HANDLE_VALUE;
-#else
-    int fd = -1;
-#endif
+    intptr_t handle = -1; // a POSIX descriptor or a Windows HANDLE; -1 = none
 };
+
+// This process's id (server-spill-dir.cpp).
+uint64_t server_process_id();
 
 // The instance directory's protocol. The marker is published before the directory and only while
 // locked, so a sweeper can never see a live owner unlocked (Codex on #124: a claim raced a sweep):
@@ -102,12 +60,7 @@ public:
             return 0;
         }
         const auto ns = std::chrono::steady_clock::now().time_since_epoch().count();
-#if defined(_WIN32)
-        const unsigned long pid = GetCurrentProcessId();
-#else
-        const long pid = (long) ::getpid();
-#endif
-        const std::string name = "instance-" + std::to_string(pid) + "-" + std::to_string(ns);
+        const std::string name = "instance-" + std::to_string(server_process_id()) + "-" + std::to_string(ns);
         const auto tmp    = base / (name + ".owner.tmp");
         const auto marker = base / (name + ".owner");
         if (!owner.try_take(tmp, /*create=*/true)) {

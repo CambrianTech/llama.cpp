@@ -2,7 +2,7 @@ llama_add_compile_flags()
 
 # Model-free scheduling validator: compile the same traversal used by server-context.
 # Model-free: the disk tier's instance custody and bounded reads (llama.cpp#124).
-add_executable(test-server-spill-dir test-server-spill-dir.cpp)
+add_executable(test-server-spill-dir test-server-spill-dir.cpp ../tools/server/server-spill-dir.cpp)
 target_compile_features(test-server-spill-dir PRIVATE cxx_std_17)
 add_test(NAME test-server-spill-dir COMMAND test-server-spill-dir)
 set_tests_properties(test-server-spill-dir PROPERTIES LABELS "main")
