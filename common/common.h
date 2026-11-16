@@ -1158,7 +1158,7 @@ struct common_prompt_checkpoint {
 
     // continuum: held for a turn the core will learn (its served prompt's end, n_prefix - 1): never evicted or
     // superseded until that turn is learned on a side sequence or abandoned
-    bool pinned = false;
+    uint64_t pin = 0; // continuum: the learn pin holding it (unique per engine process; 0: not pinned)
 
     // (optional) id of the task that created the checkpoint
     int id_task = -1;

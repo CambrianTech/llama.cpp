@@ -2735,12 +2735,12 @@ private:
             }
             auto victim = cks.end();
             for (auto it = cks.begin(); it != cks.end(); ++it) {
-                if (it != newest && !it->pinned) {
+                if (it != newest && it->pin == 0) {
                     victim = it;
                     break;
                 }
             }
-            if (victim == cks.end() && newest != cks.end() && !newest->pinned) {
+            if (victim == cks.end() && newest != cks.end() && newest->pin == 0) {
                 victim = newest; // all that is left
             }
             if (victim == cks.end()) {
@@ -2763,7 +2763,8 @@ private:
         const int64_t step = checkpoint_step(slot);
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + step) {
+            // a checkpoint pinned for learning stays until learned or released, however close (/learn/release)
+            if (it->id_task != id_task && it->pin == 0 && last >= 0 && it->n_tokens <= last + step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2819,7 +2820,8 @@ private:
 
         auto & kept = slot.prompt.checkpoints.emplace_back(std::move(cur));
         if (slot.task->params.learn_pin && kept.n_tokens == (int64_t) slot.task->n_tokens() - 1) {
-            kept.pinned = true; // the core will learn this turn: kept until learned or released (/learn/release)
+            kept.pin = ++learn_pin_clock; // the core will learn this turn: kept until learned or released (/learn/release)
+            slot.stats.mind_pin       = kept.pin;
             slot.stats.mind_pinned_at = kept.n_tokens;
         }
 
@@ -3062,7 +3064,7 @@ private:
                 {
                     auto res = std::make_unique<server_task_result_learn_release>();
                     res->id      = task.id;
-                    res->outcome = learn_release(task.params.page, task.params.learn_release_at);
+                    res->outcome = learn_release(task.params.page, task.params.learn_release_pin);
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_MIND_PREFETCH:
@@ -7042,7 +7044,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
 
 // Continuum fork: POST /minds/prefetch {"page": "<mind>"}: her state comes from flash into a parked sequence now,
 // ahead of her turn (server-context-minds.inc). The reply names where she is.
-// an abandoned turn's learn pin, released (the core sends the turn receipt's mind.page and mind.pinned_at)
+// an abandoned turn's learn pin, released (the core sends the turn receipt's mind.page and mind.pin)
 std::unique_ptr<server_res_generator> server_routes::handle_learn_release(const server_http_req & req) {
     auto res = create_response();
     auto & rd = res->rd;
@@ -7051,13 +7053,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_learn_release(const 
         server_task task(SERVER_TASK_TYPE_LEARN_RELEASE);
         task.id = rd.get_new_id();
         task.params.page = mind_page_parse(json_value(body, "page", std::string()));
-        task.params.learn_release_at = json_value(body, "pinned_at", (int64_t) -1);
+        task.params.learn_release_pin = json_value(body, "pin", (uint64_t) 0);
         if (json_value(body, "incarnation", (uint64_t) 0) != mind_incarnation()) {
             res->error(format_error_response("incarnation names another engine: this release was for a replaced engine", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (!task.params.page.valid() || task.params.learn_release_at < 0) {
-            res->error(format_error_response("page must name a mind and pinned_at the receipt's position", ERROR_TYPE_INVALID_REQUEST));
+        if (!task.params.page.valid() || task.params.learn_release_pin == 0) {
+            res->error(format_error_response("page must name a mind and pin the turn receipt's mind.pin", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
         rd.post_task(std::move(task));

@@ -44,9 +44,10 @@ inline const char * mind_place_name(mind_place p) {
 }
 
 // What POST /learn/release did with a learn pin (frozen spellings): released: the checkpoint is unpinned now;
-// released_on_flash: she is on flash, and it is unpinned when her checkpoints come back; not_pinned: no pinned
-// checkpoint of hers is at that position (already learned, released, or never pinned); unknown_mind: the engine
-// holds no mind by that page.
+// released_on_flash: she is on flash, and it is unpinned when her checkpoints come back; not_pinned: no checkpoint
+// of hers holds that pin (already learned, released, or invalidated by a prompt that diverged before it);
+// unknown_mind: the engine holds no mind by that page. A pin is its id (mind.pin on the turn receipt), never a
+// position: two turns of the same length never share one.
 enum class pin_release : uint8_t { released, released_on_flash, not_pinned, unknown_mind };
 
 inline const char * pin_release_name(pin_release r) {

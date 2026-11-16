@@ -191,7 +191,7 @@ struct task_params {
     mind_page page;
     // Continuum fork: the core will learn this turn later: pin the checkpoint at its prompt's end - 1
     bool learn_pin = false;
-    int64_t learn_release_at = -1; // /learn/release: the pinned checkpoint's position (the turn receipt's mind.pinned_at)
+    uint64_t learn_release_pin = 0; // /learn/release: the pin to release (the turn receipt's mind.pin)
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)

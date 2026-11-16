@@ -22,14 +22,14 @@
         // write is in flight, or after it failed, she lives here and is inserted from here, never lost
         std::shared_ptr<std::vector<uint8_t>> ram;
         std::shared_ptr<std::atomic<int>>     written;         // 0 pending, 1 landed, -1 failed
-        std::vector<int64_t>                  released;        // pins released while she was on flash (positions)
+        std::vector<uint64_t>                 released;        // pins released while she was on flash
     };
 
-    // unpin her checkpoint at `at` in `cks`; true when one was pinned there
-    static bool unpin_at(std::list<common_prompt_checkpoint> & cks, int64_t at) {
+    // release learn pin `pin` in `cks`; true when a checkpoint held it
+    static bool unpin(std::list<common_prompt_checkpoint> & cks, uint64_t pin) {
         for (auto & c : cks) {
-            if (c.pinned && c.n_tokens == at) {
-                c.pinned = false;
+            if (c.pin == pin) {
+                c.pin = 0;
                 return true;
             }
         }
@@ -38,10 +38,10 @@
 
     // An abandoned turn's learn pin, released wherever she is: on a lane, parked, or on flash (applied when her
     // checkpoints come back). The checkpoint stays as an ordinary one: the budget may now evict it.
-    pin_release learn_release(mind_page page, int64_t at) {
+    pin_release learn_release(mind_page page, uint64_t pin) {
         for (auto & s : slots) {
             if (s.page == page) {
-                return unpin_at(s.prompt.checkpoints, at) ? pin_release::released : pin_release::not_pinned;
+                return unpin(s.prompt.checkpoints, pin) ? pin_release::released : pin_release::not_pinned;
             }
         }
         resident_mind * m = find_mind(page);
@@ -49,15 +49,15 @@
             return pin_release::unknown_mind;
         }
         if (!m->file.empty() || m->ram) {
-            m->released.push_back(at); // her checkpoints are in her flash bytes
+            m->released.push_back(pin); // her checkpoints are in her flash bytes
             return pin_release::released_on_flash;
         }
-        return unpin_at(m->prompt.checkpoints, at) ? pin_release::released : pin_release::not_pinned;
+        return unpin(m->prompt.checkpoints, pin) ? pin_release::released : pin_release::not_pinned;
     }
 
     // her checkpoints as bytes beside her state: count, then per checkpoint its position fields, three sizes and
     // the three blobs (target, draft, speculative state)
-    static constexpr size_t ckpt_header_bytes = sizeof(int64_t) + 3 * sizeof(int32_t) + 1 + 3 * sizeof(uint64_t);
+    static constexpr size_t ckpt_header_bytes = sizeof(int64_t) + 3 * sizeof(int32_t) + 4 * sizeof(uint64_t);
 
     static void ckpt_write(const std::list<common_prompt_checkpoint> & cks, uint8_t * w) {
         auto put = [&](const void * p, size_t n) { std::memcpy(w, p, n); w += n; };
@@ -65,9 +65,9 @@
         put(&count, sizeof(count));
         for (const auto & c : cks) {
             const int32_t  id = c.id_task, mn = c.pos_min, mx = c.pos_max;
-            const uint8_t  pin = c.pinned ? 1 : 0;
+            const uint64_t pin = c.pin;
             const uint64_t a = c.data_tgt.size(), b = c.data_dft.size(), d = c.data_spec.size();
-            put(&c.n_tokens, sizeof(c.n_tokens)); put(&id, 4); put(&mn, 4); put(&mx, 4); put(&pin, 1);
+            put(&c.n_tokens, sizeof(c.n_tokens)); put(&id, 4); put(&mn, 4); put(&mx, 4); put(&pin, 8);
             put(&a, 8); put(&b, 8); put(&d, 8);
             put(c.data_tgt.data(), a); put(c.data_dft.data(), b); put(c.data_spec.data(), d);
         }
@@ -82,12 +82,12 @@
         }
         for (uint64_t i = 0; i < count; ++i) {
             common_prompt_checkpoint c;
-            int32_t id, mn, mx; uint8_t pin; uint64_t a, b, d;
-            if (!get(&c.n_tokens, sizeof(c.n_tokens)) || !get(&id, 4) || !get(&mn, 4) || !get(&mx, 4) || !get(&pin, 1) ||
+            int32_t id, mn, mx; uint64_t pin, a, b, d;
+            if (!get(&c.n_tokens, sizeof(c.n_tokens)) || !get(&id, 4) || !get(&mn, 4) || !get(&mx, 4) || !get(&pin, 8) ||
                 !get(&a, 8) || !get(&b, 8) || !get(&d, 8) || (uint64_t) (end - r) < a + b + d) {
                 return false;
             }
-            c.id_task = id; c.pos_min = mn; c.pos_max = mx; c.pinned = pin != 0;
+            c.id_task = id; c.pos_min = mn; c.pos_max = mx; c.pin = pin;
             c.data_tgt.assign(r, r + a);  r += a;
             c.data_dft.assign(r, r + b);  r += b;
             c.data_spec.assign(r, r + d); r += d;
@@ -99,6 +99,7 @@
     std::vector<int32_t>       park_free;  // free parked sequence ids (sized once at load)
     std::vector<resident_mind> minds;      // parked and flashed minds (reserved once at load)
     uint64_t                   mind_clock = 0;
+    uint64_t                   learn_pin_clock = 0; // learn pins issued by this process (a pin's id; 0 is none)
 
     // At load: the parked ids are what the context reports beyond the lanes (llama_n_seq_max), never assumed.
     bool minds_init() {
@@ -307,8 +308,8 @@
         SRV_INF("mind %016llx%016llx back from %s: %.1f MiB inserted in %.2f ms\n", (unsigned long long) m.page.hi,
                 (unsigned long long) m.page.lo, ram ? "RAM" : "flash", size / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0);
         m.prompt.checkpoints = std::move(checkpoints);
-        for (const int64_t at : m.released) {
-            unpin_at(m.prompt.checkpoints, at); // released while she was on flash
+        for (const uint64_t pin : m.released) {
+            unpin(m.prompt.checkpoints, pin); // released while she was on flash
         }
         m.released.clear();
         // her file is removed on the page-IO worker, ordered after its own write (it may still be landing)

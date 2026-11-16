@@ -635,8 +635,8 @@
             park_free.push_back(pending.side);
             if (pending.began && ok && !pending.drained) {
                 for (auto & c : slot.prompt.checkpoints) {
-                    if (c.pinned && c.n_tokens == n0) {
-                        c.pinned = false;
+                    if (c.pin != 0 && c.n_tokens == n0) {
+                        c.pin = 0;
                     }
                 }
             }

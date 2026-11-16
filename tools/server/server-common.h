@@ -372,7 +372,8 @@ struct server_slot_stats {
     mind_from mind_came_from   = mind_from::none;
     int64_t   mind_switch_us   = 0;
     uint64_t  mind_generation  = 0;
-    int64_t   mind_pinned_at   = -1; // learn_pin: the pinned checkpoint's position (the token /learn/release takes)
+    uint64_t  mind_pin         = 0;  // learn_pin: the pin's id (what /learn/release takes; unique per engine process)
+    int64_t   mind_pinned_at   = -1; // learn_pin: the pinned checkpoint's position (information only)
 
     uint64_t n_prompt_cached    = 0;
     uint64_t n_prompt_processed = 0;

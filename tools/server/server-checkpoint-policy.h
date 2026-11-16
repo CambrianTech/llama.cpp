@@ -34,10 +34,10 @@ typename List::iterator checkpoint_to_evict(List & checkpoints, int32_t view_end
     if (view_end >= 0 && checkpoints.size() >= 2) {
         ++victim;
     }
-    while (victim != checkpoints.end() && victim->pinned) {
+    while (victim != checkpoints.end() && victim->pin != 0) {
         ++victim;
     }
-    if (victim == checkpoints.end() && !checkpoints.empty() && !checkpoints.front().pinned) {
+    if (victim == checkpoints.end() && !checkpoints.empty() && checkpoints.front().pin == 0) {
         return checkpoints.begin(); // only her head is left unpinned
     }
     return victim;
@@ -55,7 +55,7 @@ size_t erase_superseded_checkpoints(List & checkpoints, const Checkpoint & kept,
     const auto * head = &checkpoints.front();
     size_t erased = 0;
     for (auto it = checkpoints.begin(); it != checkpoints.end();) {
-        if (&*it != head && it->id_task != id_task && !it->pinned) {
+        if (&*it != head && it->id_task != id_task && it->pin == 0) {
             on_erase(*it);
             it = checkpoints.erase(it);
             ++erased;
