@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 static int64_t now_us() {
@@ -22,8 +23,8 @@ static int64_t now_us() {
 static llama_context * make_ctx(const common_params & params, llama_model * model) {
     auto cparams       = common_context_params_to_llama(params);
     cparams.n_seq_max  = 2;    // seq 0 live, seq 1 parked
-    cparams.n_ctx      = 1024;
-    cparams.n_batch    = 512;
+    cparams.n_ctx      = 8192;
+    cparams.n_batch    = 4096;
     cparams.n_ubatch   = 512;
     cparams.kv_unified = true; // one stream: a parked id shares the live sequence's cells
     return llama_init_from_model(model, cparams);
@@ -60,7 +61,9 @@ int main(int argc, char ** argv) {
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     std::printf("model: recurrent=%d hybrid=%d\n", (int) llama_model_is_recurrent(model), (int) llama_model_is_hybrid(model));
 
-    constexpr int N = 300, M = 120; // the prefix to keep; tokens the live sequence advances through
+    // the prefix to keep (TEST_SEQ_PARK_N overrides, to measure how a checkpoint grows with context)
+    const int N = std::getenv("TEST_SEQ_PARK_N") ? std::atoi(std::getenv("TEST_SEQ_PARK_N")) : 300;
+    constexpr int M = 120; // tokens the live sequence advances through
     std::vector<llama_token> prefix, detour;
     for (int i = 0; i < N; ++i) prefix.push_back((llama_token) (1000 + (i * 7919) % 20000));
     for (int i = 0; i < M; ++i) detour.push_back((llama_token) (2000 + (i * 104729) % 20000));
