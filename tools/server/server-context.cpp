@@ -2585,13 +2585,19 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // make room for the new checkpoint, if needed. Continuum fork (CONTINUUM-ENGINE 4.7.3): with
+            // view spans her head (the oldest) is her restore point when her next prompt diverges before
+            // her view end, so the oldest AFTER it goes first; the head goes only when it is all there is
+            const bool keep_head = slot.prompt.view_end >= 0 && slot.prompt.checkpoints.size() >= 2;
+            auto victim = slot.prompt.checkpoints.begin();
+            if (keep_head) {
+                ++victim;
+            }
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                    victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         // the copy is made aside and kept only once complete
