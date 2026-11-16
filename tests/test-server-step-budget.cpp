@@ -1,11 +1,12 @@
-// what this catches: the frame budget (server-step-budget.h) without a model: build, GPU and gap
-// time are attributed from the three timestamps; the stall between steps counts only while work is
-// pending (an idle engine is not stalling); unsynchronized steps are never counted as idle or busy;
-// decode and prefill-carrying steps are kept apart; a reader on another thread sees monotonic counters
-// it can difference into a window; the idle share matches a hand-computed loop.
+// what this catches: the decode loop's host timings (server-step-budget.h) without a model: the call,
+// the sync wait and the time between steps are attributed from the three timestamps; time between
+// steps counts only while work is pending (an idle engine is not stalling); an unsynchronized step is
+// counted only as unsynced, never in the synchronized timings (regression for Codex's review of fork
+// 6651dcb65: begin 0 / submitted 300 / end 310 once reported a share of 1.0); decode and
+// prefill-carrying steps are kept apart; a reader on another thread sees monotonic counters it can
+// difference into a window.
 #include "../tools/server/server-step-budget.h"
 
-#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <thread>
@@ -17,47 +18,46 @@ static void require(bool condition, const char * message) {
     }
 }
 
-// One step: build `b`, GPU `g`, then `s` of sampling before end(); returns the end time.
-static int64_t step(step_budget & sb, int64_t t, step_kind k, uint32_t n, int64_t b, int64_t g, int64_t s, bool pending) {
+// One synchronized step: call `c`, wait `w`, then `s` of sampling before end(); returns the end time.
+static int64_t step(step_budget & sb, int64_t t, step_kind k, uint32_t n, int64_t c, int64_t w, int64_t s, bool pending) {
     sb.begin(t, k, n);
-    sb.submitted(t + b);
-    sb.synced(t + b + g);
-    sb.end(t + b + g + s, pending);
-    return t + b + g + s;
+    sb.submitted(t + c);
+    sb.synced(t + c + w);
+    sb.end(t + c + w + s, pending);
+    return t + c + w + s;
 }
 
 static void a_decode_loop_is_attributed_exactly() {
     step_budget sb;
     int64_t t = 1000;
-    // the measured M5 shape: ~20% build, ~55% GPU, the rest between steps
     for (int i = 0; i < 10; ++i) {
         t = step(sb, t, step_kind::decode, 4, 200, 550, 150, true);
         t += 100; // bookkeeping before the next llama_decode
     }
-    sb.begin(t, step_kind::decode, 4); // closes the 10th step's stall
+    sb.begin(t, step_kind::decode, 4); // closes the 10th step's time between steps
     auto d = sb.snapshot().decode;
     require(d.steps == 10 && d.tokens == 40, "steps and tokens counted");
-    require(d.build_us == 2000 && d.gpu_us == 5500, "build and GPU attributed from the timestamps");
-    require(d.gap_us == 10 * (150 + 100), "sampling after the sync and the wait for the next submit are the gap");
-    require(std::fabs(*d.gpu_idle_share() - 4500.0 / 10000.0) < 1e-9, "idle share = (build + gap) / (build + gpu + gap) = 45%");
+    require(d.decode_call_us == 2000 && d.sync_wait_us == 5500, "call and sync wait attributed from the timestamps");
+    require(d.inter_step_us == 10 * (150 + 100), "sampling after the sync and the wait for the next call are between steps");
 }
 
 static void an_idle_engine_is_not_a_stall() {
     step_budget sb;
     int64_t t = step(sb, 0, step_kind::decode, 1, 10, 50, 5, /*pending=*/false);
     sb.begin(t + 60'000'000, step_kind::decode, 1); // a minute without requests
-    require(sb.snapshot().decode.gap_us == 5, "only the in-step sampling counts; the idle minute does not");
+    require(sb.snapshot().decode.inter_step_us == 5, "only the in-step sampling counts; the idle minute does not");
 }
 
-static void unsynced_steps_are_neither_idle_nor_busy() {
+static void an_unsynchronized_step_is_only_unsynced() {
     step_budget sb;
     sb.begin(0, step_kind::with_prefill, 512);
     sb.submitted(300);
     sb.end(310, true); // a prefill chunk without outputs: no sync
     sb.begin(400, step_kind::with_prefill, 512);
     auto p = sb.snapshot().with_prefill;
-    require(p.build_us == 300, "its build is still CPU time the GPU waited on");
-    require(p.gpu_us == 0 && p.gap_us == 0 && p.unsynced_us == 100, "the rest is unsynced: not idle, not busy");
+    require(p.steps == 0 && p.decode_call_us == 0 && p.sync_wait_us == 0 && p.inter_step_us == 0,
+            "nothing of an unsynchronized step enters the synchronized timings");
+    require(p.unsynced_steps == 1 && p.unsynced_us == 400, "its whole span, to the next call, is unsynced");
     require(sb.snapshot().decode.steps == 0, "prefill-carrying steps are kept apart from decode-only steps");
 }
 
@@ -74,7 +74,7 @@ static void a_reader_differences_a_window_while_the_loop_runs() {
     step_budget_counters last{};
     while (!done) {
         auto now = sb.snapshot().decode;
-        require(now.steps >= last.steps && now.gpu_us >= last.gpu_us, "counters only rise");
+        require(now.steps >= last.steps && now.sync_wait_us >= last.sync_wait_us, "counters only rise");
         auto window = now - last;
         require(window.steps <= 200000, "a window is a difference of two snapshots");
         last = now;
@@ -86,7 +86,7 @@ static void a_reader_differences_a_window_while_the_loop_runs() {
 int main() {
     a_decode_loop_is_attributed_exactly();
     an_idle_engine_is_not_a_stall();
-    unsynced_steps_are_neither_idle_nor_busy();
+    an_unsynchronized_step_is_only_unsynced();
     a_reader_differences_a_window_while_the_loop_runs();
     std::cout << "test-server-step-budget: ok\n";
     return 0;

@@ -940,7 +940,20 @@ static bool ggml_backend_metal_moe_gather_entry(const struct ggml_tensor * src0_
     return true;
 }
 
+// Continuum fork (CONTINUUM-ENGINE 4.7.9): cumulative GPU busy time measured from command-buffer
+// timestamps. A generic proc name, so any backend that can time its own work answers the same call.
+static bool ggml_backend_metal_gpu_time(ggml_backend_dev_t dev, uint64_t * busy_ns, uint64_t * cmd_bufs) {
+    if (dev == NULL || busy_ns == NULL || cmd_bufs == NULL) {
+        return false;
+    }
+    ggml_metal_device_gpu_time_read((ggml_metal_device_t) dev->context, busy_ns, cmd_bufs);
+    return true;
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_gpu_time") == 0) {
+        return (void *)ggml_backend_metal_gpu_time;
+    }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }
