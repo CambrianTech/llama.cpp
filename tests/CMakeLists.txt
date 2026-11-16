@@ -185,6 +185,7 @@ llama_build_and_test(test-sampler-penalties.cpp)
 llama_build(test-server-lanes.cpp) # needs -m <model>: laned sampling picks the serial tokens; the step's us serial vs laned
 target_compile_features(test-server-lanes PRIVATE cxx_std_20)
 llama_build(test-sampler-coarse.cpp) # needs -m <model>: ballpark sampling picks exactly the full path's token
+llama_build_and_test(test-server-view-end.cpp)
 
 # GGML_TENSOR_FLAG_GRAD: a leaf whose gradient the backward computes, never optimized (the walk reads the cached prefix K/V gradient)
 llama_build_and_test(test-grad-leaf.cpp)
