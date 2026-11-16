@@ -7,6 +7,14 @@
 // timer), refuses typed, and measures itself. The engine's off-thread concerns (the checkpoint copier,
 // per-sequence sampling, the host pool's report) are modules of this one shape, never hand-built
 // threads.
+//
+// Stop CANCELS: the job in flight finishes; every job still queued completes at once with
+// module_refusal::cancelled (a typed result in its future, never a broken promise) and is destroyed
+// there, so whatever it captured (pool handles: host_bytes) is released by the same RAII that charges
+// it. An owner that needs a drain waits on its futures before stopping. The queue is bounded by a
+// capacity its OWNER supplies from what it owns (e.g. the engine's slots), never a constant here; a
+// full queue refuses typed. Job payloads that hold memory carry pool-charged handles, never raw
+// copies, so pending work is never an uncharged second pool.
 
 #include <algorithm>
 #include <chrono>
@@ -22,6 +30,7 @@
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 // An immutable value published by one writer and read by many: a reader takes a pointer, never a lock
@@ -49,7 +58,9 @@ private:
 
 // Why a module did not take a job.
 enum class module_refusal : uint8_t {
-    stopping, // the module is shutting down: the job was not queued
+    stopping,  // the module is shutting down: the job was not queued
+    full,      // the owner's capacity is reached: the job was not queued
+    cancelled, // queued, then the module stopped before it ran
 };
 
 // What every module measures about itself, published with its own snapshot.
@@ -58,6 +69,8 @@ struct module_stats {
     uint64_t done        = 0; // jobs finished since start
     uint64_t busy_us     = 0; // time spent in jobs since start
     uint64_t max_job_us  = 0; // the longest single job since start
+    uint64_t cancelled   = 0; // queued jobs completed as cancelled by a stop
+    uint64_t refused     = 0; // submissions refused (stopping or full)
 };
 
 // A module that owns one worker thread. `Snapshot` is what it tells the rest of the engine; the
@@ -65,8 +78,9 @@ struct module_stats {
 template <typename Snapshot>
 class engine_module {
 public:
-    engine_module(std::string name, Snapshot initial)
-        : name_(std::move(name)), snapshot_(std::move(initial)),
+    // `capacity`: how many jobs may wait, from what the owner owns (never zero).
+    engine_module(std::string name, Snapshot initial, size_t capacity)
+        : name_(std::move(name)), snapshot_(std::move(initial)), capacity_(std::max<size_t>(capacity, 1)),
           worker_([this](std::stop_token stop) { run(stop); }) {}
 
     engine_module(const engine_module &)             = delete;
@@ -83,18 +97,25 @@ public:
 
     const std::string & name() const { return name_; }
 
-    // Queue `job`; its future carries the result. Refused (typed) once the module is stopping.
+    // What a submitted job's future yields: its result, or why it never ran.
+    template <typename R>
+    using outcome = std::expected<R, module_refusal>;
+
+    // Queue `job`; its future carries the result, or module_refusal::cancelled if a stop dropped it.
+    // Refused (typed) once the module is stopping or its queue is at capacity.
     template <typename Job>
-    std::expected<std::future<std::invoke_result_t<Job>>, module_refusal> submit(Job && job) {
+    std::expected<std::future<outcome<std::invoke_result_t<Job>>>, module_refusal> submit(Job && job) {
         using R = std::invoke_result_t<Job>;
-        std::packaged_task<R()> task(std::forward<Job>(job));
-        auto future = task.get_future();
+        auto entry  = std::make_unique<queued<R, std::decay_t<Job>>>(std::forward<Job>(job));
+        auto future = entry->promise.get_future();
         {
             std::scoped_lock lock(mutex_);
-            if (worker_.get_stop_token().stop_requested()) {
-                return std::unexpected(module_refusal::stopping);
+            if (worker_.get_stop_token().stop_requested() || queue_.size() >= capacity_) {
+                stats_.refused++;
+                return std::unexpected(worker_.get_stop_token().stop_requested() ? module_refusal::stopping
+                                                                                 : module_refusal::full);
             }
-            queue_.emplace_back([t = std::move(task)]() mutable { t(); });
+            queue_.push_back(std::move(entry));
             stats_.queued = queue_.size();
         }
         wake_.notify_one();
@@ -111,8 +132,9 @@ public:
 protected:
     void publish(Snapshot next) { snapshot_.publish(std::move(next)); }
 
-    // Stop taking work, let the job in flight finish, join the worker. Queued jobs are dropped and
-    // their futures broken. Idempotent. Every module's destructor calls it before anything else.
+    // Stop taking work, let the job in flight finish, join the worker; every job still queued completes
+    // as module_refusal::cancelled and is destroyed (its captures released). Idempotent. Every
+    // module's destructor calls it before anything else.
     void stop_and_join() {
         {
             std::scoped_lock lock(mutex_);
@@ -122,24 +144,51 @@ protected:
         if (worker_.joinable()) {
             worker_.join();
         }
+        cancel_queued();
     }
 
 private:
+    // One queued job, type-erased: it either runs (fulfilling its promise) or is cancelled (fulfilling
+    // it with module_refusal::cancelled). Destroying it releases whatever it captured.
+    struct job_base {
+        virtual ~job_base()   = default;
+        virtual void run()    = 0;
+        virtual void cancel() = 0;
+    };
+    template <typename R, typename F>
+    struct queued final : job_base {
+        explicit queued(F f) : fn(std::move(f)) {}
+        void run() override {
+            if constexpr (std::is_void_v<R>) {
+                fn();
+                promise.set_value(outcome<R>{});
+            } else {
+                promise.set_value(outcome<R>(fn()));
+            }
+        }
+        void cancel() override { promise.set_value(outcome<R>(std::unexpected(module_refusal::cancelled))); }
+        F                           fn;
+        std::promise<outcome<R>>    promise;
+    };
+
     void run(std::stop_token stop) {
         while (true) {
-            std::packaged_task<void()> job;
+            std::unique_ptr<job_base> job;
             {
                 std::unique_lock lock(mutex_);
-                // wakes on work or on stop: never a poll, never a timer
-                if (!wake_.wait(lock, stop, [this] { return !queue_.empty(); })) {
-                    return; // stop requested with nothing taken
+                // wakes on work or on stop: never a poll, never a timer. A stop wins over queued work:
+                // queued jobs are cancelled by stop_and_join, never drained here.
+                wake_.wait(lock, stop, [this] { return !queue_.empty(); });
+                if (stop.stop_requested()) {
+                    return;
                 }
                 job = std::move(queue_.front());
                 queue_.pop_front();
                 stats_.queued = queue_.size();
             }
             const auto started = std::chrono::steady_clock::now();
-            job();
+            job->run();
+            job.reset(); // its captures are released before the next job is taken
             const auto us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - started).count();
             std::scoped_lock lock(mutex_);
@@ -149,11 +198,26 @@ private:
         }
     }
 
+    // After the worker joined: every job still queued completes as cancelled and is destroyed.
+    void cancel_queued() {
+        std::deque<std::unique_ptr<job_base>> dropped;
+        {
+            std::scoped_lock lock(mutex_);
+            dropped.swap(queue_);
+            stats_.cancelled += dropped.size();
+            stats_.queued = 0;
+        }
+        for (auto & job : dropped) {
+            job->cancel();
+        }
+    }
+
     std::string                             name_;
     snapshot_cell<Snapshot>                 snapshot_;
     mutable std::mutex                      mutex_;
     std::condition_variable_any             wake_;
-    std::deque<std::packaged_task<void()>>  queue_;
+    std::deque<std::unique_ptr<job_base>>   queue_;
     module_stats                            stats_;
+    size_t                                  capacity_;
     std::jthread                            worker_; // last: started after every member it uses exists
 };
