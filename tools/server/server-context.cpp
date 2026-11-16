@@ -7041,6 +7041,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_minds_prefetch(const
         server_task task(SERVER_TASK_TYPE_MIND_PREFETCH);
         task.id = rd.get_new_id();
         task.params.page = mind_page_parse(json_value(body, "page", std::string()));
+        // a stream meant for another process of this engine (a replacement after a restart) is refused, typed
+        if (body.contains("engine_pid") && json_value(body, "engine_pid", (int64_t) -1) != (int64_t) server_process_pid()) {
+            res->error(format_error_response("engine_pid names another engine process: this prefetch was for a replaced engine", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         if (!task.params.page.valid()) {
             res->error(format_error_response("page must name a mind (32 hexadecimal digits, a UUID)", ERROR_TYPE_INVALID_REQUEST));
             return res;

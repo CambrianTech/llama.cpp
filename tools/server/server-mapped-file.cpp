@@ -9,6 +9,8 @@
 #endif
 #include <windows.h>
 
+int64_t server_process_pid() { return (int64_t) GetCurrentProcessId(); }
+
 server_mapped_file::server_mapped_file(const std::string & path) {
     HANDLE f = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
@@ -49,6 +51,8 @@ server_mapped_file::~server_mapped_file() {
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+int64_t server_process_pid() { return (int64_t) ::getpid(); }
 
 server_mapped_file::server_mapped_file(const std::string & path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
