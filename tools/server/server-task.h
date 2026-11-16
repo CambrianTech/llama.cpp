@@ -779,8 +779,11 @@ struct server_prompt_data {
 // A spill in flight: the state's bytes in file order (sequence state main, draft; then each checkpoint's
 // target, draft, speculative). `status`: 0 writing, 1 written, -1 failed.
 struct server_spill_buffer {
+    // status: queued -> writing -> written | failed; or queued -> claimed (the entry was restored before its
+    // write started: the loop took the blocks back by move and the worker skips the write)
+    enum : int { queued = 0, written = 1, failed = -1, writing = 2, claimed = 3 };
     std::vector<std::vector<uint8_t>> blocks;
-    std::atomic<int>                  status{0};
+    std::atomic<int>                  status{queued};
     // Its bytes stay charged (to the one page-IO budget and to the RAM tier's count) for exactly as long
     // as they exist: released here, when the last owner (the write, or the entry until it is reaped or
     // erased) lets the buffer go, never at the write's completion while the bytes are still in RAM
@@ -793,6 +796,9 @@ struct server_spill_buffer {
     server_spill_buffer(const server_spill_buffer &) = delete;
     server_spill_buffer & operator=(const server_spill_buffer &) = delete;
     ~server_spill_buffer() {
+        // the bytes are freed first: a release can admit queued page IO, which must find the RAM already free
+        // (Codex on #124)
+        std::vector<std::vector<uint8_t>>().swap(blocks);
         reservation.release();
         if (counted) {
             counted->fetch_sub(bytes, std::memory_order_relaxed);

@@ -1863,6 +1863,10 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
         if constexpr (server_test_faults::enabled) {
             server_test_faults::hold(gate); // a test holds spill writes as it holds page IO
         }
+        int expected = server_spill_buffer::queued;
+        if (!buf->status.compare_exchange_strong(expected, server_spill_buffer::writing, std::memory_order_acq_rel)) {
+            return; // claimed: the entry was restored before this write started; its blocks went back to it
+        }
         const auto t0 = std::chrono::steady_clock::now();
         FILE * f = fopen(path.c_str(), "wb");
         bool ok = f != nullptr;
@@ -1879,7 +1883,7 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
             SRV_INF(" - spilled prompt cache entry to disk: %d tokens, %.3f MiB in %.1f ms (page-io pool)\n",
                     n_tokens, bytes / (1024.0 * 1024.0), ms);
         }
-        buf->status.store(ok ? 1 : -1, std::memory_order_release);
+        buf->status.store(ok ? server_spill_buffer::written : server_spill_buffer::failed, std::memory_order_release);
         // the bytes stay charged until the buffer itself is freed (its destructor): when this job lets
         // go and the entry is reaped or erased, whichever is last
     });
@@ -1892,9 +1896,9 @@ void server_prompt_cache::reap_spills() {
             continue;
         }
         const int status = state.spilling->status.load(std::memory_order_acquire);
-        if (status == 1) {
+        if (status == server_spill_buffer::written) {
             state.spilling.reset(); // written: the RAM copy goes
-        } else if (status == -1) {
+        } else if (status == server_spill_buffer::failed) {
             // the write failed: the bytes come back and the entry stays resident
             auto & blocks = state.spilling->blocks;
             size_t b = 0;
@@ -1918,18 +1922,34 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     if (state.spilling) {
-        // its bytes are still in RAM (the write is running, landed unreaped, or failed): copy them back
-        // from the buffer the write reads, never the disk
-        const auto & blocks = state.spilling->blocks;
-        size_t b = 0;
-        state.data.main = blocks[b++];
-        state.data.drft = blocks[b++];
-        for (auto & ckpt : state.prompt.checkpoints) {
-            ckpt.data_tgt  = blocks[b++];
-            ckpt.data_dft  = blocks[b++];
-            ckpt.data_spec = blocks[b++];
+        // its bytes are still in RAM, never read back from disk. A write not started yet is claimed and the
+        // blocks MOVE back (no copy; the worker skips the write). A write running or landed keeps its buffer
+        // (the worker may be reading it): load() applies the KV from it by reference, and only the
+        // checkpoints, which the slot must own, are copied (Codex on #124: no full deep copy).
+        auto & buf = *state.spilling;
+        int expected = server_spill_buffer::queued;
+        const bool took = buf.status.compare_exchange_strong(expected, server_spill_buffer::claimed, std::memory_order_acq_rel);
+        auto & blocks = buf.blocks;
+        size_t b = 2; // main and drft stay in the buffer unless taken
+        if (took) {
+            state.data.main = std::move(blocks[0]);
+            state.data.drft = std::move(blocks[1]);
         }
-        state.spilling.reset();
+        for (auto & ckpt : state.prompt.checkpoints) {
+            if (took) {
+                ckpt.data_tgt  = std::move(blocks[b++]);
+                ckpt.data_dft  = std::move(blocks[b++]);
+                ckpt.data_spec = std::move(blocks[b++]);
+            } else {
+                ckpt.data_tgt  = blocks[b++];
+                ckpt.data_dft  = blocks[b++];
+                ckpt.data_spec = blocks[b++];
+            }
+        }
+        if (took) {
+            state.spilling.reset(); // the moved-from buffer is empty; its charge is released with it
+        }
+        // else: load() reads main/drft from state.spilling and drops it after applying them
         // the file is removed after its write, in order, on the pool
         const std::string path = state.spill_path;
         io->submit(path, [path] { std::error_code rm; std::filesystem::remove(path, rm); });
@@ -2158,8 +2178,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & l
             return false;
         }
 
+        // the KV comes from the entry's own vectors, or by reference from its in-flight spill's buffer
+        const auto & src_main = it_best->spilling ? it_best->spilling->blocks[0] : it_best->data.main;
+        const auto & src_drft = it_best->spilling ? it_best->spilling->blocks[1] : it_best->data.drft;
         {
-            auto & data = it_best->data.main;
+            const auto & data = src_main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -2168,13 +2191,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & l
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
-            auto & data = it_best->data.drft;
+            const auto & data = src_drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -2186,11 +2206,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & l
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
+        std::vector<uint8_t>().swap(it_best->data.main);
+        std::vector<uint8_t>().swap(it_best->data.drft);
+        it_best->spilling.reset(); // applied: the write (if running) keeps the buffer alive until it finishes
 
         prompt = std::move(it_best->prompt);
 
