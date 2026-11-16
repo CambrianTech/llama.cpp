@@ -1434,11 +1434,26 @@ private:
                 SRV_ERR("%s", "--parked-checkpoints needs a recurrent or hybrid model without a sliding window\n");
                 return false;
             }
-            llama_memory_t mem = llama_get_memory(ctx_tgt);
+            // the target's partial state is its recurrent cell (an empty attention range moves no KV); a
+            // draft context (MTP) has a plain KV cache whose checkpoint is the whole sequence, so a parked
+            // id shares ALL of the draft's cells by id
+            llama_memory_t mem     = llama_get_memory(ctx_tgt);
+            llama_memory_t mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
             parked_pool = parked_seq_pool::make(
                 parked_seq_ops{
-                    [mem](int32_t src, int32_t dst) { llama_memory_seq_cp(mem, src, dst, 0, 0); },
-                    [mem](int32_t seq) { llama_memory_seq_rm(mem, seq, -1, -1); },
+                    [mem, mem_dft](int32_t src, int32_t dst) {
+                        llama_memory_seq_cp(mem, src, dst, 0, 0);
+                        if (mem_dft) {
+                            llama_memory_seq_rm(mem_dft, dst, -1, -1);
+                            llama_memory_seq_cp(mem_dft, src, dst, -1, -1);
+                        }
+                    },
+                    [mem, mem_dft](int32_t seq) {
+                        llama_memory_seq_rm(mem, seq, -1, -1);
+                        if (mem_dft) {
+                            llama_memory_seq_rm(mem_dft, seq, -1, -1);
+                        }
+                    },
                 },
                 params_base.n_parallel, params_base.n_parked_checkpoints);
             SRV_INF("checkpoints are parked by reference: %d sequence ids after the %d slots\n",
@@ -2603,7 +2618,7 @@ private:
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
-            if (parts.dft) {
+            if (parts.dft && ckpt.parked_seq < 0) { // a parked checkpoint already holds the draft by id
                 ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             }
             if (parts.spec) {
@@ -2996,7 +3011,10 @@ private:
                             const uint64_t sz_tgt   = parked
                                 ? llama_state_seq_get_size_ext(ctx_tgt, c.parked_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
                                 : c.data_tgt.size();
-                            const uint64_t sz_dft   = c.data_dft.size();
+                            const bool     parked_dft = parked && ctx_dft != nullptr;
+                            const uint64_t sz_dft   = parked_dft
+                                ? llama_state_seq_get_size_ext(ctx_dft, c.parked_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
+                                : c.data_dft.size();
                             const uint64_t sz_spec  = c.data_spec.size();
                             put(&n_tokens, sizeof(n_tokens)); put(&pos_min, sizeof(pos_min)); put(&pos_max, sizeof(pos_max));
                             put(&sz_tgt, sizeof(sz_tgt)); put(&sz_dft, sizeof(sz_dft)); put(&sz_spec, sizeof(sz_spec));
@@ -3009,7 +3027,15 @@ private:
                             } else {
                                 put(c.data_tgt.data(), c.data_tgt.size());
                             }
-                            put(c.data_dft.data(), c.data_dft.size());
+                            if (parked_dft && materialize) {
+                                std::vector<uint8_t> bytes(sz_dft);
+                                llama_state_seq_get_data_ext(ctx_dft, bytes.data(), bytes.size(), c.parked_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                put(bytes.data(), bytes.size());
+                            } else if (parked_dft) {
+                                put(nullptr, sz_dft);
+                            } else {
+                                put(c.data_dft.data(), c.data_dft.size());
+                            }
                             put(c.data_spec.data(), c.data_spec.size());
                         }
                     };

@@ -2363,6 +2363,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
+    // parked checkpoint ids are sequence ids of the draft context too, and llama reserves one output row
+    // per sequence id: the total covers them (CONTINUUM-ENGINE 4.7.11)
+    result.n_outputs_max = std::max(result.n_outputs_max, params.n_parallel + params.n_parked_checkpoints);
     return result;
 }
 

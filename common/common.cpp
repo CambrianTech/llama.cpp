@@ -2379,6 +2379,15 @@ void common_prompt_checkpoint::load_dft(
         return;
     }
 
+    if (parked_seq >= 0) {
+        // by reference: the draft's whole sequence (its KV cells, shared by id) replaces the live one, the
+        // same state a copied checkpoint would have written back, with no bytes moved
+        llama_memory_t mem = llama_get_memory(ctx);
+        llama_memory_seq_rm(mem, seq_id, -1, -1);
+        llama_memory_seq_cp(mem, parked_seq, seq_id, -1, -1);
+        return;
+    }
+
     if (data_dft.empty()) {
         return;
     }
