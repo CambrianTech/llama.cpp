@@ -42,6 +42,12 @@ target_compile_features(test-server-host-bytes PRIVATE cxx_std_23)
 add_test(NAME test-server-host-bytes COMMAND test-server-host-bytes)
 set_tests_properties(test-server-host-bytes PROPERTIES LABELS "main")
 
+# Model-free validator: a decode step as a frame (two in flight, step-retired release, arena, boundary commands).
+add_executable(test-server-step-frame test-server-step-frame.cpp)
+target_compile_features(test-server-step-frame PRIVATE cxx_std_23)
+add_test(NAME test-server-step-frame COMMAND test-server-step-frame)
+set_tests_properties(test-server-step-frame PROPERTIES LABELS "main")
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
