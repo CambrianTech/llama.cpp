@@ -27,11 +27,18 @@ inline bool checkpoint_at_user_start(bool view_spans, bool store_empty, int64_t 
 // The checkpoint to erase to make room for one more. With view spans (view_end >= 0) her head (the
 // oldest) is her restore point when her next prompt diverges before her view end, so the oldest AFTER
 // it goes first; the head goes only when it is all there is. Without view spans, the oldest goes.
+// A checkpoint pinned for learning is never the victim; end() when every candidate is pinned.
 template <typename List>
 typename List::iterator checkpoint_to_evict(List & checkpoints, int32_t view_end) {
     auto victim = checkpoints.begin();
     if (view_end >= 0 && checkpoints.size() >= 2) {
         ++victim;
+    }
+    while (victim != checkpoints.end() && victim->pinned) {
+        ++victim;
+    }
+    if (victim == checkpoints.end() && !checkpoints.empty() && !checkpoints.front().pinned) {
+        return checkpoints.begin(); // only her head is left unpinned
     }
     return victim;
 }
@@ -48,7 +55,7 @@ size_t erase_superseded_checkpoints(List & checkpoints, const Checkpoint & kept,
     const auto * head = &checkpoints.front();
     size_t erased = 0;
     for (auto it = checkpoints.begin(); it != checkpoints.end();) {
-        if (&*it != head && it->id_task != id_task) {
+        if (&*it != head && it->id_task != id_task && !it->pinned) {
             on_erase(*it);
             it = checkpoints.erase(it);
             ++erased;

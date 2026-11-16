@@ -1065,6 +1065,7 @@ private:
         bool began = false;
         std::string grant;
         int32_t lora_id = -1;
+        llama_seq_id side = -1; // learning on a side sequence: her own sequence is never touched
         std::string refusal = "none";
         bool drained = false;
         uint64_t restoration_reservation = 0;
@@ -1864,9 +1865,8 @@ private:
 
         // a named mind switches by sequence moves (server-context-minds.inc), never through the prompt cache
         if (ret && minds_on() && task.params.page.valid()) {
-            mind_switch(*ret, task.params.page);
-            if (ret->page != task.params.page) {
-                return nullptr; // the lane's mind could not leave intact: this request waits for a lane
+            if (!mind_switch(*ret, task.params.page)) {
+                return nullptr; // the switch could not complete intact: this request waits (never runs cold)
             }
             update_cache = false;
         }
@@ -2671,6 +2671,9 @@ private:
             // make room for the new checkpoint, if needed: her head stays while there is anything else
             // to evict (server-checkpoint-policy.h)
             auto victim = checkpoint_to_evict(slot.prompt.checkpoints, slot.prompt.view_end);
+            if (victim == slot.prompt.checkpoints.end()) {
+                break; // every checkpoint is pinned for learning: the store holds one more until they are learned
+            }
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024);
@@ -2693,7 +2696,10 @@ private:
             return;
         }
 
-        const auto & kept = slot.prompt.checkpoints.emplace_back(std::move(cur));
+        auto & kept = slot.prompt.checkpoints.emplace_back(std::move(cur));
+        if (slot.task->params.learn_pin && kept.n_tokens == (int64_t) slot.task->n_tokens() - 1) {
+            kept.pinned = true; // the core will learn this turn: kept until learned or abandoned
+        }
 
         // Continuum fork (CONTINUUM-ENGINE 4.7.3, placed checkpoints): her new view-end checkpoint
         // supersedes every checkpoint an earlier act left on this prefix except her head's (the oldest,
@@ -5053,6 +5059,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id_slot = json_value(data, "id_slot", -1);
             task.params.page = mind_page_parse(json_value(data, "page", std::string())); // text only at this edge
+            task.params.learn_pin = json_value(data, "learn_pin", false);
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
@@ -6543,6 +6550,7 @@ void server_routes::init_routes() {
         task.learn.n_prefix = json_value(body, "n_prefix", 0);
         task.learn.lora_id  = json_value(body, "lora_id",  -1);
         task.learn.lr       = json_value(body, "lr",       1e-4f);
+        task.learn.side     = json_value(body, "side_sequence", false);
         if (body.contains("messages")) {
             try {
                 const auto example = render_learn_example(body);
@@ -6571,6 +6579,25 @@ void server_routes::init_routes() {
                 rd.post_task(std::move(task));
                 auto result = rd.next(req.should_stop);
                 if (result) { res->ok(result->to_json()); }
+                return res;
+            }
+            // A side-sequence learn never serves the example on her slot (that would cut her context back to the
+            // example's prompt): her slot must already hold the prompt as a prefix of what she has now, and the
+            // learn runs on a side sequence (server-context-learn.inc), refused typed otherwise
+            if (task.learn.side) {
+                auto & rd = res->rd;
+                task.id = rd.get_new_id();
+                rd.post_task(std::move(task));
+                auto result = rd.next(req.should_stop);
+                if (!result) {
+                    GGML_ASSERT(req.should_stop());
+                    return res;
+                }
+                if (result->is_error()) {
+                    res->error(result->to_json());
+                    return res;
+                }
+                res->ok(result->to_json());
                 return res;
             }
             // A past example (S4 (f); fork #89): her slot may no longer hold this prompt. Serve it

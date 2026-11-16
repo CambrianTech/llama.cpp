@@ -102,6 +102,10 @@ struct learn_request {
     std::vector<llama_token> prompt;            // the served prompt, when known: her slot must hold exactly it
     int32_t                  lora_id  = -1;     // the trainable adapter (the shadow), loaded dormant
     float                    lr       = 1e-4f;
+    // continuum: learn on a side sequence (her prefix re-tagged, the pinned checkpoint's recurrent state loaded):
+    // her own sequence is never cut, reloaded or truncated; refused, typed, when no side sequence or no pinned
+    // checkpoint at n_prefix - 1 exists (never a fallback to her slot)
+    bool                     side     = false;
 };
 
 struct learn_outcome {
@@ -178,6 +182,8 @@ struct task_params {
     int32_t view_end_pos = -1;
     // Continuum fork: the mind this request is (the core's PageKey::Mind; server-mind.h). Invalid: anonymous.
     mind_page page;
+    // Continuum fork: the core will learn this turn later: pin the checkpoint at its prompt's end - 1
+    bool learn_pin = false;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)

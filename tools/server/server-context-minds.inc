@@ -267,14 +267,16 @@
     }
 
     // `slot` serves `page` next. The mind it holds (if any) is parked; hers comes back from where she is.
-    void mind_switch(server_slot & slot, mind_page page) {
+    // false: the switch could not complete (the leaving mind could not leave intact, or the arriving mind's state
+    // could not be inserted): the request waits for a lane, never runs cold beside a stored version of her.
+    bool mind_switch(server_slot & slot, mind_page page) {
         slot.stats.mind_hi = page.hi;
         slot.stats.mind_lo = page.lo;
         if (slot.page == page) {
             slot.stats.mind_came_from  = mind_from::lane;
             slot.stats.mind_switch_us  = 0;
             slot.stats.mind_generation = slot.page_generation;
-            return;
+            return true;
         }
         const int64_t t0 = ggml_time_us();
         // the lane's mind leaves, whole
@@ -293,7 +295,7 @@
                 seq_move(slot.id, m.seq);
             } else if (!flash_out(m, slot.id)) {
                 SLT_ERR(slot, "%s", "the leaving mind could be neither parked nor copied out; she is kept on this lane\n");
-                return; // her state is intact on the lane; the arriving request waits for another lane
+                return false; // her state is intact on the lane; the arriving request waits for another lane
             }
             m.prompt = std::move(slot.prompt);
             slot.prompt.clear();
@@ -327,11 +329,12 @@
             }
             generation = m.generation + 1;
             if (!ok) {
-                // she stays where she is (on flash, record and file intact); the lane starts this request empty
+                // she stays where she is (record and bytes intact: one version of her); the request waits for
+                // cells, never runs cold beside her stored state
                 slot.prompt_clear();
-                from = "flash, pool full";
-                kind = mind_from::flash_pool_full;
-                break;
+                slot.page = mind_page{};
+                SLT_WRN(slot, "%s", "the arriving mind could not be inserted (the pool is full even with every other mind out); her request waits\n");
+                return false;
             }
             slot.prompt = std::move(m.prompt);
             slot.lora   = std::move(m.lora);
@@ -351,4 +354,5 @@
         slot.stats.mind_generation = generation;
         SLT_INF(slot, "mind switch: out %.3f ms, in (%s) %.3f ms, she holds %d tokens\n", t_out / 1000.0, from,
                 (ggml_time_us() - t0 - t_out) / 1000.0, slot.prompt.n_tokens());
+        return true;
     }

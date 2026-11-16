@@ -1156,6 +1156,10 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
+    // continuum: held for a turn the core will learn (its served prompt's end, n_prefix - 1): never evicted or
+    // superseded until that turn is learned on a side sequence or abandoned
+    bool pinned = false;
+
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
 
