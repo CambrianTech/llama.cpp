@@ -510,6 +510,19 @@ private:
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
+    // Continuum fork: device snapshots keyed by a caller snapshot id (llama_state_seq_snapshot_*)
+    struct device_snapshot {
+        std::vector<uint8_t> header; // the host-side part: magic, seq id, tensor layout
+        llama_memory_buffers bufs;   // the state itself, in device buffers
+    };
+    std::map<uint64_t, device_snapshot> snapshots;
+
+public:
+    size_t snapshot_save(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags);
+    bool   snapshot_load(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags);
+    void   snapshot_free(uint64_t snapshot_id);
+private:
+
     bool has_evaluated_once = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE

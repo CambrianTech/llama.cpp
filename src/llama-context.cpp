@@ -3165,6 +3165,56 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     }
 }
 
+size_t llama_context::snapshot_save(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags) {
+    flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    auto & snap = snapshots[snapshot_id];
+    snap.header.resize(state_seq_get_size(seq_id, flags));
+    try {
+        {
+            llama_io_write_device io(snap.header.data(), snap.header.size(), snap.bufs);
+            io.write(&io_magic, sizeof(io_magic));
+            io.write(&seq_id, sizeof(seq_id));
+            state_seq_write_data(io, seq_id, flags);
+        } // the device copies are made as the writer completes
+        size_t device_bytes = 0;
+        for (const auto & [buft, mbuf] : snap.bufs) {
+            device_bytes += mbuf.total_size;
+        }
+        return device_bytes;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving snapshot: %s\n", __func__, err.what());
+        snapshots.erase(snapshot_id);
+        return 0;
+    }
+}
+
+bool llama_context::snapshot_load(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags) {
+    flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    auto it = snapshots.find(snapshot_id);
+    if (it == snapshots.end()) {
+        return false;
+    }
+    try {
+        llama_io_read_device io(it->second.header.data(), it->second.header.size(), it->second.bufs);
+        uint32_t magic_read;
+        io.read(&magic_read, sizeof(magic_read));
+        if (io_magic != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+        llama_seq_id seq_id_read;
+        io.read(&seq_id_read, sizeof(seq_id_read));
+        state_seq_read_data(io, seq_id, flags);
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading snapshot: %s\n", __func__, err.what());
+        return false;
+    }
+}
+
+void llama_context::snapshot_free(uint64_t snapshot_id) {
+    snapshots.erase(snapshot_id);
+}
+
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
@@ -4140,4 +4190,19 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+
+size_t llama_state_seq_snapshot_save(llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags) {
+    ctx->synchronize();
+    return ctx->snapshot_save(seq_id, snapshot_id, flags);
+}
+
+bool llama_state_seq_snapshot_load(llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags) {
+    ctx->synchronize();
+    return ctx->snapshot_load(seq_id, snapshot_id, flags);
+}
+
+void llama_state_seq_snapshot_free(llama_context * ctx, uint64_t snapshot_id) {
+    ctx->snapshot_free(snapshot_id);
 }

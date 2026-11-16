@@ -158,6 +158,48 @@ int main(int argc, char ** argv) {
     std::printf("partial restored vs cold logits: max |diff| = %.6g, argmax %d vs %d\n", max_diff_partial, argmax_partial, argmax_ref);
 
     llama_free(ctx);
+
+    // ---- the revised design: the target's partial state as a DEVICE SNAPSHOT keyed by snapshot id, on a
+    // context with ONE sequence (no parked ids, no extra rollback rows)
+    float max_diff_snap = 0.0f;
+    int   argmax_snap   = 0;
+    {
+        auto cparams       = common_context_params_to_llama(params);
+        cparams.n_seq_max  = 1;
+        cparams.n_ctx      = 8192;
+        cparams.n_batch    = 4096;
+        cparams.n_ubatch   = 512;
+        llama_context * sctx = llama_init_from_model(model, cparams);
+        llama_memory_t  smem = llama_get_memory(sctx);
+        if (!decode(sctx, prefix, 0, 0)) { std::fprintf(stderr, "FAILED: snapshot prefix decode\n"); return 1; }
+        llama_synchronize(sctx);
+        const int64_t t_s0 = now_us();
+        const size_t snap_bytes = llama_state_seq_snapshot_save(sctx, 0, /*snapshot_id=*/42, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const int64_t t_save = now_us() - t_s0;
+        if (snap_bytes == 0) { std::fprintf(stderr, "FAILED: snapshot save\n"); return 1; }
+        if (!decode(sctx, detour, N, 0)) { std::fprintf(stderr, "FAILED: snapshot detour\n"); return 1; }
+        llama_synchronize(sctx);
+        const int64_t t_l0 = now_us();
+        if (!llama_state_seq_snapshot_load(sctx, 0, 42, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) { std::fprintf(stderr, "FAILED: snapshot load\n"); return 1; }
+        if (!llama_memory_seq_rm(smem, 0, N, -1)) { std::fprintf(stderr, "FAILED: trim after snapshot load\n"); return 1; }
+        llama_synchronize(sctx);
+        const int64_t t_load = now_us() - t_l0;
+        if (!decode(sctx, { next }, N, 0)) { std::fprintf(stderr, "FAILED: snapshot restored decode\n"); return 1; }
+        const std::vector<float> got_snap = last_logits(sctx, n_vocab);
+        for (int i = 0; i < n_vocab; ++i) {
+            max_diff_snap = std::max(max_diff_snap, std::fabs(ref[i] - got_snap[i]));
+            if (got_snap[i] > got_snap[argmax_snap]) argmax_snap = i;
+        }
+        std::printf("device snapshot (n_seq_max 1): %zu device bytes, save %lld us, restore %lld us; logits max |diff| %.6g, argmax %d vs %d\n",
+                    snap_bytes, (long long) t_save, (long long) t_load, max_diff_snap, argmax_snap, argmax_ref);
+        llama_state_seq_snapshot_free(sctx, 42);
+        llama_free(sctx);
+    }
+    if (argmax_snap != argmax_ref || max_diff_snap > 1e-2f) {
+        std::fprintf(stderr, "FAILED: the device snapshot restore does not reproduce the cold run\n");
+        return 1;
+    }
+
     llama_model_free(model);
     llama_backend_free();
 
