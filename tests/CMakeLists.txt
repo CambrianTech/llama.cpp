@@ -36,6 +36,12 @@ target_compile_features(test-server-module PRIVATE cxx_std_23)
 add_test(NAME test-server-module COMMAND test-server-module)
 set_tests_properties(test-server-module PROPERTIES LABELS "main")
 
+# Model-free validator: a resident's bytes as a pool-owned handle (RAII release, sharing by reference).
+add_executable(test-server-host-bytes test-server-host-bytes.cpp)
+target_compile_features(test-server-host-bytes PRIVATE cxx_std_23)
+add_test(NAME test-server-host-bytes COMMAND test-server-host-bytes)
+set_tests_properties(test-server-host-bytes PROPERTIES LABELS "main")
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
