@@ -168,6 +168,16 @@ static void a_mover_streams_moves_without_waiting() {
     require(moved == 300 && aliased == 300 && refused == 300, "every transfer completed exactly once");
 }
 
+// A test pool: issues pins on its bytes and counts the ones out (the custody a mover must hold and return).
+struct pin_pool {
+    std::atomic<int> out{0};
+    static void unpin(void * pool, uint64_t) noexcept { static_cast<pin_pool *>(pool)->out.fetch_sub(1); }
+    buffer_pin pin(std::byte * data, uint64_t bytes) {
+        out.fetch_add(1);
+        return buffer_pin(data, bytes, this, &unpin, 0);
+    }
+};
+
 // The parallel copier: many transfers in flight, each split across lanes; bytes arrive exactly; every
 // ticket completes once; a size mismatch and a disk pair are refused typed.
 static void run_copies(size_t lanes, size_t chunk, size_t n_transfers, size_t bytes_each, double * gbps) {
@@ -178,10 +188,12 @@ static void run_copies(size_t lanes, size_t chunk, size_t n_transfers, size_t by
         for (size_t b = 0; b < bytes_each; b += 4096) src[i][b] = std::byte(uint8_t(i * 31 + b / 4096));
     }
     // pool 0 = sources, pool 1 = destinations; buffer = index
-    auto resolve = [&](const buffer_ref & r) -> std::byte * {
+    pin_pool pool;
+    auto resolve = [&](const buffer_ref & r) -> buffer_pin {
         auto & v = r.pool == 0 ? src : dst;
-        // the custody contract: a live generation (0 here) and in bounds, else refused
-        return r.generation == 0 && r.buffer < v.size() && r.offset + r.bytes <= v[r.buffer].size() ? v[r.buffer].data() + r.offset : nullptr;
+        // the custody contract: a live generation (0 here) and in bounds, else no pin
+        if (r.generation != 0 || r.buffer >= v.size() || r.offset + r.bytes > v[r.buffer].size()) return {};
+        return pool.pin(v[r.buffer].data() + r.offset, v[r.buffer].size() - r.offset);
     };
     frame_ring<transfer_frame> in(n_transfers + 8);
     std::map<uint64_t, transfer_status> done;
@@ -216,6 +228,34 @@ static void run_copies(size_t lanes, size_t chunk, size_t n_transfers, size_t by
     }
     require(done[n_transfers + 1] == transfer_status::refused, "a size mismatch is refused, never truncated");
     require(done[n_transfers + 2] == transfer_status::refused, "a disk pair is refused by the host copier");
+    require(pool.out.load() == 0, "every pin returned");
+}
+
+// what this catches (Codex on #134): a consumer's close raced the producer's tail store, erasing the closed
+// bit or stranding a frame whose push returned true; and a producer waiting for room never woke on close
+static void a_close_never_strands_an_accepted_frame() {
+    for (int round = 0; round < 2000; ++round) {
+        frame_ring<uint64_t> ring(8);
+        std::atomic<uint64_t> accepted{0};
+        std::atomic<bool> producer_done{false};
+        std::thread producer([&] {
+            for (uint64_t i = 1; i < 1000; ++i) {
+                if (ring.push(i)) {
+                    accepted.fetch_add(1);
+                } else if (ring.closed() || !ring.wait_for_room()) {
+                    break; // closed: wait_for_room returns false rather than sleeping forever
+                }
+            }
+            producer_done = true;
+        });
+        uint64_t drained = 0, buf[8];
+        for (int k = 0; k < round % 7; ++k) drained += ring.drain(buf);
+        ring.close();
+        producer.join();
+        while (size_t n = ring.drain(buf)) drained += n;
+        require(ring.closed(), "the closed bit survives a racing push");
+        require(drained == accepted.load(), "every frame whose push returned true is drained");
+    }
 }
 
 // Codex's #134 review, one regression each.
@@ -237,9 +277,11 @@ static void drain_all(memory_mover & mover, done_map & done, size_t want) {
 // caller could only drain after pump returned (capacity 2 + 3 aliases deadlocked)
 static void a_full_completion_ring_is_backpressure_not_a_deadlock() {
     std::vector<std::byte> a(4096), b(4096);
-    auto resolve = [&](const buffer_ref & r) -> std::byte * {
+    pin_pool pool;
+    auto resolve = [&](const buffer_ref & r) -> buffer_pin {
         auto & v = r.buffer == 0 ? a : b;
-        return r.generation == 0 && r.offset + r.bytes <= v.size() ? v.data() + r.offset : nullptr;
+        if (r.generation != 0 || r.offset + r.bytes > v.size()) return {};
+        return pool.pin(v.data() + r.offset, v.size() - r.offset);
     };
     frame_ring<transfer_frame> in(16);
     parallel_copier mover(in, resolve, 2, 4096, 2);
@@ -256,8 +298,11 @@ static void a_full_completion_ring_is_backpressure_not_a_deadlock() {
 // overlapping ranges in one buffer reached parallel memcpy (UB)
 static void invalid_aliases_and_overlaps_are_refused() {
     std::vector<std::byte> a(1 << 16);
-    auto resolve = [&](const buffer_ref & r) -> std::byte * {
-        return r.generation == 0 && r.offset + r.bytes <= a.size() ? a.data() + r.offset : nullptr;
+    pin_pool pool;
+    auto resolve = [&](const buffer_ref & r) -> buffer_pin {
+        if (r.generation != 0 || r.offset + r.bytes > a.size()) return {};
+        // buffers 0 and 1 are two ids over the SAME bytes (a physical alias the ids do not show)
+        return pool.pin(a.data() + r.offset, a.size() - r.offset);
     };
     frame_ring<transfer_frame> in(16);
     parallel_copier mover(in, resolve, 4, 4096, 8);
@@ -267,22 +312,50 @@ static void invalid_aliases_and_overlaps_are_refused() {
     require(in.push({ 3, ref(0, 0, 8192), ref(0, 4096, 8192) }), "q"); // overlapping ranges
     require(in.push({ 4, ref(0, 0, 4096), ref(0, 1 << 16, 4096) }), "q"); // out of bounds
     require(in.push({ 5, ref(0, 0, 4096), ref(0, 8192, 4096) }), "q");  // disjoint: a real copy
+    const auto other = [](uint64_t off, uint64_t n) { return buffer_ref{ memory_domain::host, 0, 1, 0, off, n }; };
+    require(in.push({ 6, ref(0, 0, 4096), other(0, 4096) }), "q");    // another id, the SAME bytes
+    require(in.push({ 7, ref(0, 0, 4096), other(2048, 4096) }), "q"); // another id, overlapping bytes
     done_map done;
-    drain_all(mover, done, 5);
+    drain_all(mover, done, 7);
     require(done[1] == transfer_status::refused && done[2] == transfer_status::refused, "an alias is never unvalidated");
     require(done[3] == transfer_status::refused, "overlap is refused, never raced");
     require(done[4] == transfer_status::refused, "out of bounds is refused");
     require(done[5] == transfer_status::moved, "a disjoint copy in one buffer moves");
+    require(done[6] == transfer_status::aliased, "two ids over the same physical bytes alias, decided on addresses");
+    require(done[7] == transfer_status::refused, "two ids over overlapping physical bytes are refused");
+    require(pool.out.load() == 0, "every pin went back to its pool once its completion was drained");
 }
 
 // what this catches: the destructor joined lanes blocked on full completion rings, and tickets never handed
 // to a lane had no terminal outcome
+// what this catches (Codex on #134): a generation alone did not keep the pool's custody; the pins must be
+// held from start until the completion is DRAINED, then returned
+static void a_transfer_holds_its_pins_until_drained() {
+    std::vector<std::byte> a(1 << 20), b(1 << 20);
+    pin_pool pool;
+    auto resolve = [&](const buffer_ref & r) -> buffer_pin {
+        auto & v = r.buffer == 0 ? a : b;
+        return pool.pin(v.data(), v.size());
+    };
+    frame_ring<transfer_frame> in(4);
+    parallel_copier mover(in, resolve, 2, 64 * 1024, 2);
+    require(in.push({ 1, { memory_domain::host, 0, 0, 0, 0, 1 << 20 }, { memory_domain::host, 0, 1, 0, 0, 1 << 20 } }), "q");
+    mover.pump();
+    while (mover.doorbell() == 0) mover.wait_done(0);   // the copy landed and was published...
+    require(pool.out.load() == 2, "...yet both pins stay out until the completion is drained");
+    done_map done;
+    drain_all(mover, done, 1);
+    require(done[1] == transfer_status::moved && pool.out.load() == 0, "drained: moved, and both pins returned");
+}
+
 static void teardown_with_work_outstanding_ends_every_ticket() {
     const size_t n = 64, bytes = 1 << 20;
     std::vector<std::vector<std::byte>> src(n, std::vector<std::byte>(bytes)), dst(n, std::vector<std::byte>(bytes));
-    auto resolve = [&](const buffer_ref & r) -> std::byte * {
+    pin_pool pool;
+    auto resolve = [&](const buffer_ref & r) -> buffer_pin {
         auto & v = r.pool == 0 ? src : dst;
-        return r.generation == 0 && r.buffer < v.size() && r.offset + r.bytes <= v[r.buffer].size() ? v[r.buffer].data() + r.offset : nullptr;
+        if (r.generation != 0 || r.buffer >= v.size() || r.offset + r.bytes > v[r.buffer].size()) return {};
+        return pool.pin(v[r.buffer].data() + r.offset, v[r.buffer].size() - r.offset);
     };
     frame_ring<transfer_frame> in(n);
     {
@@ -300,6 +373,7 @@ static void teardown_with_work_outstanding_ends_every_ticket() {
             cancelled += s == transfer_status::cancelled;
         }
         require(cancelled > 0, "transfers no lane took are cancelled, typed");
+        require(pool.out.load() == 0, "after every terminal frame is drained, no pin is held");
         require(!in.push({ n + 1, {}, {} }), "a shut-down mover takes nothing more");
     } // the destructor joins without hanging
     {
@@ -326,8 +400,10 @@ int main(int argc, char ** argv) {
     a_full_ring_is_backpressure();
     close_wakes_a_waiting_consumer();
     a_mover_streams_moves_without_waiting();
+    a_close_never_strands_an_accepted_frame();
     a_full_completion_ring_is_backpressure_not_a_deadlock();
     invalid_aliases_and_overlaps_are_refused();
+    a_transfer_holds_its_pins_until_drained();
     teardown_with_work_outstanding_ends_every_ticket();
     the_parallel_copier_moves_many_at_once();
     std::cout << "test-server-frames: ok\n";
