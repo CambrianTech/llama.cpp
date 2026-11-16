@@ -4808,7 +4808,7 @@ server_context_meta server_context::get_meta() const {
             { "max_tokens_per_sequence", impl->n_ctx_slot },
             { "sequence_capacity",       llama_n_seq_max(impl->ctx_tgt) },
         },
-        /* step_budget            */ impl->budget,
+        /* budget                 */ impl->budget,
     };
 }
 
@@ -5237,10 +5237,10 @@ static json get_res_props(const server_context_meta & meta, const common_params 
                               {"unsynced_steps", c.unsynced_steps}, {"unsynced_us", c.unsynced_us},
                               {"failed_steps", c.failed_steps}, {"failed_us", c.failed_us} };
             };
-            if (!meta.step_budget) {
+            if (!meta.budget) {
                 return json(nullptr);
             }
-            auto snap = meta.step_budget->snapshot();
+            auto snap = meta.budget->snapshot();
             return json { {"decode", counters(snap.decode)}, {"with_prefill", counters(snap.with_prefill)} };
         }() },
         { "gpu_time",                    [] {
