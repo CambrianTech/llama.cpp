@@ -1075,25 +1075,36 @@ extern "C" {
            llama_state_seq_flags   flags);
 
     // Continuum fork (CONTINUUM-ENGINE 4.7.11): DEVICE SNAPSHOTS of a sequence's state, keyed by a caller
-    // snapshot id instead of the sequence id, so a sequence can hold many. Save copies the sequence's
-    // state tensors into device buffers owned by the snapshot with backend ops (no host bytes; the
-    // host keeps only a small header); load copies them back; free releases them. With
-    // LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY a hybrid model snapshots its recurrent row only.
-    LLAMA_API size_t llama_state_seq_snapshot_save(
-            struct llama_context * ctx,
-                    llama_seq_id   seq_id,
-                        uint64_t   snapshot_id,
-           llama_state_seq_flags   flags);
+    // snapshot id (the pool's identity), so a sequence can hold many. Save copies the sequence's state
+    // tensors into device buffers owned by the snapshot (no host bytes; the host keeps a small header);
+    // load copies them back; free releases them. With LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY a hybrid model
+    // snapshots its recurrent row only. Every call returns a typed status and never throws or aborts.
+    enum llama_snapshot_status {
+        LLAMA_SNAPSHOT_OK           = 0,
+        LLAMA_SNAPSHOT_ABSENT       = 1, // no snapshot under this id / nothing to snapshot under these flags
+        LLAMA_SNAPSHOT_INCOMPATIBLE = 2, // flags or tensor layout differ from the target: nothing was changed
+        LLAMA_SNAPSHOT_ALLOC_FAILED = 3, // device memory could not be allocated: a previous snapshot is kept
+        LLAMA_SNAPSHOT_COPY_FAILED  = 4, // the copy itself failed
+    };
 
-    LLAMA_API bool llama_state_seq_snapshot_load(
-            struct llama_context * ctx,
-                    llama_seq_id   seq_id,
-                        uint64_t   snapshot_id,
-           llama_state_seq_flags   flags);
+    // The device bytes a snapshot of `seq_id` would hold, so the pool reserves BEFORE anything allocates.
+    LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_bytes(
+            struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, size_t * device_bytes);
 
-    LLAMA_API void llama_state_seq_snapshot_free(
-            struct llama_context * ctx,
-                        uint64_t   snapshot_id);
+    // Stage, copy, then publish: a failed save leaves any previous snapshot under this id loadable. While
+    // a replacement is staged both generations exist (the pool charges both).
+    LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_save(
+            struct llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags, size_t * device_bytes);
+
+    // Validated before the live sequence is touched: refused (INCOMPATIBLE) on a flags or layout mismatch.
+    LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_load(
+            struct llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags);
+
+    // Synchronizes first: no submitted step can still read the buffers being freed.
+    LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_free(struct llama_context * ctx, uint64_t snapshot_id);
+
+    // Test-only fault injection: the next `n` snapshot device allocations fail.
+    LLAMA_API void llama_state_seq_snapshot_test_fail_next_allocs(int n);
 
     //
     // Decoding

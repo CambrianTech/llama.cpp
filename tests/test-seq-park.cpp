@@ -13,6 +13,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 #include <cstdlib>
 #include <vector>
 
@@ -160,9 +163,8 @@ int main(int argc, char ** argv) {
     llama_free(ctx);
 
     // ---- the revised design: the target's partial state as a DEVICE SNAPSHOT keyed by snapshot id, on a
-    // context with ONE sequence (no parked ids, no extra rollback rows)
-    float max_diff_snap = 0.0f;
-    int   argmax_snap   = 0;
+    // context with ONE sequence (no parked ids, no extra rollback rows), plus the fault replays from
+    // Codex's review of 7ca9509f0
     {
         auto cparams       = common_context_params_to_llama(params);
         cparams.n_seq_max  = 1;
@@ -171,33 +173,89 @@ int main(int argc, char ** argv) {
         cparams.n_ubatch   = 512;
         llama_context * sctx = llama_init_from_model(model, cparams);
         llama_memory_t  smem = llama_get_memory(sctx);
-        if (!decode(sctx, prefix, 0, 0)) { std::fprintf(stderr, "FAILED: snapshot prefix decode\n"); return 1; }
-        llama_synchronize(sctx);
+        const auto P = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        auto require = [](bool ok, const char * what) { if (!ok) { std::fprintf(stderr, "FAILED: %s\n", what); std::exit(1); } };
+        auto restored_matches_cold = [&](uint64_t id, const char * what) {
+            require(llama_state_seq_snapshot_load(sctx, 0, id, P) == LLAMA_SNAPSHOT_OK, what);
+            require(llama_memory_seq_rm(smem, 0, N, -1), "trim attention after the restore");
+            require(decode(sctx, { next }, N, 0), "decode after the restore");
+            const std::vector<float> got = last_logits(sctx, n_vocab);
+            float d = 0.0f; int am = 0;
+            for (int i = 0; i < n_vocab; ++i) { d = std::max(d, std::fabs(ref[i] - got[i])); if (got[i] > got[am]) am = i; }
+            require(am == argmax_ref && d <= 1e-2f, what);
+            // back to the clean prefix for the next case: the recurrent state cannot be trimmed past `next`,
+            // so restore the snapshot again (the mechanism under test) and trim attention
+            require(llama_state_seq_snapshot_load(sctx, 0, id, P) == LLAMA_SNAPSHOT_OK, "re-restore to the prefix");
+            require(llama_memory_seq_rm(smem, 0, N, -1), "trim back to the prefix");
+            return d;
+        };
+        auto host_state = [&]() { // test-only witness of the live state: its serialized bytes
+            std::vector<uint8_t> v(llama_state_seq_get_size_ext(sctx, 0, P));
+            llama_state_seq_get_data_ext(sctx, v.data(), v.size(), 0, P);
+            return v;
+        };
+
+        require(decode(sctx, prefix, 0, 0), "snapshot prefix decode");
+        llama_synchronize(sctx); // time the snapshot, not the prefill still in flight
+        size_t quoted = 0, bytes = 0;
+        require(llama_state_seq_snapshot_bytes(sctx, 0, P, &quoted) == LLAMA_SNAPSHOT_OK && quoted > 0, "size quote before save");
         const int64_t t_s0 = now_us();
-        const size_t snap_bytes = llama_state_seq_snapshot_save(sctx, 0, /*snapshot_id=*/42, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        require(llama_state_seq_snapshot_save(sctx, 0, 42, P, &bytes) == LLAMA_SNAPSHOT_OK, "save");
         const int64_t t_save = now_us() - t_s0;
-        if (snap_bytes == 0) { std::fprintf(stderr, "FAILED: snapshot save\n"); return 1; }
-        if (!decode(sctx, detour, N, 0)) { std::fprintf(stderr, "FAILED: snapshot detour\n"); return 1; }
+        require(bytes == quoted, "the quote equals what the save holds (the pool reserves exactly this)");
+
+        // 1. a failed REPLACEMENT keeps the prior snapshot loadable
+        require(decode(sctx, detour, N, 0), "detour");
+        llama_state_seq_snapshot_test_fail_next_allocs(1);
+        size_t b2 = 0;
+        require(llama_state_seq_snapshot_save(sctx, 0, 42, P, &b2) == LLAMA_SNAPSHOT_ALLOC_FAILED, "a failed allocation is reported typed");
+        // 2. an incompatible load is refused BEFORE the live sequence changes
+        const auto before = host_state();
+        require(llama_state_seq_snapshot_load(sctx, 0, 42, LLAMA_STATE_SEQ_FLAGS_NONE) == LLAMA_SNAPSHOT_INCOMPATIBLE, "flags mismatch refused");
+        require(llama_state_seq_snapshot_load(sctx, 0, 999, P) == LLAMA_SNAPSHOT_ABSENT, "an unknown id is absent");
+        require(host_state() == before, "a refused load leaves the live sequence byte-identical");
         llama_synchronize(sctx);
         const int64_t t_l0 = now_us();
-        if (!llama_state_seq_snapshot_load(sctx, 0, 42, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) { std::fprintf(stderr, "FAILED: snapshot load\n"); return 1; }
-        if (!llama_memory_seq_rm(smem, 0, N, -1)) { std::fprintf(stderr, "FAILED: trim after snapshot load\n"); return 1; }
-        llama_synchronize(sctx);
-        const int64_t t_load = now_us() - t_l0;
-        if (!decode(sctx, { next }, N, 0)) { std::fprintf(stderr, "FAILED: snapshot restored decode\n"); return 1; }
-        const std::vector<float> got_snap = last_logits(sctx, n_vocab);
-        for (int i = 0; i < n_vocab; ++i) {
-            max_diff_snap = std::max(max_diff_snap, std::fabs(ref[i] - got_snap[i]));
-            if (got_snap[i] > got_snap[argmax_snap]) argmax_snap = i;
+        require(llama_state_seq_snapshot_load(sctx, 0, 42, P) == LLAMA_SNAPSHOT_OK, "timed restore");
+        const int64_t t_load = now_us() - t_l0; // the restore alone (it synchronizes on entry; nothing is in flight)
+        const float d1 = restored_matches_cold(42, "the prior snapshot survived the failed replacement");
+
+        // 3. save / free with backend work still in flight (no explicit synchronize by the caller)
+        require(decode(sctx, detour, N, 0), "detour 2");               // submitted, not synchronized
+        size_t b3 = 0;
+        require(llama_state_seq_snapshot_save(sctx, 0, 70, P, &b3) == LLAMA_SNAPSHOT_OK, "save with work in flight");
+        require(decode(sctx, { next }, N + M, 0), "more work in flight");
+        require(llama_state_seq_snapshot_free(sctx, 70) == LLAMA_SNAPSHOT_OK, "free with work in flight");
+        require(llama_state_seq_snapshot_free(sctx, 70) == LLAMA_SNAPSHOT_ABSENT, "a second free is absent, typed");
+
+        // 4. allocate / recycle cycles: physical footprint must not grow
+        auto footprint = []() -> int64_t {
+#if defined(__APPLE__)
+            task_vm_info_data_t info; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+            return task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &info, &n) == KERN_SUCCESS ? (int64_t) info.phys_footprint : -1;
+#else
+            return -1;
+#endif
+        };
+        int64_t peak = 0;
+        const int64_t base = footprint();
+        for (int cycle = 0; cycle < 200; ++cycle) {
+            size_t b4 = 0;
+            require(llama_state_seq_snapshot_save(sctx, 0, 100 + (uint64_t) (cycle % 4), P, &b4) == LLAMA_SNAPSHOT_OK, "cycle save");
+            if (cycle % 4 == 3) {
+                for (uint64_t id = 100; id < 104; ++id) llama_state_seq_snapshot_free(sctx, id);
+            }
+            peak = std::max(peak, footprint());
         }
-        std::printf("device snapshot (n_seq_max 1): %zu device bytes, save %lld us, restore %lld us; logits max |diff| %.6g, argmax %d vs %d\n",
-                    snap_bytes, (long long) t_save, (long long) t_load, max_diff_snap, argmax_snap, argmax_ref);
+        const int64_t after = footprint();
+        std::printf("device snapshot (n_seq_max 1): %zu device bytes (quoted %zu), save %lld us, restore %lld us, logits max |diff| %.6g\n",
+                    bytes, quoted, (long long) t_save, (long long) t_load, d1);
+        std::printf("fault replays ok: failed replacement kept the prior, incompatible/absent refused with the live state byte-identical, save/free with work in flight\n");
+        std::printf("200 save/free cycles of 4 snapshots: footprint base %.1f MiB, peak %.1f MiB, after %.1f MiB\n",
+                    base / 1048576.0, peak / 1048576.0, after / 1048576.0);
+        require(after - base < (int64_t) bytes, "no growth across cycles beyond one snapshot of slack");
         llama_state_seq_snapshot_free(sctx, 42);
         llama_free(sctx);
-    }
-    if (argmax_snap != argmax_ref || max_diff_snap > 1e-2f) {
-        std::fprintf(stderr, "FAILED: the device snapshot restore does not reproduce the cold run\n");
-        return 1;
     }
 
     llama_model_free(model);

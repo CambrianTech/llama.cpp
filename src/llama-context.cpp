@@ -2846,7 +2846,40 @@ public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
     }
 
+    // upstream ON_DEVICE path: commit on destruction, abort if it cannot (unchanged behavior)
     ~llama_io_write_device() {
+        if (!done && commit() != commit_status::ok) {
+            GGML_ABORT("%s: device state write failed\n", __func__);
+        }
+    }
+
+    enum class commit_status { ok, alloc_failed };
+
+    // Continuum fork: the tensors this write would copy, by identity and size (offsets are not part of
+    // compatibility: a recurrent sequence may occupy a different cell at load)
+    std::vector<std::pair<const ggml_tensor *, size_t>> layout() const {
+        std::vector<std::pair<const ggml_tensor *, size_t>> out;
+        out.reserve(winfos.size());
+        for (const auto & w : winfos) {
+            out.emplace_back(w.tensor, w.size);
+        }
+        return out;
+    }
+
+    size_t payload_bytes() const {
+        size_t n = 0;
+        for (const auto & w : winfos) {
+            n += w.size;
+        }
+        return n;
+    }
+
+    // a dry pass: nothing is allocated or copied
+    void discard() { done = true; }
+
+    // allocate (or reuse) the device buffers and copy the recorded tensors; never throws
+    commit_status commit() {
+        done = true;
         llama_memory_buffers mbufs_new;
 
         for (const auto & winfo : winfos) {
@@ -2910,7 +2943,10 @@ public:
                 if (!mbuf_cur.buf || mbuf_cur.total_size != mbuf.total_size) {
                     mbuf_cur = std::move(mbuf);
 
-                    mbuf_cur.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
+                    mbuf_cur.buf.reset(test_fail_alloc() ? nullptr : ggml_backend_alloc_ctx_tensors_from_buft(mbuf_cur.ctx.get(), buft));
+                    if (!mbuf_cur.buf) {
+                        return commit_status::alloc_failed;
+                    }
 
                     LLAMA_LOG_INFO("%s: allocated '%s' buffer %.3f MiB\n", __func__, ggml_backend_buft_name(buft), mbuf.total_size/1024.0/1024.0);
                 } else {
@@ -2936,6 +2972,19 @@ public:
                 ggml_backend_tensor_copy(mbuf_cur.org[i], mbuf_cur.cpy[i]);
             }
         }
+        return commit_status::ok;
+    }
+
+    // test-only fault: the next N device allocations of snapshot writes fail
+    static std::atomic<int> & fail_allocs() { static std::atomic<int> n{0}; return n; }
+    static bool test_fail_alloc() {
+        int n = fail_allocs().load();
+        while (n > 0) {
+            if (fail_allocs().compare_exchange_weak(n, n - 1)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void write(const void * src, size_t size) override {
@@ -2971,6 +3020,7 @@ private:
     std::vector<write_info> winfos;
 
     llama_memory_buffers & mbufs;
+    bool done = false;
 };
 
 class llama_io_read_device : public llama_io_read_i {
@@ -2978,7 +3028,20 @@ public:
     llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
     }
 
+    // upstream ON_DEVICE path: commit on destruction, abort on a mismatch (unchanged behavior)
     ~llama_io_read_device() {
+        if (!done && !commit()) {
+            GGML_ABORT("%s: memory buffer mismatch\n", __func__);
+        }
+    }
+
+    // an aborted read: nothing is copied
+    void discard() { done = true; }
+
+    // copy the stored tensors into the recorded destinations; false on any layout mismatch (checked for
+    // every buffer type BEFORE any copy), never throws or aborts
+    bool commit() {
+        done = true;
         llama_memory_buffers mbufs_new;
 
         for (const auto & rinfo : rinfos) {
@@ -3013,18 +3076,30 @@ public:
         }
 
         for (auto & [buft, mbuf] : mbufs_new) {
-            const auto & mbuf_cur = mbufs.at(buft);
-
-            if (!mbuf_cur.buf || mbuf_cur.n_tensors != mbuf.n_tensors || mbuf_cur.total_size != mbuf.total_size) {
-                GGML_ABORT("%s: memory buffer mismatch\n", __func__);
+            const auto it = mbufs.find(buft);
+            if (it == mbufs.end()) {
+                return false;
             }
+            const auto & mbuf_cur = it->second;
+            if (!mbuf_cur.buf || mbuf_cur.n_tensors != mbuf.n_tensors || mbuf_cur.total_size != mbuf.total_size ||
+                mbuf_cur.cpy.size() != mbuf.org.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < mbuf.org.size(); ++i) {
+                if (ggml_nbytes(mbuf_cur.cpy[i]) != ggml_nbytes(mbuf.org[i])) {
+                    return false;
+                }
+            }
+        }
 
+        for (auto & [buft, mbuf] : mbufs_new) {
+            const auto & mbuf_cur = mbufs.at(buft);
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
                 ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
             }
         }
 
-        GGML_ASSERT(buf_size == 0);
+        return buf_size == 0;
     }
 
     void read(void * dst, size_t size) override {
@@ -3060,6 +3135,7 @@ private:
     std::vector<read_info> rinfos;
 
     const llama_memory_buffers & mbufs;
+    bool done = false;
 };
 
 size_t llama_context::state_get_size() {
@@ -3165,54 +3241,94 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     }
 }
 
-size_t llama_context::snapshot_save(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags) {
+// Continuum fork: device snapshots, transactional and typed (Codex's review of 7ca9509f0).
+llama_snapshot_status llama_context::snapshot_bytes(llama_seq_id seq_id, llama_state_seq_flags flags, size_t * device_bytes) {
     flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
-    auto & snap = snapshots[snapshot_id];
-    snap.header.resize(state_seq_get_size(seq_id, flags));
-    try {
-        {
-            llama_io_write_device io(snap.header.data(), snap.header.size(), snap.bufs);
-            io.write(&io_magic, sizeof(io_magic));
-            io.write(&seq_id, sizeof(seq_id));
-            state_seq_write_data(io, seq_id, flags);
-        } // the device copies are made as the writer completes
-        size_t device_bytes = 0;
-        for (const auto & [buft, mbuf] : snap.bufs) {
-            device_bytes += mbuf.total_size;
-        }
-        return device_bytes;
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error saving snapshot: %s\n", __func__, err.what());
-        snapshots.erase(snapshot_id);
-        return 0;
-    }
+    std::vector<uint8_t> header(state_seq_get_size(seq_id, flags));
+    llama_memory_buffers none;
+    llama_io_write_device dry(header.data(), header.size(), none);
+    dry.discard(); // metadata only: nothing is ever allocated or copied by this pass
+    dry.write(&io_magic, sizeof(io_magic));
+    dry.write(&seq_id, sizeof(seq_id));
+    state_seq_write_data(dry, seq_id, flags);
+    *device_bytes = dry.payload_bytes();
+    return *device_bytes > 0 ? LLAMA_SNAPSHOT_OK : LLAMA_SNAPSHOT_ABSENT;
 }
 
-bool llama_context::snapshot_load(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags) {
+llama_snapshot_status llama_context::snapshot_save(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags, size_t * device_bytes) {
+    flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    // stage into separate storage; the published snapshot (if any) is untouched until this one is complete
+    device_snapshot staged;
+    staged.flags = flags;
+    staged.header.resize(state_seq_get_size(seq_id, flags));
+    llama_io_write_device io(staged.header.data(), staged.header.size(), staged.bufs);
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+        state_seq_write_data(io, seq_id, flags);
+    } catch (...) {
+        io.discard(); // a failed write pass allocates and copies nothing
+        throw;
+    }
+    staged.layout = io.layout();
+    const size_t payload = io.payload_bytes();
+    if (payload == 0) {
+        io.discard();
+        return LLAMA_SNAPSHOT_ABSENT; // nothing to snapshot under these flags
+    }
+    if (io.commit() != llama_io_write_device::commit_status::ok) {
+        return LLAMA_SNAPSHOT_ALLOC_FAILED; // the previous snapshot under this id stays loadable
+    }
+    snapshots[snapshot_id] = std::move(staged); // publish; a replaced generation is freed here, after the copy
+    *device_bytes = payload;
+    return LLAMA_SNAPSHOT_OK;
+}
+
+llama_snapshot_status llama_context::snapshot_load(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags) {
     flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
     auto it = snapshots.find(snapshot_id);
     if (it == snapshots.end()) {
-        return false;
+        return LLAMA_SNAPSHOT_ABSENT;
     }
+    const device_snapshot & snap = it->second;
+    if (snap.flags != flags) {
+        return LLAMA_SNAPSHOT_INCOMPATIBLE;
+    }
+    // validate BEFORE the live sequence is touched: the target's own layout under these flags (a dry,
+    // metadata-only write pass) must match the snapshot's, tensor by tensor
+    {
+        std::vector<uint8_t> header(state_seq_get_size(seq_id, flags));
+        llama_memory_buffers none;
+        llama_io_write_device dry(header.data(), header.size(), none);
+        dry.discard(); // metadata only
+        dry.write(&io_magic, sizeof(io_magic));
+        dry.write(&seq_id, sizeof(seq_id));
+        state_seq_write_data(dry, seq_id, flags);
+        const bool same = dry.layout() == snap.layout;
+        if (!same) {
+            return LLAMA_SNAPSHOT_INCOMPATIBLE;
+        }
+    }
+    llama_io_read_device io(snap.header.data(), snap.header.size(), snap.bufs);
     try {
-        llama_io_read_device io(it->second.header.data(), it->second.header.size(), it->second.bufs);
         uint32_t magic_read;
         io.read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
-            throw std::runtime_error("wrong sequence state magic");
-        }
         llama_seq_id seq_id_read;
         io.read(&seq_id_read, sizeof(seq_id_read));
+        if (magic_read != io_magic) {
+            io.discard();
+            return LLAMA_SNAPSHOT_INCOMPATIBLE;
+        }
         state_seq_read_data(io, seq_id, flags);
-        return true;
-    } catch (const std::exception & err) {
-        LLAMA_LOG_ERROR("%s: error loading snapshot: %s\n", __func__, err.what());
-        return false;
+    } catch (...) {
+        io.discard(); // never copy into a half-read state
+        throw;
     }
+    return io.commit() ? LLAMA_SNAPSHOT_OK : LLAMA_SNAPSHOT_COPY_FAILED;
 }
 
-void llama_context::snapshot_free(uint64_t snapshot_id) {
-    snapshots.erase(snapshot_id);
+llama_snapshot_status llama_context::snapshot_free(uint64_t snapshot_id) {
+    return snapshots.erase(snapshot_id) > 0 ? LLAMA_SNAPSHOT_OK : LLAMA_SNAPSHOT_ABSENT;
 }
 
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
@@ -4193,16 +4309,37 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
 }
 
 
-size_t llama_state_seq_snapshot_save(llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
-    return ctx->snapshot_save(seq_id, snapshot_id, flags);
+template <typename F>
+static llama_snapshot_status llama_snapshot_guard(F && f) {
+    try {
+        return f();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        return LLAMA_SNAPSHOT_COPY_FAILED;
+    }
 }
 
-bool llama_state_seq_snapshot_load(llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
-    return ctx->snapshot_load(seq_id, snapshot_id, flags);
+llama_snapshot_status llama_state_seq_snapshot_bytes(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, size_t * device_bytes) {
+    *device_bytes = 0;
+    return llama_snapshot_guard([&] { return ctx->snapshot_bytes(seq_id, flags, device_bytes); });
 }
 
-void llama_state_seq_snapshot_free(llama_context * ctx, uint64_t snapshot_id) {
-    ctx->snapshot_free(snapshot_id);
+llama_snapshot_status llama_state_seq_snapshot_save(llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags, size_t * device_bytes) {
+    *device_bytes = 0;
+    ctx->synchronize(); // the state read is the state after every submitted step
+    return llama_snapshot_guard([&] { return ctx->snapshot_save(seq_id, snapshot_id, flags, device_bytes); });
+}
+
+llama_snapshot_status llama_state_seq_snapshot_load(llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags) {
+    ctx->synchronize();
+    return llama_snapshot_guard([&] { return ctx->snapshot_load(seq_id, snapshot_id, flags); });
+}
+
+llama_snapshot_status llama_state_seq_snapshot_free(llama_context * ctx, uint64_t snapshot_id) {
+    ctx->synchronize(); // no submitted step may still read buffers about to be freed
+    return llama_snapshot_guard([&] { return ctx->snapshot_free(snapshot_id); });
+}
+
+void llama_state_seq_snapshot_test_fail_next_allocs(int n) {
+    llama_io_write_device::fail_allocs().store(n);
 }
