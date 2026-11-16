@@ -1,5 +1,6 @@
 #include <limits>
 #include "server-context.h"
+#include "server-slot-pick.h"
 #include "server-view-end.h"
 #include "../../src/llama-ext.h"
 #include "server-train.h"
@@ -1880,6 +1881,11 @@ private:
         if (id_slot < 0 || id_slot >= (int) slots.size()) {
             return nullptr;
         }
+        // a parked id is its mind's, not the empty placeholder holding its place (Codex on #105: another
+        // request took the placeholder, so the original could not come back)
+        if (slot_id_is_parked(id_slot)) {
+            return nullptr;
+        }
 
         for (server_slot & slot : slots) {
             if (slot.id == id_slot) {
@@ -1909,91 +1915,39 @@ private:
 
         bool update_cache = false;
 
-        // if a specific slot is requested, use it (still goes through cache update logic below)
-        if (task.id_slot != -1) {
-            ret = get_slot_by_id(task.id_slot);
-            if (ret) {
+        // one pure decision over a typed view of every slot (server-slot-pick.h): a parked id is never
+        // handed out, a task naming it waits for its mind (Codex on #105)
+        std::vector<server_slot_view> view;
+        view.reserve(slots.size());
+        for (const server_slot & slot : slots) {
+            const bool parked = slot_id_is_parked(slot.id);
+            const bool scan   = task.id_slot == -1 && slot_prompt_similarity != 0.0f && !parked && !slot.is_processing();
+            view.push_back({ slot.id, slot.is_processing(), parked, slot.t_last_used, slot.prompt.tokens.size(),
+                             scan ? slot.prompt.tokens.get_common_prefix(task.tokens) : 0 });
+        }
+        const server_slot_pick pick = server_pick_slot(view.data(), view.size(), task.id_slot, task.tokens.size(), slot_prompt_similarity);
+        switch (pick.kind) {
+            case server_slot_pick_kind::wait:
+            case server_slot_pick_kind::no_slot:
+                return nullptr; // deferred; the caller already refused an id that is neither live nor parked
+            case server_slot_pick_kind::by_id:
+                ret = &slots[pick.index];
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
-            } else {
-                // a parked slot (server-reconfigure.h): the task waits for its own slot, never another's
-                return nullptr;
-            }
-        }
-
-        // find the slot that has at least n% prompt similarity
-        if (slot_prompt_similarity != 0.0f) {
-            float f_sim_best = 0;
-
-            for (server_slot & slot : slots) {
-                if (task.id_slot != -1 && slot.id != task.id_slot) {
-                    continue;
-                }
-
-                // skip the slot if it is not available
-                if (slot.is_processing()) {
-                    SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
-                    continue;
-                }
-
-                const auto & tokens = slot.prompt.tokens;
-
-                // skip the slot if it does not contains cached tokens
-                if (tokens.empty()) {
-                    SLT_TRC(slot, "%s", " - skipping, slot is empty\n");
-                    continue;
-                }
-
-                // fraction of the Longest Common Prefix length with respect to the input prompt length
-                const size_t lcp_len = tokens.get_common_prefix(task.tokens);
-                const float f_sim_cur = float(lcp_len) / task.tokens.size();
-
-                SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
-
-                // select the current slot if the criteria match
-                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
-                    f_sim_best = f_sim_cur;
-
-                    ret = &slot;
-                }
-            }
-
-            if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
-
-                if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                            f_sim_best, slot_prompt_similarity, f_keep);
-                }
-
+                break;
+            case server_slot_pick_kind::by_prefix: {
+                ret = &slots[pick.index];
+                const float f_keep = (pick.f_sim * task.tokens.size()) / ret->prompt.tokens.size();
+                SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                        pick.f_sim, slot_prompt_similarity, f_keep);
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
-                    update_cache = true;
-                }
+                update_cache = f_keep < 0.5f;
+                break;
             }
-        }
-
-        // find the slot that has been least recently used
-        if (ret == nullptr) {
-            int64_t t_last = -1;
-
-            for (server_slot & slot : slots) {
-                // skip the slot if it is not available
-                if (slot.is_processing()) {
-                    continue;
-                }
-
-                // select the current slot if the criteria match
-                if (!ret || slot.t_last_used <= t_last) {
-                    t_last = slot.t_last_used;
-                    ret = &slot;
-                }
-            }
-
-            if (ret != nullptr) {
-                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
-
+            case server_slot_pick_kind::by_lru:
+                ret = &slots[pick.index];
+                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", ret->t_last_used);
                 update_cache = true;
-            }
+                break;
         }
 
         if (ret) {
