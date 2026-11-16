@@ -6761,7 +6761,7 @@ void server_routes::init_routes() {
     // never through the learning events above. The subscriber names the ring's bound (`capacity`, its
     // memory to spend; none is refused, never defaulted); the stream opens with the engine's identity
     // and its clock origin; a run the ring could not keep arrives as a `missed` record in position.
-    this->get_engine_steps = [this](const server_http_req & req) {
+    this->get_engine_steps = [this](const server_http_req & req) -> std::unique_ptr<server_res_generator> {
         const std::string asked = req.get_param("capacity");
         const long long capacity = asked.empty() ? 0 : std::atoll(asked.c_str());
         const int64_t origin_us = ggml_time_us();
