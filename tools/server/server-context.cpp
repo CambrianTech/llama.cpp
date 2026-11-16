@@ -1,6 +1,6 @@
 #include <limits>
 #include "server-context.h"
-#include "server-checkpoint-policy.h"
+#include "server-checkpoint-store.h"
 #include "server-view-end.h"
 #include "server-mapped-file.h"
 #include <filesystem>
@@ -2695,7 +2695,7 @@ private:
     }
 
     // Room for a checkpoint of `bytes` under the budget: the slot holding the most checkpoint bytes gives up its
-    // least valuable one (checkpoint_to_evict keeps her head while anything else is left), until it fits. False:
+    // least valuable one in her store's one eviction order (server-checkpoint-store.h), until it fits. False:
     // it cannot fit even with every checkpoint gone (larger than the budget); the caller makes none.
     bool make_room_for_checkpoint(size_t bytes) {
         if (host_budget == 0) {
@@ -2709,13 +2709,11 @@ private:
         }
         size_t held = checkpoint_bytes(false); // what stays resident: copies on their way to flash are leaving
         while (held + bytes > host_budget) {
+            // the lane holding the most gives one up, in her store's one eviction order (never a pin)
             server_slot * from = nullptr;
             size_t        most = 0;
             for (auto & s : slots) {
-                size_t b = 0;
-                for (const auto & c : s.prompt.checkpoints) {
-                    b += c.size();
-                }
+                const size_t b = s.prompt.checkpoints.bytes();
                 if (b > most) {
                     most = b;
                     from = &s;
@@ -2724,32 +2722,14 @@ private:
             if (from == nullptr) {
                 return false;
             }
-            // her newest checkpoint is where her next act resumes (her context only appends): it goes last.
-            // Otherwise the store's own order (her head kept while anything else is left), never a pinned one.
-            auto & cks = from->prompt.checkpoints;
-            auto newest = cks.end();
-            for (auto it = cks.begin(); it != cks.end(); ++it) {
-                if (newest == cks.end() || it->n_tokens > newest->n_tokens) {
-                    newest = it;
-                }
-            }
-            auto victim = cks.end();
-            for (auto it = cks.begin(); it != cks.end(); ++it) {
-                if (it != newest && it->pin == 0) {
-                    victim = it;
-                    break;
-                }
-            }
-            if (victim == cks.end() && newest != cks.end() && newest->pin == 0) {
-                victim = newest; // all that is left
-            }
-            if (victim == cks.end()) {
+            const size_t freed = from->prompt.checkpoints.evict_one(from->prompt.view_end, [&](const common_prompt_checkpoint & c) {
+                SLT_WRN(*from, "host budget: erasing a checkpoint (n_tokens = %" PRId64 ", %.3f MiB) for a new one of %.3f MiB\n",
+                        c.n_tokens, (float) c.size() / 1024 / 1024, (float) bytes / 1024 / 1024);
+            });
+            if (freed == 0) {
                 return false; // every checkpoint left is pinned for learning
             }
-            SLT_WRN(*from, "host budget: erasing a checkpoint (n_tokens = %" PRId64 ", %.3f MiB) for a new one of %.3f MiB\n",
-                    victim->n_tokens, (float) victim->size() / 1024 / 1024, (float) bytes / 1024 / 1024);
-            held -= victim->size();
-            from->prompt.checkpoints.erase(victim);
+            held -= freed;
         }
         return true;
     }
@@ -2758,37 +2738,13 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        const int64_t step = checkpoint_step(slot);
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            // a checkpoint pinned for learning stays until learned or released, however close (/learn/release)
-            if (it->id_task != id_task && it->pin == 0 && last >= 0 && it->n_tokens <= last + step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
-
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
-            }
-
-            last = it->n_tokens;
-            ++it;
-        }
-
-        while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed: her head stays while there is anything else
-            // to evict (server-checkpoint-policy.h)
-            auto victim = checkpoint_to_evict(slot.prompt.checkpoints, slot.prompt.view_end);
-            if (victim == slot.prompt.checkpoints.end()) {
-                break; // every checkpoint is pinned for learning: the store holds one more until they are learned
-            }
-
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024);
-
-            slot.prompt.checkpoints.erase(victim);
-        }
+        // the store makes room: the close ones earlier acts left, then by count (server-checkpoint-store.h)
+        const checkpoint_store<common_prompt_checkpoint>::admission admission {
+            id_task, checkpoint_step(slot), (size_t) params_base.n_ctx_checkpoints, slot.prompt.view_end };
+        slot.prompt.checkpoints.make_room(admission, [&](const common_prompt_checkpoint & it) {
+            SLT_TRC(slot, "erasing context checkpoint to make room (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    it.pos_min, it.pos_max, it.n_tokens, (float) it.size() / 1024 / 1024);
+        });
 
         // under the one host budget: quote the copy before making it (its peak), and make room first
         {
@@ -2818,22 +2774,17 @@ private:
             return;
         }
 
-        auto & kept = slot.prompt.checkpoints.emplace_back(std::move(cur));
-        if (slot.task->params.learn_pin && kept.n_tokens == (int64_t) slot.task->n_tokens() - 1) {
-            kept.pin = ++learn_pin_clock; // the core will learn this turn: kept until learned or released (/learn/release)
-            slot.stats.mind_pin       = kept.pin;
+        // a turn the core will learn keeps this checkpoint until learned or released (/learn/release)
+        const bool     pin_it = slot.task->params.learn_pin && cur.n_tokens == (int64_t) slot.task->n_tokens() - 1;
+        const uint64_t pin    = pin_it ? ++learn_pin_clock : 0;
+        const auto & kept = slot.prompt.checkpoints.keep(std::move(cur), admission, pin, [&](const common_prompt_checkpoint & it) {
+            SLT_TRC(slot, "erasing a checkpoint her view end supersedes (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    it.n_tokens, (float) it.size() / 1024 / 1024);
+        });
+        if (pin != 0) {
+            slot.stats.mind_pin       = pin;
             slot.stats.mind_pinned_at = kept.n_tokens;
         }
-
-        // Continuum fork (CONTINUUM-ENGINE 4.7.3, placed checkpoints): her new view-end checkpoint
-        // supersedes every checkpoint an earlier act left on this prefix except her head's (the oldest,
-        // the restore point when her next prompt diverges before her view end). What stays per slot is
-        // her head, her newest view end, and this act's end checkpoints.
-        erase_superseded_checkpoints(slot.prompt.checkpoints, kept, slot.prompt.view_end, id_task,
-            [&](const common_prompt_checkpoint & it) {
-                SLT_TRC(slot, "erasing a checkpoint her view end supersedes (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it.n_tokens, (float) it.size() / 1024 / 1024);
-            });
 
         fit_prompt_cache_to_budget(); // the cache yields what the checkpoints now hold
 
@@ -4141,15 +4092,9 @@ private:
 
                             {
                                 // erase any checkpoints with pos_max > pos_next
-                                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-                                    const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
-                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
-                                    } else {
-                                        ++it;
-                                    }
-                                }
+                                slot.prompt.checkpoints.drop_past_position(pos_next, [&](const common_prompt_checkpoint & cur) {
+                                    SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                });
                             }
                         }
 
@@ -4313,10 +4258,9 @@ private:
                         // where her next prompt diverges, and blind step checkpoints only pile up (CONTINUUM-ENGINE
                         // 4.7.2-4.7.3; the M5, 2026-11-16: up to 32 x ~110 MB per slot thrashed the host)
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
-                            const auto & checkpoints = slot.prompt.checkpoints;
-                            if (checkpoint_at_user_start(view_end_pos >= 0, checkpoints.empty(), slot.prompt.n_tokens(), last_user_pos,
-                                                         checkpoints.empty() ? 0 : checkpoints.back().n_tokens, checkpoint_step(slot))) {
-                                break; // server-checkpoint-policy.h
+                            if (slot.prompt.checkpoints.stop_at_user_start(view_end_pos >= 0, slot.prompt.n_tokens(), last_user_pos,
+                                                                           checkpoint_step(slot))) {
+                                break; // server-checkpoint-store.h
                             }
                         }
 

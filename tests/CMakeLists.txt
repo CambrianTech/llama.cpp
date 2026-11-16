@@ -2,10 +2,10 @@ llama_add_compile_flags()
 
 # Model-free scheduling validator: compile the same traversal used by server-context.
 # Model-free: placed checkpoints keep her head through a full store (CONTINUUM-ENGINE 4.7.3, llama.cpp#121).
-add_executable(test-server-checkpoint-policy test-server-checkpoint-policy.cpp)
-target_compile_features(test-server-checkpoint-policy PRIVATE cxx_std_17)
-add_test(NAME test-server-checkpoint-policy COMMAND test-server-checkpoint-policy)
-set_tests_properties(test-server-checkpoint-policy PROPERTIES LABELS "main")
+add_executable(test-server-checkpoint-store test-server-checkpoint-store.cpp)
+target_compile_features(test-server-checkpoint-store PRIVATE cxx_std_17)
+add_test(NAME test-server-checkpoint-store COMMAND test-server-checkpoint-store)
+set_tests_properties(test-server-checkpoint-store PROPERTIES LABELS "main")
 
 add_executable(test-server-prefill test-server-prefill.cpp)
 target_compile_features(test-server-prefill PRIVATE cxx_std_17)

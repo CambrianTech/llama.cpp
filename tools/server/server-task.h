@@ -1,6 +1,7 @@
 #pragma once
 
 #include "server-mind.h"
+#include "server-checkpoint-store.h"
 #include "common.h"
 #include "llama.h"
 
@@ -772,7 +773,7 @@ struct server_task_result_learn : server_task_result {
 struct server_prompt {
     server_tokens tokens;
 
-    std::list<common_prompt_checkpoint> checkpoints;
+    checkpoint_store<common_prompt_checkpoint> checkpoints; // the one owner of her checkpoints (server-checkpoint-store.h)
 
     // Continuum fork: where the last prompt processed into these tokens put its view end, and the
     // first position of the checkpoints made for its end (-1 = unknown), for the checkpoint subset
