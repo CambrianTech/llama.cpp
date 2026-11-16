@@ -1113,6 +1113,12 @@ extern "C" {
     LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_load(
             struct llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags);
 
+    // Write a FULL-sequence snapshot (saved with flags 0) as a standard state file (the format
+    // llama_state_seq_save_file writes and llama_state_seq_load_file reads), from the snapshot alone:
+    // safe on a writer thread while the context keeps decoding.
+    LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_write_file(
+            struct llama_context * ctx, uint64_t snapshot_id, const char * filepath, const llama_token * tokens, size_t n_tokens);
+
     // Synchronizes first: no submitted step can still read the buffers being freed.
     LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_free(struct llama_context * ctx, uint64_t snapshot_id);
 
