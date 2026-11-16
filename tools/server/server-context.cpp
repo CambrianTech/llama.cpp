@@ -3060,11 +3060,10 @@ private:
             case SERVER_TASK_TYPE_MIND_PREFETCH:
                 {
                     const int64_t t0 = ggml_time_us();
-                    const char * where = minds_on() ? mind_prefetch(task.params.page) : "minds off";
-                    auto res = std::make_unique<server_task_result_control>();
-                    res->id      = task.id;
-                    res->success = std::strcmp(where, "lane") == 0 || std::strcmp(where, "parked") == 0;
-                    res->message = std::string(where) + " (" + std::to_string((ggml_time_us() - t0) / 1000.0) + " ms)";
+                    auto res = std::make_unique<server_task_result_mind_prefetch>();
+                    res->id         = task.id;
+                    res->place      = minds_on() ? mind_prefetch(task.params.page) : mind_place::minds_off;
+                    res->elapsed_ms = (ggml_time_us() - t0) / 1000.0;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
@@ -7092,7 +7091,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
         return res;
     }
 
-    GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
+    GGML_ASSERT(dynamic_cast<server_task_result_mind_prefetch*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }

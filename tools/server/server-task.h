@@ -113,9 +113,12 @@ struct learn_outcome {
     bool        effects_uncertain = false;
     std::string refusal = "none";
     bool        ok       = false;
-    // continuum: where it learned, typed. side_sequence: her live sequence was never touched (preserved whatever
-    // the outcome); slot: on her own sequence (cut back to the learned turn's prefix)
-    enum class learned_on_kind : uint8_t { slot, side_sequence } learned_on = learned_on_kind::slot;
+    // continuum: where it learned, typed. none: no learning ran (a refusal or deferral before custody);
+    // side_sequence: on a side sequence; slot: on her own sequence (cut back to the learned turn's prefix).
+    enum class learned_on_kind : uint8_t { none, slot, side_sequence } learned_on = learned_on_kind::none;
+    // whether her live sequence is exactly as it was: stated by the path that ran, never inferred from success
+    // (true for every refusal before custody and every side-sequence learn; false only when the slot path cut it)
+    bool        live_sequence_preserved = true;
     bool        deferred = false;
     int64_t     retry_after_ms = 0;
     std::string failure;
@@ -717,6 +720,16 @@ struct server_task_result_control : server_task_result {
             out["message"] = message;
         }
         return out;
+    }
+};
+
+// continuum: POST /minds/prefetch's reply, typed (`mind`: a mind_place_name spelling)
+struct server_task_result_mind_prefetch : server_task_result {
+    mind_place place = mind_place::minds_off;
+    double     elapsed_ms = 0.0;
+
+    virtual json to_json() override {
+        return json { { "mind", mind_place_name(place) }, { "elapsed_ms", elapsed_ms } };
     }
 };
 

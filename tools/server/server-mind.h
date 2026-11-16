@@ -32,6 +32,17 @@ struct mind_page {
     bool operator!=(const mind_page & o) const { return !(*this == o); }
 };
 
+// Where a prefetch left her (POST /minds/prefetch's "mind"; frozen spellings in mind_place_name). lane / parked: she
+// is in the pool and her switch is a sequence move. unknown: the engine has never served her (her first turn builds
+// her). deferred_no_parked_id / deferred_pool_full: she stays on flash and her turn switches through it.
+// minds_off: the engine was launched without --minds.
+enum class mind_place : uint8_t { lane, parked, unknown, deferred_no_parked_id, deferred_pool_full, minds_off };
+
+inline const char * mind_place_name(mind_place p) {
+    static const char * names[] = { "lane", "parked", "unknown", "deferred_no_parked_id", "deferred_pool_full", "minds_off" };
+    return names[(size_t) p];
+}
+
 // "page": 32 hexadecimal digits, dashes allowed (a UUID). Anything else is no page (the request is anonymous).
 inline mind_page mind_page_parse(const std::string & s) {
     mind_page p;
