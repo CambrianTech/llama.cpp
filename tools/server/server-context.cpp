@@ -5231,7 +5231,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
             auto counters = [](const step_budget_counters & c) {
                 return json { {"steps", c.steps}, {"tokens", c.tokens}, {"decode_call_us", c.decode_call_us},
                               {"sync_wait_us", c.sync_wait_us}, {"inter_step_us", c.inter_step_us},
-                              {"unsynced_steps", c.unsynced_steps}, {"unsynced_us", c.unsynced_us} };
+                              {"unsynced_steps", c.unsynced_steps}, {"unsynced_us", c.unsynced_us},
+                              {"failed_steps", c.failed_steps}, {"failed_us", c.failed_us} };
             };
             if (!meta.step_budget) {
                 return json(nullptr);

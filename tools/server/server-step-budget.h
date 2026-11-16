@@ -20,6 +20,9 @@
 // A step without outputs is not synchronized (prefill chunks stream on): its whole span, from begin
 // to the next begin, is `unsynced_us` and nothing else, so it never enters the synchronized timings.
 // Time while no work is pending is not counted at all: an engine waiting for requests is not stalling.
+// An attempt that never reaches end() (llama_decode returned non-zero and the loop retries, or a throw
+// left the step) is closed by the next begin as `failed_steps` / `failed_us` (its begin to that next
+// begin), so its cost is never lost and never mixed into the good steps' timings (Codex on #133).
 //
 // The counters are cumulative and monotonic, written by the decode thread with relaxed atomics and
 // read from any thread without a lock; a reader differences two reads into a window, so the engine
@@ -43,11 +46,14 @@ struct step_budget_counters {
     uint64_t inter_step_us  = 0;
     uint64_t unsynced_steps = 0;
     uint64_t unsynced_us    = 0;
+    uint64_t failed_steps   = 0;
+    uint64_t failed_us      = 0;
 
     step_budget_counters operator-(const step_budget_counters & earlier) const {
         return { steps - earlier.steps, tokens - earlier.tokens, decode_call_us - earlier.decode_call_us,
                  sync_wait_us - earlier.sync_wait_us, inter_step_us - earlier.inter_step_us,
-                 unsynced_steps - earlier.unsynced_steps, unsynced_us - earlier.unsynced_us };
+                 unsynced_steps - earlier.unsynced_steps, unsynced_us - earlier.unsynced_us,
+                 failed_steps - earlier.failed_steps, failed_us - earlier.failed_us };
     }
 };
 
@@ -60,6 +66,12 @@ class step_budget {
 public:
     // The decode thread, around each llama_decode call. `now_us` is a monotonic clock.
     void begin(int64_t now_us, step_kind kind, uint32_t n_tokens) {
+        if (open_) {
+            // the previous attempt never ended: a failed or retried decode
+            auto & c = of(kind_);
+            add(c.failed_steps, 1);
+            add(c.failed_us, span(begin_us_, now_us));
+        }
         close_previous(now_us);
         open_       = true;
         kind_       = kind;
@@ -102,7 +114,7 @@ public:
 private:
     struct atomic_counters {
         std::atomic<uint64_t> steps{0}, tokens{0}, decode_call_us{0}, sync_wait_us{0}, inter_step_us{0},
-                              unsynced_steps{0}, unsynced_us{0};
+                              unsynced_steps{0}, unsynced_us{0}, failed_steps{0}, failed_us{0};
     };
 
     // The time from the previous step's end to this begin: a stall when work was pending, attributed
@@ -130,7 +142,7 @@ private:
     static step_budget_counters read(const atomic_counters & a) {
         const auto r = [](const std::atomic<uint64_t> & v) { return v.load(std::memory_order_relaxed); };
         return { r(a.steps), r(a.tokens), r(a.decode_call_us), r(a.sync_wait_us), r(a.inter_step_us),
-                 r(a.unsynced_steps), r(a.unsynced_us) };
+                 r(a.unsynced_steps), r(a.unsynced_us), r(a.failed_steps), r(a.failed_us) };
     }
 
     atomic_counters decode_;
