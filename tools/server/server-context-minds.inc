@@ -17,7 +17,9 @@
         uint64_t                              last_use = 0;
         int32_t                               seq      = -1; // parked: the pool sequence id; flash: -1
         std::string                           file;          // flash: her page file
-        bool                                  writing  = false; // flash: the page-IO worker has not landed it yet
+        // her bytes in RAM, held by this record (never by the worker alone) until her file has landed: while the
+        // write is in flight, or after it failed, she lives here and is inserted from here, never lost
+        std::shared_ptr<std::vector<uint8_t>> ram;
         std::shared_ptr<std::atomic<int>>     written;         // 0 pending, 1 landed, -1 failed
     };
 
@@ -121,46 +123,77 @@
         }
         cold->seq     = -1;
         cold->file    = mind_file(cold->page);
-        cold->writing = true;
+        cold->ram     = bytes; // the record holds her bytes until her file has landed
         cold->written = std::make_shared<std::atomic<int>>(0);
-        const std::string path = cold->file;
-        auto done = cold->written;
+        flash_write(*cold);
+        SRV_INF("mind %016llx%016llx out of the pool: %.1f MiB copied out in %.2f ms, cells freed; held in RAM until written\n",
+                (unsigned long long) cold->page.hi, (unsigned long long) cold->page.lo,
+                bytes->size() / (1024.0 * 1024.0), t_copy / 1000.0);
+        return true;
+    }
+
+    // Her bytes to her file on the page-IO worker; the worker shares them, the record keeps them.
+    void flash_write(resident_mind & m) {
+        const std::string path = m.file;
+        auto bytes = m.ram;
+        auto done  = m.written;
+        done->store(0, std::memory_order_release);
         page_io->submit(path, [path, bytes, done] {
             FILE * f = std::fopen(path.c_str(), "wb");
             bool ok = f != nullptr && std::fwrite(bytes->data(), 1, bytes->size(), f) == bytes->size();
             ok = (f != nullptr && std::fclose(f) == 0) && ok;
             done->store(ok ? 1 : -1, std::memory_order_release);
         });
-        SRV_INF("mind %016llx%016llx to flash: %.1f MiB copied out of the pool in %.2f ms, cells freed; written off the decode thread\n",
-                (unsigned long long) cold->page.hi, (unsigned long long) cold->page.lo,
-                bytes->size() / (1024.0 * 1024.0), t_copy / 1000.0);
-        return true;
     }
 
-    // Her flash page back into `seq`: the file is mapped and inserted directly (no read into a buffer first).
-    // A write still in flight is waited for here (it is her own bytes; the page-IO worker is landing them).
-    bool flash_insert(resident_mind & m, llama_seq_id seq) {
-        if (m.writing) {
-            while (m.written->load(std::memory_order_acquire) == 0) {
-                std::this_thread::yield();
+    // Between steps: a landed file releases her RAM copy; a failed write keeps it (she lives in RAM) and is
+    // written again. Never waits.
+    void minds_reap() {
+        for (auto & m : minds) {
+            if (!m.ram || !m.written) {
+                continue;
             }
-            m.writing = false;
-            if (m.written->load() < 0) {
-                SRV_ERR("mind %016llx: her flash page failed to write; she starts cold\n", (unsigned long long) m.page.hi);
-                return false;
+            const int st = m.written->load(std::memory_order_acquire);
+            if (st == 1) {
+                m.ram.reset();
+            } else if (st == -1) {
+                // she lives in RAM (never lost); the write is not retried every step against a failing disk: her
+                // next trip out of a lane writes her again
+                SRV_WRN("mind %016llx%016llx: her flash write failed; she stays in RAM\n",
+                        (unsigned long long) m.page.hi, (unsigned long long) m.page.lo);
+                m.written.reset();
             }
         }
+    }
+
+    // Her bytes back into `seq`, from where they are: RAM while her write is in flight or failed (never a wait on
+    // the disk), else her file mapped and inserted directly (no read into a buffer first).
+    bool flash_insert(resident_mind & m, llama_seq_id seq) {
         const int64_t t0 = ggml_time_us();
-        server_mapped_file map(m.file);
-        if (!map.ok() || map.size() < 2 * sizeof(uint64_t)) {
+        std::unique_ptr<server_mapped_file> map;
+        auto ram = m.ram; // held for the insert even if the write lands meanwhile
+        const uint8_t * base = nullptr;
+        size_t          size = 0;
+        if (ram) {
+            base = ram->data();
+            size = ram->size();
+        } else {
+            map = std::make_unique<server_mapped_file>(m.file);
+            if (!map->ok()) {
+                return false;
+            }
+            base = map->data();
+            size = map->size();
+        }
+        if (size < 2 * sizeof(uint64_t)) {
             return false;
         }
         uint64_t h[2];
-        std::memcpy(h, map.data(), sizeof(h));
-        if (map.size() != 2 * sizeof(uint64_t) + h[0] + h[1]) {
+        std::memcpy(h, base, sizeof(h));
+        if (size != 2 * sizeof(uint64_t) + h[0] + h[1]) {
             return false;
         }
-        const uint8_t * r = map.data() + sizeof(h);
+        const uint8_t * r = base + sizeof(h);
         // her cells come from the pool: when it is full, the coldest parked mind goes down to flash first, and the
         // insert is tried again (a level above makes room for the level below, never a drop)
         bool ok = false;
@@ -187,12 +220,14 @@
                     (unsigned long long) m.page.hi, (unsigned long long) m.page.lo);
             return false; // her file and record are kept: she is still on flash, never lost
         }
-        SRV_INF("mind %016llx%016llx from flash: %.1f MiB inserted in %.2f ms\n", (unsigned long long) m.page.hi,
-                (unsigned long long) m.page.lo, map.size() / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0);
-        std::error_code ec;
-        std::filesystem::remove(m.file, ec);
+        SRV_INF("mind %016llx%016llx back from %s: %.1f MiB inserted in %.2f ms\n", (unsigned long long) m.page.hi,
+                (unsigned long long) m.page.lo, ram ? "RAM" : "flash", size / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0);
+        // her file is removed on the page-IO worker, ordered after its own write (it may still be landing)
+        const std::string path = m.file;
+        page_io->submit(path, [path] { std::error_code ec; std::filesystem::remove(path, ec); });
         m.file.clear();
-        return ok;
+        m.ram.reset();
+        return true;
     }
 
     // Ahead of her turn (the core names who is next): a mind on flash is inserted into a free parked sequence

@@ -3319,6 +3319,9 @@ private:
 #endif
 
     void update_slots() {
+        if (minds_on()) {
+            minds_reap(); // a landed flash write frees her RAM copy; a failed one is written again
+        }
         const bool learning_at_start = bool(learning);
         publish_busy_slots();
         struct publish_on_exit { server_context_impl * s; ~publish_on_exit() { s->publish_busy_slots(); } } publish_guard{this};
