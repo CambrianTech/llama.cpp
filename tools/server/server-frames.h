@@ -27,6 +27,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -142,12 +143,17 @@ enum class memory_domain : uint8_t {
     disk,    // a page file
 };
 
+// Custody (Codex on #134): the pool that owns `buffer` keeps it live and unrecycled from the push of a
+// transfer naming it until that transfer's completion frame is DRAINED; `generation` is the buffer's
+// incarnation in its pool, bumped on every reuse, so a reference that outlived its buffer is refused by
+// the resolver, never resolved to the next occupant's bytes.
 struct buffer_ref {
-    memory_domain domain = memory_domain::host;
-    uint32_t      pool   = 0; // the owning pool (the host pool, a device pool, a page store)
-    uint32_t      buffer = 0; // the buffer within that pool
-    uint64_t      offset = 0;
-    uint64_t      bytes  = 0;
+    memory_domain domain     = memory_domain::host;
+    uint32_t      pool       = 0; // the owning pool (the host pool, a device pool, a page store)
+    uint32_t      buffer     = 0; // the buffer within that pool
+    uint32_t      generation = 0; // the buffer's incarnation (see custody above)
+    uint64_t      offset     = 0;
+    uint64_t      bytes      = 0;
 };
 static_assert(std::is_trivially_copyable_v<buffer_ref>);
 
@@ -162,13 +168,17 @@ struct transfer_frame {
 enum class transfer_status : uint8_t {
     moved,      // the backend moved the bytes
     aliased,    // same physical domain: dst now names src's bytes, nothing was copied
-    refused,    // the backend cannot move between these domains (typed, never a silent CPU copy)
+    refused,    // invalid (stale, out of bounds, unequal lengths, overlapping) or an unsupported pair:
+                // typed, never a silent CPU copy
     failed,     // the backend reported an error
+    cancelled,  // the mover shut down before the transfer was handed to an engine: nothing was written
 };
 
 struct transfer_done_frame {
     uint64_t        ticket = 0;
     transfer_status status = transfer_status::moved;
+    uint32_t        slot   = NO_SLOT; // the backend's in-flight slot, retired when this frame is drained
+    static constexpr uint32_t NO_SLOT = UINT32_MAX;
 };
 
 // The one base for every byte mover. A subclass is only the diff: how its engines start a move and
@@ -193,6 +203,9 @@ public:
     size_t pump() {
         size_t started = 0;
         while (true) {
+            if (!unsettled_.empty()) {
+                return started; // settlements wait for the caller's drain: take nothing new (bounded)
+            }
             if (!pending_) {
                 transfer_frame f;
                 if (in_.drain(std::span<transfer_frame>(&f, 1)) == 0) {
@@ -213,15 +226,42 @@ public:
     }
 
     // A transfer is waiting for engine room (the caller should drain completions, then pump again).
-    bool blocked() const { return pending_.has_value(); }
+    bool blocked() const { return pending_.has_value() || !unsettled_.empty(); }
 
-    // Consumer side: take completions from every producer; returns how many.
+    // Consumer side, on the pumping thread: take completions from every producer; returns how many. A
+    // drained frame retires its backend slot, which is what bounds the completions outstanding.
     size_t drain_done(std::span<transfer_done_frame> out) {
         size_t n = settled_.drain(out);
+        while (n < out.size() && !unsettled_.empty()) {
+            out[n++] = unsettled_.front();
+            unsettled_.erase(unsettled_.begin());
+        }
         for (auto & ring : finished_) {
             n += ring->drain(out.subspan(n));
         }
+        for (size_t i = 0; i < n; ++i) {
+            if (out[i].slot != transfer_done_frame::NO_SLOT) {
+                retire(out[i].slot);
+            }
+        }
         return n;
+    }
+
+    // Shutdown, on the pumping thread: every transfer still queued or part-handed that no engine took is
+    // settled `cancelled` (nothing written); transfers an engine took complete as they land. After it,
+    // every ticket pushed has exactly one terminal frame to drain. Pushing more is refused (closed).
+    void shutdown() {
+        in_.close();
+        if (pending_) {
+            if (const auto ended = cancel_pending()) {
+                settle(pending_->ticket, *ended);
+            } // else an engine holds part of it and reports its one terminal frame
+            pending_.reset();
+        }
+        transfer_frame f;
+        while (in_.drain(std::span<transfer_frame>(&f, 1)) == 1) {
+            settle(f.ticket, transfer_status::cancelled);
+        }
     }
 
     // Consumer side: sleep until any producer rings the doorbell (read doorbell() BEFORE draining).
@@ -242,26 +282,48 @@ protected:
     // progress); refused: it cannot move between these domains.
     virtual start_result start(const transfer_frame & t) = 0;
 
-    // Whether dst can simply name src's bytes (one physical domain): no copy at all.
+    // Whether dst can simply name src's bytes (one physical domain): no copy at all. Only after both
+    // references are validated (live generation, in bounds, equal lengths): an alias never vouches for
+    // a reference the backend would refuse to copy.
     virtual bool aliases(const buffer_ref & src, const buffer_ref & dst) const = 0;
 
-    // Completion context `context` (one lane) reports a finished move.
-    void complete(size_t context, uint64_t ticket, transfer_status status) { publish(*finished_[context], ticket, status); }
+    // The transfer pending when shutdown came: the backend stops handing it out. Its terminal status when
+    // no engine holds any of it (settled here), or nullopt when an engine does (that engine reports it).
+    virtual std::optional<transfer_status> cancel_pending() { return transfer_status::cancelled; }
+
+    // A drained completion's slot may be reused.
+    virtual void retire(uint32_t /*slot*/) {}
+
+    // Completion context `context` (one lane) reports a finished move. The backend guarantees room: its
+    // completions outstanding never exceed the ring's capacity (a slot is retired only on drain), so a
+    // lane never waits on the consumer.
+    void complete(size_t context, uint64_t ticket, transfer_status status, uint32_t slot) {
+        const bool pushed = finished_[context]->push(transfer_done_frame{ ticket, status, slot });
+        if (!pushed) {
+            std::abort(); // the slot bound above is the contract; breaking it is a bug, never a wait
+        }
+        ring();
+    }
 
 private:
-    void settle(uint64_t ticket, transfer_status status) { publish(settled_, ticket, status); }
-
-    void publish(frame_ring<transfer_done_frame> & ring, uint64_t ticket, transfer_status status) {
-        while (!ring.push(transfer_done_frame{ ticket, status })) {
+    // On the pumping thread: into the settled ring, or held for the caller's drain when it is full
+    // (never a wait: the same thread drains).
+    void settle(uint64_t ticket, transfer_status status) {
+        if (!settled_.push(transfer_done_frame{ ticket, status })) {
             backpressured_.fetch_add(1, std::memory_order_relaxed);
-            ring.wait_for_room(); // the consumer is behind: sleep until it drains (no spin)
+            unsettled_.push_back(transfer_done_frame{ ticket, status });
         }
+        ring();
+    }
+
+    void ring() {
         doorbell_.fetch_add(1, std::memory_order_release);
         doorbell_.notify_all();
     }
 
     frame_ring<transfer_frame> &                                   in_;
     std::optional<transfer_frame>                                  pending_; // pumping thread only
+    std::vector<transfer_done_frame>                               unsettled_; // pumping thread only
     frame_ring<transfer_done_frame>                                settled_;  // producer: the pumping thread
     std::vector<std::unique_ptr<frame_ring<transfer_done_frame>>>  finished_; // producer: one lane each
     std::atomic<uint64_t>                                          doorbell_{0};
@@ -279,7 +341,9 @@ public:
     using resolver = std::function<std::byte *(const buffer_ref &)>; // a pool's id -> its bytes
 
     parallel_copier(frame_ring<transfer_frame> & in, resolver resolve, size_t lanes, size_t chunk_bytes, size_t in_flight)
-        : memory_mover(in, in_flight, lanes), resolve_(std::move(resolve)), chunk_(std::max<size_t>(chunk_bytes, 4096)),
+        // every lane's completion ring holds every slot: a slot is retired only when its completion is
+        // drained, so a lane can never find its ring full
+        : memory_mover(in, std::max<size_t>(in_flight, 1), lanes), resolve_(std::move(resolve)), chunk_(std::max<size_t>(chunk_bytes, 4096)),
           slots_(std::max<size_t>(in_flight, 1)) {
         for (size_t i = 0; i < std::max<size_t>(lanes, 1); ++i) {
             lanes_.push_back(std::make_unique<lane>(in_flight * 4));
@@ -289,7 +353,11 @@ public:
         }
     }
 
+    // Teardown never hangs: shutdown() cancels what no lane took, the lanes land the chunks they hold
+    // (their completion pushes cannot block), then they are joined. Completions not drained go with the
+    // mover; the caller drains before destroying it when it needs every terminal frame.
     ~parallel_copier() override {
+        shutdown();
         for (auto & l : lanes_) {
             l->work.close();
         }
@@ -313,24 +381,61 @@ private:
         std::jthread            worker;
     };
     struct slot {
-        std::atomic<bool>     in_use{false};
+        std::atomic<bool>     in_use{false};   // claimed at start; free again only when its completion is drained
         std::atomic<uint32_t> remaining{0};
+        std::atomic<uint8_t>  status{0};       // moved, or failed when shutdown cut it part-handed
         uint64_t              ticket = 0;
     };
 
+    // The same live bytes named twice: same domain, pool, buffer, generation, offset AND length, and the
+    // resolver vouches for them (live generation, in bounds).
     bool aliases(const buffer_ref & a, const buffer_ref & b) const override {
-        return a.domain == b.domain && a.pool == b.pool && a.buffer == b.buffer && a.offset == b.offset;
+        return a.domain == b.domain && a.pool == b.pool && a.buffer == b.buffer && a.generation == b.generation &&
+               a.offset == b.offset && a.bytes == b.bytes && a.domain != memory_domain::disk && resolve_(a) != nullptr;
     }
+
+    static bool overlapping(const buffer_ref & a, const buffer_ref & b) {
+        return a.domain == b.domain && a.pool == b.pool && a.buffer == b.buffer &&
+               a.offset < b.offset + b.bytes && b.offset < a.offset + a.bytes;
+    }
+
+    std::optional<transfer_status> cancel_pending() override {
+        if (!progress_) {
+            return transfer_status::cancelled; // never claimed a slot
+        }
+        const auto p = *progress_;
+        progress_.reset();
+        slot & s = slots_[p.slot];
+        if (p.next == 0) {
+            s.in_use.store(false, std::memory_order_release); // no chunk handed: nothing written, slot free
+            return transfer_status::cancelled;
+        }
+        // part-handed: its handed chunks land and the last one reports `failed` (a partial destination);
+        // the chunks never handed are subtracted so that last one is found
+        s.status.store((uint8_t) transfer_status::failed, std::memory_order_relaxed);
+        const uint32_t not_handed = (uint32_t) (p.n_chunks - p.next);
+        if (s.remaining.fetch_sub(not_handed, std::memory_order_acq_rel) == not_handed) {
+            // every handed chunk already landed before the subtraction: none will report it, so it ends here
+            s.in_use.store(false, std::memory_order_release);
+            return transfer_status::failed;
+        }
+        return std::nullopt;
+    }
+
+    void retire(uint32_t s) override { slots_[s].in_use.store(false, std::memory_order_release); }
 
     start_result start(const transfer_frame & t) override {
         if (!progress_) {
             if (t.src.domain == memory_domain::disk || t.dst.domain == memory_domain::disk || t.src.bytes != t.dst.bytes) {
                 return start_result::refused; // disk moves belong to a reader backend; a size mismatch is never truncated
             }
+            if (overlapping(t.src, t.dst)) {
+                return start_result::refused; // independent parallel chunks over overlapping ranges race (UB)
+            }
             std::byte * src = resolve_(t.src);
             std::byte * dst = resolve_(t.dst);
             if (src == nullptr || dst == nullptr) {
-                return start_result::refused;
+                return start_result::refused; // stale generation, unknown buffer or out of bounds
             }
             const auto s = claim_slot();
             if (!s) {
@@ -338,6 +443,7 @@ private:
             }
             const uint64_t n_chunks = std::max<uint64_t>(1, (t.src.bytes + chunk_ - 1) / chunk_);
             slots_[*s].ticket = t.ticket;
+            slots_[*s].status.store((uint8_t) transfer_status::moved, std::memory_order_relaxed);
             slots_[*s].remaining.store((uint32_t) n_chunks, std::memory_order_release);
             progress_ = progress{ *s, src, dst, t.src.bytes, n_chunks, 0 };
         }
@@ -378,9 +484,8 @@ private:
                 std::memcpy(batch[i].dst, batch[i].src, batch[i].bytes);
                 slot & s = slots_[batch[i].slot];
                 if (s.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    const uint64_t ticket = s.ticket;
-                    s.in_use.store(false, std::memory_order_release);
-                    complete(index, ticket, transfer_status::moved);
+                    // the slot stays claimed until this completion is drained (retire): that is the bound
+                    complete(index, s.ticket, (transfer_status) s.status.load(std::memory_order_relaxed), batch[i].slot);
                 }
             }
             if (n == 0) {
