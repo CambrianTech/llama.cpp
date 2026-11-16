@@ -1,4 +1,5 @@
 #include <limits>
+#include <set>
 #include "server-context.h"
 #include "../../src/llama-ext.h"
 #include "server-train.h"
@@ -887,6 +888,11 @@ public:
     // serving slots working right now, refreshed by the loop at the start and end of every
     // update_slots pass; the trainer reads it between batches (see server-train.h)
     std::atomic<int> n_busy_slots{0};
+
+    // How many generating slots decode per step, as the core last chose it from its measured policy
+    // (continuum 4.10 P5 slice 2); -1 is every generating slot, today's behaviour. The fork chooses
+    // WHICH: those that have waited longest since they last joined a batch. Set by POST /engine/decode-set.
+    std::atomic<int64_t> decode_width{-1};
 
     // The most one sequence may hold: llama_n_ctx_seq capped at the model's training context.
     // ONE value, set at load: every slot is sized from it and context_geometry reports it, so
@@ -3794,10 +3800,33 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // The decode set: with a width chosen, only that many generating slots decode this step, the
+        // longest-waiting first (aging, so none starves); the rest stay GENERATING with their KV and
+        // sampler untouched and add nothing to this batch. Without one, every generating slot decodes.
+        std::set<int> decode_set;
+        const int64_t width = decode_width.load(std::memory_order_relaxed);
+        if (width >= 0) {
+            std::vector<const server_slot *> ready;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    ready.push_back(&slot);
+                }
+            }
+            std::stable_sort(ready.begin(), ready.end(), [](const server_slot * a, const server_slot * b) {
+                return a->t_last_batched_us < b->t_last_batched_us;
+            });
+            for (size_t i = 0; i < ready.size() && i < (size_t) std::max<int64_t>(width, 1); i++) {
+                decode_set.insert(ready[i]->id);
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
+            }
+            if (width >= 0 && decode_set.count(slot.id) == 0) {
+                return; // outside this step's decode set: waits with its KV in place
             }
 
             // check if we can batch this slot with the previous one (or the holder's set)
@@ -6700,6 +6729,29 @@ void server_routes::init_routes() {
             }
             return true;
         });
+        return res;
+    };
+
+    // The decode set's width (continuum 4.10 P5 slice 2): how many generating slots decode per step,
+    // chosen by the core from its measured policy. {"width": n} with n >= 1 sets it; {"width": null}
+    // returns to every generating slot. The engine chooses which slots fill it (aging).
+    this->post_decode_set = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        if (!body.contains("width")) {
+            res->error(format_error_response("\"width\" is required (a count of at least 1, or null for every generating slot)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const json & width = body.at("width");
+        if (width.is_null()) {
+            ctx_server.decode_width.store(-1);
+        } else if (width.is_number_integer() && width.get<int64_t>() >= 1) {
+            ctx_server.decode_width.store(width.get<int64_t>());
+        } else {
+            res->error(format_error_response("\"width\" must be at least 1, or null", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        res->ok({ { "width", width } });
         return res;
     };
 
