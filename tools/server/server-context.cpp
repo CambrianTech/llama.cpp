@@ -1,5 +1,6 @@
 #include <limits>
 #include "server-context.h"
+#include "server-lanes.h"
 #include "server-view-end.h"
 #include "../../src/llama-ext.h"
 #include "server-train.h"
@@ -375,6 +376,14 @@ struct server_slot {
     json json_schema;
 
     common_sampler_ptr smpl;
+
+    // Continuum fork (CONTINUUM-ENGINE 4.7.14): this step's sample, made on a lane before the loop that
+    // emits it; a sampling error is carried here and raised in this slot's own step
+    bool                     presampled   = false;
+    llama_token              presampled_id = LLAMA_TOKEN_NULL;
+    common_sampler_ptr       presampled_save;     // the speculative save point, cloned before the verify
+    std::vector<llama_token> presampled_accepted; // the speculative verify's accepted tokens
+    std::string              presample_error;
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
@@ -985,6 +994,10 @@ private:
     // whether any configured drafter reads the prompt's tokens (the n-gram family); set at load
     bool spec_reads_prompt = false;
 
+    // the lanes one step's slots sample on at once (CONTINUUM-ENGINE 4.7.14); sized at load from the
+    // slot count and the cores the OS reports, never more lanes than slots
+    std::unique_ptr<server_lanes> sample_lanes;
+
     common_init_result_ptr llama_init;
 
     llama_context * ctx_tgt = nullptr;
@@ -1419,6 +1432,12 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+
+        {
+            const size_t cores   = std::max<size_t>(1, std::thread::hardware_concurrency());
+            const size_t workers = std::min<size_t>(params_base.n_parallel > 1 ? params_base.n_parallel - 1 : 0, cores - 1);
+            sample_lanes = std::make_unique<server_lanes>(workers);
+        }
 
         spec_reads_prompt = std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
             [](common_speculative_type t) {
@@ -4367,6 +4386,71 @@ private:
         return true;
     }
 
+    // Continuum fork (CONTINUUM-ENGINE 4.7.14): every slot that samples in this view samples at once.
+    // Gather on this thread (one synchronize; a row is raw pointers into the context's outputs, so
+    // sampling from it never calls into the context), sample on the lanes (each slot's sampler is its
+    // own state), and the loops in post_decode then emit in slot order exactly as before. Same tokens:
+    // each sampler sees the same rows and its own RNG in the same order.
+    void presample(int32_t off, int32_t n_batch_tokens) {
+        auto inside = [&](int32_t idx) { return idx >= off && idx < off + n_batch_tokens; };
+        struct sample_job {
+            server_slot *                   slot;
+            bool                            verify; // speculative verify (MTP), else one plain sample
+            std::vector<common_sampler_row> rows;
+        };
+        std::vector<sample_job> jobs;
+        for (auto & slot : slots) {
+            slot.presampled = false;
+            slot.presample_error.clear();
+            if (!slot.task) {
+                continue;
+            }
+            const bool drafting = slot.can_speculate() && !slot.spec_draft.empty();
+            if (slot.state == SLOT_STATE_GENERATING && drafting && !slot.spec_i_batch.empty()) {
+                GGML_ASSERT(slot.spec_i_batch.size() == slot.spec_draft.size() + 1);
+                jobs.push_back({ &slot, true, {} });
+                continue;
+            }
+            if (!inside(slot.i_batch) || drafting) {
+                continue;
+            }
+            const bool done_prompt = slot.state == SLOT_STATE_DONE_PROMPT &&
+                slot.task->type != SERVER_TASK_TYPE_EMBEDDING && slot.task->type != SERVER_TASK_TYPE_RERANK;
+            if (slot.state == SLOT_STATE_GENERATING || done_prompt) {
+                jobs.push_back({ &slot, false, {} });
+            }
+        }
+        if (jobs.empty()) {
+            return;
+        }
+        for (auto & job : jobs) {
+            if (job.verify) {
+                for (const int idx : job.slot->spec_i_batch) {
+                    job.rows.push_back(common_sampler_row_ith(ctx_tgt, idx));
+                }
+            } else {
+                job.rows.push_back(common_sampler_row_ith(ctx_tgt, job.slot->i_batch - off));
+            }
+        }
+        scoped_timer timer(t_sampl, n_sampl);
+        sample_lanes->run(jobs.size(), [&](size_t j) {
+            auto & job  = jobs[j];
+            auto & slot = *job.slot;
+            try {
+                if (job.verify) {
+                    slot.presampled_save.reset(common_sampler_clone(slot.smpl.get()));
+                    slot.presampled_accepted = common_sampler_sample_and_accept_rows(slot.smpl.get(), job.rows, slot.spec_draft);
+                } else {
+                    slot.presampled_id = common_sampler_sample_row(slot.smpl.get(), job.rows[0]);
+                    common_sampler_accept(slot.smpl.get(), slot.presampled_id, true);
+                }
+                slot.presampled = true;
+            } catch (const std::exception & e) {
+                slot.presample_error = e.what(); // raised in this slot's own step, as the serial path did
+            }
+        });
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
@@ -4382,6 +4466,8 @@ private:
                 }
             }
         });
+
+        presample(off, n_batch_tokens);
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
@@ -4436,15 +4522,15 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+            // sampled and accepted on a lane by presample(); the predicate there mirrors this loop
+            if (!slot.presample_error.empty()) {
+                throw std::runtime_error(std::exchange(slot.presample_error, {}));
             }
+            GGML_ASSERT(slot.presampled && "presample() must cover every slot this loop samples");
+            const llama_token id = slot.presampled_id;
+            slot.presampled = false;
 
             slot.i_batch = -1;
-
-            common_sampler_accept(slot.smpl.get(), id, true);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -4498,10 +4584,14 @@ private:
 
             // verify and try to accept the draft
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
-
-                GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                // cloned, verified and accepted on a lane by presample()
+                if (!slot.presample_error.empty()) {
+                    throw std::runtime_error(std::exchange(slot.presample_error, {}));
+                }
+                GGML_ASSERT(slot.presampled && "presample() must cover every slot this loop verifies");
+                slot.presampled = false;
+                common_sampler_ptr smpl_save = std::move(slot.presampled_save);
+                auto accepted = std::move(slot.presampled_accepted);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
