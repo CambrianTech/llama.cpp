@@ -1,5 +1,7 @@
 #pragma once
 
+#include "server-step-budget.h"
+
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -65,6 +67,8 @@ struct server_context_meta {
     json memory_breakdown;
     // Realized context capacity; shared KV is not slots times a slot window.
     json context_geometry;
+    // The decode loop's frame budget, measured every step (CONTINUUM-ENGINE 4.7.9); read live by /props.
+    std::shared_ptr<const step_budget> budget; // the decode loop's host step timings (named apart from its type: GCC rejects the shadow)
 };
 
 enum server_state {

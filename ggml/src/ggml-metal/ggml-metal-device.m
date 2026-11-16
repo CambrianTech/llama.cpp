@@ -1,3 +1,4 @@
+#include <os/lock.h>
 #import "ggml-metal-device.h"
 #include "ggml-metal-ops.h"
 
@@ -831,7 +832,37 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // Continuum fork (CONTINUUM-ENGINE 4.7.9): GPU busy time from the command buffers' own
+    // GPUStartTime/GPUEndTime, overlap removed, so utilization is device execution, never host waits
+    os_unfair_lock gpu_time_lock;
+    uint64_t       gpu_busy_ns;
+    uint64_t       gpu_cmd_bufs;
+    double         gpu_last_end_s;
 };
+
+void ggml_metal_device_gpu_time_record(ggml_metal_device_t dev, double start_s, double end_s) {
+    if (!(end_s > start_s)) {
+        return; // a buffer that never ran on the GPU (error, empty) reports nothing
+    }
+    os_unfair_lock_lock(&dev->gpu_time_lock);
+    const double from = start_s > dev->gpu_last_end_s ? start_s : dev->gpu_last_end_s; // count overlap once
+    if (end_s > from) {
+        dev->gpu_busy_ns += (uint64_t) ((end_s - from) * 1e9);
+    }
+    if (end_s > dev->gpu_last_end_s) {
+        dev->gpu_last_end_s = end_s;
+    }
+    dev->gpu_cmd_bufs += 1;
+    os_unfair_lock_unlock(&dev->gpu_time_lock);
+}
+
+void ggml_metal_device_gpu_time_read(ggml_metal_device_t dev, uint64_t * busy_ns, uint64_t * cmd_bufs) {
+    os_unfair_lock_lock(&dev->gpu_time_lock);
+    *busy_ns  = dev->gpu_busy_ns;
+    *cmd_bufs = dev->gpu_cmd_bufs;
+    os_unfair_lock_unlock(&dev->gpu_time_lock);
+}
 
 //
 // MTLResidenceSet wrapper
@@ -1029,6 +1060,7 @@ const char * ggml_metal_device_id_token(enum ggml_metal_device_id id) {
 
 ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
     ggml_metal_device_t dev = calloc(1, sizeof(struct ggml_metal_device));
+    dev->gpu_time_lock = OS_UNFAIR_LOCK_INIT;
 
     assert(dev != NULL);
 

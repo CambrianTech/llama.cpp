@@ -520,6 +520,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
 
+            {
+                ggml_metal_device_t dev = ctx->dev;
+                [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                    ggml_metal_device_gpu_time_record(dev, cb.GPUStartTime, cb.GPUEndTime);
+                }];
+            }
+
             if (ctx->cmd_bufs[n_cb].obj) {
                 [ctx->cmd_bufs[n_cb].obj release];
             }
@@ -538,6 +545,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
             id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
             [cmd_buf retain];
+
+            {
+                ggml_metal_device_t dev = ctx->dev;
+                [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                    ggml_metal_device_gpu_time_record(dev, cb.GPUStartTime, cb.GPUEndTime);
+                }];
+            }
 
             if (ctx->cmd_bufs[cb_idx].obj) {
                 [ctx->cmd_bufs[cb_idx].obj release];

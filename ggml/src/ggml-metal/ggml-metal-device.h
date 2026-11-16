@@ -307,6 +307,10 @@ void ggml_metal_device_free(ggml_metal_device_t dev);
 
 ggml_metal_device_t ggml_metal_device_get(int device, int n_devices);
 
+// GPU busy time from command-buffer timestamps (overlap counted once) and the buffers measured
+void ggml_metal_device_gpu_time_record(ggml_metal_device_t dev, double start_s, double end_s);
+void ggml_metal_device_gpu_time_read  (ggml_metal_device_t dev, uint64_t * busy_ns, uint64_t * cmd_bufs);
+
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
 
