@@ -1726,7 +1726,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
+    cparams.n_seq_max         = params.n_parallel + params.n_parked_checkpoints; // live slots, then parked checkpoint ids
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
@@ -2284,7 +2284,7 @@ size_t common_prompt_checkpoint::size() const {
 }
 
 bool common_prompt_checkpoint::empty() const {
-    return data_tgt.empty();
+    return data_tgt.empty() && parked_seq < 0;
 }
 
 void common_prompt_checkpoint::clear() {
@@ -2296,6 +2296,9 @@ void common_prompt_checkpoint::clear() {
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();
+
+    parked.reset();
+    parked_seq = -1;
 }
 
 void common_prompt_checkpoint::update_pos(
@@ -2348,6 +2351,13 @@ void common_prompt_checkpoint::load_tgt(
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
     if (ctx == nullptr) {
+        return;
+    }
+
+    if (parked_seq >= 0) {
+        // by reference: the parked id's partial state (its recurrent cell) into the live sequence; an
+        // empty attention range moves no KV cells (the caller trims attention by position)
+        llama_memory_seq_cp(llama_get_memory(ctx), parked_seq, seq_id, 0, 0);
         return;
     }
 

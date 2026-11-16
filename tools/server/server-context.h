@@ -1,6 +1,7 @@
 #pragma once
 
 #include "server-step-budget.h"
+#include "server-parked-seqs.h"
 
 #include "server-http.h"
 #include "server-task.h"
@@ -69,6 +70,8 @@ struct server_context_meta {
     json context_geometry;
     // The decode loop's frame budget, measured every step (CONTINUUM-ENGINE 4.7.9); read live by /props.
     std::shared_ptr<const step_budget> step_budget;
+    // Parked checkpoints (CONTINUUM-ENGINE 4.7.11); null when --parked-checkpoints is 0.
+    std::shared_ptr<const parked_seq_pool> parked_checkpoints;
 };
 
 enum server_state {

@@ -2,6 +2,7 @@
 #include "server-context.h"
 #include "../../src/llama-ext.h"
 #include "server-train.h"
+#include "server-parked-seqs.h"
 #include "server-adapter-file.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -79,6 +80,10 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
+    // llama reserves at least one output row per sequence id (output_reserve floors at n_seq_max), and
+    // parked checkpoint ids are sequence ids: the total covers them. Each costs one vocabulary-sized row
+    // a parked id never fills (follow-up: floor on output-producing sequences, CONTINUUM-ENGINE 4.7.11).
+    result.total   = std::max<int32_t>(result.total, params.n_parallel + params.n_parked_checkpoints);
     return result;
 }
 
@@ -977,6 +982,10 @@ private:
     common_params params_base;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
+    // Continuum fork (CONTINUUM-ENGINE 4.7.11): checkpoints held by reference in spare sequence ids;
+    // null when --parked-checkpoints is 0 (checkpoints are copied as before)
+    std::shared_ptr<parked_seq_pool> parked_pool;
+
     common_init_result_ptr llama_init;
 
     llama_context * ctx_tgt = nullptr;
@@ -1143,6 +1152,10 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // first: a checkpoint handle released after this is a no-op, never a call into a freed context
+        // (slots and the prompt cache are rebuilt on the next load, so no stale parked id is restored)
+        parked_pool.reset();
+
         spec.reset();
         spec_init.reset();
 
@@ -1218,6 +1231,14 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        if (params_base.n_parked_checkpoints > 0) {
+            // a split KV gives each sequence n_ctx / n_seq_max: parked ids must not shrink a slot's window
+            if (!params_base.kv_unified) {
+                SRV_ERR("%s", "--parked-checkpoints requires --kv-unified\n");
+                return false;
+            }
+            // the sequence limit (slots + parked ids) is enforced once, by context creation itself
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1404,6 +1425,25 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+
+        if (params_base.n_parked_checkpoints > 0) {
+            // a parked checkpoint holds exactly the partial state a server checkpoint copies: the recurrent
+            // cell. A sliding window's KV is not shared by an empty attention range, so it is refused here.
+            const bool recurrent_state = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+            if (!recurrent_state || llama_model_n_swa(model_tgt) != 0) {
+                SRV_ERR("%s", "--parked-checkpoints needs a recurrent or hybrid model without a sliding window\n");
+                return false;
+            }
+            llama_memory_t mem = llama_get_memory(ctx_tgt);
+            parked_pool = parked_seq_pool::make(
+                parked_seq_ops{
+                    [mem](int32_t src, int32_t dst) { llama_memory_seq_cp(mem, src, dst, 0, 0); },
+                    [mem](int32_t seq) { llama_memory_seq_rm(mem, seq, -1, -1); },
+                },
+                params_base.n_parallel, params_base.n_parked_checkpoints);
+            SRV_INF("checkpoints are parked by reference: %d sequence ids after the %d slots\n",
+                    params_base.n_parked_checkpoints, params_base.n_parallel);
+        }
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -2547,7 +2587,21 @@ private:
                 }
             }
             if (parts.tgt) {
-                ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (parked_pool) {
+                    // by reference: the live partial state parked under a spare sequence id, no bytes copied
+                    auto held = parked_pool->park(slot.id);
+                    if (!held) {
+                        SLT_WRN(slot, "%s checkpoint refused: every parked sequence id is in use (%d), %s\n",
+                                is_prompt ? "context" : "speculative", parked_pool->capacity(),
+                                is_prompt ? "a restore from here will be cold" : "the draft is dropped");
+                        ckpt.clear();
+                        return false;
+                    }
+                    ckpt.parked_seq = (*held)->id();
+                    ckpt.parked     = *held;
+                } else {
+                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
             }
             if (parts.dft) {
                 ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -2925,7 +2979,10 @@ private:
                                     kept_checkpoints.size(), n, kept_at.c_str(), view_end, end_from);
                         }
                     }
-                    auto write_checkpoints = [&](auto && put) {
+                    // `materialize`: write a parked checkpoint's bytes (read from its parked id) or, for the
+                    // size quote, only count them: persisting a page is the one place a parked checkpoint
+                    // becomes bytes, as its own bytes
+                    auto write_checkpoints = [&](auto && put, bool materialize) {
                         const uint32_t magic   = 0x434B5054u; // 'CKPT'
                         const uint32_t version = 1;
                         const uint32_t n_ckpt  = (uint32_t) kept_checkpoints.size();
@@ -2935,12 +2992,23 @@ private:
                             const int64_t  n_tokens = c.n_tokens;
                             const int32_t  pos_min  = c.pos_min;
                             const int32_t  pos_max  = c.pos_max;
-                            const uint64_t sz_tgt   = c.data_tgt.size();
+                            const bool     parked   = c.parked_seq >= 0;
+                            const uint64_t sz_tgt   = parked
+                                ? llama_state_seq_get_size_ext(ctx_tgt, c.parked_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
+                                : c.data_tgt.size();
                             const uint64_t sz_dft   = c.data_dft.size();
                             const uint64_t sz_spec  = c.data_spec.size();
                             put(&n_tokens, sizeof(n_tokens)); put(&pos_min, sizeof(pos_min)); put(&pos_max, sizeof(pos_max));
                             put(&sz_tgt, sizeof(sz_tgt)); put(&sz_dft, sizeof(sz_dft)); put(&sz_spec, sizeof(sz_spec));
-                            put(c.data_tgt.data(), c.data_tgt.size());
+                            if (parked && materialize) {
+                                std::vector<uint8_t> bytes(sz_tgt);
+                                llama_state_seq_get_data_ext(ctx_tgt, bytes.data(), bytes.size(), c.parked_seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                put(bytes.data(), bytes.size());
+                            } else if (parked) {
+                                put(nullptr, sz_tgt);
+                            } else {
+                                put(c.data_tgt.data(), c.data_tgt.size());
+                            }
                             put(c.data_dft.data(), c.data_dft.size());
                             put(c.data_spec.data(), c.data_spec.size());
                         }
@@ -2975,7 +3043,7 @@ private:
                                 projected_bytes += n;
                             }
                         };
-                        write_checkpoints(count);
+                        write_checkpoints(count, /*materialize=*/false);
                         write_adapters(count);
                         if (size_overflow) {
                             send_error(task, "Slot file size overflow", ERROR_TYPE_SERVER);
@@ -3008,7 +3076,7 @@ private:
                     // Companion serialization is shared with the pre-write size quote.
                     {
                         std::ofstream out(filepath + ".ckpt", std::ios::binary | std::ios::trunc);
-                        write_checkpoints([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); });
+                        write_checkpoints([&](const void * ptr, size_t n) { out.write(reinterpret_cast<const char *>(ptr), n); }, /*materialize=*/true);
                         if (!out) {
                             SLT_WRN(*slot, "checkpoint sidecar could not be written: %s (the restore will be cold)\n", filepath.c_str());
                         }
@@ -5172,6 +5240,7 @@ server_context_meta server_context::get_meta() const {
             { "sequence_capacity",       llama_n_seq_max(impl->ctx_tgt) },
         },
         /* step_budget            */ impl->budget,
+        /* parked_checkpoints     */ impl->parked_pool,
     };
 }
 
@@ -5605,6 +5674,10 @@ static json get_res_props(const server_context_meta & meta, const common_params 
             auto snap = meta.step_budget->snapshot();
             return json { {"decode", counters(snap.decode)}, {"with_prefill", counters(snap.with_prefill)} };
         }() },
+        { "parked_checkpoints",          meta.parked_checkpoints
+            ? json { {"capacity", meta.parked_checkpoints->capacity()}, {"in_use", meta.parked_checkpoints->in_use()},
+                     {"parked", meta.parked_checkpoints->parked()}, {"refused", meta.parked_checkpoints->refused()} }
+            : json(nullptr) },
         { "gpu_time",                    [] {
             // device busy time from the backend's own command-buffer timestamps (overlap counted once),
             // with the host clock it was read at: utilization = delta busy_us / delta clock_us

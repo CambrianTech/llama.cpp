@@ -1692,6 +1692,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--parked-checkpoints"}, "N",
+        "Continuum fork: hold up to N context checkpoints (across all slots) by reference in spare sequence ids on the "
+        "device instead of copying them to host memory (default: 0 = copied). Recurrent or hybrid models without a "
+        "sliding window only, with --kv-unified; a checkpoint the parked ids cannot hold is refused, never copied instead.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--parked-checkpoints must be >= 0");
+            }
+            params.n_parked_checkpoints = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N|auto",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum, auto = each sequence's prompt over --ctx-checkpoints, so its checkpoints cover its whole prompt)", params.checkpoint_min_step),
         [](common_params & params, const std::string & value) {

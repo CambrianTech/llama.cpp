@@ -623,6 +623,8 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+    int32_t n_parked_checkpoints = 0;    // Continuum fork (CONTINUUM-ENGINE 4.7.11): spare sequence ids that hold
+                                         // checkpoints by reference on the device; 0 = serialized checkpoints
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
@@ -1167,6 +1169,12 @@ struct common_prompt_checkpoint {
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
+
+    // Continuum fork (CONTINUUM-ENGINE 4.7.11): the target's partial state held BY REFERENCE in a parked
+    // sequence id instead of copied into data_tgt. `parked` owns the id (its last copy frees the cell);
+    // `parked_seq` is the id load_tgt restores from with llama_memory_seq_cp.
+    std::shared_ptr<const void> parked;
+    llama_seq_id                parked_seq = -1;
 
     size_t size() const;
 
