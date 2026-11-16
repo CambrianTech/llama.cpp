@@ -34,6 +34,7 @@ struct server_page_job {
     // restore, then applied only when it covers exactly the restored tokens
     std::vector<uint8_t> dft_sidecar;
     bool                 dft_ok = false;
+    uint64_t             lora_hash = 0; // the restored page's `.lora` bytes, which its draft must name
 
     // restore: what the worker read (the adapter identity is checked on the loop, against the
     // adapters loaded when it applies)

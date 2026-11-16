@@ -45,11 +45,23 @@
     }
 
     // The `.dft` sidecar (#79): the draft context's KV for the sequence, once per page. Header: magic,
-    // version, the number of tokens it covers and an FNV-1a hash of exactly those tokens (a restore never
-    // pairs it with another save's page of the same length), then the state's size and bytes.
+    // version, the number of tokens it covers, an FNV-1a hash of exactly those tokens, an FNV-1a hash of the
+    // save's own `.lora` sidecar bytes (the adapters and their file revisions the state was computed under:
+    // the same tokens under other adapters are another computation), then the state's size and bytes.
+    // A save removes the old `.dft` before it publishes the page, so a save interrupted anywhere leaves either
+    // no draft (it drafts cold) or its own, never an earlier save's (Codex on #130).
     static constexpr uint32_t page_dft_magic   = 0x44524654u; // 'DRFT'
-    static constexpr uint32_t page_dft_version = 1;
-    static constexpr size_t   page_dft_header  = 2 * sizeof(uint32_t) + 3 * sizeof(uint64_t);
+    static constexpr uint32_t page_dft_version = 2;
+    static constexpr size_t   page_dft_header  = 2 * sizeof(uint32_t) + 4 * sizeof(uint64_t);
+
+    static uint64_t page_bytes_hash(const uint8_t * bytes, size_t n) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < n; ++i) {
+            h ^= bytes[i];
+            h *= 0x100000001b3ull;
+        }
+        return h;
+    }
 
     static uint64_t page_tokens_hash(const llama_token * tokens, size_t n) {
         uint64_t h = 0xcbf29ce484222325ull;
@@ -228,12 +240,13 @@
         if (ctx_dft != nullptr) {
             const uint64_t n_tok = job->tokens.size();
             const uint64_t hash  = page_tokens_hash(job->tokens.data(), job->tokens.size());
+            const uint64_t lhash = page_bytes_hash(job->lora_sidecar.data(), job->lora_sidecar.size());
             const uint64_t n_st  = n_dft_state;
             job->dft_sidecar.resize(n_dft);
             uint8_t * w = job->dft_sidecar.data();
             auto put = [&](const void * src, size_t n) { std::memcpy(w, src, n); w += n; };
             put(&page_dft_magic, sizeof(page_dft_magic)); put(&page_dft_version, sizeof(page_dft_version));
-            put(&n_tok, sizeof(n_tok)); put(&hash, sizeof(hash)); put(&n_st, sizeof(n_st));
+            put(&n_tok, sizeof(n_tok)); put(&hash, sizeof(hash)); put(&lhash, sizeof(lhash)); put(&n_st, sizeof(n_st));
             if (llama_state_seq_get_data_ext(ctx_dft, w, n_dft_state, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft_state) {
                 job->dft_sidecar.clear(); // written as absent: the restore drafts cold, never on a torn state
             }
@@ -245,6 +258,12 @@
 
     // The worker's share of a save: the page and its sidecars on disk.
     static void page_write(server_page_job & job) {
+        {
+            // an earlier save's draft goes before this save's page is published, so no interruption can pair
+            // them; this save's draft is written last, whole, below
+            std::error_code ec;
+            std::filesystem::remove(job.filepath + ".dft", ec);
+        }
         const server_page_file file { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION };
         job.n_bytes = file.write(job.filepath, job.tokens.data(), job.tokens.size(), job.body, job.error);
         if (job.n_bytes == 0) {
@@ -408,6 +427,11 @@
                 job.error = "the page's adapter identity is missing or unreadable: " + lora_path;
                 return;
             }
+            // the identity's exact bytes, which the draft sidecar names (page_apply_restore matches them)
+            server_page_reader whole(lora_path);
+            std::vector<uint8_t> bytes(whole.ok ? whole.size : 0);
+            whole.get(bytes.data(), bytes.size());
+            job.lora_hash = whole.ok ? page_bytes_hash(bytes.data(), bytes.size()) : 0;
         }
 
         const server_page_file file { LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_VERSION };
@@ -484,15 +508,16 @@
             server_page_reader dft(job.filepath + ".dft");
             if (dft.ok && dft.size >= page_dft_header) {
                 uint32_t magic = 0, version = 0;
-                uint64_t n_tok = 0, hash = 0, n_st = 0;
+                uint64_t n_tok = 0, hash = 0, lhash = 0, n_st = 0;
                 dft.get(&magic, sizeof(magic)); dft.get(&version, sizeof(version));
-                dft.get(&n_tok, sizeof(n_tok)); dft.get(&hash, sizeof(hash)); dft.get(&n_st, sizeof(n_st));
+                dft.get(&n_tok, sizeof(n_tok)); dft.get(&hash, sizeof(hash)); dft.get(&lhash, sizeof(lhash));
+                dft.get(&n_st, sizeof(n_st));
                 if (dft.ok && magic == page_dft_magic && version == page_dft_version && n_st == dft.size - page_dft_header) {
                     job.dft_sidecar.resize(page_dft_header + n_st);
                     uint8_t * w = job.dft_sidecar.data();
                     auto put = [&](const void * src, size_t n) { std::memcpy(w, src, n); w += n; };
                     put(&magic, sizeof(magic)); put(&version, sizeof(version));
-                    put(&n_tok, sizeof(n_tok)); put(&hash, sizeof(hash)); put(&n_st, sizeof(n_st));
+                    put(&n_tok, sizeof(n_tok)); put(&hash, sizeof(hash)); put(&lhash, sizeof(lhash)); put(&n_st, sizeof(n_st));
                     dft.get(w, n_st);
                     job.dft_ok = dft.ok;
                 }
@@ -663,13 +688,15 @@
         if (ctx_dft != nullptr) {
             bool applied = false;
             if (job.dft_ok) {
-                uint64_t n_tok = 0, hash = 0, n_st = 0;
+                uint64_t n_tok = 0, hash = 0, lhash = 0, n_st = 0;
                 const uint8_t * r = job.dft_sidecar.data() + 2 * sizeof(uint32_t);
                 std::memcpy(&n_tok, r, sizeof(n_tok)); r += sizeof(n_tok);
                 std::memcpy(&hash,  r, sizeof(hash));  r += sizeof(hash);
+                std::memcpy(&lhash, r, sizeof(lhash)); r += sizeof(lhash);
                 std::memcpy(&n_st,  r, sizeof(n_st));  r += sizeof(n_st);
                 const auto & toks = job.tokens;
-                if (n_tok == toks.size() && hash == page_tokens_hash(toks.data(), toks.size())) {
+                // the same tokens AND the same computation (adapters + revisions) as the page restored
+                if (n_tok == toks.size() && hash == page_tokens_hash(toks.data(), toks.size()) && lhash == job.lora_hash) {
                     llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
                     applied = llama_state_seq_set_data_ext(ctx_dft, r, n_st, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) == n_st;
                 }
