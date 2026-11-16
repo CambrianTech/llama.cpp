@@ -44,6 +44,25 @@
         return kept_checkpoints;
     }
 
+    // The `.dft` sidecar (#79): the draft context's KV for the sequence, once per page. Header: magic,
+    // version, the number of tokens it covers and an FNV-1a hash of exactly those tokens (a restore never
+    // pairs it with another save's page of the same length), then the state's size and bytes.
+    static constexpr uint32_t page_dft_magic   = 0x44524654u; // 'DRFT'
+    static constexpr uint32_t page_dft_version = 1;
+    static constexpr size_t   page_dft_header  = 2 * sizeof(uint32_t) + 3 * sizeof(uint64_t);
+
+    static uint64_t page_tokens_hash(const llama_token * tokens, size_t n) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t t = (uint32_t) tokens[i];
+            for (int b = 0; b < 4; ++b) {
+                h ^= (t >> (8 * b)) & 0xffu;
+                h *= 0x100000001b3ull;
+            }
+        }
+        return h;
+    }
+
     // The `.ckpt` sidecar: the kept checkpoints, each with its target, draft and speculative state.
     template <typename Put>
     static void page_write_checkpoints(const std::vector<const common_prompt_checkpoint *> & kept, Put && put) {
@@ -133,6 +152,9 @@
             };
             page_write_checkpoints(kept, count);
             page_write_adapters(slot->lora, count);
+            if (ctx_dft != nullptr) {
+                count(nullptr, page_dft_header + llama_state_seq_get_size_ext(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE));
+            }
             if (size_overflow) {
                 send_error(task, "Slot file size overflow", ERROR_TYPE_SERVER);
                 return;
@@ -164,7 +186,9 @@
         size_t n_ckpt = 0, n_lora = 0;
         page_write_checkpoints(kept, [&](const void *, size_t n) { n_ckpt += n; });
         page_write_adapters(slot->lora, [&](const void *, size_t n) { n_lora += n; });
-        const uint64_t bytes = (uint64_t) n_body + packed.size() + n_ckpt + n_lora;
+        const size_t n_dft_state = ctx_dft != nullptr ? llama_state_seq_get_size_ext(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t n_dft = ctx_dft != nullptr ? page_dft_header + n_dft_state : 0;
+        const uint64_t bytes = (uint64_t) n_body + packed.size() + n_ckpt + n_lora + n_dft;
         if (task.slot_action.page_reserved == 0) {
             task.slot_action.page_asked_us = ggml_time_us();
             auto parked = std::make_shared<server_task>(std::move(task));
@@ -201,6 +225,19 @@
         job->ckpt_sidecar.reserve(n_ckpt);
         page_write_checkpoints(kept, [&](const void * p, size_t n) { server_page_put(job->ckpt_sidecar, p, n); });
         page_write_adapters(slot->lora, [&](const void * p, size_t n) { server_page_put(job->lora_sidecar, p, n); });
+        if (ctx_dft != nullptr) {
+            const uint64_t n_tok = job->tokens.size();
+            const uint64_t hash  = page_tokens_hash(job->tokens.data(), job->tokens.size());
+            const uint64_t n_st  = n_dft_state;
+            job->dft_sidecar.resize(n_dft);
+            uint8_t * w = job->dft_sidecar.data();
+            auto put = [&](const void * src, size_t n) { std::memcpy(w, src, n); w += n; };
+            put(&page_dft_magic, sizeof(page_dft_magic)); put(&page_dft_version, sizeof(page_dft_version));
+            put(&n_tok, sizeof(n_tok)); put(&hash, sizeof(hash)); put(&n_st, sizeof(n_st));
+            if (llama_state_seq_get_data_ext(ctx_dft, w, n_dft_state, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft_state) {
+                job->dft_sidecar.clear(); // written as absent: the restore drafts cold, never on a torn state
+            }
+        }
         job->copy_ms = (ggml_time_us() - t_copy) / 1000.0;
 
         page_io_submit(task.id, std::move(job), page_write);
@@ -218,6 +255,26 @@
         }
         if (!server_page_write_bytes(job.filepath + ".lora", job.lora_sidecar)) {
             SRV_WRN("slot %d: adapter sidecar could not be written: %s (this page will not restore)\n", job.id_slot, job.filepath.c_str());
+        }
+        {
+            // the draft KV, whole or not at all: a temp file renamed over, so a reader never sees a torn
+            // one; a page without one has none on disk (a stale .dft from an earlier save is removed)
+            const std::string dft_path = job.filepath + ".dft";
+            const std::string dft_tmp  = dft_path + ".partial";
+            std::error_code ec;
+            bool ok = !job.dft_sidecar.empty() && server_page_write_bytes(dft_tmp, job.dft_sidecar);
+            if (ok) {
+                std::filesystem::rename(dft_tmp, dft_path, ec);
+                ok = !ec;
+            }
+            if (!ok) {
+                std::filesystem::remove(dft_tmp, ec);
+                std::filesystem::remove(dft_path, ec);
+                if (!job.dft_sidecar.empty()) {
+                    SRV_WRN("slot %d: draft sidecar could not be written: %s (the restore drafts cold)\n", job.id_slot, dft_path.c_str());
+                }
+            }
+            std::vector<uint8_t>().swap(job.dft_sidecar);
         }
         // on disk now: the copy is freed here, and its bytes returned to the budget, not when the loop
         // takes the completion
@@ -255,7 +312,7 @@
         job->progress  = std::move(progress);
         // the bytes it will hold: the page and its sidecars as they are on disk (a missing file holds
         // none and fails its read)
-        for (const char * suffix : { "", ".ckpt", ".lora" }) {
+        for (const char * suffix : { "", ".ckpt", ".lora", ".dft" }) {
             std::error_code ec;
             const auto n = std::filesystem::file_size(job->filepath + suffix, ec);
             job->bytes += ec ? 0 : (uint64_t) n;
@@ -319,6 +376,7 @@
     static void page_free_buffers(server_page_job & job) {
         std::vector<uint8_t>().swap(job.body);
         std::vector<int32_t>().swap(job.tokens);
+        std::vector<uint8_t>().swap(job.dft_sidecar);
         job.checkpoints.clear();
     }
 
@@ -417,6 +475,31 @@
         job.checkpoints_ok = ok;
         if (!ok) {
             job.checkpoints.clear();
+        }
+
+        // The draft KV (#79): read whole when its file is exactly a header plus the state it names; any
+        // other size is torn or foreign and is never allocated. Matching it to the restored tokens is the
+        // loop's (page_apply_restore).
+        {
+            server_page_reader dft(job.filepath + ".dft");
+            if (dft.ok && dft.size >= page_dft_header) {
+                uint32_t magic = 0, version = 0;
+                uint64_t n_tok = 0, hash = 0, n_st = 0;
+                dft.get(&magic, sizeof(magic)); dft.get(&version, sizeof(version));
+                dft.get(&n_tok, sizeof(n_tok)); dft.get(&hash, sizeof(hash)); dft.get(&n_st, sizeof(n_st));
+                if (dft.ok && magic == page_dft_magic && version == page_dft_version && n_st == dft.size - page_dft_header) {
+                    job.dft_sidecar.resize(page_dft_header + n_st);
+                    uint8_t * w = job.dft_sidecar.data();
+                    auto put = [&](const void * src, size_t n) { std::memcpy(w, src, n); w += n; };
+                    put(&magic, sizeof(magic)); put(&version, sizeof(version));
+                    put(&n_tok, sizeof(n_tok)); put(&hash, sizeof(hash)); put(&n_st, sizeof(n_st));
+                    dft.get(w, n_st);
+                    job.dft_ok = dft.ok;
+                }
+            }
+            if (!job.dft_ok) {
+                std::vector<uint8_t>().swap(job.dft_sidecar);
+            }
         }
     }
 
@@ -573,6 +656,30 @@
             return;
         }
         std::vector<uint8_t>().swap(job.body);
+
+        // The draft's KV comes back with the page (#79) when it covers exactly these tokens; otherwise the
+        // draft sequence is cleared, never left holding another occupant's KV at these positions: it then
+        // drafts cold and the target still verifies every token
+        if (ctx_dft != nullptr) {
+            bool applied = false;
+            if (job.dft_ok) {
+                uint64_t n_tok = 0, hash = 0, n_st = 0;
+                const uint8_t * r = job.dft_sidecar.data() + 2 * sizeof(uint32_t);
+                std::memcpy(&n_tok, r, sizeof(n_tok)); r += sizeof(n_tok);
+                std::memcpy(&hash,  r, sizeof(hash));  r += sizeof(hash);
+                std::memcpy(&n_st,  r, sizeof(n_st));  r += sizeof(n_st);
+                const auto & toks = job.tokens;
+                if (n_tok == toks.size() && hash == page_tokens_hash(toks.data(), toks.size())) {
+                    llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                    applied = llama_state_seq_set_data_ext(ctx_dft, r, n_st, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE) == n_st;
+                }
+            }
+            if (!applied) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                SLT_WRN(*slot, "no draft sidecar matching this page (%s.dft): the draft starts cold\n", job.filepath.c_str());
+            }
+            std::vector<uint8_t>().swap(job.dft_sidecar);
+        }
 
         slot->prompt.clear();
         slot->prompt.tokens = std::move(*restored);

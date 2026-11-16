@@ -2567,7 +2567,12 @@ private:
             if (parts.tgt) {
                 ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             }
-            if (parts.dft) {
+            // Continuum fork (#79): a draft whose memory rolls back by trimming (plain attention KV, the MTP
+            // head) has nothing a checkpoint must hold: on restore, slot.mem.seq_rm trims its live KV to the
+            // checkpoint. PARTIAL_ONLY returned that whole KV (~2 KB/token, 246 MB at 118k tokens) in EVERY
+            // checkpoint, 79% of each, up to n_ctx_checkpoints copies per slot in host RAM. A saved page
+            // carries the draft KV once instead (the `.dft` sidecar, server-context-page.inc).
+            if (parts.dft && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
                 ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             }
             if (parts.spec) {
