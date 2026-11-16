@@ -60,7 +60,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
-    SERVER_TASK_TYPE_MIND_PREFETCH, // Continuum fork: the next mind, from flash into a parked sequence, ahead of her turn
+    SERVER_TASK_TYPE_MIND_PREFETCH,
+    SERVER_TASK_TYPE_LEARN_RELEASE, // Continuum fork: an abandoned turn's learn pin, released (server-context-minds.inc) // Continuum fork: the next mind, from flash into a parked sequence, ahead of her turn
     SERVER_TASK_TYPE_SLOT_PAGE_IO_DONE, // Continuum fork: a save's or restore's file IO finished on its worker
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,
@@ -190,6 +191,7 @@ struct task_params {
     mind_page page;
     // Continuum fork: the core will learn this turn later: pin the checkpoint at its prompt's end - 1
     bool learn_pin = false;
+    int64_t learn_release_at = -1; // /learn/release: the pinned checkpoint's position (the turn receipt's mind.pinned_at)
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -720,6 +722,15 @@ struct server_task_result_control : server_task_result {
             out["message"] = message;
         }
         return out;
+    }
+};
+
+// continuum: POST /learn/release's reply, typed (`release`: a pin_release_name spelling)
+struct server_task_result_learn_release : server_task_result {
+    pin_release outcome = pin_release::unknown_mind;
+
+    virtual json to_json() override {
+        return json { { "release", pin_release_name(outcome) } };
     }
 };
 

@@ -22,7 +22,38 @@
         // write is in flight, or after it failed, she lives here and is inserted from here, never lost
         std::shared_ptr<std::vector<uint8_t>> ram;
         std::shared_ptr<std::atomic<int>>     written;         // 0 pending, 1 landed, -1 failed
+        std::vector<int64_t>                  released;        // pins released while she was on flash (positions)
     };
+
+    // unpin her checkpoint at `at` in `cks`; true when one was pinned there
+    static bool unpin_at(std::list<common_prompt_checkpoint> & cks, int64_t at) {
+        for (auto & c : cks) {
+            if (c.pinned && c.n_tokens == at) {
+                c.pinned = false;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // An abandoned turn's learn pin, released wherever she is: on a lane, parked, or on flash (applied when her
+    // checkpoints come back). The checkpoint stays as an ordinary one: the budget may now evict it.
+    pin_release learn_release(mind_page page, int64_t at) {
+        for (auto & s : slots) {
+            if (s.page == page) {
+                return unpin_at(s.prompt.checkpoints, at) ? pin_release::released : pin_release::not_pinned;
+            }
+        }
+        resident_mind * m = find_mind(page);
+        if (m == nullptr) {
+            return pin_release::unknown_mind;
+        }
+        if (!m->file.empty() || m->ram) {
+            m->released.push_back(at); // her checkpoints are in her flash bytes
+            return pin_release::released_on_flash;
+        }
+        return unpin_at(m->prompt.checkpoints, at) ? pin_release::released : pin_release::not_pinned;
+    }
 
     // her checkpoints as bytes beside her state: count, then per checkpoint its position fields, three sizes and
     // the three blobs (target, draft, speculative state)
@@ -276,6 +307,10 @@
         SRV_INF("mind %016llx%016llx back from %s: %.1f MiB inserted in %.2f ms\n", (unsigned long long) m.page.hi,
                 (unsigned long long) m.page.lo, ram ? "RAM" : "flash", size / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0);
         m.prompt.checkpoints = std::move(checkpoints);
+        for (const int64_t at : m.released) {
+            unpin_at(m.prompt.checkpoints, at); // released while she was on flash
+        }
+        m.released.clear();
         // her file is removed on the page-IO worker, ordered after its own write (it may still be landing)
         const std::string path = m.file;
         page_io->submit(path, [path] { std::error_code ec; std::filesystem::remove(path, ec); });

@@ -2819,7 +2819,8 @@ private:
 
         auto & kept = slot.prompt.checkpoints.emplace_back(std::move(cur));
         if (slot.task->params.learn_pin && kept.n_tokens == (int64_t) slot.task->n_tokens() - 1) {
-            kept.pinned = true; // the core will learn this turn: kept until learned or abandoned
+            kept.pinned = true; // the core will learn this turn: kept until learned or released (/learn/release)
+            slot.stats.mind_pinned_at = kept.n_tokens;
         }
 
         // Continuum fork (CONTINUUM-ENGINE 4.7.3, placed checkpoints): her new view-end checkpoint
@@ -3056,6 +3057,13 @@ private:
             case SERVER_TASK_TYPE_SLOT_PAGE_IO_DONE:
                 {
                     page_io_done(std::move(task));
+                } break;
+            case SERVER_TASK_TYPE_LEARN_RELEASE:
+                {
+                    auto res = std::make_unique<server_task_result_learn_release>();
+                    res->id      = task.id;
+                    res->outcome = learn_release(task.params.page, task.params.learn_release_at);
+                    queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_MIND_PREFETCH:
                 {
@@ -6657,6 +6665,7 @@ void server_routes::init_routes() {
         return res;
     };
     this->post_minds_prefetch = [this](const server_http_req & req) { return handle_minds_prefetch(req); };
+    this->post_learn_release  = [this](const server_http_req & req) { return handle_learn_release(req); };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
     this->revoke_learn_grant = [grant_route](const server_http_req & req) { return grant_route(req, "revoke"); };
 
@@ -7033,6 +7042,40 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
 
 // Continuum fork: POST /minds/prefetch {"page": "<mind>"}: her state comes from flash into a parked sequence now,
 // ahead of her turn (server-context-minds.inc). The reply names where she is.
+// an abandoned turn's learn pin, released (the core sends the turn receipt's mind.page and mind.pinned_at)
+std::unique_ptr<server_res_generator> server_routes::handle_learn_release(const server_http_req & req) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    const json body = req.body.empty() ? json::object() : json::parse(req.body);
+    {
+        server_task task(SERVER_TASK_TYPE_LEARN_RELEASE);
+        task.id = rd.get_new_id();
+        task.params.page = mind_page_parse(json_value(body, "page", std::string()));
+        task.params.learn_release_at = json_value(body, "pinned_at", (int64_t) -1);
+        if (json_value(body, "incarnation", (uint64_t) 0) != mind_incarnation()) {
+            res->error(format_error_response("incarnation names another engine: this release was for a replaced engine", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!task.params.page.valid() || task.params.learn_release_at < 0) {
+            res->error(format_error_response("page must name a mind and pinned_at the receipt's position", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        rd.post_task(std::move(task));
+    }
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    GGML_ASSERT(dynamic_cast<server_task_result_learn_release*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_minds_prefetch(const server_http_req & req) {
     auto res = create_response();
     auto & rd = res->rd;

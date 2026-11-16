@@ -94,6 +94,9 @@ json server_slot_stats::to_json() const {
             {"switch_ms",  mind_switch_us / 1000.0},
             {"generation", mind_generation},
         };
+        if (mind_pinned_at >= 0) {
+            base["mind"]["pinned_at"] = mind_pinned_at;
+        }
     }
 
     return base;
