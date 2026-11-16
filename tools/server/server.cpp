@@ -225,6 +225,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_learn                  = models_routes->proxy_post;
         routes.get_learn_grants            = models_routes->proxy_get;
         routes.get_learn_events            = models_routes->proxy_get;
+        routes.post_decode_set             = models_routes->proxy_post;
         routes.post_learn_grants           = models_routes->proxy_post;
         routes.post_learn_preflight        = models_routes->proxy_post;
         routes.post_prompt_cache_limit     = models_routes->proxy_post;
@@ -300,6 +301,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/learn/preflight",           ex_wrapper(routes.post_learn_preflight));
     ctx_http.post("/learn/grants",              ex_wrapper(routes.post_learn_grants));
     ctx_http.get ("/learn/events",              ex_wrapper(routes.get_learn_events));
+    ctx_http.post("/engine/decode-set",         ex_wrapper(routes.post_decode_set));
     ctx_http.post("/prompt-cache/limit",        ex_wrapper(routes.post_prompt_cache_limit));
     ctx_http.get ("/page-io",                   ex_wrapper(routes.get_page_io));
     ctx_http.post("/page-io/budget",            ex_wrapper(routes.post_page_io_budget));
