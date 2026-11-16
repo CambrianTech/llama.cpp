@@ -17,6 +17,8 @@
 #include <mach/mach.h>
 #endif
 #include <cstdlib>
+#include <string>
+#include <thread>
 #include <vector>
 
 static int64_t now_us() {
@@ -26,21 +28,28 @@ static int64_t now_us() {
 static llama_context * make_ctx(const common_params & params, llama_model * model) {
     auto cparams       = common_context_params_to_llama(params);
     cparams.n_seq_max  = 2;    // seq 0 live, seq 1 parked
-    cparams.n_ctx      = 8192;
     cparams.n_batch    = 4096;
     cparams.n_ubatch   = 512;
     cparams.kv_unified = true; // one stream: a parked id shares the live sequence's cells
     return llama_init_from_model(model, cparams);
 }
 
+// feeds `toks` in batches of at most the context's n_batch; logits only for the last token
 static bool decode(llama_context * ctx, const std::vector<llama_token> & toks, llama_pos p0, llama_seq_id seq) {
-    llama_batch batch = llama_batch_init((int32_t) toks.size(), 0, 1);
-    for (size_t i = 0; i < toks.size(); ++i) {
-        common_batch_add(batch, toks[i], p0 + (llama_pos) i, { seq }, i + 1 == toks.size());
+    const size_t step = llama_n_batch(ctx);
+    for (size_t off = 0; off < toks.size(); off += step) {
+        const size_t n = std::min(step, toks.size() - off);
+        llama_batch batch = llama_batch_init((int32_t) n, 0, 1);
+        for (size_t i = 0; i < n; ++i) {
+            common_batch_add(batch, toks[off + i], p0 + (llama_pos) (off + i), { seq }, off + i + 1 == toks.size());
+        }
+        const bool ok = llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+        if (!ok) {
+            return false;
+        }
     }
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
-    return ok;
+    return true;
 }
 
 static std::vector<float> last_logits(llama_context * ctx, int n_vocab) {
@@ -168,7 +177,6 @@ int main(int argc, char ** argv) {
     {
         auto cparams       = common_context_params_to_llama(params);
         cparams.n_seq_max  = 1;
-        cparams.n_ctx      = 8192;
         cparams.n_batch    = 4096;
         cparams.n_ubatch   = 512;
         llama_context * sctx = llama_init_from_model(model, cparams);
@@ -268,6 +276,60 @@ int main(int argc, char ** argv) {
                     base / 1048576.0, peak / 1048576.0, after / 1048576.0);
         require(after - base < (int64_t) bytes, "no growth across cycles beyond one snapshot of slack");
         llama_state_seq_snapshot_free(sctx, 42);
+
+        // 5. a page SAVED OFF THE MAIN THREAD: the main thread takes only a full-state device snapshot;
+        //    a writer thread writes the standard state file from it WHILE the context keeps decoding.
+        //    The file must equal llama_state_seq_save_file's byte for byte and restore a cold-equal state.
+        {
+            require(llama_memory_seq_rm(smem, 0, -1, -1), "clear for the page test");
+            require(decode(sctx, prefix, 0, 0), "page prefix");
+            llama_synchronize(sctx);
+            const std::string dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp";
+            const std::string sync_path = dir + "/seq-park-sync.page", snap_path = dir + "/seq-park-snap.page";
+            const int64_t t_sync0 = now_us();
+            require(llama_state_seq_save_file(sctx, sync_path.c_str(), 0, prefix.data(), prefix.size()) > 0, "synchronous save");
+            const int64_t t_sync = now_us() - t_sync0;
+            size_t page_bytes = 0;
+            const int64_t t_snap0 = now_us();
+            require(llama_state_seq_snapshot_save(sctx, 0, 500, LLAMA_STATE_SEQ_FLAGS_NONE, &page_bytes) == LLAMA_SNAPSHOT_OK, "full-state snapshot");
+            const int64_t t_snap = now_us() - t_snap0; // what the main thread now pays
+            llama_snapshot_status written = LLAMA_SNAPSHOT_COPY_FAILED;
+            int64_t t_write = 0;
+            std::thread writer([&] {
+                const int64_t t0 = now_us();
+                written = llama_state_seq_snapshot_write_file(sctx, 500, snap_path.c_str(), prefix.data(), prefix.size());
+                t_write = now_us() - t0;
+            });
+            require(decode(sctx, detour, N, 0), "the context keeps decoding while the page is written");
+            llama_synchronize(sctx);
+            writer.join();
+            require(written == LLAMA_SNAPSHOT_OK, "the writer thread wrote the page");
+            require(llama_state_seq_snapshot_free(sctx, 500) == LLAMA_SNAPSHOT_OK, "free the page snapshot");
+            auto slurp = [](const std::string & path) {
+                std::FILE * f = std::fopen(path.c_str(), "rb");
+                std::vector<uint8_t> v;
+                if (!f) return v;
+                std::fseek(f, 0, SEEK_END); v.resize((size_t) std::ftell(f)); std::fseek(f, 0, SEEK_SET);
+                const size_t got = std::fread(v.data(), 1, v.size(), f); std::fclose(f); v.resize(got);
+                return v;
+            };
+            const auto a_bytes = slurp(sync_path), b_bytes = slurp(snap_path);
+            require(!a_bytes.empty() && a_bytes == b_bytes, "the snapshot-written page equals the synchronous page byte for byte");
+            // and it restores: load into the cleared sequence, decode the next token, compare with the cold run
+            require(llama_memory_seq_rm(smem, 0, -1, -1), "clear before loading the page");
+            std::vector<llama_token> back(prefix.size());
+            size_t n_back = 0;
+            require(llama_state_seq_load_file(sctx, snap_path.c_str(), 0, back.data(), back.size(), &n_back) > 0 && n_back == prefix.size(), "load the page");
+            require(decode(sctx, { next }, N, 0), "decode after loading the page");
+            const std::vector<float> got = last_logits(sctx, n_vocab);
+            int am = 0; float d = 0.0f;
+            for (int i = 0; i < n_vocab; ++i) { d = std::max(d, std::fabs(ref[i] - got[i])); if (got[i] > got[am]) am = i; }
+            require(am == argmax_ref && d <= 1e-2f, "the page restores the cold-run logits");
+            std::printf("page save: %zu-byte file; synchronous save %lld us on the main thread vs snapshot %lld us on it + %lld us on a writer thread (decoding meanwhile); byte-identical, restores (max |diff| %.6g)\n",
+                        a_bytes.size(), (long long) t_sync, (long long) t_snap, (long long) t_write, d);
+            std::remove(sync_path.c_str());
+            std::remove(snap_path.c_str());
+        }
         llama_free(sctx);
     }
 
