@@ -1836,6 +1836,8 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
     const std::string path = disk_dir + "/" + std::to_string(spill_seq++) + ".state";
     auto buf = std::make_shared<server_spill_buffer>();
     buf->reservation.hold(admission, bytes);
+    buf->counted = spill_in_flight;
+    buf->bytes   = bytes;
     spill_in_flight->fetch_add(bytes, std::memory_order_relaxed);
     buf->blocks.reserve(2 + 3 * state.prompt.checkpoints.size());
     buf->blocks.push_back(std::move(state.data.main));
@@ -1857,7 +1859,7 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
     state.spilling   = buf;
 
     const int n_tokens = state.prompt.n_tokens();
-    io->submit(path, [buf, path, bytes, n_tokens, in_flight = spill_in_flight, gate = io_gate] {
+    io->submit(path, [buf, path, bytes, n_tokens, gate = io_gate] {
         if constexpr (server_test_faults::enabled) {
             server_test_faults::hold(gate); // a test holds spill writes as it holds page IO
         }
@@ -1878,10 +1880,8 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
                     n_tokens, bytes / (1024.0 * 1024.0), ms);
         }
         buf->status.store(ok ? 1 : -1, std::memory_order_release);
-        // landed (or failed): its bytes leave the budget and the RAM tier's count here, even when its
-        // entry was erased meanwhile; a failed write's bytes return to the entry as resident data
-        buf->reservation.release();
-        in_flight->fetch_sub(bytes, std::memory_order_relaxed);
+        // the bytes stay charged until the buffer itself is freed (its destructor): when this job lets
+        // go and the entry is reaped or erased, whichever is last
     });
     return true;
 }
@@ -2057,6 +2057,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         // larger than the whole RAM tier goes to disk itself in `update`, displacing nothing
         const size_t room_needed = state_size_new > limit_size ? 0 : state_size_new;
         while (size() + room_needed > limit_size && evict_oldest_resident()) {
+        }
+        // every resident evicted and still over: bytes in flight to disk hold the rest, so this entry is
+        // not cached rather than breaching the cap (Codex on #124: cap 100, 80 in flight, a new 50)
+        if (size() + room_needed > limit_size) {
+            SRV_WRN(" - prompt state of %.3f MiB not cached: %.3f MiB in flight to disk leave no room under the %.3f MiB limit\n",
+                    state_size_new / (1024.0 * 1024.0), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+            return nullptr;
         }
     }
 

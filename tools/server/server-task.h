@@ -781,9 +781,23 @@ struct server_prompt_data {
 struct server_spill_buffer {
     std::vector<std::vector<uint8_t>> blocks;
     std::atomic<int>                  status{0};
-    // its bytes, charged to the one page-IO budget from the move until the write lands, whoever
-    // finishes first (the worker, or an erase that dropped the entry meanwhile)
-    server_page_reservation           reservation;
+    // Its bytes stay charged (to the one page-IO budget and to the RAM tier's count) for exactly as long
+    // as they exist: released here, when the last owner (the write, or the entry until it is reaped or
+    // erased) lets the buffer go, never at the write's completion while the bytes are still in RAM
+    // (Codex on #124).
+    server_page_reservation                reservation;
+    std::shared_ptr<std::atomic<uint64_t>> counted;
+    uint64_t                               bytes = 0;
+
+    server_spill_buffer() = default;
+    server_spill_buffer(const server_spill_buffer &) = delete;
+    server_spill_buffer & operator=(const server_spill_buffer &) = delete;
+    ~server_spill_buffer() {
+        reservation.release();
+        if (counted) {
+            counted->fetch_sub(bytes, std::memory_order_relaxed);
+        }
+    }
 };
 
 struct server_prompt_cache_state {
