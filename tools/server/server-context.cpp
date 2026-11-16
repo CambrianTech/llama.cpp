@@ -981,6 +981,9 @@ private:
     common_params params_base;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
+    // whether any configured drafter reads the prompt's tokens (the n-gram family); set at load
+    bool spec_reads_prompt = false;
+
     common_init_result_ptr llama_init;
 
     llama_context * ctx_tgt = nullptr;
@@ -1415,6 +1418,13 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+
+        spec_reads_prompt = std::any_of(params_base.speculative.types.begin(), params_base.speculative.types.end(),
+            [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE || t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
+                       t == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V || t == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
+                       t == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+            });
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -3510,7 +3520,11 @@ private:
                             return; // no draft this step
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        // only the n-gram drafters read the prompt's tokens (MTP and model drafters do not): build
+                        // the whole-context copy for them alone, never per step for nobody (CONTINUUM-ENGINE 4.7.13)
+                        if (spec_reads_prompt) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,

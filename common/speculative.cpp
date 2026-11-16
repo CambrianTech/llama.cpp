@@ -2677,8 +2677,8 @@ void common_speculative_draft(common_speculative * spec) {
                 }
 
                 if (!result.empty()) {
-                    SPC_DBG("called impl %s, hist size = %zu, call_count = %zu, gen = %zu\n",
-                            common_speculative_type_to_str(impl.get()->type).c_str(), dp.prompt->size(),
+                    SPC_DBG("called impl %s, n_past = %zu, call_count = %zu, gen = %zu\n",
+                            common_speculative_type_to_str(impl.get()->type).c_str(), (size_t) dp.n_past,
                             impl.get()->n_call_draft, result.size());
 
                     // remember which implementation was used
