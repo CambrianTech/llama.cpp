@@ -1923,9 +1923,16 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
         SRV_ERR("prompt cache disk tier: cannot open %s\n", state.spill_path.c_str());
         return false;
     }
+    // the file must be exactly what this instance admitted when it spilled: the state's bytes plus one
+    // 8-byte length per block; anything else is refused before a single block is read or allocated
+    // (Codex on #124: the file size alone could exceed the admitted state)
+    const uint64_t n_blocks = 2 + 3 * (uint64_t) state.prompt.checkpoints.size();
+    const uint64_t expected = (uint64_t) state.spill_size + n_blocks * sizeof(uint64_t);
     std::error_code size_ec;
-    uint64_t remaining = std::filesystem::file_size(state.spill_path, size_ec);
-    bool ok = !size_ec && server_spill_read_block(f, state.data.main, remaining) && server_spill_read_block(f, state.data.drft, remaining);
+    const uint64_t file_bytes = std::filesystem::file_size(state.spill_path, size_ec);
+    uint64_t remaining = expected;
+    bool ok = !size_ec && file_bytes == expected &&
+              server_spill_read_block(f, state.data.main, remaining) && server_spill_read_block(f, state.data.drft, remaining);
     for (auto & ckpt : state.prompt.checkpoints) {
         ok = ok && server_spill_read_block(f, ckpt.data_tgt, remaining) && server_spill_read_block(f, ckpt.data_dft, remaining) &&
              server_spill_read_block(f, ckpt.data_spec, remaining);

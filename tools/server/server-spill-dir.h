@@ -39,16 +39,18 @@ public:
     server_owner_lock & operator=(const server_owner_lock &) = delete;
     ~server_owner_lock() { release(); }
 
-    // true when this process now holds the lock on `path` (created if absent)
-    bool try_take(const std::filesystem::path & path) {
+    // true when this process now holds the lock on `path`. `create`: make the file (exclusively: it
+    // must not exist yet); otherwise open only an existing file, never creating a marker for anyone.
+    bool try_take(const std::filesystem::path & path, bool create) {
         release();
 #if defined(_WIN32)
-        // no sharing: a second open of a file another process holds open fails
-        handle = CreateFileW(path.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS,
-                             FILE_ATTRIBUTE_NORMAL, nullptr);
+        // no read/write sharing: a second open of a file another process holds open fails (delete
+        // sharing lets the owner rename its own marker)
+        handle = CreateFileW(path.wstring().c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_DELETE, nullptr,
+                             create ? CREATE_NEW : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         return handle != INVALID_HANDLE_VALUE;
 #else
-        fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC | (create ? (O_CREAT | O_EXCL) : 0), 0600);
         if (fd < 0) {
             return false;
         }
@@ -83,10 +85,17 @@ private:
 #endif
 };
 
+// The instance directory's protocol. The marker is published before the directory and only while
+// locked, so a sweeper can never see a live owner unlocked (Codex on #124: a claim raced a sweep):
+//   owner:   create <name>.owner.tmp exclusively, lock it, rename it to <name>.owner (atomic; the lock
+//            stays on the open file), then create <name>/;
+//   sweeper: for each final <name>.owner (never a .tmp, never anything else), open it WITHOUT creating
+//            and try the lock; taken means its owner is gone: remove <name>/, then the marker. A
+//            directory without a marker, a .tmp, or any other file is never touched.
 class server_spill_dir {
 public:
-    // Claims an instance directory under `base` and sweeps instance directories whose owner is gone.
-    // Returns the number swept; `ok()` says whether this instance holds its directory.
+    // Claims an instance directory under `base` and sweeps instances whose owner is gone. Returns the
+    // number swept; `ok()` says whether this instance holds its directory.
     size_t claim(const std::filesystem::path & base, std::error_code & ec) {
         std::filesystem::create_directories(base, ec);
         if (ec) {
@@ -98,26 +107,53 @@ public:
 #else
         const long pid = (long) ::getpid();
 #endif
-        dir = base / ("instance-" + std::to_string(pid) + "-" + std::to_string(ns));
+        const std::string name = "instance-" + std::to_string(pid) + "-" + std::to_string(ns);
+        const auto tmp    = base / (name + ".owner.tmp");
+        const auto marker = base / (name + ".owner");
+        if (!owner.try_take(tmp, /*create=*/true)) {
+            return 0;
+        }
+        std::filesystem::rename(tmp, marker, ec);
+        if (ec) {
+            owner.release();
+            std::error_code rm;
+            std::filesystem::remove(tmp, rm);
+            return 0;
+        }
+        dir = base / name;
         std::filesystem::create_directories(dir, ec);
-        if (ec || !owner.try_take(dir / ".owner")) {
+        if (ec) {
+            owner.release();
+            std::error_code rm;
+            std::filesystem::remove(marker, rm);
             dir.clear();
             return 0;
         }
-        size_t swept = 0;
+        owner_marker = marker;
+        // collect first: removing entries while iterating the same directory is unspecified
+        std::vector<std::filesystem::path> markers;
         for (const auto & entry : std::filesystem::directory_iterator(base, ec)) {
-            const auto name = entry.path().filename().string();
-            if (!entry.is_directory() || name.rfind("instance-", 0) != 0 || entry.path() == dir) {
-                continue; // anything that is not an instance directory is never ours to touch
+            markers.push_back(entry.path());
+        }
+        size_t swept = 0;
+        for (const auto & path : markers) {
+            const auto file = path.filename().string();
+            const std::string suffix = ".owner";
+            if (file.rfind("instance-", 0) != 0 || file.size() <= suffix.size() ||
+                file.compare(file.size() - suffix.size(), suffix.size(), suffix) != 0 || path == marker) {
+                continue; // only a final owner marker names an instance a sweeper may judge
             }
             server_owner_lock probe;
-            if (!probe.try_take(entry.path() / ".owner")) {
-                continue; // a live owner holds it
+            if (!probe.try_take(path, /*create=*/false)) {
+                continue; // a live owner holds it (or it vanished meanwhile)
             }
-            probe.release();
+            const auto instance = base / file.substr(0, file.size() - suffix.size());
             std::error_code rm;
-            std::filesystem::remove_all(entry.path(), rm);
-            swept += rm ? 0 : 1;
+            std::filesystem::remove_all(instance, rm);
+            if (!rm) {
+                std::filesystem::remove(path, rm); // the marker last: a crash in between is swept again
+                swept += rm ? 0 : 1;
+            }
         }
         return swept;
     }
@@ -127,14 +163,16 @@ public:
 
     ~server_spill_dir() {
         if (ok()) {
-            owner.release();
             std::error_code ec;
             std::filesystem::remove_all(dir, ec); // this instance's files leave with it
+            std::filesystem::remove(owner_marker, ec);
+            owner.release();
         }
     }
 
 private:
     std::filesystem::path dir;
+    std::filesystem::path owner_marker;
     server_owner_lock     owner;
 };
 

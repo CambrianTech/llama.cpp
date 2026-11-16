@@ -24,23 +24,31 @@ static void two_owners_never_touch_each_other() {
     const fs::path base = fs::temp_directory_path() / ("spill-dir-test-" + std::to_string(std::rand()));
     fs::remove_all(base);
     fs::create_directories(base);
-    { std::ofstream(base / "foreign.state") << "not ours"; }      // a file in DIR that is no instance's
-    fs::create_directories(base / "notes");                         // a directory that is no instance's
-    // an abandoned instance: its .owner exists but nobody holds the lock
+    { std::ofstream(base / "foreign.state") << "not ours"; }       // a file in DIR that is no instance's
+    fs::create_directories(base / "notes");                          // a directory that is no instance's
+    // an abandoned instance: its final marker exists and nobody holds its lock
     fs::create_directories(base / "instance-1-1");
-    { std::ofstream(base / "instance-1-1" / ".owner") << ""; }
+    { std::ofstream(base / "instance-1-1.owner") << ""; }
     { std::ofstream(base / "instance-1-1" / "0.state") << "stale"; }
+    // an instance directory with NO marker (a claim before its marker, or anything unproven): untouched,
+    // and a sweeper never creates a marker for it (Codex on #124)
+    fs::create_directories(base / "instance-2-2");
+    // a claim in progress: its .tmp marker exists (a live owner would hold it): never judged
+    { std::ofstream(base / "instance-3-3.owner.tmp") << ""; }
 
     std::error_code ec;
     auto a = std::make_unique<server_spill_dir>();
-    require(a->claim(base, ec) == 1 && a->ok(), "the first owner claims its directory and sweeps the abandoned one");
+    require(a->claim(base, ec) == 1 && a->ok(), "the first owner claims its directory and sweeps the one abandoned instance");
     { std::ofstream(a->path() / "0.state") << "a's spill"; }
     server_spill_dir b;
-    require(b.claim(base, ec) == 0 && b.ok(), "a second live owner sweeps nothing");
+    require(b.claim(base, ec) == 0 && b.ok(), "a second live owner sweeps nothing: the first one's marker is locked");
     require(a->path() != b.path(), "each owner has its own directory");
     require(fs::exists(a->path() / "0.state"), "the second owner never deletes the first owner's spill");
-    require(fs::exists(base / "foreign.state") && fs::exists(base / "notes"), "nothing that is not an instance directory is touched");
-    require(!fs::exists(base / "instance-1-1"), "an abandoned instance directory is swept");
+    require(fs::exists(base / "foreign.state") && fs::exists(base / "notes"), "nothing that is not an instance is touched");
+    require(!fs::exists(base / "instance-1-1") && !fs::exists(base / "instance-1-1.owner"), "an abandoned instance and its marker are swept");
+    require(fs::exists(base / "instance-2-2") && !fs::exists(base / "instance-2-2.owner"),
+            "a directory without a marker is never swept, and no sweeper creates a marker for it");
+    require(fs::exists(base / "instance-3-3.owner.tmp"), "a claim in progress (.tmp) is never judged");
     const fs::path a_dir = a->path();
     a.reset();
     require(!fs::exists(a_dir), "an owner's directory leaves with it");
