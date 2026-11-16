@@ -3293,10 +3293,12 @@ private:
                     // on successful decode, restore the original batch size
                     n_batch = llama_n_batch(ctx_tgt);
                 } else {
+                    budget->abandon(ggml_time_us()); // this attempt failed where it stands
                     // try again with the updated n_batch
                     continue;
                 }
             } catch (const std::exception & e) {
+                budget->abandon(ggml_time_us());
                 SRV_ERR("decode() failed: %s\n", e.what());
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
@@ -3307,6 +3309,7 @@ private:
                 budget->end(ggml_time_us(), std::any_of(slots.begin(), slots.end(),
                         [](const server_slot & sl) { return sl.is_processing(); }));
             } catch (const std::exception & e) {
+                budget->abandon(ggml_time_us());
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing

@@ -21,8 +21,9 @@
 // to the next begin, is `unsynced_us` and nothing else, so it never enters the synchronized timings.
 // Time while no work is pending is not counted at all: an engine waiting for requests is not stalling.
 // An attempt that never reaches end() (llama_decode returned non-zero and the loop retries, or a throw
-// left the step) is closed by the next begin as `failed_steps` / `failed_us` (its begin to that next
-// begin), so its cost is never lost and never mixed into the good steps' timings (Codex on #133).
+// left the step) is closed where it fails, by abandon(), as `failed_steps` / `failed_us` (its begin to
+// that exit), exactly once; it is never mixed into the good steps' timings and never absorbs the idle
+// time after it (Codex on #133).
 //
 // The counters are cumulative and monotonic, written by the decode thread with relaxed atomics and
 // read from any thread without a lock; a reader differences two reads into a window, so the engine
@@ -66,12 +67,7 @@ class step_budget {
 public:
     // The decode thread, around each llama_decode call. `now_us` is a monotonic clock.
     void begin(int64_t now_us, step_kind kind, uint32_t n_tokens) {
-        if (open_) {
-            // the previous attempt never ended: a failed or retried decode
-            auto & c = of(kind_);
-            add(c.failed_steps, 1);
-            add(c.failed_us, span(begin_us_, now_us));
-        }
+        abandon(now_us); // an exit that missed its abandon() still counts, up to here
         close_previous(now_us);
         open_       = true;
         kind_       = kind;
@@ -107,6 +103,19 @@ public:
         synced_kind_  = synced_.has_value();
         open_         = false;
         after_end_    = true;
+    }
+
+    // The decode loop, where an attempt fails (a non-zero return it retries or reports, or a throw from the
+    // decode or its post-processing). Once per attempt: a closed or ended step is left as it is.
+    void abandon(int64_t now_us) {
+        if (!open_) {
+            return;
+        }
+        auto & c = of(kind_);
+        add(c.failed_steps, 1);
+        add(c.failed_us, span(begin_us_, now_us));
+        open_      = false;
+        after_end_ = false; // the time after a failure is not a stall this engine can attribute
     }
 
     step_budget_snapshot snapshot() const { return { read(decode_), read(with_prefill_) }; }

@@ -83,26 +83,30 @@ static void a_reader_differences_a_window_while_the_loop_runs() {
     require(sb.snapshot().decode.steps == 200000, "every step counted");
 }
 
-// what this catches: llama_decode returning non-zero (the loop retries with a smaller batch) or a throw left
-// a begin open; the next begin overwrote it and the attempt's cost vanished
-static void a_failed_attempt_is_counted_apart() {
+// what this catches: llama_decode returning non-zero (the loop retries) or a throw left a begin open, and
+// either the next begin overwrote it (the cost vanished) or closed it late (the idle time after it counted)
+static void a_failed_attempt_is_closed_where_it_fails() {
     step_budget sb;
     sb.begin(0, step_kind::with_prefill, 512);
-    sb.submitted(700);                                 // returned non-zero: no sync, no end
-    int64_t t = step(sb, 900, step_kind::with_prefill, 256, 200, 300, 50, true); // the retry
-    sb.begin(t, step_kind::decode, 1);
+    sb.submitted(700);
+    sb.abandon(700);                                   // returned non-zero: closed at the retry decision
+    sb.abandon(800);                                   // exactly once
     auto p = sb.snapshot().with_prefill;
-    require(p.failed_steps == 1 && p.failed_us == 900, "the abandoned attempt counts its begin to the retry's begin");
-    require(p.steps == 1 && p.decode_call_us == 200 && p.sync_wait_us == 300 && p.inter_step_us == 50,
+    require(p.failed_steps == 1 && p.failed_us == 700, "the failed attempt counts its begin to its exit, once");
+    int64_t t = step(sb, 900, step_kind::with_prefill, 256, 200, 300, 50, true); // the retry
+    p = sb.snapshot().with_prefill;
+    require(p.steps == 1 && p.decode_call_us == 200 && p.sync_wait_us == 300 && p.failed_us == 700,
             "the retry alone is the synchronized step");
-    sb.begin(t + 10, step_kind::decode, 1);            // a throw left this decode open
-    sb.begin(t + 80, step_kind::decode, 1);
-    require(sb.snapshot().decode.failed_steps == 2 && sb.snapshot().decode.failed_us == 80,
-            "consecutive abandoned attempts each count their span");
+    sb.begin(t, step_kind::decode, 1);
+    sb.abandon(t + 10);                                // a throw, then a minute with no requests
+    require(sb.snapshot().decode.failed_us == 10, "visible before the next request, without the idle minute");
+    sb.begin(t + 60'000'000, step_kind::decode, 1);
+    auto d = sb.snapshot().decode;
+    require(d.failed_us == 10 && d.inter_step_us == 0 && d.unsynced_us == 0, "the idle minute is nobody's cost");
 }
 
 int main() {
-    a_failed_attempt_is_counted_apart();
+    a_failed_attempt_is_closed_where_it_fails();
     a_decode_loop_is_attributed_exactly();
     an_idle_engine_is_not_a_stall();
     an_unsynchronized_step_is_only_unsynced();
