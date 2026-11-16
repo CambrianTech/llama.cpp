@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <map>
 #include <optional>
 #include <string>
@@ -75,9 +76,14 @@ struct host_pool_reservation {
 };
 
 struct host_pool_reserve_result {
-    std::optional<host_pool_reservation> reservation; // set when admitted
-    std::optional<host_pool_refusal>     refusal;     // set when refused
-    std::vector<uint64_t>                evict;       // residents the owner must free now (admitted or not)
+    std::expected<host_pool_reservation, host_pool_refusal> admitted;
+    std::vector<uint64_t> evict; // residents the owner must free now (admitted or not)
+};
+
+// Why a commit did not land.
+enum class host_pool_commit_refusal : uint8_t {
+    unknown_reservation,   // never reserved, already committed, or rolled back
+    larger_than_reserved,  // the copy grew past its reservation: the peak was not bounded
 };
 
 // The engine instance a grant is meant for.
@@ -88,7 +94,8 @@ struct host_pool_instance {
     bool operator==(const host_pool_instance & o) const { return pid == o.pid && started_s == o.started_s; }
 };
 
-enum class host_pool_outcome_kind : uint8_t { applied, pending, refused };
+// Where a granted budget stands: reached, or still above it while pinned bytes drain.
+enum class host_pool_outcome_kind : uint8_t { applied, pending };
 
 enum class host_pool_grant_refusal : uint8_t { wrong_instance, stale_generation, generation_conflict };
 
@@ -102,9 +109,8 @@ inline const char * host_pool_grant_refusal_name(host_pool_grant_refusal r) {
 }
 
 struct host_pool_grant_result {
-    host_pool_outcome_kind                 outcome = host_pool_outcome_kind::applied;
-    std::optional<host_pool_grant_refusal> refusal;
-    std::vector<uint64_t>                  evict; // residents the owner must free now to move toward the target
+    std::expected<host_pool_outcome_kind, host_pool_grant_refusal> outcome;
+    std::vector<uint64_t> evict; // residents the owner must free now to move toward the target
 };
 
 class host_pool {
@@ -114,64 +120,56 @@ public:
 
     // ---- the core's grant -------------------------------------------------------------------
     host_pool_grant_result set_budget(host_pool_instance instance, uint64_t generation, size_t bytes) {
-        host_pool_grant_result out;
+        // a refusal leaves the state exactly as it was
         if (!(instance == instance_)) {
-            out.outcome = host_pool_outcome_kind::refused;
-            out.refusal = host_pool_grant_refusal::wrong_instance;
-            return out;
+            return { std::unexpected(host_pool_grant_refusal::wrong_instance), {} };
         }
         if (generation < generation_) {
-            out.outcome = host_pool_outcome_kind::refused;
-            out.refusal = host_pool_grant_refusal::stale_generation;
-            return out;
+            return { std::unexpected(host_pool_grant_refusal::stale_generation), {} };
         }
         if (generation == generation_ && bytes != target_) {
-            out.outcome = host_pool_outcome_kind::refused;
-            out.refusal = host_pool_grant_refusal::generation_conflict;
-            return out;
+            return { std::unexpected(host_pool_grant_refusal::generation_conflict), {} };
         }
         generation_ = generation;
         target_     = bytes;
-        out.evict   = make_room(0);
-        out.outcome = outcome();
-        return out;
+        auto evict  = make_room(0);
+        return { outcome(), std::move(evict) };
     }
 
     // ---- allocation ---------------------------------------------------------------------------
     // Reserve `bytes` for a new resident of `kind`. The owner frees every id in `evict` (whether or
     // not the reservation was admitted), then copies only inside an admitted reservation.
     host_pool_reserve_result reserve(host_pool_kind kind, size_t bytes) {
-        host_pool_reserve_result out;
         if (bytes > target_) {
-            out.refusal = host_pool_refusal::oversized;
             refused_[(size_t) host_pool_refusal::oversized]++;
-            return out;
+            return { std::unexpected(host_pool_refusal::oversized), {} };
         }
-        out.evict = make_room(bytes);
+        auto evict = make_room(bytes);
         if (charged() + bytes > target_) {
-            out.refusal = host_pool_refusal::pinned_pressure;
             refused_[(size_t) host_pool_refusal::pinned_pressure]++;
-            return out;
+            return { std::unexpected(host_pool_refusal::pinned_pressure), std::move(evict) };
         }
         const uint64_t id = next_id_++;
         reserved_ += bytes;
         reservations_[id] = host_pool_reservation{ id, kind, bytes };
-        out.reservation   = reservations_[id];
-        return out;
+        return { reservations_[id], std::move(evict) };
     }
 
-    // The copy succeeded: the reservation becomes a committed resident of its actual `bytes` (at most
-    // what was reserved), returning its id. Unknown reservation: false.
-    bool commit(const host_pool_reservation & r, size_t bytes, host_pool_value value) {
+    // The copy succeeded: the reservation becomes a committed resident of its actual `bytes`, at most
+    // what was reserved (the rest returns to the pool).
+    std::expected<void, host_pool_commit_refusal> commit(const host_pool_reservation & r, size_t bytes, host_pool_value value) {
         auto it = reservations_.find(r.id);
-        if (it == reservations_.end() || bytes > it->second.bytes) {
-            return false;
+        if (it == reservations_.end()) {
+            return std::unexpected(host_pool_commit_refusal::unknown_reservation);
+        }
+        if (bytes > it->second.bytes) {
+            return std::unexpected(host_pool_commit_refusal::larger_than_reserved);
         }
         reserved_ -= it->second.bytes;
         reservations_.erase(it);
         residents_[r.id] = host_pool_resident{ r.kind, bytes, value, 0, ++clock_ };
         committed_[(size_t) r.kind] += bytes;
-        return true;
+        return {};
     }
 
     // The copy failed: the reservation's bytes return, nothing is committed.

@@ -26,9 +26,15 @@ set_tests_properties(test-server-learn-ledger PROPERTIES LABELS "main")
 
 # Model-free host-pool validator: one byte budget across prompt cache, checkpoints and pages.
 add_executable(test-server-host-pool test-server-host-pool.cpp)
-target_compile_features(test-server-host-pool PRIVATE cxx_std_17)
+target_compile_features(test-server-host-pool PRIVATE cxx_std_23)
 add_test(NAME test-server-host-pool COMMAND test-server-host-pool)
 set_tests_properties(test-server-host-pool PROPERTIES LABELS "main")
+
+# Model-free engine-module validator: own thread, move-only jobs, snapshots that never wait.
+add_executable(test-server-module test-server-module.cpp)
+target_compile_features(test-server-module PRIVATE cxx_std_23)
+add_test(NAME test-server-module COMMAND test-server-module)
+set_tests_properties(test-server-module PROPERTIES LABELS "main")
 
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})

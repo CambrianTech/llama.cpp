@@ -34,10 +34,10 @@ static void within(const host_pool & p, const char * where) {
 static uint64_t admit(host_pool & p, K kind, size_t bytes, host_pool_value value, std::vector<uint64_t> & freed) {
     auto r = p.reserve(kind, bytes);
     freed.insert(freed.end(), r.evict.begin(), r.evict.end());
-    require(r.reservation.has_value(), "the allocation is admitted");
-    require(p.commit(*r.reservation, bytes, value), "the reservation commits");
+    require(r.admitted.has_value(), "the allocation is admitted");
+    require(p.commit(*r.admitted, bytes, value).has_value(), "the reservation commits");
     within(p, "admit stays within the grant");
-    return r.reservation->id;
+    return r.admitted->id;
 }
 
 static void eviction_order_is_one_value_unit() {
@@ -62,16 +62,16 @@ static void eviction_order_is_one_value_unit() {
 static void reservations_bound_the_peak_and_roll_back() {
     host_pool p(ENGINE, 1000);
     auto a = p.reserve(K::checkpoint, 700);
-    require(a.reservation.has_value(), "the first reservation fits");
+    require(a.admitted.has_value(), "the first reservation fits");
     within(p, "a reservation counts against the grant before any copy");
     auto b = p.reserve(K::cache, 400);
-    require(!b.reservation && b.refusal == host_pool_refusal::pinned_pressure, "a reserved peak leaves no room: typed refusal, never an overflow");
-    p.rollback(*a.reservation);
+    require(!b.admitted && b.admitted.error() == host_pool_refusal::pinned_pressure, "a reserved peak leaves no room: typed refusal, never an overflow");
+    p.rollback(*a.admitted);
     require(p.reserved_bytes() == 0 && p.committed_bytes() == 0, "a failed copy returns every reserved byte");
     auto c = p.reserve(K::cache, 400);
-    require(c.reservation.has_value(), "after the rollback the bytes are free again");
-    require(!p.commit(*c.reservation, 401, host_pool_value::unmeasured()), "a commit larger than its reservation is refused");
-    require(p.commit(*c.reservation, 380, host_pool_value::unmeasured()), "a commit at or under its reservation lands");
+    require(c.admitted.has_value(), "after the rollback the bytes are free again");
+    require(!p.commit(*c.admitted, 401, host_pool_value::unmeasured()).has_value(), "a commit larger than its reservation is refused");
+    require(p.commit(*c.admitted, 380, host_pool_value::unmeasured()).has_value(), "a commit at or under its reservation lands");
     require(p.committed_bytes() == 380 && p.reserved_bytes() == 0, "the actual bytes are charged, the rest returns");
     within(p, "commit");
 }
@@ -80,11 +80,11 @@ static void oversized_and_pinned_are_typed_refusals() {
     host_pool p(ENGINE, 1000);
     std::vector<uint64_t> freed;
     auto big = p.reserve(K::cache, 1001);
-    require(!big.reservation && big.refusal == host_pool_refusal::oversized, "larger than the whole grant: oversized");
+    require(!big.admitted && big.admitted.error() == host_pool_refusal::oversized, "larger than the whole grant: oversized");
     const uint64_t held = admit(p, K::checkpoint, 900, host_pool_value::measured(1e-6), freed);
     require(p.pin(held), "a restore pins it");
     auto squeezed = p.reserve(K::cache, 200);
-    require(!squeezed.reservation && squeezed.refusal == host_pool_refusal::pinned_pressure, "a pinned resident is never evicted for a newcomer");
+    require(!squeezed.admitted && squeezed.admitted.error() == host_pool_refusal::pinned_pressure, "a pinned resident is never evicted for a newcomer");
     require(p.holds(held), "the pinned resident is still held");
     require(p.refused(host_pool_refusal::oversized) == 1 && p.refused(host_pool_refusal::pinned_pressure) == 1, "refusals are counted by cause");
     within(p, "refusals leave the accounting intact");
@@ -116,22 +116,22 @@ static void zero_budget_is_legal() {
     require(zero.outcome == O::applied && zero.evict.size() == 2, "a zero grant evicts every unpinned resident");
     require(p.committed_bytes() == 0, "nothing is held under a zero grant");
     auto next = p.reserve(K::checkpoint, 1);
-    require(!next.reservation && next.refusal == host_pool_refusal::oversized, "under a zero grant every allocation is refused, typed");
+    require(!next.admitted && next.admitted.error() == host_pool_refusal::oversized, "under a zero grant every allocation is refused, typed");
 }
 
 static void grants_are_keyed_by_instance_and_generation() {
     host_pool p(ENGINE, 1000);
     const host_pool_instance other{ 4242, 1794830001 };
     auto foreign = p.set_budget(other, 1, 500);
-    require(foreign.outcome == O::refused && foreign.refusal == host_pool_grant_refusal::wrong_instance, "a grant for another instance is refused");
+    require(!foreign.outcome && foreign.outcome.error() == host_pool_grant_refusal::wrong_instance, "a grant for another instance is refused");
     require(p.target_bytes() == 1000 && p.generation() == 0, "a refused grant leaves the state exactly as it was");
     require(p.set_budget(ENGINE, 2, 800).outcome == O::applied, "a newer generation applies");
     auto repeat = p.set_budget(ENGINE, 2, 800);
     require(repeat.outcome == O::applied && repeat.evict.empty() && p.target_bytes() == 800, "the same generation and size is an idempotent repeat");
     auto conflict = p.set_budget(ENGINE, 2, 700);
-    require(conflict.outcome == O::refused && conflict.refusal == host_pool_grant_refusal::generation_conflict, "the same generation with another size is refused");
+    require(!conflict.outcome && conflict.outcome.error() == host_pool_grant_refusal::generation_conflict, "the same generation with another size is refused");
     auto stale = p.set_budget(ENGINE, 1, 900);
-    require(stale.outcome == O::refused && stale.refusal == host_pool_grant_refusal::stale_generation, "an older generation is refused");
+    require(!stale.outcome && stale.outcome.error() == host_pool_grant_refusal::stale_generation, "an older generation is refused");
     require(p.target_bytes() == 800 && p.generation() == 2, "refusals never move the grant");
 }
 
@@ -152,13 +152,13 @@ static void a_day_of_mixed_traffic_never_exceeds_the_grant() {
                     require(!p.holds(id), "an evicted resident is no longer held");
                     live.erase(std::remove(live.begin(), live.end(), id), live.end());
                 }
-                if (r.reservation) {
+                if (r.admitted) {
                     if (rnd() % 10 == 0) {
-                        p.rollback(*r.reservation);
+                        p.rollback(*r.admitted);
                     } else {
                         const auto v = rnd() % 3 == 0 ? host_pool_value::unmeasured() : host_pool_value::measured((double) (rnd() % 1000) * 1e-9);
-                        require(p.commit(*r.reservation, bytes - (bytes > 1 ? rnd() % (bytes / 2 + 1) : 0), v), "commit within the reservation");
-                        live.push_back(r.reservation->id);
+                        require(p.commit(*r.admitted, bytes - (bytes > 1 ? rnd() % (bytes / 2 + 1) : 0), v).has_value(), "commit within the reservation");
+                        live.push_back(r.admitted->id);
                     }
                 }
                 break;

@@ -33,6 +33,9 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+# Continuum fork: the server is C++23 (std::expected, jthread/stop_token, concepts): one engine-module
+# pattern (server-module.h) and typed outcomes instead of hand-built threads and boolean results.
+target_compile_features(${TARGET} PUBLIC cxx_std_23)
 
 # the faults tools/server/tests inject (server-test-faults.h); only the server test build sets it
 option(LLAMA_SERVER_TEST_FAULTS "llama-server: compile in the test fault injection (tests only, never a release)" OFF)
@@ -69,4 +72,4 @@ add_executable(${TARGET} main.cpp)
 install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
-target_compile_features(${TARGET} PRIVATE cxx_std_17)
+target_compile_features(${TARGET} PRIVATE cxx_std_23)
