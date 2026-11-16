@@ -769,9 +769,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    // ballpark first unless the grammar must see the whole vocabulary now; a grammar rejection below
-    // resamples over the full array
-    gsmpl->set_logits(ctx, idx, /*coarse=*/!(grammar_first && grammar_should_apply(gsmpl)));
+    // ballpark first unless the grammar must see the whole vocabulary now, or the reasoning budget is
+    // FORCING (it sets every candidate but the forced token to -inf, and the forced token need not be in
+    // a ballpark subset); a grammar rejection below resamples over the full array
+    const bool forcing = rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING;
+    gsmpl->set_logits(ctx, idx, /*coarse=*/!forcing && !(grammar_first && grammar_should_apply(gsmpl)));
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
