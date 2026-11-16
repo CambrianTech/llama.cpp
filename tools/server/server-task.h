@@ -60,6 +60,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_MIND_PREFETCH, // Continuum fork: the next mind, from flash into a parked sequence, ahead of her turn
     SERVER_TASK_TYPE_SLOT_PAGE_IO_DONE, // Continuum fork: a save's or restore's file IO finished on its worker
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,

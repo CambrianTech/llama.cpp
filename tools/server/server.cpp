@@ -230,6 +230,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_prompt_cache_limit     = models_routes->proxy_post;
         routes.get_page_io                 = models_routes->proxy_get;
         routes.post_page_io_budget         = models_routes->proxy_post;
+        routes.post_minds_prefetch         = models_routes->proxy_post;
         routes.post_learn_residency        = models_routes->proxy_post;
         routes.release_learn_residency     = models_routes->proxy_post;
         routes.revoke_learn_residency      = models_routes->proxy_post;
@@ -303,6 +304,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/prompt-cache/limit",        ex_wrapper(routes.post_prompt_cache_limit));
     ctx_http.get ("/page-io",                   ex_wrapper(routes.get_page_io));
     ctx_http.post("/page-io/budget",            ex_wrapper(routes.post_page_io_budget));
+    ctx_http.post("/minds/prefetch",            ex_wrapper(routes.post_minds_prefetch));
     ctx_http.post("/learn/grants/revoke",       ex_wrapper(routes.revoke_learn_grant));
     ctx_http.get ("/train",                    ex_wrapper(routes.get_train));
     ctx_http.post("/train",                    ex_wrapper(routes.post_train));

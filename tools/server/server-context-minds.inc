@@ -195,6 +195,41 @@
         return ok;
     }
 
+    // Ahead of her turn (the core names who is next): a mind on flash is inserted into a free parked sequence
+    // now, while the others decode, so her switch is the sequence move. Returns where she is afterwards.
+    const char * mind_prefetch(mind_page page) {
+        for (const auto & s : slots) {
+            if (s.page == page) {
+                return "lane";
+            }
+        }
+        resident_mind * m = find_mind(page);
+        if (m == nullptr) {
+            return "new";
+        }
+        if (m->seq >= 0) {
+            m->last_use = ++mind_clock; // she is next: the last to be sent down
+            return "parked";
+        }
+        if (park_free.empty()) {
+            flash_coldest();
+        }
+        if (park_free.empty()) {
+            return "flash, no parked id free";
+        }
+        const llama_seq_id seq = park_free.back();
+        park_free.pop_back();
+        // flash_coldest() may run inside the insert and move records: hold her by page, not by pointer
+        if (!flash_insert(*find_mind(page), seq)) {
+            park_free.push_back(seq);
+            return "flash, pool full";
+        }
+        resident_mind * back = find_mind(page);
+        back->seq      = seq;
+        back->last_use = ++mind_clock;
+        return "parked";
+    }
+
     // `slot` serves `page` next. The mind it holds (if any) is parked; hers comes back from where she is.
     void mind_switch(server_slot & slot, mind_page page) {
         if (slot.page == page) {

@@ -2926,6 +2926,16 @@ private:
                 {
                     page_io_done(std::move(task));
                 } break;
+            case SERVER_TASK_TYPE_MIND_PREFETCH:
+                {
+                    const int64_t t0 = ggml_time_us();
+                    const char * where = minds_on() ? mind_prefetch(task.params.page) : "minds off";
+                    auto res = std::make_unique<server_task_result_control>();
+                    res->id      = task.id;
+                    res->success = std::strcmp(where, "lane") == 0 || std::strcmp(where, "parked") == 0;
+                    res->message = std::string(where) + " (" + std::to_string((ggml_time_us() - t0) / 1000.0) + " ms)";
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -6504,6 +6514,7 @@ void server_routes::init_routes() {
         res->ok(page_io_snapshot());
         return res;
     };
+    this->post_minds_prefetch = [this](const server_http_req & req) { return handle_minds_prefetch(req); };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
     this->revoke_learn_grant = [grant_route](const server_http_req & req) { return grant_route(req, "revoke"); };
 
@@ -6854,6 +6865,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_save_load*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+// Continuum fork: POST /minds/prefetch {"page": "<mind>"}: her state comes from flash into a parked sequence now,
+// ahead of her turn (server-context-minds.inc). The reply names where she is.
+std::unique_ptr<server_res_generator> server_routes::handle_minds_prefetch(const server_http_req & req) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    const json body = req.body.empty() ? json::object() : json::parse(req.body);
+    {
+        server_task task(SERVER_TASK_TYPE_MIND_PREFETCH);
+        task.id = rd.get_new_id();
+        task.params.page = mind_page_parse(json_value(body, "page", std::string()));
+        if (!task.params.page.valid()) {
+            res->error(format_error_response("page must name a mind (32 hexadecimal digits, a UUID)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        rd.post_task(std::move(task));
+    }
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
     res->ok(result->to_json());
     return res;
 }
