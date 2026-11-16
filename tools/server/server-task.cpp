@@ -2024,6 +2024,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.drft =*/ std::move(state_data_dft),
         },
         /*.lora   =*/ lora,
+        /*.spill_path =*/ {},   // resident in RAM until the disk tier spills it
+        /*.spill_size =*/ 0,
     });
 
     return &states.back();
