@@ -54,27 +54,31 @@ public:
     frame_ring & operator=(const frame_ring &) = delete;
 
     // Producer side. False when full: backpressure, decided by the producer, never hidden.
+    // A frame is accepted iff its publication (a CAS on the tail word) lands before a close: a close can
+    // never be erased by a racing push, and a push that returned true is always drained (Codex on #134).
     bool push(const T & frame) {
-        const uint64_t raw = tail_.load(std::memory_order_relaxed);
+        uint64_t raw = tail_.load(std::memory_order_relaxed);
         if (raw & CLOSED) {
             return false; // a closed stream takes nothing more
         }
         const uint64_t tail = raw;
         if (tail - head_cache_ >= slots_.size()) {
-            head_cache_ = head_.load(std::memory_order_acquire);
+            head_cache_ = head_.load(std::memory_order_acquire) & COUNT;
             if (tail - head_cache_ >= slots_.size()) {
                 return false;
             }
         }
         slots_[tail & mask_] = frame;
-        tail_.store(tail + 1, std::memory_order_release);
+        if (!tail_.compare_exchange_strong(raw, tail + 1, std::memory_order_release, std::memory_order_relaxed)) {
+            return false; // closed between the check and the publication: not accepted
+        }
         tail_.notify_one();
         return true;
     }
 
     // Consumer side: take up to out.size() frames at once; returns how many.
     size_t drain(std::span<T> out) {
-        const uint64_t head = head_.load(std::memory_order_relaxed);
+        const uint64_t head = head_.load(std::memory_order_relaxed) & COUNT;
         uint64_t tail = tail_cache_;
         if (tail == head) {
             tail = tail_cache_ = tail_.load(std::memory_order_acquire) & COUNT;
@@ -84,20 +88,22 @@ public:
             out[i] = slots_[(head + i) & mask_];
         }
         if (n > 0) {
-            head_.store(head + n, std::memory_order_release);
+            head_.fetch_add(n, std::memory_order_release); // an RMW: a racing close's bit is never erased
             head_.notify_one(); // a producer waiting for room wakes
         }
         return n;
     }
 
-    // Producer side: sleep until there is room for one frame (an atomic wait on the consumer's head).
-    void wait_for_room() const {
-        const uint64_t tail = tail_.load(std::memory_order_relaxed);
-        uint64_t head = head_.load(std::memory_order_acquire);
-        while (tail - head >= slots_.size()) {
-            head_.wait(head, std::memory_order_acquire);
-            head = head_.load(std::memory_order_acquire);
+    // Producer side: sleep until there is room for one frame or the stream is closed (an atomic wait on the
+    // consumer's head word, which carries the closed bit too). False: closed, nothing more will be taken.
+    bool wait_for_room() const {
+        const uint64_t tail = tail_.load(std::memory_order_relaxed) & COUNT;
+        uint64_t raw = head_.load(std::memory_order_acquire);
+        while (!(raw & CLOSED) && tail - (raw & COUNT) >= slots_.size()) {
+            head_.wait(raw, std::memory_order_acquire);
+            raw = head_.load(std::memory_order_acquire);
         }
+        return !(raw & CLOSED);
     }
 
     // Consumer side: sleep until a frame is pushed or the stream is closed. An atomic wait returns only
@@ -112,16 +118,19 @@ public:
         }
     }
 
-    // The producer ends the stream; a waiting consumer wakes (the word it sleeps on changes).
+    // Either side ends the stream; both words carry the bit, so a waiting consumer AND a producer waiting
+    // for room wake (the word each sleeps on changes). Frames accepted before it are still drained.
     void close() {
-        tail_.fetch_or(CLOSED, std::memory_order_release);
+        tail_.fetch_or(CLOSED, std::memory_order_acq_rel);
+        head_.fetch_or(CLOSED, std::memory_order_acq_rel);
         tail_.notify_all();
+        head_.notify_all();
     }
     bool closed() const { return (tail_.load(std::memory_order_acquire) & CLOSED) != 0; }
 
     size_t   capacity() const { return slots_.size(); }
     uint64_t pushed()   const { return tail_.load(std::memory_order_acquire) & COUNT; }
-    uint64_t taken()    const { return head_.load(std::memory_order_acquire); }
+    uint64_t taken()    const { return head_.load(std::memory_order_acquire) & COUNT; }
 
 private:
     static constexpr uint64_t CLOSED = uint64_t(1) << 63;
@@ -129,7 +138,7 @@ private:
 
     std::vector<T>                     slots_;
     const uint64_t                     mask_;
-    alignas(64) std::atomic<uint64_t>  head_{0};       // consumer writes
+    alignas(64) std::atomic<uint64_t>  head_{0};       // consumer advances (fetch_add): count | CLOSED
     alignas(64) std::atomic<uint64_t>  tail_{0};       // producer writes: count | CLOSED
     alignas(64) uint64_t               head_cache_ = 0; // producer's view of head
     alignas(64) uint64_t               tail_cache_ = 0; // consumer's view of tail
@@ -156,6 +165,53 @@ struct buffer_ref {
     uint64_t      bytes      = 0;
 };
 static_assert(std::is_trivially_copyable_v<buffer_ref>);
+
+// The owning pool's custody of a resolved reference (Codex on #134: a raw pointer plus a generation does
+// not keep the bytes live). A pool resolves a buffer_ref into a pin: the bytes' address, held live and
+// unrecycled until the pin is released (its destructor calls the pool's own unpin with the pool's token).
+// A mover holds a transfer's pins until its completion is drained. Nothing here owns memory: the pool does.
+class buffer_pin {
+public:
+    using unpin_fn = void (*)(void * pool, uint64_t token) noexcept;
+
+    buffer_pin() = default;
+    buffer_pin(std::byte * data, uint64_t bytes, void * pool, unpin_fn unpin, uint64_t token)
+        : data_(data), bytes_(bytes), pool_(pool), unpin_(unpin), token_(token) {}
+    buffer_pin(buffer_pin && o) noexcept { take(o); }
+    buffer_pin & operator=(buffer_pin && o) noexcept {
+        if (this != &o) {
+            release();
+            take(o);
+        }
+        return *this;
+    }
+    buffer_pin(const buffer_pin &)             = delete;
+    buffer_pin & operator=(const buffer_pin &) = delete;
+    ~buffer_pin() { release(); }
+
+    explicit operator bool() const { return data_ != nullptr; }
+    std::byte * data() const { return data_; }
+    uint64_t    bytes() const { return bytes_; }
+
+    void release() noexcept {
+        if (unpin_ != nullptr) {
+            unpin_(pool_, token_);
+        }
+        data_ = nullptr; bytes_ = 0; pool_ = nullptr; unpin_ = nullptr; token_ = 0;
+    }
+
+private:
+    void take(buffer_pin & o) noexcept {
+        data_ = o.data_; bytes_ = o.bytes_; pool_ = o.pool_; unpin_ = o.unpin_; token_ = o.token_;
+        o.data_ = nullptr; o.bytes_ = 0; o.pool_ = nullptr; o.unpin_ = nullptr; o.token_ = 0;
+    }
+
+    std::byte * data_  = nullptr;
+    uint64_t    bytes_ = 0;
+    void *      pool_  = nullptr;
+    unpin_fn    unpin_ = nullptr;
+    uint64_t    token_ = 0;
+};
 
 // ---- moving bytes ----------------------------------------------------------------------------------
 
@@ -220,6 +276,7 @@ public:
             switch (start(*pending_)) {
                 case start_result::started:     started++; pending_.reset(); break;
                 case start_result::refused:     settle(pending_->ticket, transfer_status::refused); pending_.reset(); break;
+                case start_result::aliased:     settle(pending_->ticket, transfer_status::aliased); pending_.reset(); break;
                 case start_result::would_block: return started; // engines full: drain completions, pump again
             }
         }
@@ -275,7 +332,8 @@ public:
     uint64_t backpressured() const { return backpressured_.load(std::memory_order_relaxed); }
 
 protected:
-    enum class start_result : uint8_t { started, refused, would_block };
+    // aliased: the backend found both references resolve to the same physical bytes (nothing to move)
+    enum class start_result : uint8_t { started, refused, would_block, aliased };
 
     // Hand the move to this backend's engines, as much as they have room for, without waiting.
     // would_block: called again with the same frame on the next pump (the backend keeps its own
@@ -336,11 +394,14 @@ private:
 // spread across the lanes, every lane copies its chunks at once, and the LAST chunk of a transfer to
 // land publishes its completion. Lane count and chunk size come from the node's measured copy
 // bandwidth curve (where adding a lane stops adding bandwidth), never a constant here.
+//
+// `Resolver`: callable (const buffer_ref &) -> buffer_pin, the owning pool's own resolution: an empty pin
+// for a stale generation, an unknown buffer or bytes out of bounds. Aliasing and overlap are decided on the
+// resolved PHYSICAL ranges, so two different ids naming the same bytes are caught.
+template <typename Resolver>
 class parallel_copier final : public memory_mover {
 public:
-    using resolver = std::function<std::byte *(const buffer_ref &)>; // a pool's id -> its bytes
-
-    parallel_copier(frame_ring<transfer_frame> & in, resolver resolve, size_t lanes, size_t chunk_bytes, size_t in_flight)
+    parallel_copier(frame_ring<transfer_frame> & in, Resolver resolve, size_t lanes, size_t chunk_bytes, size_t in_flight)
         // every lane's completion ring holds every slot: a slot is retired only when its completion is
         // drained, so a lane can never find its ring full
         : memory_mover(in, std::max<size_t>(in_flight, 1), lanes), resolve_(std::move(resolve)), chunk_(std::max<size_t>(chunk_bytes, 4096)),
@@ -385,18 +446,16 @@ private:
         std::atomic<uint32_t> remaining{0};
         std::atomic<uint8_t>  status{0};       // moved, or failed when shutdown cut it part-handed
         uint64_t              ticket = 0;
+        buffer_pin            src, dst;        // the pools' custody, held until the completion is drained
     };
 
-    // The same live bytes named twice: same domain, pool, buffer, generation, offset AND length, and the
-    // resolver vouches for them (live generation, in bounds).
-    bool aliases(const buffer_ref & a, const buffer_ref & b) const override {
-        return a.domain == b.domain && a.pool == b.pool && a.buffer == b.buffer && a.generation == b.generation &&
-               a.offset == b.offset && a.bytes == b.bytes && a.domain != memory_domain::disk && resolve_(a) != nullptr;
-    }
+    // Decided in start() on the resolved physical ranges, never on ids.
+    bool aliases(const buffer_ref &, const buffer_ref &) const override { return false; }
 
-    static bool overlapping(const buffer_ref & a, const buffer_ref & b) {
-        return a.domain == b.domain && a.pool == b.pool && a.buffer == b.buffer &&
-               a.offset < b.offset + b.bytes && b.offset < a.offset + a.bytes;
+    void free_slot(slot & s) {
+        s.src.release();
+        s.dst.release();
+        s.in_use.store(false, std::memory_order_release);
     }
 
     std::optional<transfer_status> cancel_pending() override {
@@ -407,7 +466,7 @@ private:
         progress_.reset();
         slot & s = slots_[p.slot];
         if (p.next == 0) {
-            s.in_use.store(false, std::memory_order_release); // no chunk handed: nothing written, slot free
+            free_slot(s); // no chunk handed: nothing written; the pins go back to their pools
             return transfer_status::cancelled;
         }
         // part-handed: its handed chunks land and the last one reports `failed` (a partial destination);
@@ -416,36 +475,47 @@ private:
         const uint32_t not_handed = (uint32_t) (p.n_chunks - p.next);
         if (s.remaining.fetch_sub(not_handed, std::memory_order_acq_rel) == not_handed) {
             // every handed chunk already landed before the subtraction: none will report it, so it ends here
-            s.in_use.store(false, std::memory_order_release);
+            free_slot(s);
             return transfer_status::failed;
         }
         return std::nullopt;
     }
 
-    void retire(uint32_t s) override { slots_[s].in_use.store(false, std::memory_order_release); }
+    void retire(uint32_t s) override { free_slot(slots_[s]); }
 
     start_result start(const transfer_frame & t) override {
         if (!progress_) {
             if (t.src.domain == memory_domain::disk || t.dst.domain == memory_domain::disk || t.src.bytes != t.dst.bytes) {
                 return start_result::refused; // disk moves belong to a reader backend; a size mismatch is never truncated
             }
-            if (overlapping(t.src, t.dst)) {
-                return start_result::refused; // independent parallel chunks over overlapping ranges race (UB)
-            }
-            std::byte * src = resolve_(t.src);
-            std::byte * dst = resolve_(t.dst);
-            if (src == nullptr || dst == nullptr) {
+            buffer_pin src = resolve_(t.src);
+            buffer_pin dst = resolve_(t.dst);
+            if (!src || !dst || src.bytes() < t.src.bytes || dst.bytes() < t.dst.bytes) {
                 return start_result::refused; // stale generation, unknown buffer or out of bounds
+            }
+            // physical ranges, whatever ids named them
+            const std::byte * a = src.data();
+            const std::byte * b = dst.data();
+            const uint64_t    n = t.src.bytes;
+            if (a == b) {
+                return start_result::aliased; // the same bytes: nothing to move (the pins go back now)
+            }
+            if (a < b + n && b < a + n) {
+                return start_result::refused; // independent parallel chunks over overlapping ranges race (UB)
             }
             const auto s = claim_slot();
             if (!s) {
-                return start_result::would_block; // every in-flight slot is busy
+                return start_result::would_block; // every in-flight slot is busy (the pins go back; re-resolved next pump)
             }
+            std::byte * src_bytes = src.data();
+            std::byte * dst_bytes = dst.data();
+            slots_[*s].src = std::move(src);
+            slots_[*s].dst = std::move(dst);
             const uint64_t n_chunks = std::max<uint64_t>(1, (t.src.bytes + chunk_ - 1) / chunk_);
             slots_[*s].ticket = t.ticket;
             slots_[*s].status.store((uint8_t) transfer_status::moved, std::memory_order_relaxed);
             slots_[*s].remaining.store((uint32_t) n_chunks, std::memory_order_release);
-            progress_ = progress{ *s, src, dst, t.src.bytes, n_chunks, 0 };
+            progress_ = progress{ *s, src_bytes, dst_bytes, t.src.bytes, n_chunks, 0 };
         }
         // push the remaining chunks, round robin across lanes, as far as the lanes have room
         while (progress_->next < progress_->n_chunks) {
@@ -497,7 +567,7 @@ private:
         }
     }
 
-    resolver                            resolve_;
+    Resolver                            resolve_;
     size_t                              chunk_;
     std::vector<slot>                   slots_;
     std::vector<std::unique_ptr<lane>>  lanes_;
