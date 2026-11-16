@@ -9,9 +9,12 @@
 #include <list>
 #include <map>
 #include <atomic>
+#include <memory>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-page-io.h"
+#include "server-spill-dir.h"
 
 
 struct server_page_job; // server-page-job.h: one page switch between the task loop and its file IO
@@ -773,6 +776,36 @@ struct server_prompt_data {
     }
 };
 
+// A spill in flight: the state's bytes in file order (sequence state main, draft; then each checkpoint's
+// target, draft, speculative). `status`: 0 writing, 1 written, -1 failed.
+struct server_spill_buffer {
+    // status: queued -> writing -> written | failed; or queued -> claimed (the entry was restored before its
+    // write started: the loop took the blocks back by move and the worker skips the write)
+    enum : int { queued = 0, written = 1, failed = -1, writing = 2, claimed = 3 };
+    std::vector<std::vector<uint8_t>> blocks;
+    std::atomic<int>                  status{queued};
+    // Its bytes stay charged (to the one page-IO budget and to the RAM tier's count) for exactly as long
+    // as they exist: released here, when the last owner (the write, or the entry until it is reaped or
+    // erased) lets the buffer go, never at the write's completion while the bytes are still in RAM
+    // (Codex on #124).
+    server_page_reservation                reservation;
+    std::shared_ptr<std::atomic<uint64_t>> counted;
+    uint64_t                               bytes = 0;
+
+    server_spill_buffer() = default;
+    server_spill_buffer(const server_spill_buffer &) = delete;
+    server_spill_buffer & operator=(const server_spill_buffer &) = delete;
+    ~server_spill_buffer() {
+        // the bytes are freed first: a release can admit queued page IO, which must find the RAM already free
+        // (Codex on #124)
+        std::vector<std::vector<uint8_t>>().swap(blocks);
+        reservation.release();
+        if (counted) {
+            counted->fetch_sub(bytes, std::memory_order_relaxed);
+        }
+    }
+};
+
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
@@ -780,6 +813,21 @@ struct server_prompt_cache_state {
     // the adapters the state was computed under; restored only into the same set
     lora_active_set lora;
 
+    // set while the state's bytes (its sequence state and its checkpoints' data) live in this
+    // file instead of RAM; its tokens and checkpoint positions stay in RAM, so a lookup still
+    // matches it without touching the disk
+    std::string spill_path;
+    size_t      spill_size = 0;
+
+    // while its file is being written on the page-io pool: the bytes, moved out of this state (never
+    // copied), read by the write and by a lookup that matches before the write lands
+    std::shared_ptr<server_spill_buffer> spilling;
+
+    bool spilled() const {
+        return !spill_path.empty();
+    }
+
+    // bytes held in RAM: a spilled state holds none
     size_t size() const {
         size_t res = data.size();
 
@@ -805,11 +853,66 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // the disk tier: when set, a state evicted from RAM is written here instead of dropped, and
+    // a lookup that matches it reads it back; empty = no disk tier
+    std::string disk_dir;
+
+    // in bytes, 0 = no limit
+    size_t disk_limit = 0;
+
+    uint64_t spill_seq = 0;
+
+    // this instance's directory under the configured one (server-spill-dir.h: another engine's files are
+    // never touched), and the pool its files are written on (the task loop only moves the bytes)
+    server_spill_dir        spill_dir;
+    server_page_io_pool *   io        = nullptr;
+    server_page_admission * admission = nullptr;
+    // RAM still held by spills whose write has not landed, entries erased meanwhile included: the
+    // RAM tier counts it (size()) so eviction never believes it free early (Codex on #124)
+    std::shared_ptr<std::atomic<uint64_t>> spill_in_flight = std::make_shared<std::atomic<uint64_t>>(0);
+    // a test hook: the page-IO gate (server-test-faults.h), so a test pauses spill writes like page IO
+    std::string io_gate;
+
+    ~server_prompt_cache();
+
+    // enable the disk tier under `dir` (this instance's own directory; instance directories whose owner
+    // is gone are swept), writing on `pool`
+    bool set_disk(const std::string & dir, int32_t limit_mib, server_page_io_pool * pool, server_page_admission * admission,
+                  std::string io_gate);
+
+    // on the task loop: drop the bytes of spills whose write landed, and keep resident the ones whose
+    // write failed
+    void reap_spills();
+
+    // bytes held in RAM, by resident states only
     size_t size() const;
 
+    // bytes held on disk, by spilled states
+    size_t disk_size() const;
+
+    // tokens of the resident states (the RAM tier's token limit)
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_main, size_t state_size_drft);
+    // move the state's bytes to a file; false leaves it resident
+    bool spill(server_prompt_cache_state & state);
+
+    // read a spilled state's bytes back into RAM and remove its file
+    bool unspill(server_prompt_cache_state & state);
+
+    // the resident the incoming request will load (load()'s own choice, by the same cheap prefix test)
+    const server_prompt_cache_state * leaving(const server_tokens & next, const lora_active_set & lora) const;
+    const server_prompt_cache_state * keep = nullptr; // set only for the duration of one alloc
+
+    // remove a state, and its file if it has one
+    std::list<server_prompt_cache_state>::iterator erase(std::list<server_prompt_cache_state>::iterator it);
+
+    // make room in RAM: the oldest resident state goes to disk, or is dropped without a disk tier
+    bool evict_oldest_resident();
+
+    // `next`: the tokens of the request about to load from this cache (nullptr when none). The resident that
+    // request will take is never evicted to make room for this save: it is leaving the cache anyway.
+    server_prompt_cache_state * alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_main, size_t state_size_drft,
+                                      const server_tokens * next = nullptr, const lora_active_set * next_lora = nullptr);
 
     bool load(server_prompt & prompt, const lora_active_set & lora, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

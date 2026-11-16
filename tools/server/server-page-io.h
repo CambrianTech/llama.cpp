@@ -176,6 +176,17 @@ public:
         return false;
     }
 
+    // Admits `bytes` now or refuses: never parks (a caller that cannot wait, e.g. a prompt-cache spill
+    // that must free RAM now, drops instead of queueing behind the budget).
+    bool try_admit(uint64_t bytes) {
+        std::lock_guard<std::mutex> lock(m);
+        if (closed || !waiting.empty() || !fits(bytes)) {
+            return false;
+        }
+        in_flight += bytes;
+        return true;
+    }
+
     void release(uint64_t bytes) {
         std::vector<std::function<void()>> run;
         {

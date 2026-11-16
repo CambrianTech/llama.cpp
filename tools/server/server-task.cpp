@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-test-faults.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -9,6 +10,11 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
 
 #include <sstream>
 
@@ -1747,10 +1753,22 @@ json learn_outcome::to_json() const {
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {
-    size_t res = 0;
+    // resident bytes plus spills whose write has not landed (their entries' vectors are empty while the
+    // bytes sit in the write's buffer; an erased entry's in-flight bytes still count until it lands)
+    size_t res = (size_t) spill_in_flight->load(std::memory_order_relaxed);
 
     for (const auto & state : states) {
         res += state.size();
+    }
+
+    return res;
+}
+
+size_t server_prompt_cache::disk_size() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        res += state.spill_size;
     }
 
     return res;
@@ -1760,13 +1778,278 @@ size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.prompt.n_tokens();
+        if (!state.spilled()) {
+            res += state.prompt.n_tokens();
+        }
     }
 
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache::~server_prompt_cache() = default; // spill_dir removes this instance's directory
+
+bool server_prompt_cache::set_disk(const std::string & dir, int32_t limit_mib, server_page_io_pool * pool,
+                                   server_page_admission * admission_, std::string io_gate_) {
+    std::error_code ec;
+    const size_t swept = spill_dir.claim(dir, ec);
+    if (!spill_dir.ok() || pool == nullptr || admission_ == nullptr) {
+        SRV_ERR("prompt cache disk tier: cannot claim an instance directory under %s: %s\n", dir.c_str(),
+                ec ? ec.message().c_str() : (pool ? "its owner lock is held" : "no page-io pool"));
+        return false;
+    }
+    disk_dir   = spill_dir.path().string();
+    io         = pool;
+    admission  = admission_;
+    io_gate    = std::move(io_gate_);
+    disk_limit = 1024ull*1024ull*(limit_mib < 0 ? 0 : limit_mib);
+    SRV_INF("prompt cache disk tier: %s, size limit: %d MiB (%zu abandoned instance directories swept)\n",
+            disk_dir.c_str(), limit_mib, swept);
+    return true;
+}
+
+bool server_prompt_cache::spill(server_prompt_cache_state & state) {
+    if (disk_dir.empty() || state.spilled()) {
+        return false;
+    }
+    const size_t bytes = state.size();
+    if (disk_limit > 0 && bytes > disk_limit) {
+        return false;
+    }
+    while (disk_limit > 0 && disk_size() + bytes > disk_limit) {
+        auto oldest = std::find_if(states.begin(), states.end(), [](const server_prompt_cache_state & s) { return s.spilled(); });
+        if (oldest == states.end()) {
+            break;
+        }
+        SRV_WRN(" - disk tier full, removing oldest spilled entry (size = %.3f MiB)\n", oldest->spill_size / (1024.0 * 1024.0));
+        erase(oldest);
+    }
+
+    // admitted against the one page-IO budget before anything moves, never parked: a spill that does not
+    // fit beside the bytes in flight is refused and the entry is dropped (as with no disk tier), so a slow
+    // or paused disk can never stack spills past the budget (Codex on #124)
+    if (!admission->try_admit(bytes)) {
+        SRV_WRN(" - disk tier: %.3f MiB does not fit the page-IO budget beside the bytes in flight; the entry is dropped\n",
+                bytes / (1024.0 * 1024.0));
+        return false;
+    }
+    // the task loop only MOVES the bytes into the spill buffer; the file is written on the page-io pool
+    const std::string path = disk_dir + "/" + std::to_string(spill_seq++) + ".state";
+    auto buf = std::make_shared<server_spill_buffer>();
+    buf->reservation.hold(admission, bytes);
+    buf->counted = spill_in_flight;
+    buf->bytes   = bytes;
+    spill_in_flight->fetch_add(bytes, std::memory_order_relaxed);
+    buf->blocks.reserve(2 + 3 * state.prompt.checkpoints.size());
+    buf->blocks.push_back(std::move(state.data.main));
+    buf->blocks.push_back(std::move(state.data.drft));
+    for (auto & ckpt : state.prompt.checkpoints) {
+        buf->blocks.push_back(std::move(ckpt.data_tgt));
+        buf->blocks.push_back(std::move(ckpt.data_dft));
+        buf->blocks.push_back(std::move(ckpt.data_spec));
+    }
+    state.data.main = {};
+    state.data.drft = {};
+    for (auto & ckpt : state.prompt.checkpoints) {
+        ckpt.data_tgt  = {};
+        ckpt.data_dft  = {};
+        ckpt.data_spec = {};
+    }
+    state.spill_path = path;
+    state.spill_size = bytes;
+    state.spilling   = buf;
+
+    const int n_tokens = state.prompt.n_tokens();
+    io->submit(path, [buf, path, bytes, n_tokens, gate = io_gate] {
+        if constexpr (server_test_faults::enabled) {
+            server_test_faults::hold(gate); // a test holds spill writes as it holds page IO
+        }
+        int expected = server_spill_buffer::queued;
+        if (!buf->status.compare_exchange_strong(expected, server_spill_buffer::writing, std::memory_order_acq_rel)) {
+            return; // claimed: the entry was restored before this write started; its blocks went back to it
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        FILE * f = fopen(path.c_str(), "wb");
+        bool ok = f != nullptr;
+        for (const auto & block : buf->blocks) {
+            ok = ok && server_spill_write_block(f, block);
+        }
+        ok = (f == nullptr || fclose(f) == 0) && ok;
+        if (!ok) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            SRV_ERR("prompt cache disk tier: failed writing %s; the entry stays in RAM\n", path.c_str());
+        } else {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            SRV_INF(" - spilled prompt cache entry to disk: %d tokens, %.3f MiB in %.1f ms (page-io pool)\n",
+                    n_tokens, bytes / (1024.0 * 1024.0), ms);
+        }
+        buf->status.store(ok ? server_spill_buffer::written : server_spill_buffer::failed, std::memory_order_release);
+        // the bytes stay charged until the buffer itself is freed (its destructor): when this job lets
+        // go and the entry is reaped or erased, whichever is last
+    });
+    return true;
+}
+
+void server_prompt_cache::reap_spills() {
+    for (auto & state : states) {
+        if (!state.spilling) {
+            continue;
+        }
+        const int status = state.spilling->status.load(std::memory_order_acquire);
+        if (status == server_spill_buffer::written) {
+            state.spilling.reset(); // written: the RAM copy goes
+        } else if (status == server_spill_buffer::failed) {
+            // the write failed: the bytes come back and the entry stays resident
+            auto & blocks = state.spilling->blocks;
+            size_t b = 0;
+            state.data.main = std::move(blocks[b++]);
+            state.data.drft = std::move(blocks[b++]);
+            for (auto & ckpt : state.prompt.checkpoints) {
+                ckpt.data_tgt  = std::move(blocks[b++]);
+                ckpt.data_dft  = std::move(blocks[b++]);
+                ckpt.data_spec = std::move(blocks[b++]);
+            }
+            state.spilling.reset();
+            state.spill_path.clear();
+            state.spill_size = 0;
+        }
+    }
+}
+
+bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
+    if (!state.spilled()) {
+        return true;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (state.spilling) {
+        // its bytes are still in RAM, never read back from disk. A write not started yet is claimed and the
+        // blocks MOVE back (no copy; the worker skips the write). A write running or landed keeps its buffer
+        // (the worker may be reading it): load() applies the KV from it by reference, and only the
+        // checkpoints, which the slot must own, are copied (Codex on #124: no full deep copy).
+        auto & buf = *state.spilling;
+        int expected = server_spill_buffer::queued;
+        const bool took = buf.status.compare_exchange_strong(expected, server_spill_buffer::claimed, std::memory_order_acq_rel);
+        auto & blocks = buf.blocks;
+        size_t b = 2; // main and drft stay in the buffer unless taken
+        if (took) {
+            state.data.main = std::move(blocks[0]);
+            state.data.drft = std::move(blocks[1]);
+        }
+        for (auto & ckpt : state.prompt.checkpoints) {
+            if (took) {
+                ckpt.data_tgt  = std::move(blocks[b++]);
+                ckpt.data_dft  = std::move(blocks[b++]);
+                ckpt.data_spec = std::move(blocks[b++]);
+            } else {
+                ckpt.data_tgt  = blocks[b++];
+                ckpt.data_dft  = blocks[b++];
+                ckpt.data_spec = blocks[b++];
+            }
+        }
+        if (took) {
+            state.spilling.reset(); // the moved-from buffer is empty; its charge is released with it
+        }
+        // else: load() reads main/drft from state.spilling and drops it after applying them
+        // the file is removed after its write, in order, on the pool
+        const std::string path = state.spill_path;
+        io->submit(path, [path] { std::error_code rm; std::filesystem::remove(path, rm); });
+        const size_t bytes = state.spill_size;
+        state.spill_path.clear();
+        state.spill_size = 0;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        SRV_INF(" - restored prompt cache entry from its in-flight spill: %d tokens, %.3f MiB in %.1f ms\n",
+                state.prompt.n_tokens(), bytes / (1024.0 * 1024.0), ms);
+        return true;
+    }
+    FILE * f = fopen(state.spill_path.c_str(), "rb");
+    if (f == nullptr) {
+        SRV_ERR("prompt cache disk tier: cannot open %s\n", state.spill_path.c_str());
+        return false;
+    }
+    // the file must be exactly what this instance admitted when it spilled: the state's bytes plus one
+    // 8-byte length per block; anything else is refused before a single block is read or allocated
+    // (Codex on #124: the file size alone could exceed the admitted state)
+    const uint64_t n_blocks = 2 + 3 * (uint64_t) state.prompt.checkpoints.size();
+    const uint64_t expected = (uint64_t) state.spill_size + n_blocks * sizeof(uint64_t);
+    std::error_code size_ec;
+    const uint64_t file_bytes = std::filesystem::file_size(state.spill_path, size_ec);
+    uint64_t remaining = expected;
+    bool ok = !size_ec && file_bytes == expected &&
+              server_spill_read_block(f, state.data.main, remaining) && server_spill_read_block(f, state.data.drft, remaining);
+    for (auto & ckpt : state.prompt.checkpoints) {
+        ok = ok && server_spill_read_block(f, ckpt.data_tgt, remaining) && server_spill_read_block(f, ckpt.data_dft, remaining) &&
+             server_spill_read_block(f, ckpt.data_spec, remaining);
+    }
+    fclose(f);
+    if (!ok || remaining != 0) {
+        SRV_ERR("prompt cache disk tier: %s is corrupt or truncated; the entry is dropped\n", state.spill_path.c_str());
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::remove(state.spill_path, ec);
+    const size_t bytes = state.spill_size;
+    state.spill_path.clear();
+    state.spill_size = 0;
+
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    SRV_INF(" - restored prompt cache entry from disk: %d tokens, %.3f MiB in %.1f ms\n",
+            state.prompt.n_tokens(), bytes / (1024.0 * 1024.0), ms);
+    return true;
+}
+
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase(std::list<server_prompt_cache_state>::iterator it) {
+    if (it->spilled()) {
+        // ordered after any write of the same file on the pool, so a writer never recreates it
+        const std::string path = it->spill_path;
+        io->submit(path, [path] { std::error_code rm; std::filesystem::remove(path, rm); });
+    }
+    return states.erase(it);
+}
+
+bool server_prompt_cache::evict_oldest_resident() {
+    // a state larger than the whole RAM tier leaves first: it cannot stay, so evicting older
+    // states for it would only push them to disk as well
+    auto oldest = std::find_if(states.begin(), states.end(), [this](const server_prompt_cache_state & s) {
+        return !s.spilled() && &s != keep && limit_size > 0 && s.size() > limit_size;
+    });
+    if (oldest == states.end()) {
+        oldest = std::find_if(states.begin(), states.end(), [this](const server_prompt_cache_state & s) { return !s.spilled() && &s != keep; });
+    }
+    if (oldest == states.end()) {
+        return false;
+    }
+    if (spill(*oldest)) {
+        return true;
+    }
+    SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+            oldest->size() / (1024.0 * 1024.0));
+    erase(oldest);
+    return true;
+}
+
+const server_prompt_cache_state * server_prompt_cache::leaving(const server_tokens & next, const lora_active_set & lora) const {
+    const server_prompt_cache_state * best = nullptr;
+    int lcp_best = 0;
+    for (const auto & s : states) {
+        if (s.lora != lora || s.prompt.tokens.size() == 0) {
+            continue;
+        }
+        const int lcp = s.prompt.tokens.get_common_prefix(next);
+        if (float(lcp) / s.prompt.tokens.size() >= 0.25f && lcp > lcp_best) { // load()'s "don't trash" floor
+            lcp_best = lcp;
+            best     = &s;
+        }
+    }
+    return best;
+}
+
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_tgt, size_t state_size_dft,
+                                                       const server_tokens * next, const lora_active_set * next_lora) {
+    reap_spills();
+    // the resident the incoming request is about to load: evicting it to make room for this save would push
+    // the very mind arriving to disk and refuse the one leaving (two minds, a tier that holds one)
+    keep = next != nullptr && next_lora != nullptr ? leaving(*next, *next_lora) : nullptr;
+    struct keep_reset { const server_prompt_cache_state *& k; ~keep_reset() { k = nullptr; } } keep_reset_ { keep };
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (it->lora != lora) {
@@ -1788,8 +2071,10 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
 
-    // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    // skip over-limit entries to avoid disturbing the cache; with a disk tier that can hold it,
+    // the entry is taken and `update` spills it once the caller has filled it
+    const bool disk_holds = !disk_dir.empty() && (disk_limit == 0 || state_size_new <= disk_limit);
+    if (limit_size > 0 && state_size_new > limit_size && !disk_holds) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         return nullptr;
@@ -1802,19 +2087,27 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (it->lora == lora && len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
-            it = states.erase(it);
+            it = erase(it);
         } else {
             ++it;
         }
     }
 
     if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+        // make room before allocating the new vectors to avoid breaching the limit; an entry
+        // larger than the whole RAM tier goes to disk itself in `update`, displacing nothing
+        // The protected entry leaves with the load that follows this save (update() restores the cap right
+        // after if it does not), so it counts as gone: the swap holds both for that moment, bounded by one entry.
+        const size_t room_needed = state_size_new > limit_size ? 0 : state_size_new;
+        auto kept = [this] { return keep != nullptr ? keep->size() : 0; };
+        while (size() - kept() + room_needed > limit_size && evict_oldest_resident()) {
+        }
+        // every other resident evicted and still over: bytes in flight to disk hold the rest, so this entry is
+        // not cached rather than breaching the cap (Codex on #124: cap 100, 80 in flight, a new 50)
+        if (size() - kept() + room_needed > limit_size) {
+            SRV_WRN(" - prompt state of %.3f MiB not cached: %.3f MiB in flight to disk leave no room under the %.3f MiB limit\n",
+                    state_size_new / (1024.0 * 1024.0), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+            return nullptr;
         }
     }
 
@@ -1847,23 +2140,26 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.drft =*/ std::move(state_data_dft),
         },
         /*.lora   =*/ lora,
+        /*.spill_path =*/ {},   // resident in RAM until the disk tier spills it
+        /*.spill_size =*/ 0,
+        /*.spilling   =*/ nullptr,
     });
 
     return &states.back();
 }
 
 void server_prompt_cache::evict_lora(const llama_adapter_lora * adapter) {
-    states.remove_if([adapter](const server_prompt_cache_state & state) {
-        for (const auto & [ptr, scale] : state.lora) {
-            if (ptr == adapter) {
-                return true;
-            }
+    for (auto it = states.begin(); it != states.end();) {
+        bool uses = false;
+        for (const auto & [ptr, scale] : it->lora) {
+            uses = uses || ptr == adapter;
         }
-        return false;
-    });
+        it = uses ? erase(it) : std::next(it);
+    }
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & lora, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    reap_spills();
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1901,8 +2197,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & l
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
+        if (!unspill(*it_best)) {
+            erase(it_best);
+            return false;
+        }
+
+        // the KV comes from the entry's own vectors, or by reference from its in-flight spill's buffer
+        const auto & src_main = it_best->spilling ? it_best->spilling->blocks[0] : it_best->data.main;
+        const auto & src_drft = it_best->spilling ? it_best->spilling->blocks[1] : it_best->data.drft;
         {
-            auto & data = it_best->data.main;
+            const auto & data = src_main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -1911,13 +2215,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & l
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
-            auto & data = it_best->data.drft;
+            const auto & data = src_drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -1929,11 +2230,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & l
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
+        std::vector<uint8_t>().swap(it_best->data.main);
+        std::vector<uint8_t>().swap(it_best->data.drft);
+        it_best->spilling.reset(); // applied: the write (if running) keeps the buffer alive until it finishes
 
         prompt = std::move(it_best->prompt);
 
@@ -1944,11 +2245,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & l
 }
 
 void server_prompt_cache::update() {
+    reap_spills();
     if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+        while (size() > limit_size && evict_oldest_resident()) {
         }
     }
 
@@ -1959,16 +2258,13 @@ void server_prompt_cache::update() {
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+        while (n_tokens() > limit_tokens_cur && evict_oldest_resident()) {
         }
     }
 
-    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-            states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+    SRV_TRC(" - cache state: %zu prompts, %.3f MiB in RAM, %.3f MiB on disk (limits: %.3f MiB, %.3f MiB on disk, %zu tokens, %zu est)\n",
+            states.size(), size() / (1024.0 * 1024.0), disk_size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0),
+            disk_limit / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
