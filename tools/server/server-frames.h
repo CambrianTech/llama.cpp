@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -427,4 +428,42 @@ inline std::optional<size_t> efficiency_cores() {
     }
 #endif
     return std::nullopt; // Linux/Windows core classes: the host adapter's job (continuum-host), not guessed here
+}
+
+// The node's copy-lane count, MEASURED: copy `probe_bytes` with each candidate lane count (best of three,
+// the probe shares the machine) and keep the FIRST GUESS (the efficiency-core count) unless another count
+// beats it by more than the margin `1/knee`: noise never moves the choice, a real knee elsewhere does.
+// Runs once at startup, off the decode thread. Returns the chosen count and its GB/s.
+struct copy_lane_measurement {
+    size_t lanes = 1;
+    double gbps  = 0.0;
+};
+inline copy_lane_measurement measure_copy_lanes(size_t guess, std::span<const size_t> others, size_t probe_bytes, double knee) {
+    std::vector<std::byte> src(probe_bytes, std::byte{1}), dst(probe_bytes);
+    auto measure = [&](size_t lanes) {
+        lanes = std::max<size_t>(lanes, 1);
+        double best = 0.0;
+        for (int rep = 0; rep < 3; ++rep) {
+            const auto t0 = std::chrono::steady_clock::now();
+            {
+                std::vector<std::jthread> ws;
+                const size_t chunk = probe_bytes / lanes;
+                for (size_t i = 0; i < lanes; ++i) {
+                    const size_t off = i * chunk, n = i + 1 == lanes ? probe_bytes - off : chunk;
+                    ws.emplace_back([&, off, n] { std::memcpy(dst.data() + off, src.data() + off, n); });
+                }
+            } // joins
+            const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            best = std::max(best, (double) probe_bytes / secs / 1e9);
+        }
+        return copy_lane_measurement{ lanes, best };
+    };
+    copy_lane_measurement pick = measure(guess);
+    for (size_t lanes : others) {
+        const auto m = measure(lanes);
+        if (m.gbps * knee > pick.gbps) {
+            pick = m; // clearly better than the guess, not noise
+        }
+    }
+    return pick;
 }
