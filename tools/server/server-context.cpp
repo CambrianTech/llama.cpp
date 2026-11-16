@@ -4939,6 +4939,13 @@ server_context_meta server_context::get_meta() const {
             { "allocated_tokens",        llama_n_ctx(impl->ctx_tgt) },
             { "max_tokens_per_sequence", impl->n_ctx_slot },
             { "sequence_capacity",       llama_n_seq_max(impl->ctx_tgt) },
+            // the engine owns mind switches (server-context-minds.inc): a request naming its "page" is switched by
+            // sequence moves; the core reads this BEFORE dispatch to skip its own page save/restore (Codex on #139)
+            { "resident_minds", json {
+                { "enabled",    impl->minds_on() },
+                { "lanes",      impl->params_base.n_parallel },
+                { "parked_ids", (int64_t) impl->park_free.size() },
+            } },
         },
     };
 }
