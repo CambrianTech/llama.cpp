@@ -26,6 +26,12 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <stop_token>
+#include <thread>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -164,42 +170,60 @@ struct transfer_done_frame {
     transfer_status status = transfer_status::moved;
 };
 
-// The one base for every byte mover. A subclass is only the diff: how its engine starts a move and
-// when that move completes. Completions come from TWO producers, each with its own single-producer
-// ring: the pumping thread settles what needs no engine (aliased, refused), and the backend's own
-// completion context finishes real moves. One doorbell counter, bumped by both, wakes the consumer:
-// fan-in without a lock.
+// The one base for every byte mover. A subclass is only the diff: how its engines start a move and
+// when each part completes. Moving is PARALLEL: a backend owns several completion contexts (lanes: CPU
+// copy threads, GPU blit queues, disk readers), each completing into its OWN single-producer ring, and
+// the pumping thread settles what needs no engine (aliased, refused) into one more. One doorbell
+// counter, bumped by every producer, wakes the consumer: fan-in without a lock.
 class memory_mover {
 public:
-    memory_mover(frame_ring<transfer_frame> & in, size_t done_capacity) : in_(in), settled_(done_capacity), finished_(done_capacity) {}
+    memory_mover(frame_ring<transfer_frame> & in, size_t done_capacity, size_t completion_contexts)
+        : in_(in), settled_(done_capacity) {
+        for (size_t i = 0; i < std::max<size_t>(completion_contexts, 1); ++i) {
+            finished_.push_back(std::make_unique<frame_ring<transfer_done_frame>>(done_capacity));
+        }
+    }
     virtual ~memory_mover() = default;
 
-    // Drain every pending transfer frame and start each on the backend's engine without waiting on
-    // any of them. Returns how many were started on the engine.
+    // Start as many queued transfers as the engines have room for, and RETURN: pump never waits. A
+    // transfer the engines cannot take yet stays pending here (the backend remembers how far it got)
+    // and resumes on the next pump; the caller drains completions in between, which is what makes
+    // room. Returns how many transfers were fully handed to an engine.
     size_t pump() {
-        transfer_frame batch[64];
         size_t started = 0;
-        for (size_t n; (n = in_.drain(batch)) > 0;) {
-            for (size_t i = 0; i < n; ++i) {
-                if (aliases(batch[i].src, batch[i].dst)) {
-                    settle(batch[i].ticket, transfer_status::aliased);
-                } else if (!start(batch[i])) {
-                    settle(batch[i].ticket, transfer_status::refused);
-                } else {
-                    started++;
+        while (true) {
+            if (!pending_) {
+                transfer_frame f;
+                if (in_.drain(std::span<transfer_frame>(&f, 1)) == 0) {
+                    return started;
                 }
+                if (aliases(f.src, f.dst)) {
+                    settle(f.ticket, transfer_status::aliased);
+                    continue;
+                }
+                pending_ = f;
+            }
+            switch (start(*pending_)) {
+                case start_result::started:     started++; pending_.reset(); break;
+                case start_result::refused:     settle(pending_->ticket, transfer_status::refused); pending_.reset(); break;
+                case start_result::would_block: return started; // engines full: drain completions, pump again
             }
         }
-        return started;
     }
 
-    // Consumer side: take completions from both producers; returns how many.
+    // A transfer is waiting for engine room (the caller should drain completions, then pump again).
+    bool blocked() const { return pending_.has_value(); }
+
+    // Consumer side: take completions from every producer; returns how many.
     size_t drain_done(std::span<transfer_done_frame> out) {
-        const size_t a = settled_.drain(out);
-        return a + finished_.drain(out.subspan(a));
+        size_t n = settled_.drain(out);
+        for (auto & ring : finished_) {
+            n += ring->drain(out.subspan(n));
+        }
+        return n;
     }
 
-    // Consumer side: sleep until either producer rings the doorbell (an atomic wait, no lock).
+    // Consumer side: sleep until any producer rings the doorbell (read doorbell() BEFORE draining).
     void wait_done(uint64_t seen) const {
         while (doorbell_.load(std::memory_order_acquire) == seen) {
             doorbell_.wait(seen, std::memory_order_acquire);
@@ -210,31 +234,176 @@ public:
     uint64_t backpressured() const { return backpressured_.load(std::memory_order_relaxed); }
 
 protected:
-    // Enqueue the move on this backend's own engine; false when it cannot move between these domains.
-    virtual bool start(const transfer_frame & t) = 0;
+    enum class start_result : uint8_t { started, refused, would_block };
+
+    // Hand the move to this backend's engines, as much as they have room for, without waiting.
+    // would_block: called again with the same frame on the next pump (the backend keeps its own
+    // progress); refused: it cannot move between these domains.
+    virtual start_result start(const transfer_frame & t) = 0;
 
     // Whether dst can simply name src's bytes (one physical domain): no copy at all.
     virtual bool aliases(const buffer_ref & src, const buffer_ref & dst) const = 0;
 
-    // The backend's ONE completion context reports a finished move.
-    void complete(uint64_t ticket, transfer_status status) { publish(finished_, ticket, status); }
+    // Completion context `context` (one lane) reports a finished move.
+    void complete(size_t context, uint64_t ticket, transfer_status status) { publish(*finished_[context], ticket, status); }
 
 private:
     void settle(uint64_t ticket, transfer_status status) { publish(settled_, ticket, status); }
 
     void publish(frame_ring<transfer_done_frame> & ring, uint64_t ticket, transfer_status status) {
         while (!ring.push(transfer_done_frame{ ticket, status })) {
-            // the consumer of completions is behind: counted, then sleep until it drains (no spin)
             backpressured_.fetch_add(1, std::memory_order_relaxed);
-            ring.wait_for_room();
+            ring.wait_for_room(); // the consumer is behind: sleep until it drains (no spin)
         }
         doorbell_.fetch_add(1, std::memory_order_release);
         doorbell_.notify_all();
     }
 
-    frame_ring<transfer_frame> &    in_;
-    frame_ring<transfer_done_frame> settled_;  // producer: the pumping thread
-    frame_ring<transfer_done_frame> finished_; // producer: the backend's completion context
-    std::atomic<uint64_t>           doorbell_{0};
-    std::atomic<uint64_t>           backpressured_{0};
+    frame_ring<transfer_frame> &                                   in_;
+    std::optional<transfer_frame>                                  pending_; // pumping thread only
+    frame_ring<transfer_done_frame>                                settled_;  // producer: the pumping thread
+    std::vector<std::unique_ptr<frame_ring<transfer_done_frame>>>  finished_; // producer: one lane each
+    std::atomic<uint64_t>                                          doorbell_{0};
+    std::atomic<uint64_t>                                          backpressured_{0};
+};
+
+// ---- the host backend: a parallel copier ------------------------------------------------------------
+
+// Host-to-host (and file-mapped) moves done by CPU lanes in parallel: a transfer is split into chunks
+// spread across the lanes, every lane copies its chunks at once, and the LAST chunk of a transfer to
+// land publishes its completion. Lane count and chunk size come from the node's measured copy
+// bandwidth curve (where adding a lane stops adding bandwidth), never a constant here.
+class parallel_copier final : public memory_mover {
+public:
+    using resolver = std::function<std::byte *(const buffer_ref &)>; // a pool's id -> its bytes
+
+    parallel_copier(frame_ring<transfer_frame> & in, resolver resolve, size_t lanes, size_t chunk_bytes, size_t in_flight)
+        : memory_mover(in, in_flight, lanes), resolve_(std::move(resolve)), chunk_(std::max<size_t>(chunk_bytes, 4096)),
+          slots_(std::max<size_t>(in_flight, 1)) {
+        for (size_t i = 0; i < std::max<size_t>(lanes, 1); ++i) {
+            lanes_.push_back(std::make_unique<lane>(in_flight * 4));
+        }
+        for (size_t i = 0; i < lanes_.size(); ++i) {
+            lanes_[i]->worker = std::jthread([this, i](std::stop_token stop) { run_lane(i, stop); });
+        }
+    }
+
+    ~parallel_copier() override {
+        for (auto & l : lanes_) {
+            l->work.close();
+        }
+        for (auto & l : lanes_) {
+            l->worker.join();
+        }
+    }
+
+    size_t lanes() const { return lanes_.size(); }
+
+private:
+    struct chunk_frame {
+        uint32_t        slot;
+        const std::byte * src;
+        std::byte *     dst;
+        uint64_t        bytes;
+    };
+    struct lane {
+        explicit lane(size_t capacity) : work(capacity) {}
+        frame_ring<chunk_frame> work;
+        std::jthread            worker;
+    };
+    struct slot {
+        std::atomic<bool>     in_use{false};
+        std::atomic<uint32_t> remaining{0};
+        uint64_t              ticket = 0;
+    };
+
+    bool aliases(const buffer_ref & a, const buffer_ref & b) const override {
+        return a.domain == b.domain && a.pool == b.pool && a.buffer == b.buffer && a.offset == b.offset;
+    }
+
+    start_result start(const transfer_frame & t) override {
+        if (!progress_) {
+            if (t.src.domain == memory_domain::disk || t.dst.domain == memory_domain::disk || t.src.bytes != t.dst.bytes) {
+                return start_result::refused; // disk moves belong to a reader backend; a size mismatch is never truncated
+            }
+            std::byte * src = resolve_(t.src);
+            std::byte * dst = resolve_(t.dst);
+            if (src == nullptr || dst == nullptr) {
+                return start_result::refused;
+            }
+            const auto s = claim_slot();
+            if (!s) {
+                return start_result::would_block; // every in-flight slot is busy
+            }
+            const uint64_t n_chunks = std::max<uint64_t>(1, (t.src.bytes + chunk_ - 1) / chunk_);
+            slots_[*s].ticket = t.ticket;
+            slots_[*s].remaining.store((uint32_t) n_chunks, std::memory_order_release);
+            progress_ = progress{ *s, src, dst, t.src.bytes, n_chunks, 0 };
+        }
+        // push the remaining chunks, round robin across lanes, as far as the lanes have room
+        while (progress_->next < progress_->n_chunks) {
+            const uint64_t off = progress_->next * chunk_;
+            const chunk_frame f{ progress_->slot, progress_->src + off, progress_->dst + off,
+                                 std::min<uint64_t>(chunk_, progress_->bytes - off) };
+            if (!lanes_[next_lane_ % lanes_.size()]->work.push(f)) {
+                return start_result::would_block; // that lane is full; resume here next pump
+            }
+            next_lane_++;
+            progress_->next++;
+        }
+        progress_.reset();
+        return start_result::started;
+    }
+
+    // A free in-flight slot, or none (never waits); the lane that lands a transfer's last chunk frees it.
+    std::optional<uint32_t> claim_slot() {
+        for (size_t i = 0; i < slots_.size(); ++i) {
+            const uint32_t s = (uint32_t) ((cursor_ + i) % slots_.size());
+            bool free = false;
+            if (slots_[s].in_use.compare_exchange_strong(free, true, std::memory_order_acq_rel)) {
+                cursor_ = s + 1;
+                return s;
+            }
+        }
+        return std::nullopt;
+    }
+
+    void run_lane(size_t index, std::stop_token) {
+        auto & l = *lanes_[index];
+        chunk_frame batch[32];
+        while (true) {
+            const size_t n = l.work.drain(batch);
+            for (size_t i = 0; i < n; ++i) {
+                std::memcpy(batch[i].dst, batch[i].src, batch[i].bytes);
+                slot & s = slots_[batch[i].slot];
+                if (s.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    const uint64_t ticket = s.ticket;
+                    s.in_use.store(false, std::memory_order_release);
+                    complete(index, ticket, transfer_status::moved);
+                }
+            }
+            if (n == 0) {
+                if (l.work.closed() && l.work.pushed() == l.work.taken()) {
+                    return;
+                }
+                l.work.wait_for_frames();
+            }
+        }
+    }
+
+    resolver                            resolve_;
+    size_t                              chunk_;
+    std::vector<slot>                   slots_;
+    std::vector<std::unique_ptr<lane>>  lanes_;
+    struct progress {
+        uint32_t          slot;
+        const std::byte * src;
+        std::byte *       dst;
+        uint64_t          bytes;
+        uint64_t          n_chunks;
+        uint64_t          next;
+    };
+    std::optional<progress>             progress_;      // pumping thread only: a transfer part-handed out
+    size_t                              next_lane_ = 0; // pumping thread only
+    size_t                              cursor_    = 0; // pumping thread only
 };

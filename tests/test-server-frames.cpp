@@ -12,6 +12,8 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <chrono>
+#include <cstdio>
 #include <thread>
 
 static void require(bool condition, const char * message) {
@@ -93,7 +95,7 @@ static void close_wakes_a_waiting_consumer() {
 class test_mover final : public memory_mover {
 public:
     test_mover(frame_ring<transfer_frame> & in, size_t done_capacity)
-        : memory_mover(in, done_capacity), engine_([this](std::stop_token stop) { run(stop); }) {}
+        : memory_mover(in, done_capacity, 1), engine_([this](std::stop_token stop) { run(stop); }) {}
     ~test_mover() override {
         engine_.request_stop();
         work_.close();
@@ -105,21 +107,19 @@ private:
         const auto physical = [](memory_domain d) { return d == memory_domain::disk ? 1 : 0; };
         return physical(a.domain) == physical(b.domain);
     }
-    bool start(const transfer_frame & t) override {
+    start_result start(const transfer_frame & t) override {
         if (!(t.src.domain == memory_domain::disk && t.dst.domain == memory_domain::host)) {
-            return false;
+            return start_result::refused;
         }
-        while (!work_.push(t)) {
-            work_.wait_for_room();
-        }
-        return true; // started, not finished: the caller never waits here
+        // started, not finished; a full engine queue is would_block, never a wait
+        return work_.push(t) ? start_result::started : start_result::would_block;
     }
     void run(std::stop_token stop) {
         transfer_frame batch[32];
         while (!stop.stop_requested() || work_.pushed() != work_.taken()) {
             const size_t n = work_.drain(batch);
             for (size_t i = 0; i < n; ++i) {
-                complete(batch[i].ticket, transfer_status::moved); // the engine's completion context
+                complete(0, batch[i].ticket, transfer_status::moved); // the engine's one completion context
             }
             if (n == 0) {
                 if (work_.closed()) break;
@@ -149,6 +149,7 @@ static void a_mover_streams_moves_without_waiting() {
         }
         while (done.size() < 900) {
             const uint64_t bell = mover.doorbell(); // read BEFORE draining: a ring after it wakes us
+            mover.pump();                           // resume anything that was waiting for room
             transfer_done_frame batch[64];
             const size_t n = mover.drain_done(batch);
             for (size_t i = 0; i < n; ++i) {
@@ -167,12 +168,75 @@ static void a_mover_streams_moves_without_waiting() {
     require(moved == 300 && aliased == 300 && refused == 300, "every transfer completed exactly once");
 }
 
-int main() {
+// The parallel copier: many transfers in flight, each split across lanes; bytes arrive exactly; every
+// ticket completes once; a size mismatch and a disk pair are refused typed.
+static void run_copies(size_t lanes, size_t chunk, size_t n_transfers, size_t bytes_each, double * gbps) {
+    std::vector<std::vector<std::byte>> src(n_transfers), dst(n_transfers);
+    for (size_t i = 0; i < n_transfers; ++i) {
+        src[i].resize(bytes_each);
+        dst[i].assign(bytes_each, std::byte{0});
+        for (size_t b = 0; b < bytes_each; b += 4096) src[i][b] = std::byte(uint8_t(i * 31 + b / 4096));
+    }
+    // pool 0 = sources, pool 1 = destinations; buffer = index
+    auto resolve = [&](const buffer_ref & r) -> std::byte * {
+        auto & v = r.pool == 0 ? src : dst;
+        return r.buffer < v.size() ? v[r.buffer].data() + r.offset : nullptr;
+    };
+    frame_ring<transfer_frame> in(n_transfers + 8);
+    std::map<uint64_t, transfer_status> done;
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        parallel_copier mover(in, resolve, lanes, chunk, 64);
+        for (size_t i = 0; i < n_transfers; ++i) {
+            const buffer_ref s{ memory_domain::host, 0, (uint32_t) i, 0, bytes_each };
+            const buffer_ref d{ memory_domain::host, 1, (uint32_t) i, 0, bytes_each };
+            require(in.push({ i + 1, s, d }), "queued");
+        }
+        const buffer_ref bad_s{ memory_domain::host, 0, 0, 0, bytes_each };
+        const buffer_ref bad_d{ memory_domain::host, 1, 0, 0, bytes_each - 1 };
+        require(in.push({ n_transfers + 1, bad_s, bad_d }), "queued");                     // size mismatch
+        require(in.push({ n_transfers + 2, bad_s, { memory_domain::disk, 9, 0, 0, bytes_each } }), "queued"); // disk pair
+        while (done.size() < n_transfers + 2) {
+            const uint64_t bell = mover.doorbell();
+            mover.pump(); // starts what the lanes have room for and returns: never waits
+            transfer_done_frame batch[64];
+            const size_t n = mover.drain_done(batch);
+            for (size_t i = 0; i < n; ++i) {
+                require(done.emplace(batch[i].ticket, batch[i].status).second, "each ticket completes once");
+            }
+            if (n == 0) mover.wait_done(bell);
+        }
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (gbps) *gbps = (double) n_transfers * (double) bytes_each / secs / 1e9;
+    for (size_t i = 0; i < n_transfers; ++i) {
+        require(done[i + 1] == transfer_status::moved, "every copy moved");
+        require(std::memcmp(src[i].data(), dst[i].data(), bytes_each) == 0, "the bytes arrived exactly");
+    }
+    require(done[n_transfers + 1] == transfer_status::refused, "a size mismatch is refused, never truncated");
+    require(done[n_transfers + 2] == transfer_status::refused, "a disk pair is refused by the host copier");
+}
+
+static void the_parallel_copier_moves_many_at_once() {
+    run_copies(/*lanes=*/6, /*chunk=*/64 * 1024, /*transfers=*/200, /*bytes=*/1 << 20, nullptr);
+}
+
+int main(int argc, char ** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--bandwidth") == 0) {
+        // the receipt: one lane against the lanes at the measured knee, same transfers
+        for (size_t lanes : { (size_t) 1, (size_t) 4, (size_t) 8, (size_t) 12 }) {
+            double g = 0;
+            run_copies(lanes, 4 << 20, 16, 64 << 20, &g);
+            std::printf("parallel_copier lanes %2zu: %6.1f GB/s (16 x 64 MiB)\n", lanes, g);
+        }
+        return 0;
+    }
     one_stream_delivers_every_frame_in_order();
     many_streams_run_at_once();
     a_full_ring_is_backpressure();
     close_wakes_a_waiting_consumer();
     a_mover_streams_moves_without_waiting();
+    the_parallel_copier_moves_many_at_once();
     std::cout << "test-server-frames: ok\n";
     return 0;
 }
