@@ -1917,23 +1917,27 @@ private:
 
         // one pure decision over a typed view of every slot (server-slot-pick.h): a parked id is never
         // handed out, a task naming it waits for its mind (Codex on #105)
-        std::vector<server_slot_view> view;
-        view.reserve(slots.size());
-        for (const server_slot & slot : slots) {
-            const bool parked = slot_id_is_parked(slot.id);
-            const bool scan   = task.id_slot == -1 && slot_prompt_similarity != 0.0f && !parked && !slot.is_processing();
-            view.push_back({ slot.id, slot.is_processing(), parked, slot.t_last_used, slot.prompt.tokens.size(),
-                             scan ? slot.prompt.tokens.get_common_prefix(task.tokens) : 0 });
-        }
+        // the view lives in storage the server owns, cleared and refilled: no allocation in steady state
+        const auto & view = slot_views(&task);
         const server_slot_pick pick = server_pick_slot(view.data(), view.size(), task.id_slot, task.tokens.size(), slot_prompt_similarity);
         switch (pick.kind) {
             case server_slot_pick_kind::wait:
             case server_slot_pick_kind::no_slot:
                 return nullptr; // deferred; the caller already refused an id that is neither live nor parked
-            case server_slot_pick_kind::by_id:
+            case server_slot_pick_kind::by_id: {
                 ret = &slots[pick.index];
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+                // upstream's behaviour, kept (Codex on #105): a named slot whose prompt clears the similarity
+                // floor but keeps under half of its context saves that context to the prompt cache first
+                const server_slot_view & v = view[pick.index];
+                if (slot_prompt_similarity != 0.0f && !task.tokens.empty() && v.n_tokens > 0) {
+                    const float f_sim = float(v.lcp) / task.tokens.size();
+                    if (f_sim > slot_prompt_similarity) {
+                        update_cache = float(v.lcp) / v.n_tokens < 0.5f;
+                    }
+                }
                 break;
+            }
             case server_slot_pick_kind::by_prefix: {
                 ret = &slots[pick.index];
                 const float f_keep = (pick.f_sim * task.tokens.size()) / ret->prompt.tokens.size();
@@ -2572,17 +2576,35 @@ private:
     }
 
     std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
-        std::vector<server_slot *> free_slots;
-        for (auto & slot : slots) {
-            if (!slot.is_processing() && slot.id != exclude_id_slot) {
-                free_slots.push_back(&slot);
-            }
-            if (free_slots.size() >= n_slots_needed) {
-                break;
-            }
+        // the same predicate as every other choice (server-slot-pick.h): never a parked id
+        const auto & view = slot_views(nullptr);
+        slot_pick_scratch.resize(std::max(slot_pick_scratch.size(), n_slots_needed)); // grows once, to the widest fan-out
+        const size_t k = server_pick_free_slots(view.data(), view.size(), n_slots_needed, exclude_id_slot, slot_pick_scratch.data());
+        std::vector<server_slot *> free_slots(k); // the caller's existing type (upstream's launch path)
+        for (size_t i = 0; i < k; ++i) {
+            free_slots[i] = &slots[slot_pick_scratch[i]];
         }
         return free_slots;
     }
+
+    // Every slot as a typed view, in storage the server owns (refilled per call, never reallocated once it
+    // reached the slot count). `task`: the prefix with its prompt is measured only where a choice could use
+    // it (an anonymous task, a similarity floor, a free slot), or for the slot it names.
+    const std::vector<server_slot_view> & slot_views(const server_task * task) {
+        slot_view_scratch.clear();
+        for (const server_slot & slot : slots) {
+            const bool parked = slot_id_is_parked(slot.id);
+            bool scan = false;
+            if (task != nullptr && slot_prompt_similarity != 0.0f && !parked && !slot.is_processing()) {
+                scan = task->id_slot == -1 || task->id_slot == slot.id;
+            }
+            slot_view_scratch.push_back({ slot.id, slot.is_processing(), parked, slot.t_last_used, slot.prompt.tokens.size(),
+                                          scan ? slot.prompt.tokens.get_common_prefix(task->tokens) : 0 });
+        }
+        return slot_view_scratch;
+    }
+    std::vector<server_slot_view> slot_view_scratch;
+    std::vector<size_t>           slot_pick_scratch;
 
     // launch multiple slots for parent + child tasks
     bool launch_slots_with_parent_task(server_slot & parent_slot, std::vector<server_slot *> & child_slots, server_task && parent_task) {

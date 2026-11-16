@@ -33,6 +33,23 @@ struct server_slot_pick {
     float                 f_sim = 0.0f;  // by_prefix: the shared fraction of the task's prompt
 };
 
+// A slot a task may take now: not running, and not a parked mind's placeholder. The one predicate every
+// choice uses (the single pick below and the fan-out of a parent's children).
+inline bool server_slot_free(const server_slot_view & s) { return !s.processing && !s.parked; }
+
+// Up to `n` free slots for a parent's children, in slot order, never `exclude` and never a parked id
+// (Codex on #105: the fan-out still handed out parked placeholders). Writes indices into the caller's
+// storage (at least `n` entries) and returns how many: nothing is allocated here.
+inline size_t server_pick_free_slots(const server_slot_view * slots, size_t n_slots, size_t n, int32_t exclude, size_t * out) {
+    size_t k = 0;
+    for (size_t i = 0; i < n_slots && k < n; ++i) {
+        if (server_slot_free(slots[i]) && slots[i].id != exclude) {
+            out[k++] = i;
+        }
+    }
+    return k;
+}
+
 // `id_slot`: the slot the task names, or -1. `n_task_tokens`: the task's prompt length. `similarity`: the
 // floor a prefix match must exceed (0 disables prefix choice).
 inline server_slot_pick server_pick_slot(const server_slot_view * slots, size_t n_slots, int32_t id_slot, size_t n_task_tokens,
@@ -50,7 +67,7 @@ inline server_slot_pick server_pick_slot(const server_slot_view * slots, size_t 
         return { server_slot_pick_kind::no_slot, 0, 0.0f };
     }
 
-    const auto free = [](const server_slot_view & s) { return !s.processing && !s.parked; };
+    const auto free = server_slot_free;
 
     if (similarity != 0.0f && n_task_tokens > 0) {
         float  best = 0.0f;

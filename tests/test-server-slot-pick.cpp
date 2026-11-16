@@ -67,9 +67,19 @@ static void shrink_requests_grow_restores_the_mind() {
     require(p.kind == server_slot_pick_kind::by_id && s[p.index].id == 2, "after the grow, the mind's request runs on its own slot");
 }
 
+// what this catches (Codex on #105): a parent's fan-out handed its children free slots that included a
+// parked mind's placeholder
+static void fan_out_never_takes_a_parked_id() {
+    const auto s = after_shrink();
+    size_t out[4];
+    const size_t k = server_pick_free_slots(s.data(), s.size(), 4, /*exclude parent=*/1, out);
+    require(k == 1 && s[out[0]].id == 3, "the only free live slot besides the parent; never the parked id 2");
+}
+
 int main() {
     a_parked_id_is_never_handed_out();
     shrink_requests_grow_restores_the_mind();
+    fan_out_never_takes_a_parked_id();
     std::printf("test-server-slot-pick: ok\n");
     return 0;
 }
