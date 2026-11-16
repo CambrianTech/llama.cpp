@@ -7,9 +7,6 @@
 #include <cstdint>
 #include <string>
 
-// This engine process's id (the core binds a mind prefetch to it). OS call in server-mapped-file.cpp.
-int64_t server_process_pid();
-
 class server_mapped_file {
 public:
     explicit server_mapped_file(const std::string & path);

@@ -10,7 +10,20 @@
 // from the context's sequence capacity) and performs the moves.
 
 #include <cstdint>
+#include <random>
 #include <string>
+
+// This engine incarnation's token, drawn once per process and reported on /props (resident_minds.incarnation).
+// The core sends it back with a prefetch, so a stream meant for a replaced engine is refused: issued by the engine
+// itself, never inferred from an OS pid (which the OS reuses).
+inline uint64_t mind_incarnation() {
+    static const uint64_t token = [] {
+        std::random_device rd;
+        const uint64_t t = ((uint64_t) rd() << 32) ^ (uint64_t) rd();
+        return t != 0 ? t : 1;
+    }();
+    return token;
+}
 
 struct mind_page {
     uint64_t hi = 0, lo = 0;
