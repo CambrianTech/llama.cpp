@@ -54,6 +54,12 @@ target_compile_features(test-server-step-budget PRIVATE cxx_std_23)
 add_test(NAME test-server-step-budget COMMAND test-server-step-budget)
 set_tests_properties(test-server-step-budget PROPERTIES LABELS "main")
 
+# Model-free validator: checkpoints as parked sequence ids (RAII free, by-id park and restore).
+add_executable(test-server-parked-seqs test-server-parked-seqs.cpp)
+target_compile_features(test-server-parked-seqs PRIVATE cxx_std_23)
+add_test(NAME test-server-parked-seqs COMMAND test-server-parked-seqs)
+set_tests_properties(test-server-parked-seqs PROPERTIES LABELS "main")
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
