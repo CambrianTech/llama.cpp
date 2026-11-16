@@ -9,9 +9,12 @@
 #include <list>
 #include <map>
 #include <atomic>
+#include <memory>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-page-io.h"
+#include "server-spill-dir.h"
 
 
 struct server_page_job; // server-page-job.h: one page switch between the task loop and its file IO
@@ -773,6 +776,13 @@ struct server_prompt_data {
     }
 };
 
+// A spill in flight: the state's bytes in file order (sequence state main, draft; then each checkpoint's
+// target, draft, speculative). `status`: 0 writing, 1 written, -1 failed.
+struct server_spill_buffer {
+    std::vector<std::vector<uint8_t>> blocks;
+    std::atomic<int>                  status{0};
+};
+
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
@@ -785,6 +795,10 @@ struct server_prompt_cache_state {
     // matches it without touching the disk
     std::string spill_path;
     size_t      spill_size = 0;
+
+    // while its file is being written on the page-io pool: the bytes, moved out of this state (never
+    // copied), read by the write and by a lookup that matches before the write lands
+    std::shared_ptr<server_spill_buffer> spilling;
 
     bool spilled() const {
         return !spill_path.empty();
@@ -825,10 +839,20 @@ struct server_prompt_cache {
 
     uint64_t spill_seq = 0;
 
+    // this instance's directory under the configured one (server-spill-dir.h: another engine's files are
+    // never touched), and the pool its files are written on (the task loop only moves the bytes)
+    server_spill_dir      spill_dir;
+    server_page_io_pool * io = nullptr;
+
     ~server_prompt_cache();
 
-    // enable the disk tier in `dir` (created, and emptied of states a previous engine left)
-    bool set_disk(const std::string & dir, int32_t limit_mib);
+    // enable the disk tier under `dir` (this instance's own directory; instance directories whose owner
+    // is gone are swept), writing on `pool`
+    bool set_disk(const std::string & dir, int32_t limit_mib, server_page_io_pool * pool);
+
+    // on the task loop: drop the bytes of spills whose write landed, and keep resident the ones whose
+    // write failed
+    void reap_spills();
 
     // bytes held in RAM, by resident states only
     size_t size() const;

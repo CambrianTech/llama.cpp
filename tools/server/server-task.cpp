@@ -1783,47 +1783,22 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache::~server_prompt_cache() {
-    for (const auto & state : states) {
-        if (state.spilled()) {
-            std::error_code ec;
-            std::filesystem::remove(state.spill_path, ec);
-        }
-    }
-}
+server_prompt_cache::~server_prompt_cache() = default; // spill_dir removes this instance's directory
 
-bool server_prompt_cache::set_disk(const std::string & dir, int32_t limit_mib) {
+bool server_prompt_cache::set_disk(const std::string & dir, int32_t limit_mib, server_page_io_pool * pool) {
     std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (ec) {
-        SRV_ERR("prompt cache disk tier: cannot create %s: %s\n", dir.c_str(), ec.message().c_str());
+    const size_t swept = spill_dir.claim(dir, ec);
+    if (!spill_dir.ok() || pool == nullptr) {
+        SRV_ERR("prompt cache disk tier: cannot claim an instance directory under %s: %s\n", dir.c_str(),
+                ec ? ec.message().c_str() : (pool ? "its owner lock is held" : "no page-io pool"));
         return false;
     }
-    // a state written by another engine instance is not this one's: its slot ids, adapters and
-    // tokens were never recorded here, so it could never be matched, only leak
-    for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (entry.path().extension() == ".state") {
-            std::filesystem::remove(entry.path(), ec);
-        }
-    }
-    disk_dir   = dir;
+    disk_dir   = spill_dir.path().string();
+    io         = pool;
     disk_limit = 1024ull*1024ull*(limit_mib < 0 ? 0 : limit_mib);
-    SRV_INF("prompt cache disk tier: %s, size limit: %d MiB\n", dir.c_str(), limit_mib);
+    SRV_INF("prompt cache disk tier: %s, size limit: %d MiB (%zu abandoned instance directories swept)\n",
+            disk_dir.c_str(), limit_mib, swept);
     return true;
-}
-
-static bool write_block(FILE * f, const std::vector<uint8_t> & data) {
-    const uint64_t n = data.size();
-    return fwrite(&n, sizeof(n), 1, f) == 1 && (n == 0 || fwrite(data.data(), 1, n, f) == n);
-}
-
-static bool read_block(FILE * f, std::vector<uint8_t> & data) {
-    uint64_t n = 0;
-    if (fread(&n, sizeof(n), 1, f) != 1) {
-        return false;
-    }
-    data.resize(n);
-    return n == 0 || fread(data.data(), 1, n, f) == n;
 }
 
 bool server_prompt_cache::spill(server_prompt_cache_state & state) {
@@ -1843,44 +1818,75 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
         erase(oldest);
     }
 
-    const auto t0 = std::chrono::steady_clock::now();
+    // the task loop only MOVES the bytes into the spill buffer; the file is written on the page-io pool
     const std::string path = disk_dir + "/" + std::to_string(spill_seq++) + ".state";
-    FILE * f = fopen(path.c_str(), "wb");
-    if (f == nullptr) {
-        SRV_ERR("prompt cache disk tier: cannot open %s\n", path.c_str());
-        return false;
-    }
-    bool ok = write_block(f, state.data.main) && write_block(f, state.data.drft);
-    for (const auto & ckpt : state.prompt.checkpoints) {
-        ok = ok && write_block(f, ckpt.data_tgt) && write_block(f, ckpt.data_dft) && write_block(f, ckpt.data_spec);
-    }
-    ok = (fclose(f) == 0) && ok;
-    if (!ok) {
-        SRV_ERR("prompt cache disk tier: failed writing %s\n", path.c_str());
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        return false;
-    }
-
-    state.data.main.clear();
-    state.data.main.shrink_to_fit();
-    state.data.drft.clear();
-    state.data.drft.shrink_to_fit();
+    auto buf = std::make_shared<server_spill_buffer>();
+    buf->blocks.reserve(2 + 3 * state.prompt.checkpoints.size());
+    buf->blocks.push_back(std::move(state.data.main));
+    buf->blocks.push_back(std::move(state.data.drft));
     for (auto & ckpt : state.prompt.checkpoints) {
-        ckpt.data_tgt.clear();
-        ckpt.data_tgt.shrink_to_fit();
-        ckpt.data_dft.clear();
-        ckpt.data_dft.shrink_to_fit();
-        ckpt.data_spec.clear();
-        ckpt.data_spec.shrink_to_fit();
+        buf->blocks.push_back(std::move(ckpt.data_tgt));
+        buf->blocks.push_back(std::move(ckpt.data_dft));
+        buf->blocks.push_back(std::move(ckpt.data_spec));
+    }
+    state.data.main = {};
+    state.data.drft = {};
+    for (auto & ckpt : state.prompt.checkpoints) {
+        ckpt.data_tgt  = {};
+        ckpt.data_dft  = {};
+        ckpt.data_spec = {};
     }
     state.spill_path = path;
     state.spill_size = bytes;
+    state.spilling   = buf;
 
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    SRV_INF(" - spilled prompt cache entry to disk: %d tokens, %.3f MiB in %.1f ms\n",
-            state.prompt.n_tokens(), bytes / (1024.0 * 1024.0), ms);
+    const int n_tokens = state.prompt.n_tokens();
+    io->submit(path, [buf, path, bytes, n_tokens] {
+        const auto t0 = std::chrono::steady_clock::now();
+        FILE * f = fopen(path.c_str(), "wb");
+        bool ok = f != nullptr;
+        for (const auto & block : buf->blocks) {
+            ok = ok && server_spill_write_block(f, block);
+        }
+        ok = (f == nullptr || fclose(f) == 0) && ok;
+        if (!ok) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            SRV_ERR("prompt cache disk tier: failed writing %s; the entry stays in RAM\n", path.c_str());
+        } else {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            SRV_INF(" - spilled prompt cache entry to disk: %d tokens, %.3f MiB in %.1f ms (page-io pool)\n",
+                    n_tokens, bytes / (1024.0 * 1024.0), ms);
+        }
+        buf->status.store(ok ? 1 : -1, std::memory_order_release);
+    });
     return true;
+}
+
+void server_prompt_cache::reap_spills() {
+    for (auto & state : states) {
+        if (!state.spilling) {
+            continue;
+        }
+        const int status = state.spilling->status.load(std::memory_order_acquire);
+        if (status == 1) {
+            state.spilling.reset(); // written: the RAM copy goes
+        } else if (status == -1) {
+            // the write failed: the bytes come back and the entry stays resident
+            auto & blocks = state.spilling->blocks;
+            size_t b = 0;
+            state.data.main = std::move(blocks[b++]);
+            state.data.drft = std::move(blocks[b++]);
+            for (auto & ckpt : state.prompt.checkpoints) {
+                ckpt.data_tgt  = std::move(blocks[b++]);
+                ckpt.data_dft  = std::move(blocks[b++]);
+                ckpt.data_spec = std::move(blocks[b++]);
+            }
+            state.spilling.reset();
+            state.spill_path.clear();
+            state.spill_size = 0;
+        }
+    }
 }
 
 bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
@@ -1888,18 +1894,45 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
         return true;
     }
     const auto t0 = std::chrono::steady_clock::now();
+    if (state.spilling) {
+        // its bytes are still in RAM (the write is running, landed unreaped, or failed): copy them back
+        // from the buffer the write reads, never the disk
+        const auto & blocks = state.spilling->blocks;
+        size_t b = 0;
+        state.data.main = blocks[b++];
+        state.data.drft = blocks[b++];
+        for (auto & ckpt : state.prompt.checkpoints) {
+            ckpt.data_tgt  = blocks[b++];
+            ckpt.data_dft  = blocks[b++];
+            ckpt.data_spec = blocks[b++];
+        }
+        state.spilling.reset();
+        // the file is removed after its write, in order, on the pool
+        const std::string path = state.spill_path;
+        io->submit(path, [path] { std::error_code rm; std::filesystem::remove(path, rm); });
+        const size_t bytes = state.spill_size;
+        state.spill_path.clear();
+        state.spill_size = 0;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        SRV_INF(" - restored prompt cache entry from its in-flight spill: %d tokens, %.3f MiB in %.1f ms\n",
+                state.prompt.n_tokens(), bytes / (1024.0 * 1024.0), ms);
+        return true;
+    }
     FILE * f = fopen(state.spill_path.c_str(), "rb");
     if (f == nullptr) {
         SRV_ERR("prompt cache disk tier: cannot open %s\n", state.spill_path.c_str());
         return false;
     }
-    bool ok = read_block(f, state.data.main) && read_block(f, state.data.drft);
+    std::error_code size_ec;
+    uint64_t remaining = std::filesystem::file_size(state.spill_path, size_ec);
+    bool ok = !size_ec && server_spill_read_block(f, state.data.main, remaining) && server_spill_read_block(f, state.data.drft, remaining);
     for (auto & ckpt : state.prompt.checkpoints) {
-        ok = ok && read_block(f, ckpt.data_tgt) && read_block(f, ckpt.data_dft) && read_block(f, ckpt.data_spec);
+        ok = ok && server_spill_read_block(f, ckpt.data_tgt, remaining) && server_spill_read_block(f, ckpt.data_dft, remaining) &&
+             server_spill_read_block(f, ckpt.data_spec, remaining);
     }
     fclose(f);
-    if (!ok) {
-        SRV_ERR("prompt cache disk tier: failed reading %s\n", state.spill_path.c_str());
+    if (!ok || remaining != 0) {
+        SRV_ERR("prompt cache disk tier: %s is corrupt or truncated; the entry is dropped\n", state.spill_path.c_str());
         return false;
     }
     std::error_code ec;
@@ -1916,8 +1949,9 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
 
 std::list<server_prompt_cache_state>::iterator server_prompt_cache::erase(std::list<server_prompt_cache_state>::iterator it) {
     if (it->spilled()) {
-        std::error_code ec;
-        std::filesystem::remove(it->spill_path, ec);
+        // ordered after any write of the same file on the pool, so a writer never recreates it
+        const std::string path = it->spill_path;
+        io->submit(path, [path] { std::error_code rm; std::filesystem::remove(path, rm); });
     }
     return states.erase(it);
 }
@@ -1944,6 +1978,7 @@ bool server_prompt_cache::evict_oldest_resident() {
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_tgt, size_t state_size_dft) {
+    reap_spills();
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (it->lora != lora) {
@@ -2026,6 +2061,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.lora   =*/ lora,
         /*.spill_path =*/ {},   // resident in RAM until the disk tier spills it
         /*.spill_size =*/ 0,
+        /*.spilling   =*/ nullptr,
     });
 
     return &states.back();
@@ -2042,6 +2078,7 @@ void server_prompt_cache::evict_lora(const llama_adapter_lora * adapter) {
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & lora, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    reap_spills();
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -2127,6 +2164,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const lora_active_set & l
 }
 
 void server_prompt_cache::update() {
+    reap_spills();
     if (limit_size > 0) {
         while (size() > limit_size && evict_oldest_resident()) {
         }
