@@ -210,7 +210,11 @@ struct common_sampler {
             coarse_stats.widens++;
             const float seeded = coarse_seed(logits, n_vocab);
             step = step == 0.0f ? std::max(thr - seeded, 1e-3f) : step * 2.0f;
-            thr = std::min(seeded, thr - step);
+            const float next = std::min(seeded, thr - step);
+            // progress or the end: a widening that does not strictly lower the threshold (an infinite or
+            // NaN seed, +inf - +inf, a step that overflowed) goes straight to -inf, where the check above
+            // ends it (Codex on #122: a +inf seed never moved the threshold)
+            thr = next < thr ? next : -INFINITY;
             n = coarse_scan(logits, n_vocab, thr);
         }
         // next step's threshold: the value at rank margin*cap among this step's logits (the candidates hold
