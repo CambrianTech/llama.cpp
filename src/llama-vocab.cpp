@@ -16,6 +16,9 @@
 #include <cstdarg>
 #include <cstring>
 #include <forward_list>
+#include <list>
+#include <mutex>
+#include <string_view>
 #include <limits>
 #include <map>
 #include <queue>
@@ -1874,6 +1877,59 @@ struct llama_vocab::impl {
 
     void tokenizer_st_partition(std::forward_list<fragment_buffer_variant> & buffer, bool parse_special) const;
 
+    // Continuum fork: text already tokenized is never tokenized again. A prompt is split at special tokens
+    // before BPE, and BPE of one fragment never depends on another, so a fragment's tokens are a pure
+    // function of its text: a chat prompt's unchanged messages are lookups, and only new text runs BPE.
+    // Keyed by the exact text (compared whole: a hash collision can never return wrong tokens), least
+    // recently used out first, bounded by bytes. Measured (qwen35-0.8b, M5, 2026-11-16): 104,600 tokens
+    // of chat cost 49 ms of BPE per request; special-token partitioning cost under 1 ms.
+    struct fragment_tokens_cache {
+        // A full 262k-token mind is ~1 MiB of text plus ~1 MiB of tokens: 64 MiB holds ~30 such minds.
+        static constexpr size_t max_bytes = 64ull << 20;
+
+        struct entry {
+            std::string              text;
+            std::vector<llama_token> tokens;
+        };
+        std::mutex                                                         mutex;
+        std::list<entry>                                                   lru; // most recent first
+        std::unordered_map<std::string_view, std::list<entry>::iterator> index;
+        size_t                                                             bytes = 0;
+
+        // appends the cached tokens of `text` to `out`; false when absent
+        bool append(const std::string & text, std::vector<llama_token> & out) {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = index.find(text);
+            if (it == index.end()) {
+                return false;
+            }
+            lru.splice(lru.begin(), lru, it->second);
+            out.insert(out.end(), it->second->tokens.begin(), it->second->tokens.end());
+            return true;
+        }
+
+        void put(std::string text, std::vector<llama_token> tokens) {
+            const size_t size = text.size() + tokens.size() * sizeof(llama_token);
+            if (size > max_bytes) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(mutex);
+            if (index.count(text)) {
+                return; // another thread tokenized the same text meanwhile
+            }
+            lru.push_front({ std::move(text), std::move(tokens) });
+            index.emplace(std::string_view(lru.front().text), lru.begin());
+            bytes += size;
+            while (bytes > max_bytes) {
+                auto & old = lru.back();
+                bytes -= old.text.size() + old.tokens.size() * sizeof(llama_token);
+                index.erase(std::string_view(old.text));
+                lru.pop_back();
+            }
+        }
+    };
+    mutable fragment_tokens_cache fragment_cache;
+
     std::string token_to_piece_for_cache(
                   llama_token   token,
                          bool   special) const;
@@ -3464,7 +3520,11 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
 #ifdef PRETOKENIZERDEBUG
                         LLAMA_LOG_WARN("TT: (%ld %ld %ld) '%s'\n", text.length(), fragment.offset, fragment.length, text.c_str());
 #endif
-                        session->tokenize(text, output);
+                        if (!fragment_cache.append(text, output)) {
+                            const size_t from = output.size();
+                            session->tokenize(text, output);
+                            fragment_cache.put(std::move(text), std::vector<llama_token>(output.begin() + from, output.end()));
+                        }
                     } else { // if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN)
                         session->append(fragment.token, output);
                     }
