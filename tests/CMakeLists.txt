@@ -24,6 +24,12 @@ target_compile_features(test-server-learn-ledger PRIVATE cxx_std_17)
 add_test(NAME test-server-learn-ledger COMMAND test-server-learn-ledger)
 set_tests_properties(test-server-learn-ledger PROPERTIES LABELS "main")
 
+# Model-free host-pool validator: one byte budget across prompt cache, checkpoints and pages.
+add_executable(test-server-host-pool test-server-host-pool.cpp)
+target_compile_features(test-server-host-pool PRIVATE cxx_std_17)
+add_test(NAME test-server-host-pool COMMAND test-server-host-pool)
+set_tests_properties(test-server-host-pool PROPERTIES LABELS "main")
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
