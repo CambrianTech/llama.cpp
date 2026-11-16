@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
@@ -514,6 +515,28 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+    // Continuum fork: device snapshots keyed by a caller snapshot id (llama_state_seq_snapshot_*)
+    struct device_snapshot {
+        std::vector<uint8_t>  header; // the host-side part: magic, seq id, tensor layout
+        llama_memory_buffers  bufs;   // the state itself, in device buffers
+        llama_state_seq_flags flags = 0;
+        std::vector<std::pair<const ggml_tensor *, size_t>> layout; // provenance: which tensors, how many bytes
+        struct splice { size_t offset; ggml_backend_buffer_type_t buft; size_t index; size_t size; };
+        std::vector<splice> splices; // where each tensor's bytes go in the host-format stream
+    };
+    // shared: a file writer on another thread keeps a snapshot alive after its id is freed or replaced
+    std::map<uint64_t, std::shared_ptr<device_snapshot>> snapshots;
+    std::mutex snapshots_mutex;
+
+public:
+    llama_snapshot_status snapshot_bytes(llama_seq_id seq_id, llama_state_seq_flags flags, size_t * device_bytes);
+    llama_snapshot_status snapshot_save(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags, size_t * device_bytes);
+    llama_snapshot_status snapshot_load(llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags);
+    bool quarantine(llama_seq_id seq_id); // clear a failed restore; true only when the sequence is empty after
+    llama_snapshot_status snapshot_free(uint64_t snapshot_id);
+    llama_snapshot_status snapshot_write_file(uint64_t snapshot_id, const char * filepath, const llama_token * tokens, size_t n_tokens);
+private:
 
     bool has_evaluated_once = false;
 

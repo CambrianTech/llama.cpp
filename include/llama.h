@@ -1085,6 +1085,55 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Continuum fork (CONTINUUM-ENGINE 4.7.11): DEVICE SNAPSHOTS of a sequence's state, keyed by a caller
+    // snapshot id (the pool's identity), so a sequence can hold many. Save copies the sequence's state
+    // tensors into device buffers owned by the snapshot (no host bytes; the host keeps a small header);
+    // load copies them back; free releases them. With LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY a hybrid model
+    // snapshots its recurrent row only. Every call returns a typed status and never throws or aborts.
+    enum llama_snapshot_status {
+        LLAMA_SNAPSHOT_OK           = 0,
+        LLAMA_SNAPSHOT_ABSENT       = 1, // no snapshot under this id / nothing to snapshot under these flags
+        LLAMA_SNAPSHOT_INCOMPATIBLE = 2, // flags or tensor layout differ from the target: nothing was changed
+        LLAMA_SNAPSHOT_ALLOC_FAILED = 3, // device memory could not be allocated: a previous snapshot is kept
+        LLAMA_SNAPSHOT_COPY_FAILED  = 4, // the copy itself failed; a load's target was cleared whole (it holds no one's state)
+        LLAMA_SNAPSHOT_TARGET_UNCLEARED = 5, // a load failed after the read began AND clearing its target failed: the
+                                             // sequence is undefined; the caller keeps custody of it (never serves,
+                                             // parks or returns it) until llama_memory_seq_rm(seq, -1, -1) succeeds
+    };
+
+    // The bytes a snapshot of `seq_id` would hold PHYSICALLY (device buffers at their alignment, ggml
+    // metadata, host header), so the pool reserves BEFORE anything allocates; save reports the same.
+    LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_bytes(
+            struct llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, size_t * device_bytes);
+
+    // Stage, copy, then publish: a failed save leaves any previous snapshot under this id loadable. While
+    // a replacement is staged both generations exist (the pool charges both).
+    LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_save(
+            struct llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags, size_t * device_bytes);
+
+    // Validated before the live sequence is touched: refused (INCOMPATIBLE) on a flags or layout mismatch. A
+    // failure after the read began quarantines the target (cleared whole) and returns COPY_FAILED: the caller
+    // must then drop any record that the sequence holds a mind's tokens (it is cold). If the clear itself does
+    // not leave the sequence empty, TARGET_UNCLEARED: the caller keeps custody of the sequence until it clears.
+    LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_load(
+            struct llama_context * ctx, llama_seq_id seq_id, uint64_t snapshot_id, llama_state_seq_flags flags);
+
+    // Write a FULL-sequence snapshot (saved with flags 0) as a standard state file (the format
+    // llama_state_seq_save_file writes and llama_state_seq_load_file reads), from the snapshot alone:
+    // safe on a writer thread while the context keeps decoding.
+    LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_write_file(
+            struct llama_context * ctx, uint64_t snapshot_id, const char * filepath, const llama_token * tokens, size_t n_tokens);
+
+    // Synchronizes first: no submitted step can still read the buffers being freed.
+    LLAMA_API enum llama_snapshot_status llama_state_seq_snapshot_free(struct llama_context * ctx, uint64_t snapshot_id);
+
+    // Test-only fault injection: the next `n` snapshot device allocations fail; the next `n` load commits
+    // fail after the read (the target is then quarantined: cleared whole, COPY_FAILED); the next `n`
+    // quarantine clears fail (TARGET_UNCLEARED).
+    LLAMA_API void llama_state_seq_snapshot_test_fail_next_allocs(int n);
+    LLAMA_API void llama_state_seq_snapshot_test_fail_next_load_commits(int n);
+    LLAMA_API void llama_state_seq_snapshot_test_fail_next_quarantine_clears(int n);
+
     //
     // Decoding
     //
