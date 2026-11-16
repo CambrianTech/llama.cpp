@@ -1923,13 +1923,14 @@ private:
                     m.lora     = slot.lora;
                     m.last_use   = ++mind_clock;
                     m.generation = slot.page_generation + 1;
+                    m.prompt = std::move(slot.prompt);
+                    slot.prompt.clear();
                     if (flash_out(m, slot.id)) {
-                        m.prompt = std::move(slot.prompt);
-                        slot.prompt.clear();
                         slot.page = mind_page{};
                         minds.push_back(std::move(m));
                         return true;
                     }
+                    slot.prompt = std::move(m.prompt); // she stays whole on her lane
                 }
             }
         }

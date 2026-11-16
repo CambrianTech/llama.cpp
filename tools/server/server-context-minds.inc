@@ -24,6 +24,47 @@
         std::shared_ptr<std::atomic<int>>     written;         // 0 pending, 1 landed, -1 failed
     };
 
+    // her checkpoints as bytes beside her state: count, then per checkpoint its position fields, three sizes and
+    // the three blobs (target, draft, speculative state)
+    static constexpr size_t ckpt_header_bytes = sizeof(int64_t) + 3 * sizeof(int32_t) + 1 + 3 * sizeof(uint64_t);
+
+    static void ckpt_write(const std::list<common_prompt_checkpoint> & cks, uint8_t * w) {
+        auto put = [&](const void * p, size_t n) { std::memcpy(w, p, n); w += n; };
+        const uint64_t count = cks.size();
+        put(&count, sizeof(count));
+        for (const auto & c : cks) {
+            const int32_t  id = c.id_task, mn = c.pos_min, mx = c.pos_max;
+            const uint8_t  pin = c.pinned ? 1 : 0;
+            const uint64_t a = c.data_tgt.size(), b = c.data_dft.size(), d = c.data_spec.size();
+            put(&c.n_tokens, sizeof(c.n_tokens)); put(&id, 4); put(&mn, 4); put(&mx, 4); put(&pin, 1);
+            put(&a, 8); put(&b, 8); put(&d, 8);
+            put(c.data_tgt.data(), a); put(c.data_dft.data(), b); put(c.data_spec.data(), d);
+        }
+    }
+
+    static bool ckpt_read(const uint8_t * r, uint64_t n, std::list<common_prompt_checkpoint> & out) {
+        const uint8_t * end = r + n;
+        auto get = [&](void * p, size_t k) { if ((size_t) (end - r) < k) { return false; } std::memcpy(p, r, k); r += k; return true; };
+        uint64_t count = 0;
+        if (!get(&count, sizeof(count))) {
+            return false;
+        }
+        for (uint64_t i = 0; i < count; ++i) {
+            common_prompt_checkpoint c;
+            int32_t id, mn, mx; uint8_t pin; uint64_t a, b, d;
+            if (!get(&c.n_tokens, sizeof(c.n_tokens)) || !get(&id, 4) || !get(&mn, 4) || !get(&mx, 4) || !get(&pin, 1) ||
+                !get(&a, 8) || !get(&b, 8) || !get(&d, 8) || (uint64_t) (end - r) < a + b + d) {
+                return false;
+            }
+            c.id_task = id; c.pos_min = mn; c.pos_max = mx; c.pinned = pin != 0;
+            c.data_tgt.assign(r, r + a);  r += a;
+            c.data_dft.assign(r, r + b);  r += b;
+            c.data_spec.assign(r, r + d); r += d;
+            out.push_back(std::move(c));
+        }
+        return r == end;
+    }
+
     std::vector<int32_t>       park_free;  // free parked sequence ids (sized once at load)
     std::vector<resident_mind> minds;      // parked and flashed minds (reserved once at load)
     uint64_t                   mind_clock = 0;
@@ -107,17 +148,24 @@
         auto bytes = std::make_shared<std::vector<uint8_t>>();
         const size_t n_tgt = llama_state_seq_get_size_ext(ctx_tgt, seq, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t n_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, seq, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-        bytes->resize(2 * sizeof(uint64_t) + n_tgt + n_dft);
+        // her checkpoints go down with her (they are host bytes too: ~100 MB each on a 35B hybrid)
+        size_t n_ck = sizeof(uint64_t);
+        for (const auto & c : cold->prompt.checkpoints) {
+            n_ck += ckpt_header_bytes + c.data_tgt.size() + c.data_dft.size() + c.data_spec.size();
+        }
+        bytes->resize(3 * sizeof(uint64_t) + n_tgt + n_dft + n_ck);
         uint8_t * w = bytes->data();
-        const uint64_t h[2] = { n_tgt, n_dft };
+        const uint64_t h[3] = { n_tgt, n_dft, n_ck };
         std::memcpy(w, h, sizeof(h));
         w += sizeof(h);
+        ckpt_write(cold->prompt.checkpoints, w + n_tgt + n_dft);
         if (llama_state_seq_get_data_ext(ctx_tgt, w, n_tgt, seq, LLAMA_STATE_SEQ_FLAGS_NONE) != n_tgt ||
             (ctx_dft && llama_state_seq_get_data_ext(ctx_dft, w + n_tgt, n_dft, seq, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft)) {
             SRV_ERR("mind %016llx: her state could not be copied out of the pool; she stays where she is\n", (unsigned long long) cold->page.hi);
             return false;
         }
         const int64_t t_copy = ggml_time_us() - t0;
+        std::list<common_prompt_checkpoint>().swap(cold->prompt.checkpoints); // their bytes are in hers now
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq, -1, -1);
         if (ctx_dft) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq, -1, -1);
@@ -186,15 +234,19 @@
             base = map->data();
             size = map->size();
         }
-        if (size < 2 * sizeof(uint64_t)) {
+        if (size < 3 * sizeof(uint64_t)) {
             return false;
         }
-        uint64_t h[2];
+        uint64_t h[3];
         std::memcpy(h, base, sizeof(h));
-        if (size != 2 * sizeof(uint64_t) + h[0] + h[1]) {
+        if (size != 3 * sizeof(uint64_t) + h[0] + h[1] + h[2]) {
             return false;
         }
         const uint8_t * r = base + sizeof(h);
+        std::list<common_prompt_checkpoint> checkpoints;
+        if (!ckpt_read(r + h[0] + h[1], h[2], checkpoints)) {
+            return false;
+        }
         // her cells come from the pool: when it is full, the coldest parked mind goes down to flash first, and the
         // insert is tried again (a level above makes room for the level below, never a drop)
         bool ok = false;
@@ -223,6 +275,7 @@
         }
         SRV_INF("mind %016llx%016llx back from %s: %.1f MiB inserted in %.2f ms\n", (unsigned long long) m.page.hi,
                 (unsigned long long) m.page.lo, ram ? "RAM" : "flash", size / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0);
+        m.prompt.checkpoints = std::move(checkpoints);
         // her file is removed on the page-IO worker, ordered after its own write (it may still be landing)
         const std::string path = m.file;
         page_io->submit(path, [path] { std::error_code ec; std::filesystem::remove(path, ec); });
@@ -289,16 +342,17 @@
             if (park_free.empty()) {
                 flash_coldest(); // the pool's coldest parked mind makes room, if one is parked
             }
+            m.prompt = std::move(slot.prompt);
+            slot.prompt.clear();
             if (!park_free.empty()) {
                 m.seq = park_free.back();
                 park_free.pop_back();
                 seq_move(slot.id, m.seq);
             } else if (!flash_out(m, slot.id)) {
+                slot.prompt = std::move(m.prompt); // she stays whole on her lane
                 SLT_ERR(slot, "%s", "the leaving mind could be neither parked nor copied out; she is kept on this lane\n");
                 return false; // her state is intact on the lane; the arriving request waits for another lane
             }
-            m.prompt = std::move(slot.prompt);
-            slot.prompt.clear();
             minds.push_back(std::move(m));
         } else if (!slot.page.valid()) {
             // content no named mind owns (a core page restore, or scratch): adopted, never cleared; the prompt's
