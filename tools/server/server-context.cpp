@@ -1580,6 +1580,14 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // Continuum fork (CONTINUUM-ENGINE 4.7.6, step 1): --cache-ram is the ONE host budget of the prompt
+            // cache AND every slot's checkpoints. They were sized apart and nothing held their sum: on the M5
+            // (2026-11-16) a 9.5 GB cache plus up to 32 x ~100 MB checkpoints x 5 slots swapped 16 GB out of the
+            // engine and decode fell to 1.3 tok/s (par ~56).
+            if (params_base.cache_ram_mib > 0) {
+                host_budget = 1024ull * 1024ull * (size_t) params_base.cache_ram_mib;
+                SRV_INF("host budget (prompt cache + checkpoints, all slots): %d MiB\n", params_base.cache_ram_mib);
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1882,6 +1890,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                fit_prompt_cache_to_budget(); // its share of the one host budget, before it takes a new entry
                 ret->prompt_save(*prompt_cache);
 
                 const auto task_lora = task.params.lora.empty() ? params_base.lora_adapters
@@ -2647,6 +2656,68 @@ private:
         }
     }
 
+    // ---- the one host budget (CONTINUUM-ENGINE 4.7.6, step 1) ------------------------------------------
+    // 0: no budget (--cache-ram -1 or 0). Checkpoints are charged first (they serve the minds in the slots);
+    // the prompt cache holds what is left and evicts down to it.
+    size_t host_budget = 0;
+
+    size_t checkpoint_bytes() const {
+        size_t b = 0;
+        for (const auto & s : slots) {
+            for (const auto & c : s.prompt.checkpoints) {
+                b += c.size();
+            }
+        }
+        return b;
+    }
+
+    // The prompt cache's share: the budget less every checkpoint (1 byte, not 0, when none is left: the
+    // cache reads 0 as "no limit").
+    void fit_prompt_cache_to_budget() {
+        if (!prompt_cache || host_budget == 0) {
+            return;
+        }
+        const size_t ck = checkpoint_bytes();
+        prompt_cache->limit_size = host_budget > ck ? host_budget - ck : 1;
+        prompt_cache->update();
+    }
+
+    // Room for a checkpoint of `bytes` under the budget: the slot holding the most checkpoint bytes gives up its
+    // least valuable one (checkpoint_to_evict keeps her head while anything else is left), until it fits. False:
+    // it cannot fit even with every checkpoint gone (larger than the budget); the caller makes none.
+    bool make_room_for_checkpoint(size_t bytes) {
+        if (host_budget == 0) {
+            return true;
+        }
+        if (bytes > host_budget) {
+            return false;
+        }
+        size_t held = checkpoint_bytes();
+        while (held + bytes > host_budget) {
+            server_slot * from = nullptr;
+            size_t        most = 0;
+            for (auto & s : slots) {
+                size_t b = 0;
+                for (const auto & c : s.prompt.checkpoints) {
+                    b += c.size();
+                }
+                if (b > most) {
+                    most = b;
+                    from = &s;
+                }
+            }
+            if (from == nullptr) {
+                return false;
+            }
+            auto victim = checkpoint_to_evict(from->prompt.checkpoints, from->prompt.view_end);
+            SLT_WRN(*from, "host budget: erasing a checkpoint (n_tokens = %" PRId64 ", %.3f MiB) for a new one of %.3f MiB\n",
+                    victim->n_tokens, (float) victim->size() / 1024 / 1024, (float) bytes / 1024 / 1024);
+            held -= victim->size();
+            from->prompt.checkpoints.erase(victim);
+        }
+        return true;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2682,6 +2753,19 @@ private:
             slot.prompt.checkpoints.erase(victim);
         }
 
+        // under the one host budget: quote the copy before making it (its peak), and make room first
+        {
+            size_t quote = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (ctx_dft && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                quote += llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+            if (!make_room_for_checkpoint(quote)) {
+                SLT_WRN(slot, "host budget: a checkpoint of %.3f MiB is larger than the whole budget; none is made\n",
+                        (float) quote / 1024 / 1024);
+                return;
+            }
+        }
+
         // the copy is made aside and kept only once complete
         common_prompt_checkpoint cur;
 
@@ -2711,6 +2795,8 @@ private:
                 SLT_TRC(slot, "erasing a checkpoint her view end supersedes (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it.n_tokens, (float) it.size() / 1024 / 1024);
             });
+
+        fit_prompt_cache_to_budget(); // the cache yields what the checkpoints now hold
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
