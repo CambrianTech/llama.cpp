@@ -1,5 +1,6 @@
 #include <limits>
 #include "server-context.h"
+#include "server-checkpoint-policy.h"
 #include "../../src/llama-ext.h"
 #include "server-train.h"
 #include "server-adapter-file.h"
@@ -741,6 +742,18 @@ struct server_slot {
             llama_memory_t mem = llama_get_memory(ctx_tgt);
             res["kv_pos_min"] = llama_memory_seq_pos_min(mem, id);
             res["kv_pos_max"] = llama_memory_seq_pos_max(mem, id);
+        }
+
+        // The slot's context checkpoints as they sit in host memory now (Continuum fork): their count
+        // and their bytes, so the core prices the checkpoint store from what it holds, not a guess.
+        {
+            size_t bytes = 0;
+            json at = json::array();
+            for (const auto & ckpt : prompt.checkpoints) {
+                bytes += ckpt.size();
+                at.push_back({ {"n_tokens", ckpt.n_tokens}, {"bytes", ckpt.size()} });
+            }
+            res["checkpoints"] = { {"count", prompt.checkpoints.size()}, {"bytes", bytes}, {"at", at} };
         }
 
         const auto & ptask = task ? task : task_prev;
@@ -2604,13 +2617,14 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // make room for the new checkpoint, if needed: her head stays while there is anything else
+            // to evict (server-checkpoint-policy.h)
+            auto victim = checkpoint_to_evict(slot.prompt.checkpoints, slot.prompt.view_end);
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                    victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         // the copy is made aside and kept only once complete
@@ -2629,6 +2643,16 @@ private:
         }
 
         const auto & kept = slot.prompt.checkpoints.emplace_back(std::move(cur));
+
+        // Continuum fork (CONTINUUM-ENGINE 4.7.3, placed checkpoints): her new view-end checkpoint
+        // supersedes every checkpoint an earlier act left on this prefix except her head's (the oldest,
+        // the restore point when her next prompt diverges before her view end). What stays per slot is
+        // her head, her newest view end, and this act's end checkpoints.
+        erase_superseded_checkpoints(slot.prompt.checkpoints, kept, slot.prompt.view_end, id_task,
+            [&](const common_prompt_checkpoint & it) {
+                SLT_TRC(slot, "erasing a checkpoint her view end supersedes (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        it.n_tokens, (float) it.size() / 1024 / 1024);
+            });
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -4081,8 +4105,11 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // break at the last user message, or at user messages at least min step past the last checkpoint.
+                        // Continuum fork: not when the request carries her view spans: then the view end below is
+                        // where her next prompt diverges, and blind step checkpoints only pile up (CONTINUUM-ENGINE
+                        // 4.7.2-4.7.3; the M5, 2026-11-16: up to 32 x ~110 MB per slot thrashed the host)
+                        if (do_checkpoint && view_end_pos < 0 && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
