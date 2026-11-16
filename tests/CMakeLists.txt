@@ -183,6 +183,7 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build_and_test(test-sampler-penalties.cpp)
 llama_build(test-sampler-coarse.cpp) # needs -m <model>: ballpark sampling picks exactly the full path's token
+llama_build_and_test(test-server-view-end.cpp)
 
 # GGML_TENSOR_FLAG_GRAD: a leaf whose gradient the backward computes, never optimized (the walk reads the cached prefix K/V gradient)
 llama_build_and_test(test-grad-leaf.cpp)
