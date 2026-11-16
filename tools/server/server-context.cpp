@@ -2707,7 +2707,7 @@ private:
         // the coldest parked mind goes down to flash first (her checkpoints with her): the minds acting keep theirs
         while (checkpoint_bytes(false) + bytes > host_budget && minds_on() && flash_coldest()) {
         }
-        size_t held = checkpoint_bytes();
+        size_t held = checkpoint_bytes(false); // what stays resident: copies on their way to flash are leaving
         while (held + bytes > host_budget) {
             server_slot * from = nullptr;
             size_t        most = 0;
@@ -2724,7 +2724,28 @@ private:
             if (from == nullptr) {
                 return false;
             }
-            auto victim = checkpoint_to_evict(from->prompt.checkpoints, from->prompt.view_end);
+            // her newest checkpoint is where her next act resumes (her context only appends): it goes last.
+            // Otherwise the store's own order (her head kept while anything else is left), never a pinned one.
+            auto & cks = from->prompt.checkpoints;
+            auto newest = cks.end();
+            for (auto it = cks.begin(); it != cks.end(); ++it) {
+                if (newest == cks.end() || it->n_tokens > newest->n_tokens) {
+                    newest = it;
+                }
+            }
+            auto victim = cks.end();
+            for (auto it = cks.begin(); it != cks.end(); ++it) {
+                if (it != newest && !it->pinned) {
+                    victim = it;
+                    break;
+                }
+            }
+            if (victim == cks.end() && newest != cks.end() && !newest->pinned) {
+                victim = newest; // all that is left
+            }
+            if (victim == cks.end()) {
+                return false; // every checkpoint left is pinned for learning
+            }
             SLT_WRN(*from, "host budget: erasing a checkpoint (n_tokens = %" PRId64 ", %.3f MiB) for a new one of %.3f MiB\n",
                     victim->n_tokens, (float) victim->size() / 1024 / 1024, (float) bytes / 1024 / 1024);
             held -= victim->size();
@@ -2775,8 +2796,8 @@ private:
                 quote += llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             }
             if (!make_room_for_checkpoint(quote)) {
-                SLT_WRN(slot, "host budget: a checkpoint of %.3f MiB is larger than the whole budget; none is made\n",
-                        (float) quote / 1024 / 1024);
+                SLT_WRN(slot, "host budget: a checkpoint of %.3f MiB does not fit beside what stays resident (budget %.3f MiB); none is made\n",
+                        (float) quote / 1024 / 1024, (float) host_budget / 1024 / 1024);
                 return;
             }
         }
