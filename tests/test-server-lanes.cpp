@@ -53,8 +53,29 @@ static void lanes_run_every_job_once() {
     require(after.load() == 6, "the lanes run normally after a failed run");
 }
 
+// regressions for Codex's review of #125: a stop signalled before a lane's first wait was missed (the
+// join hung); and a lane holding an earlier run's claim word could claim against the next run's jobs
+static void lanes_never_hang_and_never_cross_runs() {
+    for (int i = 0; i < 2000; ++i) {
+        server_lanes lanes(5); // destroyed at once: a lane may not have reached its first wait yet
+    }
+    server_lanes lanes(5);
+    std::vector<std::atomic<int>> hits(8);
+    for (int run = 0; run < 50000; ++run) {
+        const size_t n = 2 + (size_t) (run % 6);
+        for (size_t i = 0; i < n; ++i) {
+            hits[i].store(0, std::memory_order_relaxed);
+        }
+        lanes.run(n, [&](size_t i) { hits[i].fetch_add(1, std::memory_order_relaxed); });
+        for (size_t i = 0; i < n; ++i) {
+            require(hits[i].load() == 1, "back to back, every job of every run runs exactly once");
+        }
+    }
+}
+
 int main(int argc, char ** argv) {
     lanes_run_every_job_once();
+    lanes_never_hang_and_never_cross_runs();
 
     common_params params;
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {

@@ -69,12 +69,17 @@ public:
             }
             return;
         }
-        job.store(&fn, std::memory_order_relaxed);
-        n_jobs.store(n, std::memory_order_relaxed);
         done.store(0, std::memory_order_relaxed);
         failure = nullptr;
-        // published with this release: job and n_jobs are visible to whoever claims in this run
-        next.store(++run_id << 32, std::memory_order_release);
+        // one immutable record per run, published BEFORE the run's claim word: a lane claims only when the
+        // word's run id matches the record's, so a word from an earlier run can never pair with this
+        // run's jobs or bounds (Codex on #125)
+        run_record & rec = runs[++run_id % 2];
+        rec.fn.store(&fn, std::memory_order_relaxed);
+        rec.n.store(n, std::memory_order_relaxed);
+        rec.id.store(run_id, std::memory_order_release);
+        record.store(&rec, std::memory_order_release);
+        next.store(run_id << 32, std::memory_order_release);
         for (size_t i = 0; i < helpers; ++i) {
             lanes[i].wake.fetch_add(1, std::memory_order_release);
             lanes[i].wake.notify_one();
@@ -98,16 +103,19 @@ private:
     void take() {
         uint64_t claim = next.load(std::memory_order_acquire);
         while (true) {
+            // read after the claim word: a word of run r implies run r's record is published (it was
+            // stored first, with release), so a mismatch can only mean the word is stale
+            const run_record * run = record.load(std::memory_order_acquire);
             const size_t i = (size_t) (claim & 0xffffffffu);
-            // a lane holding an older word may read a newer n_jobs here; its compare-exchange then fails
-            if ((claim >> 32) == 0 || i >= n_jobs.load(std::memory_order_relaxed)) {
-                return;
+            if (run == nullptr || (claim >> 32) != run->id.load(std::memory_order_acquire) ||
+                i >= run->n.load(std::memory_order_relaxed)) {
+                return; // no run, a stale word, or this run's jobs are all claimed
             }
             if (!next.compare_exchange_weak(claim, claim + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 continue; // another lane claimed it, or a new run began: `claim` holds the current word
             }
             try {
-                (*job.load(std::memory_order_relaxed))(i);
+                (*run->fn.load(std::memory_order_relaxed))(i);
             } catch (...) {
                 std::lock_guard<std::mutex> lock(failure_mutex);
                 if (!failure) {
@@ -121,8 +129,14 @@ private:
 
     void work(lane & self) {
         server_lane_priority();
-        uint64_t seen = self.wake.load(std::memory_order_acquire);
+        // from 0, never from a load at start: a wake (or the destructor's) that came before this thread
+        // ran is still seen; and stop is checked before every sleep (Codex on #125: a stop signalled before
+        // the first wait was missed, and the join hung)
+        uint64_t seen = 0;
         while (true) {
+            if (stop.load(std::memory_order_acquire)) {
+                return;
+            }
             self.wake.wait(seen, std::memory_order_acquire);
             seen = self.wake.load(std::memory_order_acquire);
             if (stop.load(std::memory_order_acquire)) {
@@ -137,8 +151,17 @@ private:
     std::atomic<uint64_t>                            next{0};
     uint64_t                                         run_id = 0; // the caller's only
     std::atomic<size_t>                              done{0};
-    std::atomic<size_t>                              n_jobs{0};
-    std::atomic<const std::function<void(size_t)> *> job{nullptr};
+    struct run_record {
+        std::atomic<uint64_t>                            id{0};
+        std::atomic<const std::function<void(size_t)> *> fn{nullptr};
+        std::atomic<size_t>                              n{0};
+    };
+    // two records alternate. A record is rewritten only two runs later, after its run's every job was
+    // done; a lane that was descheduled across that can read mixed fields, but its claim word is then two
+    // runs stale and its compare-exchange fails, so it never runs a job. The fields are atomic so that
+    // read is never a data race.
+    run_record                                       runs[2];
+    std::atomic<const run_record *>                  record{nullptr};
     std::mutex                                       failure_mutex; // only when a job throws
     std::exception_ptr                               failure;
 };
