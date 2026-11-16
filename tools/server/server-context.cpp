@@ -3563,57 +3563,19 @@ private:
         }
     }
 
-    // @ngxson : for debugging only
-    int64_t t_pre_decode  = 0;
-    int64_t t_decode      = 0;
-    int64_t t_post_decode = 0;
-    int64_t t_sampl       = 0;
-    int64_t n_pre_decode  = 0;
-    int64_t n_decode      = 0;
-    int64_t n_post_decode = 0;
-    int64_t n_sampl       = 0;
+    // the decode loop's frame budget, every step (CONTINUUM-ENGINE 4.7.9): replaces the compile-time
+    // DEBUG_TIMINGS averages with always-on counters /props reads
+    std::shared_ptr<step_budget> budget = std::make_shared<step_budget>();
 
     // time-fair interleave: after a prefill step, generating slots are owed decode-only time equal to that step
     int64_t t_decode_owed_us = 0;
     int32_t n_batch_gen      = 0; // batch size before prompt tokens are added
     server_prefill_order prefill_order;
-// #define DEBUG_TIMINGS
-#ifdef DEBUG_TIMINGS
-    struct scoped_timer {
-        int64_t & t;
-        int64_t & n;
-        int64_t t_start;
-        scoped_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_) {
-            t_start = ggml_time_us();
-        }
-        ~scoped_timer() {
-            t += ggml_time_us() - t_start;
-            n++;
-        }
-    };
-#else
-    struct scoped_timer {
-        scoped_timer(int64_t &, int64_t &) {}
-        ~scoped_timer() {}
-    };
-#endif
 
     void update_slots() {
         const bool learning_at_start = bool(learning);
         publish_busy_slots();
         struct publish_on_exit { server_context_impl * s; ~publish_on_exit() { s->publish_busy_slots(); } } publish_guard{this};
-#ifdef DEBUG_TIMINGS
-        static int64_t t_prev = 0;
-        int64_t t_start = ggml_time_us();
-        if (t_start - t_prev > 5 * 1000 * 1000) { // every 5 seconds
-            t_prev = t_start;
-            SRV_INF("n_pre_decode      = %" PRId64 "\n", n_pre_decode);
-            SRV_INF("avg t_pre_decode  = %f ms\n", (double) t_pre_decode / n_pre_decode / 1000.0);
-            SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
-            SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
-            SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
-        }
-#endif
 
         // check if all slots are idle
         {
@@ -3643,7 +3605,6 @@ private:
         }
 
         try {
-            scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
             batch.render();
         } catch (const std::exception & e) {
@@ -3683,14 +3644,10 @@ private:
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
-                scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
-#ifdef DEBUG_TIMINGS
-                llama_synchronize(ctx_tgt);
-#endif
 
                 if (ok) {
                     // move the head of the batch forward with the number of tokens we just processed
@@ -3709,8 +3666,9 @@ private:
             }
 
             try {
-                scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
+                budget->end(ggml_time_us(), std::any_of(slots.begin(), slots.end(),
+                        [](const server_slot & sl) { return sl.is_processing(); }));
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -4616,10 +4574,16 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // the frame budget (4.7.9): build = begin..submitted, GPU = submitted..synced
+        const bool carries_prompt = off + batch_view.n_tokens > n_batch_gen;
+        budget->begin(ggml_time_us(), carries_prompt ? step_kind::with_prefill : step_kind::decode,
+                      (uint32_t) batch_view.n_tokens);
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
+            budget->submitted(ggml_time_us());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
+                budget->synced(ggml_time_us());
             }
         });
 
@@ -4789,10 +4753,7 @@ private:
             const int tok_idx = slot.i_batch - off;
 
             llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
-            }
+            id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
 
             slot.i_batch = -1;
 
@@ -5210,6 +5171,7 @@ server_context_meta server_context::get_meta() const {
             { "max_tokens_per_sequence", impl->n_ctx_slot },
             { "sequence_capacity",       llama_n_seq_max(impl->ctx_tgt) },
         },
+        /* step_budget            */ impl->budget,
     };
 }
 
@@ -5629,6 +5591,22 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "model_weight_buffers",        meta.model_weight_buffers },
         { "memory_breakdown",            meta.memory_breakdown },
         { "context_geometry",            meta.context_geometry },
+        { "step_budget",                 [&] {
+            // cumulative microseconds and counts; a reader differences two reads into a window
+            auto counters = [](const step_budget_counters & c) {
+                json j = { {"steps", c.steps}, {"tokens", c.tokens}, {"build_us", c.build_us}, {"gpu_us", c.gpu_us},
+                           {"gap_us", c.gap_us}, {"unsynced_us", c.unsynced_us} };
+                if (auto share = c.gpu_idle_share()) {
+                    j["gpu_idle_share"] = *share;
+                }
+                return j;
+            };
+            if (!meta.step_budget) {
+                return json(nullptr);
+            }
+            auto snap = meta.step_budget->snapshot();
+            return json { {"decode", counters(snap.decode)}, {"with_prefill", counters(snap.with_prefill)} };
+        }() },
         { "modalities",                  json {
             {"vision", meta.has_inp_image},
             {"video",  meta.has_inp_video},

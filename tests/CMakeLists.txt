@@ -48,6 +48,12 @@ target_compile_features(test-server-step-frame PRIVATE cxx_std_23)
 add_test(NAME test-server-step-frame COMMAND test-server-step-frame)
 set_tests_properties(test-server-step-frame PROPERTIES LABELS "main")
 
+# Model-free validator: the decode loop's frame budget (build, GPU, gap per step; GPU idle share).
+add_executable(test-server-step-budget test-server-step-budget.cpp)
+target_compile_features(test-server-step-budget PRIVATE cxx_std_23)
+add_test(NAME test-server-step-budget COMMAND test-server-step-budget)
+set_tests_properties(test-server-step-budget PROPERTIES LABELS "main")
+
 function(llama_build source)
     set(TEST_SOURCES ${source} ${ARGN})
 
