@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #ifdef LLAMA_SERVER_TEST_FAULTS
 #include <cstdlib>
+#include <fstream>
 #endif
 
 // Continuum fork: failures the server tests inject through the environment, so a test can show
@@ -24,6 +26,10 @@ struct server_test_faults {
     // can act while generations are in progress on a model that would otherwise finish in milliseconds
     // (the reconfigure test); a pace, not a failure
     int32_t step_delay_ms      = 0;
+    // LLAMA_SERVER_TEST_PAGE_IO_GATE: a path (a FIFO the test holds) each KV page switch's file IO
+    // reads one byte from before it starts, so a test holds IO in flight without sleeping: opening a
+    // FIFO's write end returns once the IO is waiting, and the byte written releases it
+    std::string page_io_gate;
 
     static server_test_faults from_env() {
         server_test_faults faults;
@@ -32,12 +38,28 @@ struct server_test_faults {
         faults.spec_checkpoints   = read("LLAMA_SERVER_TEST_FAIL_SPEC_CHECKPOINTS");
         faults.prompt_fills       = read("LLAMA_SERVER_TEST_FAIL_PROMPT_FILLS");
         faults.step_delay_ms      = read("LLAMA_SERVER_TEST_STEP_DELAY_MS");
+        if (const char * gate = std::getenv("LLAMA_SERVER_TEST_PAGE_IO_GATE")) {
+            faults.page_io_gate = gate;
+        }
 #endif
         return faults;
     }
 
     bool any() const {
-        return prompt_checkpoints || spec_checkpoints || prompt_fills || step_delay_ms;
+        return prompt_checkpoints || spec_checkpoints || prompt_fills || step_delay_ms || !page_io_gate.empty();
+    }
+
+    // Blocks the calling page IO worker until the test releases it through `gate` (see page_io_gate).
+    static void hold(const std::string & gate) {
+#ifdef LLAMA_SERVER_TEST_FAULTS
+        if (!gate.empty()) {
+            std::ifstream in(gate, std::ios::binary);
+            char released = 0;
+            in.get(released);
+        }
+#else
+        (void) gate;
+#endif
     }
 
     // true when this occurrence is one to fail, counting it
