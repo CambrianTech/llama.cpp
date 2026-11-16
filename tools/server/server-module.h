@@ -30,7 +30,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <expected>
 #include <mutex>
 #include <new>
 #include <stop_token>
@@ -171,8 +170,16 @@ enum class module_refusal : uint8_t {
 // How a job is called: once, either to run or because a stop dropped it.
 enum class job_state : uint8_t { run, cancelled };
 
-// A job's sequence number; it is complete once completed() >= its ticket.
+// A job's sequence number, from 1; it is complete once completed() >= its ticket.
 using job_ticket = uint64_t;
+
+// What submit() did: queued under `ticket` (never 0), or refused for `refusal` (ticket 0). A plain typed result:
+// the C++23 library result type is missing from grid toolchains (Ubuntu 22.04's libstdc++).
+struct module_submit {
+    job_ticket     ticket  = 0;
+    module_refusal refusal = module_refusal::stopping; // meaningful only when !queued()
+    bool queued() const { return ticket != 0; }
+};
 
 // What every module measures about itself.
 struct module_stats {
@@ -234,23 +241,24 @@ public:
     const std::string & name() const { return name_; }
 
     // Queue `j`; its ticket is complete once completed() reaches it. `outcome`, when given, is the owner's
-    // storage for how the job ended; it must outlive the ticket's completion.
-    std::expected<job_ticket, module_refusal> submit(job j, std::atomic<job_outcome> * outcome = nullptr) {
+    // storage for how the job ended: the module writes it before the ticket completes, so it must stay valid
+    // (not moved, not freed) until the owner has observed that completion (completed() >= ticket, or wait()).
+    module_submit submit(job j, std::atomic<job_outcome> * outcome = nullptr) {
         job_ticket ticket;
         if (!j) {
             std::scoped_lock lock(mutex_);
             stats_.refused++;
-            return std::unexpected(module_refusal::empty);
+            return module_submit{ 0, module_refusal::empty };
         }
         {
             std::scoped_lock lock(mutex_);
             if (worker_.get_stop_token().stop_requested()) {
                 stats_.refused++;
-                return std::unexpected(module_refusal::stopping);
+                return module_submit{ 0, module_refusal::stopping };
             }
             if (count_ == ring_.size()) {
                 stats_.refused++;
-                return std::unexpected(module_refusal::full);
+                return module_submit{ 0, module_refusal::full };
             }
             ticket = ++submitted_;
             ring_[(head_ + count_) % ring_.size()] = slot{ std::move(j), ticket, outcome };
@@ -258,7 +266,7 @@ public:
             stats_.queued = count_;
         }
         wake_.notify_one();
-        return ticket;
+        return module_submit{ ticket, module_refusal::stopping };
     }
 
     // A stop was requested: no job is taken from here on.

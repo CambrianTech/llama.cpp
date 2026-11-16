@@ -46,7 +46,7 @@ set_tests_properties(test-server-host-bytes PROPERTIES LABELS "main")
 
 # Model-free engine-module validator: own thread, move-only jobs, typed refusals, snapshots that never wait.
 add_executable(test-server-module test-server-module.cpp)
-target_compile_features(test-server-module PRIVATE cxx_std_23)
+target_compile_features(test-server-module PRIVATE cxx_std_20)
 add_test(NAME test-server-module COMMAND test-server-module)
 set_tests_properties(test-server-module PROPERTIES LABELS "main")
 
