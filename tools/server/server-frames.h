@@ -407,3 +407,24 @@ private:
     size_t                              next_lane_ = 0; // pumping thread only
     size_t                              cursor_    = 0; // pumping thread only
 };
+
+// ---- how many copy lanes: the first guess, then the measurement ------------------------------------
+
+// The first guess for CPU copy lanes is the node's EFFICIENCY core count: copying is bandwidth-bound,
+// the efficiency cores reach the memory ceiling (measured on the M5 Pro: 12 lanes = 118.9 GB/s, the
+// knee; 18 = 109) and the performance cores stay free for the decode thread. Read from the OS; empty
+// when the OS does not report core classes (then the probe below starts from the core count it can
+// see). measure_copy_lanes() refines it on the node's own bandwidth curve.
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+inline std::optional<size_t> efficiency_cores() {
+#if defined(__APPLE__)
+    int n = 0;
+    size_t len = sizeof(n);
+    if (sysctlbyname("hw.perflevel1.physicalcpu", &n, &len, nullptr, 0) == 0 && n > 0) {
+        return (size_t) n;
+    }
+#endif
+    return std::nullopt; // Linux/Windows core classes: the host adapter's job (continuum-host), not guessed here
+}
