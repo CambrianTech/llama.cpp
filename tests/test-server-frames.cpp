@@ -348,6 +348,24 @@ static void a_transfer_holds_its_pins_until_drained() {
     require(done[1] == transfer_status::moved && pool.out.load() == 0, "drained: moved, and both pins returned");
 }
 
+// what this catches (Codex on #134): an immediate alias returned its pins before its terminal frame was
+// drained, so the pool could recycle bytes a consumer was still told were aliased
+static void an_alias_holds_its_pins_until_drained() {
+    std::vector<std::byte> a(4096);
+    pin_pool pool;
+    auto resolve = [&](const buffer_ref &) -> buffer_pin { return pool.pin(a.data(), a.size()); };
+    frame_ring<transfer_frame> in(4);
+    parallel_copier mover(in, resolve, 1, 4096, 2);
+    const buffer_ref x{ memory_domain::host, 0, 0, 0, 0, 4096 };
+    const buffer_ref y{ memory_domain::host, 0, 1, 0, 0, 4096 }; // another id over the same bytes
+    require(in.push({ 1, x, y }), "q");
+    mover.pump();
+    require(pool.out.load() == 2, "settled aliased, both pins still held");
+    done_map done;
+    drain_all(mover, done, 1);
+    require(done[1] == transfer_status::aliased && pool.out.load() == 0, "drained: aliased, pins returned");
+}
+
 static void teardown_with_work_outstanding_ends_every_ticket() {
     const size_t n = 64, bytes = 1 << 20;
     std::vector<std::vector<std::byte>> src(n, std::vector<std::byte>(bytes)), dst(n, std::vector<std::byte>(bytes));
@@ -404,6 +422,7 @@ int main(int argc, char ** argv) {
     a_full_completion_ring_is_backpressure_not_a_deadlock();
     invalid_aliases_and_overlaps_are_refused();
     a_transfer_holds_its_pins_until_drained();
+    an_alias_holds_its_pins_until_drained();
     teardown_with_work_outstanding_ends_every_ticket();
     the_parallel_copier_moves_many_at_once();
     std::cout << "test-server-frames: ok\n";

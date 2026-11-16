@@ -276,7 +276,7 @@ public:
             switch (start(*pending_)) {
                 case start_result::started:     started++; pending_.reset(); break;
                 case start_result::refused:     settle(pending_->ticket, transfer_status::refused); pending_.reset(); break;
-                case start_result::aliased:     settle(pending_->ticket, transfer_status::aliased); pending_.reset(); break;
+                case start_result::aliased:     settle(pending_->ticket, transfer_status::aliased, take_terminal_slot()); pending_.reset(); break;
                 case start_result::would_block: return started; // engines full: drain completions, pump again
             }
         }
@@ -311,7 +311,7 @@ public:
         in_.close();
         if (pending_) {
             if (const auto ended = cancel_pending()) {
-                settle(pending_->ticket, *ended);
+                settle(pending_->ticket, *ended, take_terminal_slot());
             } // else an engine holds part of it and reports its one terminal frame
             pending_.reset();
         }
@@ -352,6 +352,11 @@ protected:
     // A drained completion's slot may be reused.
     virtual void retire(uint32_t /*slot*/) {}
 
+    // Set by a backend, on the pumping thread, when the terminal it hands back (start's `aliased`, or the status
+    // cancel_pending returns) still holds a slot with custody: the base settles that frame with the slot, so the
+    // pins return only when the frame is drained (Codex on #134).
+    uint32_t terminal_slot_ = transfer_done_frame::NO_SLOT;
+
     // Completion context `context` (one lane) reports a finished move. The backend guarantees room: its
     // completions outstanding never exceed the ring's capacity (a slot is retired only on drain), so a
     // lane never waits on the consumer.
@@ -366,12 +371,19 @@ protected:
 private:
     // On the pumping thread: into the settled ring, or held for the caller's drain when it is full
     // (never a wait: the same thread drains).
-    void settle(uint64_t ticket, transfer_status status) {
-        if (!settled_.push(transfer_done_frame{ ticket, status })) {
+    // `slot`: the backend slot that still holds the transfer's custody (pins), retired when this frame is drained.
+    void settle(uint64_t ticket, transfer_status status, uint32_t slot = transfer_done_frame::NO_SLOT) {
+        if (!settled_.push(transfer_done_frame{ ticket, status, slot })) {
             backpressured_.fetch_add(1, std::memory_order_relaxed);
-            unsettled_.push_back(transfer_done_frame{ ticket, status });
+            unsettled_.push_back(transfer_done_frame{ ticket, status, slot });
         }
         ring();
+    }
+
+    uint32_t take_terminal_slot() {
+        const uint32_t s = terminal_slot_;
+        terminal_slot_   = transfer_done_frame::NO_SLOT;
+        return s;
     }
 
     void ring() {
@@ -466,7 +478,7 @@ private:
         progress_.reset();
         slot & s = slots_[p.slot];
         if (p.next == 0) {
-            free_slot(s); // no chunk handed: nothing written; the pins go back to their pools
+            terminal_slot_ = p.slot; // no chunk handed, nothing written; the pins go back when this frame is drained
             return transfer_status::cancelled;
         }
         // part-handed: its handed chunks land and the last one reports `failed` (a partial destination);
@@ -474,8 +486,9 @@ private:
         s.status.store((uint8_t) transfer_status::failed, std::memory_order_relaxed);
         const uint32_t not_handed = (uint32_t) (p.n_chunks - p.next);
         if (s.remaining.fetch_sub(not_handed, std::memory_order_acq_rel) == not_handed) {
-            // every handed chunk already landed before the subtraction: none will report it, so it ends here
-            free_slot(s);
+            // every handed chunk already landed before the subtraction: none will report it, so it ends here,
+            // still holding its pins until the frame is drained
+            terminal_slot_ = p.slot;
             return transfer_status::failed;
         }
         return std::nullopt;
@@ -497,15 +510,19 @@ private:
             const std::byte * a = src.data();
             const std::byte * b = dst.data();
             const uint64_t    n = t.src.bytes;
-            if (a == b) {
-                return start_result::aliased; // the same bytes: nothing to move (the pins go back now)
-            }
-            if (a < b + n && b < a + n) {
+            if (a != b && a < b + n && b < a + n) {
                 return start_result::refused; // independent parallel chunks over overlapping ranges race (UB)
             }
             const auto s = claim_slot();
             if (!s) {
                 return start_result::would_block; // every in-flight slot is busy (the pins go back; re-resolved next pump)
+            }
+            if (a == b) {
+                // the same bytes: nothing to move, but the pins are held in the slot until the frame is drained
+                slots_[*s].src = std::move(src);
+                slots_[*s].dst = std::move(dst);
+                terminal_slot_ = *s;
+                return start_result::aliased;
             }
             std::byte * src_bytes = src.data();
             std::byte * dst_bytes = dst.data();
