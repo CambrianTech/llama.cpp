@@ -1,5 +1,6 @@
 #pragma once
 
+#include "server-mind.h"
 #include "common.h"
 #include "llama.h"
 
@@ -174,6 +175,8 @@ struct task_params {
     // append-only part of the prompt the caller's next request sends again unchanged. The prompt
     // is checkpointed exactly there and a saved page keeps that checkpoint. -1 = not given.
     int32_t view_end_pos = -1;
+    // Continuum fork: the mind this request is (the core's PageKey::Mind; server-mind.h). Invalid: anonymous.
+    mind_page page;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)

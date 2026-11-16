@@ -2544,6 +2544,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_parallel = value;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--minds"}, "N",
+        "continuum: minds the engine keeps resident beside its lanes, each as its own parked sequence of the unified "
+        "KV pool (a mind switch is a sequence move, never a serialization); the core's resident count, 0 = off",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --minds must be >= 0\n");
+            }
+            params.n_minds = value;
+        }
+    ).set_env("LLAMA_ARG_MINDS").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

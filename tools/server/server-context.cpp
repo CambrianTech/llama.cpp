@@ -2,6 +2,9 @@
 #include "server-context.h"
 #include "server-checkpoint-policy.h"
 #include "server-view-end.h"
+#include "server-mapped-file.h"
+#include <filesystem>
+#include <thread>
 #include "../../src/llama-ext.h"
 #include "server-train.h"
 #include "server-adapter-file.h"
@@ -318,6 +321,9 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+
+    // Continuum fork: the mind whose sequence this lane holds (server-context-minds.inc); invalid: anonymous
+    mind_page page;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -1244,7 +1250,9 @@ private:
 
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
-        params_base.n_outputs_max = output_limits.total;
+        // the context reserves at least one output row per sequence: parked minds are sequences (they produce no
+        // outputs, but the reserve counts them)
+        params_base.n_outputs_max = std::max<int32_t>(output_limits.total, params_base.n_parallel + std::max<int32_t>(0, params_base.n_minds));
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
@@ -1462,6 +1470,9 @@ private:
         }
         if (!page_io) {
             page_io = std::make_unique<server_page_io_pool>((size_t) params_base.n_parallel);
+        }
+        if (!minds_init()) {
+            return false;
         }
 
         // try speculative decoding
@@ -1850,6 +1861,15 @@ private:
             }
         }
 
+        // a named mind switches by sequence moves (server-context-minds.inc), never through the prompt cache
+        if (ret && minds_on() && task.params.page.valid()) {
+            mind_switch(*ret, task.params.page);
+            if (ret->page != task.params.page) {
+                return nullptr; // the lane's mind could not leave intact: this request waits for a lane
+            }
+            update_cache = false;
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
@@ -1888,6 +1908,28 @@ private:
 
         if (!params_base.kv_unified) {
             return res;
+        }
+
+        // resident minds: the pool's coldest parked mind goes to flash, whole; an idle lane's mind is never purged
+        if (minds_on()) {
+            if (flash_coldest()) {
+                return true;
+            }
+            for (auto & slot : slots) {
+                if (!slot.is_processing() && slot.page.valid() && slot.prompt.n_tokens() > 0) {
+                    resident_mind m;
+                    m.page     = slot.page;
+                    m.lora     = slot.lora;
+                    m.last_use = ++mind_clock;
+                    if (flash_out(m, slot.id)) {
+                        m.prompt = std::move(slot.prompt);
+                        slot.prompt.clear();
+                        slot.page = mind_page{};
+                        minds.push_back(std::move(m));
+                        return true;
+                    }
+                }
+            }
         }
 
         for (auto & slot : slots) {
@@ -2309,6 +2351,7 @@ private:
 #include "server-context-learn.inc"
 #include "server-context-learn-checkpoint.inc"
 #include "server-context-page.inc"
+#include "server-context-minds.inc"
 
     void send_final_response(server_slot & slot) {
         if (slot.task->params.learn_only) {
@@ -2902,6 +2945,7 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear();
+                    slot->page = mind_page{}; // erased: no mind's sequence is here now
                     page_slot_reassigned(*slot); // a restore buffered for this slot is dropped, never applied over it
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
@@ -4993,6 +5037,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
 
             task.id_slot = json_value(data, "id_slot", -1);
+            task.params.page = mind_page_parse(json_value(data, "page", std::string())); // text only at this edge
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
