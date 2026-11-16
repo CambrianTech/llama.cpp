@@ -19,6 +19,7 @@
 #include "server-test-faults.h"
 #include "server-page-io.h"
 #include "server-page-job.h"
+#include "server-engine-steps.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -895,6 +896,25 @@ public:
     // serving slots working right now, refreshed by the loop at the start and end of every
     // update_slots pass; the trainer reads it between batches (see server-train.h)
     std::atomic<int> n_busy_slots{0};
+
+    // a captured step's working buffers (reused every step: no allocation once they reach the slot count)
+    struct step_slot {
+        int32_t  id_slot;
+        int      task;
+        int32_t  depth;
+        int32_t  prefilled;
+        int32_t  generated;
+        uint64_t n_gen;
+        uint64_t n_accepted;
+    };
+    std::vector<step_slot>                   step_slots;
+    std::vector<std::pair<int32_t, int32_t>> step_counts; // per slot id: prompt, generated tokens
+    std::vector<int32_t>                     step_chosen;
+    std::vector<engine_step_work>            step_work;
+
+    // every step the task loop runs, for the one subscriber of `GET /engine/steps` (4.10 P5)
+    engine_step_capture engine_steps;
+    uint64_t engine_step_id = 0;
 
     // The most one sequence may hold: llama_n_ctx_seq capped at the model's training context.
     // ONE value, set at load: every slot is sized from it and context_geometry reports it, so
@@ -3317,6 +3337,34 @@ private:
         int32_t n_batch = llama_n_batch(ctx_tgt);
         const bool    has_prompt   = batch.size() > n_batch_gen;
         const int64_t t_step_start = ggml_time_us();
+        // The step capture: what this step runs, and each slot's depth and counters before it.
+        // the step capture's buffers live on the context and are sized once to the slots: a captured
+        // step copies typed fields, never allocates, never builds JSON (server-engine-steps.h)
+        const bool     capturing = batch.size() > 0 && engine_steps.active();
+        const uint64_t step_id   = capturing ? ++engine_step_id : 0;
+        step_slots.clear();
+        if (capturing) {
+            step_counts.assign(slots.size(), { 0, 0 });
+            for (const auto & t : batch.tokens) {
+                if (t.id_slot >= 0 && (size_t) t.id_slot < step_counts.size()) {
+                    (t.is_prompt ? step_counts[t.id_slot].first : step_counts[t.id_slot].second)++;
+                }
+            }
+            step_chosen.clear();
+            for (const auto & slot : slots) {
+                if (slot.id < 0 || (size_t) slot.id >= step_counts.size() || !slot.task) {
+                    continue;
+                }
+                const auto & counts = step_counts[slot.id];
+                if (counts.first == 0 && counts.second == 0) {
+                    continue;
+                }
+                step_slots.push_back({ slot.id, slot.task->id, (int32_t) slot.prompt.n_tokens(), counts.first, counts.second,
+                                       (uint64_t) slot.stats.n_gen, (uint64_t) slot.stats.n_draft_accepted });
+                step_chosen.push_back(slot.task->id);
+            }
+            engine_steps.push_began(t_step_start, step_id, step_chosen.data(), step_chosen.size());
+        }
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
             try {
@@ -3358,6 +3406,24 @@ private:
         // a prefill step adds its duration to the decode time owed; a decode-only step pays it back
         const int64_t t_step = ggml_time_us() - t_step_start;
         t_decode_owed_us = has_prompt ? t_decode_owed_us + t_step : std::max<int64_t>(0, t_decode_owed_us - t_step);
+        if (capturing) {
+            step_work.clear();
+            for (const auto & s : step_slots) {
+                const auto slot = std::find_if(slots.begin(), slots.end(), [&](const server_slot & candidate) { return candidate.id == s.id_slot; });
+                // a task that finished in this step was released and its counters reset: its
+                // decoded count is the tokens it generated in the batch, its accepted drafts unknown
+                const bool same = slot != slots.end() && slot->task && slot->task->id == s.task;
+                engine_step_work w;
+                w.task           = s.task;
+                w.depth          = s.depth;
+                w.prefilled      = s.prefilled;
+                w.decoded        = same ? (uint64_t) slot->stats.n_gen - s.n_gen : (uint64_t) s.generated;
+                w.accepted_known = same;
+                w.accepted       = same ? (uint64_t) slot->stats.n_draft_accepted - s.n_accepted : 0;
+                step_work.push_back(w);
+            }
+            engine_steps.push_ended(ggml_time_us(), step_id, step_work.data(), step_work.size());
+        }
         // Completion-triggered learning can begin inside post_decode. Its entry
         // preparation is already one measured blocking segment; do not append a
         // graph segment before the queued NEXT_RESPONSE lets serving run again.
@@ -6367,6 +6433,54 @@ void server_routes::init_routes() {
                 return true;
             }
             output = res_this->results.next_ticket(res_this->subscriber, keepalive);
+            if (output.empty()) {
+                output = ":\n\n"; // keepalive
+            }
+            return true;
+        });
+        return res;
+    };
+
+    // The engine-step stream (continuum 4.10 P5): every step the task loop runs, to ONE subscriber,
+    // never through the learning events above. The subscriber names the ring's bound (`capacity`, its
+    // memory to spend; none is refused, never defaulted); the stream opens with the engine's identity
+    // and its clock origin; a run the ring could not keep arrives as a `missed` record in position.
+    this->get_engine_steps = [this](const server_http_req & req) -> std::unique_ptr<server_res_generator> {
+        const std::string asked = req.get_param("capacity");
+        const long long capacity = asked.empty() ? 0 : std::atoll(asked.c_str());
+        const int64_t origin_us = ggml_time_us();
+        if (capacity <= 0 || !ctx_server.engine_steps.open((size_t) capacity, (size_t) params.n_parallel, origin_us)) {
+            auto res = create_response();
+            res->error(format_error_response(capacity <= 0 ? "\"capacity\" (the ring's bound, in records) is required"
+                                                           : "another subscriber holds the engine-step stream",
+                                             ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        struct step_stream : server_res_generator {
+            engine_step_capture & steps;
+            step_stream(server_queue & tasks, server_response & results, int sleep_idle_seconds, engine_step_capture & steps)
+                : server_res_generator(tasks, results, sleep_idle_seconds, true), steps(steps) {}
+            void on_complete() override {
+                steps.close();
+                server_res_generator::on_complete();
+            }
+        };
+        auto res = std::make_unique<step_stream>(queue_tasks, queue_results, params.sleep_idle_seconds, ctx_server.engine_steps);
+        res->set_req(&req); // its connection ends the stream (should_stop)
+        res->status = 200;
+        res->content_type = "text/event-stream";
+        res->data = "data: " + safe_json_to_str({ { "kind", "opened" }, { "engine", ctx_server.learning_engine_identity() }, { "origin_us", origin_us } }) + "\n\n";
+        const int keepalive = params.sse_ping_interval > 0 ? params.sse_ping_interval : 1;
+        res->set_next([res_this = res.get(), keepalive](std::string & output) -> bool {
+            if (res_this->should_stop()) {
+                return false;
+            }
+            if (!res_this->data.empty()) {
+                output = std::move(res_this->data);
+                res_this->data.clear();
+                return true;
+            }
+            output = res_this->steps.next_frame(keepalive);
             if (output.empty()) {
                 output = ":\n\n"; // keepalive
             }
