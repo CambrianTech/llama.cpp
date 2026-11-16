@@ -91,13 +91,17 @@ struct field_nested : public field {
     virtual void eval(field_eval_context & ctx, const json & data) override;
 };
 
+// n_seq_live: the sequences the server serves now (POST /reconfigure changes it; params_base.n_parallel
+// is the launch's count), which bounds n_cmpl
 std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(
                     const common_params & params_base,
+                    int32_t n_seq_live,
                     task_params & params);
 
 task_params eval_llama_cmpl_schema(
                     const llama_vocab * vocab,
                     const common_params & params_base,
+                    int32_t n_seq_live,
                     const std::vector<llama_logit_bias> & logit_bias_eog,
                     const json & data);
 

@@ -1278,11 +1278,13 @@ struct common_init_result::impl {
     // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
 
     common_threadpools threadpools;
+    bool threadpools_made = false; // init() runs once; a context created later is attached to them
 
     llama_model_ptr   model;
     llama_context_ptr context;
 
     std::vector<llama_adapter_lora_ptr> lora;
+    bool adapters_failed = false; // an adapter did not load: no context is created on this model
 
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
@@ -1291,9 +1293,10 @@ struct common_init_result::impl {
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
+        auto cparams = common_context_params_to_llama(params);
+
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
@@ -1326,6 +1329,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        // Continuum fork: the context size fit chose becomes the params' own (fit changes only the
+        // context's n_ctx, common/fit.cpp), so init_context() creates the context it fitted
+        params.n_ctx = cparams.n_ctx;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1352,6 +1359,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
             COM_ERR("failed to load lora adapter '%s'\n", la.path.c_str());
+            pimpl->adapters_failed = true;
             return;
         }
 
@@ -1387,8 +1395,23 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias.end(),
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
+}
+
+bool common_init_result::init_context(common_params & params, bool warmup) {
+    GGML_ASSERT(pimpl->model && "init_context needs a loaded model");
+    GGML_ASSERT(!pimpl->context && "free_context() before creating another context");
+
+    if (pimpl->adapters_failed) {
+        COM_ERR("%s", "an adapter failed to load, no context is created on this model\n");
+        return false;
+    }
+
+    llama_model * model = pimpl->model.get();
+    auto cparams = common_context_params_to_llama(params);
 
     // init the backend samplers as part of the context creation
+    pimpl->samplers.clear();
+    pimpl->samplers_seq_config.clear();
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
 
@@ -1405,59 +1428,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return;
+        return false;
     }
 
     pimpl->context.reset(lctx);
 
     set_process_priority(params.cpuparams.priority);
 
-    pimpl->threadpools.init(lctx, params);
-}
-
-llama_model * common_init_result::model() {
-    return pimpl->model.get();
-}
-
-llama_context * common_init_result::context() {
-    return pimpl->context.get();
-}
-
-common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
-    if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
-        return nullptr;
-    }
-    return pimpl->samplers[seq_id].get();
-}
-
-void common_init_result::reset_samplers() {
-    for (int i = 0; i < (int) pimpl->samplers.size(); ++i) {
-        llama_sampler_reset(common_sampler_get(pimpl->samplers[i].get()));
-    }
-}
-
-std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
-    return pimpl->lora;
-}
-
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
-
-    llama_model * model = res->model();
-    if (model == NULL) {
-        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
-        return res;
+    if (pimpl->threadpools_made) {
+        pimpl->threadpools.attach(lctx);
+    } else {
+        pimpl->threadpools.init(lctx, params);
+        pimpl->threadpools_made = true;
     }
 
-    if (model_only) {
-        return res;
-    }
-
-    llama_context * lctx = res->context();
-    if (lctx == NULL) {
-        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return res;
-    }
+    // the context's own setup below; a failure in it leaves the context created, as it always has
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1472,7 +1457,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         const auto cvec = common_control_vector_load(params.control_vectors);
         if (cvec.n_embd == -1) {
-            return res;
+            return true;
         }
 
         int err = llama_set_adapter_cvec(
@@ -1483,7 +1468,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
                 params.control_vector_layer_start,
                 params.control_vector_layer_end);
         if (err) {
-            return res;
+            return true;
         }
     }
 
@@ -1507,7 +1492,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
 
         if (!ok) {
-            return res;
+            return true;
         }
     }
 
@@ -1515,7 +1500,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    if (params.warmup) {
+    if (warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
         std::vector<llama_token> tmp;
@@ -1550,7 +1535,67 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_perf_context_reset(lctx);
 
         // reset samplers to reset RNG state after warmup to the seeded state
-        res->reset_samplers();
+        reset_samplers();
+    }
+
+    return true;
+}
+
+void common_init_result::free_context() {
+    pimpl->context.reset();
+    // the backend sampler configs were the freed context's
+    pimpl->samplers.clear();
+    pimpl->samplers_seq_config.clear();
+}
+
+llama_model * common_init_result::model() {
+    return pimpl->model.get();
+}
+
+llama_context * common_init_result::context() {
+    return pimpl->context.get();
+}
+
+common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
+    if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
+        return nullptr;
+    }
+    return pimpl->samplers[seq_id].get();
+}
+
+void common_init_result::reset_samplers() {
+    for (int i = 0; i < (int) pimpl->samplers.size(); ++i) {
+        llama_sampler_reset(common_sampler_get(pimpl->samplers[i].get()));
+    }
+}
+
+std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
+    return pimpl->lora;
+}
+
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
+
+    if (res->model() == NULL) {
+        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
+        return res;
+    }
+
+    // on failure the context stays null, which is what callers check
+    res->init_context(params, params.warmup);
+
+    return res;
+}
+
+common_init_result_ptr common_load_from_params(common_params & params) {
+    common_init_result_ptr res(new common_init_result(params, false));
+
+    if (res->model() == NULL) {
+        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
     }
 
     return res;
@@ -1830,6 +1875,13 @@ void common_threadpools::init(llama_context * ctx, const common_params & params)
         return;
     }
 
+    llama_attach_threadpool(ctx, threadpool, threadpool_batch);
+}
+
+void common_threadpools::attach(llama_context * ctx) const {
+    if (threadpool == nullptr) {
+        return; // init() made none (no CPU backend, or the pools failed): the context keeps its own
+    }
     llama_attach_threadpool(ctx, threadpool, threadpool_batch);
 }
 

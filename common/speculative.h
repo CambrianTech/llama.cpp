@@ -91,7 +91,16 @@ typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_s
 
 struct common_speculative_init_result {
     common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    // Continuum fork: the draft model alone (loaded when params name one); the draft/MTP context is
+    // init_context()'s, so it can be freed and created again with another geometry while the draft
+    // model, and the target model an MTP context runs on, stay loaded (SERVING-ENGINE.md, S2)
+    explicit common_speculative_init_result(common_params & params);
     ~common_speculative_init_result();
+
+    // creates the draft/MTP context for ctx_tgt's geometry; false if params ask for one and it could
+    // not be created
+    bool init_context(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    void free_context();
 
     llama_model   * model();
     llama_context * context();

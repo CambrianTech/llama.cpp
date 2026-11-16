@@ -14,6 +14,11 @@ add_library(${TARGET} STATIC
     server-common.cpp
     server-common.h
     server-context.cpp
+    server-geometry.h
+    server-reconfigure.cpp
+    server-reconfigure.h
+    server-slot-page.cpp
+    server-slot-page.h
     server-train.cpp
     server-context.h
     server-stream.cpp

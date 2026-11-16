@@ -12,6 +12,7 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-geometry.h"
 
 
 struct server_page_job; // server-page-job.h: one page switch between the task loop and its file IO
@@ -67,6 +68,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_LEARN,
     SERVER_TASK_TYPE_LEARN_GRANTS,
     SERVER_TASK_TYPE_PROMPT_CACHE_LIMIT,
+    SERVER_TASK_TYPE_RECONFIGURE, // Continuum fork: grow or shrink the contexts live (server-reconfigure.h)
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -304,6 +306,9 @@ struct server_task {
     // used by SERVER_TASK_TYPE_LEARN
     learn_request learn;
     json restore_checkpoint;
+
+    // used by SERVER_TASK_TYPE_RECONFIGURE: the geometry to take
+    server_geometry reconfigure;
 
     server_task() = default;
 
