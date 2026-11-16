@@ -84,6 +84,18 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"] = n_draft_accepted;
     }
 
+    if (mind_hi != 0 || mind_lo != 0) {
+        static const char * names[] = { "none", "lane", "parked", "flash", "ram", "new", "adopted", "flash_pool_full" };
+        char page[33];
+        std::snprintf(page, sizeof(page), "%016llx%016llx", (unsigned long long) mind_hi, (unsigned long long) mind_lo);
+        base["mind"] = {
+            {"page",       page},
+            {"from",       names[(size_t) mind_came_from]},
+            {"switch_ms",  mind_switch_us / 1000.0},
+            {"generation", mind_generation},
+        };
+    }
+
     return base;
 }
 

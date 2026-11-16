@@ -324,6 +324,7 @@ struct server_slot {
 
     // Continuum fork: the mind whose sequence this lane holds (server-context-minds.inc); invalid: anonymous
     mind_page page;
+    uint64_t  page_generation = 0; // her state's generation on this lane
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -1920,7 +1921,8 @@ private:
                     resident_mind m;
                     m.page     = slot.page;
                     m.lora     = slot.lora;
-                    m.last_use = ++mind_clock;
+                    m.last_use   = ++mind_clock;
+                    m.generation = slot.page_generation + 1;
                     if (flash_out(m, slot.id)) {
                         m.prompt = std::move(slot.prompt);
                         slot.prompt.clear();

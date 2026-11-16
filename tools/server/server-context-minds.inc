@@ -15,6 +15,7 @@
         server_prompt                         prompt;  // her tokens, checkpoints and view end (host bookkeeping)
         std::vector<common_adapter_lora_info> lora;
         uint64_t                              last_use = 0;
+        uint64_t                              generation = 0; // advances each time her state moves
         int32_t                               seq      = -1; // parked: the pool sequence id; flash: -1
         std::string                           file;          // flash: her page file
         // her bytes in RAM, held by this record (never by the worker alone) until her file has landed: while the
@@ -267,16 +268,22 @@
 
     // `slot` serves `page` next. The mind it holds (if any) is parked; hers comes back from where she is.
     void mind_switch(server_slot & slot, mind_page page) {
+        slot.stats.mind_hi = page.hi;
+        slot.stats.mind_lo = page.lo;
         if (slot.page == page) {
+            slot.stats.mind_came_from  = mind_from::lane;
+            slot.stats.mind_switch_us  = 0;
+            slot.stats.mind_generation = slot.page_generation;
             return;
         }
         const int64_t t0 = ggml_time_us();
         // the lane's mind leaves, whole
         if (slot.page.valid() && slot.prompt.n_tokens() > 0) {
             resident_mind m;
-            m.page     = slot.page;
-            m.lora     = slot.lora;
-            m.last_use = ++mind_clock;
+            m.page       = slot.page;
+            m.lora       = slot.lora;
+            m.last_use   = ++mind_clock;
+            m.generation = slot.page_generation + 1;
             if (park_free.empty()) {
                 flash_coldest(); // the pool's coldest parked mind makes room, if one is parked
             }
@@ -298,6 +305,8 @@
         const int64_t t_out = ggml_time_us() - t0;
         // hers comes in from where she is
         const char * from = "new";
+        mind_from    kind = slot.page.valid() || slot.prompt.n_tokens() == 0 ? mind_from::fresh : mind_from::adopted;
+        uint64_t     generation = 1;
         for (size_t i = 0; i < minds.size(); ++i) {
             if (minds[i].page != page) {
                 continue;
@@ -308,15 +317,20 @@
                 seq_move(m.seq, slot.id);
                 park_free.push_back(m.seq);
                 from = "parked";
+                kind = mind_from::parked;
                 ok   = true;
             } else {
-                from = "flash";
+                const bool in_ram = (bool) m.ram;
+                from = in_ram ? "RAM" : "flash";
+                kind = in_ram ? mind_from::ram : mind_from::flash;
                 ok   = flash_insert(m, slot.id);
             }
+            generation = m.generation + 1;
             if (!ok) {
                 // she stays where she is (on flash, record and file intact); the lane starts this request empty
                 slot.prompt_clear();
                 from = "flash, pool full";
+                kind = mind_from::flash_pool_full;
                 break;
             }
             slot.prompt = std::move(m.prompt);
@@ -330,7 +344,11 @@
             }
             break;
         }
-        slot.page = page;
+        slot.page            = page;
+        slot.page_generation = generation;
+        slot.stats.mind_came_from  = kind;
+        slot.stats.mind_switch_us  = ggml_time_us() - t0;
+        slot.stats.mind_generation = generation;
         SLT_INF(slot, "mind switch: out %.3f ms, in (%s) %.3f ms, she holds %d tokens\n", t_out / 1000.0, from,
                 (ggml_time_us() - t0 - t_out) / 1000.0, slot.prompt.n_tokens());
     }

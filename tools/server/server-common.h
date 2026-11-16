@@ -362,7 +362,17 @@ json format_response_rerank(
 //
 
 // shared between server_slot and server_task_result_*
+// Continuum fork: where the mind a request named came from when she took the lane (server-context-minds.inc)
+enum class mind_from : uint8_t { none, lane, parked, flash, ram, fresh, adopted, flash_pool_full };
+
 struct server_slot_stats {
+    // the switch receipt (a request that named its mind): her page, where her state came from, how long the
+    // switch took and her state's generation (it advances each time her state moves)
+    uint64_t  mind_hi = 0, mind_lo = 0;
+    mind_from mind_came_from   = mind_from::none;
+    int64_t   mind_switch_us   = 0;
+    uint64_t  mind_generation  = 0;
+
     uint64_t n_prompt_cached    = 0;
     uint64_t n_prompt_processed = 0;
     uint64_t n_gen              = 0;
