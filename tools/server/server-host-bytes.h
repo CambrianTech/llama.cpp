@@ -76,6 +76,7 @@ using host_bytes_handle = std::shared_ptr<const host_bytes>;
 enum class host_bytes_refusal : uint8_t {
     oversized,            // larger than the whole grant
     pinned_pressure,      // fits the grant, but pinned and reserved bytes leave no room
+    awaiting_release,     // the room is named for eviction; free the returned residents, then retry
     write_failed,         // the copy into the reservation failed
     larger_than_reserved, // the writer produced more than it reserved
     pool_gone,            // the engine is shutting down
@@ -92,8 +93,12 @@ public:
         auto result = pool->with([&](host_pool & p) { return p.reserve(kind, peak); });
         evict.insert(evict.end(), result.evict.begin(), result.evict.end());
         if (!result.admitted) {
-            return std::unexpected(result.admitted.error() == host_pool_refusal::oversized
-                                   ? host_bytes_refusal::oversized : host_bytes_refusal::pinned_pressure);
+            switch (result.admitted.error()) {
+                case host_pool_refusal::oversized:        return std::unexpected(host_bytes_refusal::oversized);
+                case host_pool_refusal::pinned_pressure:  return std::unexpected(host_bytes_refusal::pinned_pressure);
+                case host_pool_refusal::awaiting_release: return std::unexpected(host_bytes_refusal::awaiting_release);
+            }
+            return std::unexpected(host_bytes_refusal::pinned_pressure);
         }
         return host_bytes_writer(pool, *result.admitted);
     }
