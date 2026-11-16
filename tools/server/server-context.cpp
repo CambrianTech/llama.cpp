@@ -3806,13 +3806,20 @@ private:
         std::set<int> decode_set;
         const int64_t width = decode_width.load(std::memory_order_relaxed);
         if (width >= 0) {
+            // Only slots this step can batch together are candidates: the adapter turn's holder first
+            // (it was stamped as batched above, so a sort by wait alone would put it last and fill the
+            // width with slots it cannot batch with, a step that decodes nothing; Codex on #120), then
+            // the slots compatible with it, longest waiting first.
             std::vector<const server_slot *> ready;
-            for (const auto & slot : slots) {
-                if (slot.state == SLOT_STATE_GENERATING) {
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING && batches_with(slot)) {
                     ready.push_back(&slot);
                 }
             }
-            std::stable_sort(ready.begin(), ready.end(), [](const server_slot * a, const server_slot * b) {
+            std::stable_sort(ready.begin(), ready.end(), [&](const server_slot * a, const server_slot * b) {
+                if ((a == holder) != (b == holder)) {
+                    return a == holder;
+                }
                 return a->t_last_batched_us < b->t_last_batched_us;
             });
             for (size_t i = 0; i < ready.size() && i < (size_t) std::max<int64_t>(width, 1); i++) {
