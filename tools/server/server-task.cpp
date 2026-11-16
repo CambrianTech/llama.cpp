@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-test-faults.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -1752,7 +1753,9 @@ json learn_outcome::to_json() const {
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {
-    size_t res = 0;
+    // resident bytes plus spills whose write has not landed (their entries' vectors are empty while the
+    // bytes sit in the write's buffer; an erased entry's in-flight bytes still count until it lands)
+    size_t res = (size_t) spill_in_flight->load(std::memory_order_relaxed);
 
     for (const auto & state : states) {
         res += state.size();
@@ -1785,16 +1788,19 @@ size_t server_prompt_cache::n_tokens() const {
 
 server_prompt_cache::~server_prompt_cache() = default; // spill_dir removes this instance's directory
 
-bool server_prompt_cache::set_disk(const std::string & dir, int32_t limit_mib, server_page_io_pool * pool) {
+bool server_prompt_cache::set_disk(const std::string & dir, int32_t limit_mib, server_page_io_pool * pool,
+                                   server_page_admission * admission_, std::string io_gate_) {
     std::error_code ec;
     const size_t swept = spill_dir.claim(dir, ec);
-    if (!spill_dir.ok() || pool == nullptr) {
+    if (!spill_dir.ok() || pool == nullptr || admission_ == nullptr) {
         SRV_ERR("prompt cache disk tier: cannot claim an instance directory under %s: %s\n", dir.c_str(),
                 ec ? ec.message().c_str() : (pool ? "its owner lock is held" : "no page-io pool"));
         return false;
     }
     disk_dir   = spill_dir.path().string();
     io         = pool;
+    admission  = admission_;
+    io_gate    = std::move(io_gate_);
     disk_limit = 1024ull*1024ull*(limit_mib < 0 ? 0 : limit_mib);
     SRV_INF("prompt cache disk tier: %s, size limit: %d MiB (%zu abandoned instance directories swept)\n",
             disk_dir.c_str(), limit_mib, swept);
@@ -1818,9 +1824,19 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
         erase(oldest);
     }
 
+    // admitted against the one page-IO budget before anything moves, never parked: a spill that does not
+    // fit beside the bytes in flight is refused and the entry is dropped (as with no disk tier), so a slow
+    // or paused disk can never stack spills past the budget (Codex on #124)
+    if (!admission->try_admit(bytes)) {
+        SRV_WRN(" - disk tier: %.3f MiB does not fit the page-IO budget beside the bytes in flight; the entry is dropped\n",
+                bytes / (1024.0 * 1024.0));
+        return false;
+    }
     // the task loop only MOVES the bytes into the spill buffer; the file is written on the page-io pool
     const std::string path = disk_dir + "/" + std::to_string(spill_seq++) + ".state";
     auto buf = std::make_shared<server_spill_buffer>();
+    buf->reservation.hold(admission, bytes);
+    spill_in_flight->fetch_add(bytes, std::memory_order_relaxed);
     buf->blocks.reserve(2 + 3 * state.prompt.checkpoints.size());
     buf->blocks.push_back(std::move(state.data.main));
     buf->blocks.push_back(std::move(state.data.drft));
@@ -1841,7 +1857,10 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
     state.spilling   = buf;
 
     const int n_tokens = state.prompt.n_tokens();
-    io->submit(path, [buf, path, bytes, n_tokens] {
+    io->submit(path, [buf, path, bytes, n_tokens, in_flight = spill_in_flight, gate = io_gate] {
+        if constexpr (server_test_faults::enabled) {
+            server_test_faults::hold(gate); // a test holds spill writes as it holds page IO
+        }
         const auto t0 = std::chrono::steady_clock::now();
         FILE * f = fopen(path.c_str(), "wb");
         bool ok = f != nullptr;
@@ -1859,6 +1878,10 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
                     n_tokens, bytes / (1024.0 * 1024.0), ms);
         }
         buf->status.store(ok ? 1 : -1, std::memory_order_release);
+        // landed (or failed): its bytes leave the budget and the RAM tier's count here, even when its
+        // entry was erased meanwhile; a failed write's bytes return to the entry as resident data
+        buf->reservation.release();
+        in_flight->fetch_sub(bytes, std::memory_order_relaxed);
     });
     return true;
 }

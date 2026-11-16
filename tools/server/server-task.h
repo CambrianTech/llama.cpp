@@ -781,6 +781,9 @@ struct server_prompt_data {
 struct server_spill_buffer {
     std::vector<std::vector<uint8_t>> blocks;
     std::atomic<int>                  status{0};
+    // its bytes, charged to the one page-IO budget from the move until the write lands, whoever
+    // finishes first (the worker, or an erase that dropped the entry meanwhile)
+    server_page_reservation           reservation;
 };
 
 struct server_prompt_cache_state {
@@ -841,14 +844,21 @@ struct server_prompt_cache {
 
     // this instance's directory under the configured one (server-spill-dir.h: another engine's files are
     // never touched), and the pool its files are written on (the task loop only moves the bytes)
-    server_spill_dir      spill_dir;
-    server_page_io_pool * io = nullptr;
+    server_spill_dir        spill_dir;
+    server_page_io_pool *   io        = nullptr;
+    server_page_admission * admission = nullptr;
+    // RAM still held by spills whose write has not landed, entries erased meanwhile included: the
+    // RAM tier counts it (size()) so eviction never believes it free early (Codex on #124)
+    std::shared_ptr<std::atomic<uint64_t>> spill_in_flight = std::make_shared<std::atomic<uint64_t>>(0);
+    // a test hook: the page-IO gate (server-test-faults.h), so a test pauses spill writes like page IO
+    std::string io_gate;
 
     ~server_prompt_cache();
 
     // enable the disk tier under `dir` (this instance's own directory; instance directories whose owner
     // is gone are swept), writing on `pool`
-    bool set_disk(const std::string & dir, int32_t limit_mib, server_page_io_pool * pool);
+    bool set_disk(const std::string & dir, int32_t limit_mib, server_page_io_pool * pool, server_page_admission * admission,
+                  std::string io_gate);
 
     // on the task loop: drop the bytes of spills whose write landed, and keep resident the ones whose
     // write failed
