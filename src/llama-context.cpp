@@ -3400,10 +3400,27 @@ llama_snapshot_status llama_context::snapshot_load(llama_seq_id seq_id, uint64_t
         copied = false;
     }
     if (!copied) {
-        llama_memory_seq_rm(get_memory(), seq_id, -1, -1);
-        return LLAMA_SNAPSHOT_COPY_FAILED;
+        return quarantine(seq_id) ? LLAMA_SNAPSHOT_COPY_FAILED : LLAMA_SNAPSHOT_TARGET_UNCLEARED;
     }
     return LLAMA_SNAPSHOT_OK;
+}
+
+// Clear a sequence whose restore failed after the read began. Success is proven, not assumed: seq_rm
+// reports success AND the sequence holds no position afterwards. Anything else is TARGET_UNCLEARED for the
+// caller, who keeps custody of the sequence (a half-restored state must never be served or reused).
+static std::atomic<int> & quarantine_clear_failures() {
+    static std::atomic<int> n{0};
+    return n;
+}
+
+bool llama_context::quarantine(llama_seq_id seq_id) {
+    for (int n = quarantine_clear_failures().load(); n > 0;) {
+        if (quarantine_clear_failures().compare_exchange_weak(n, n - 1)) {
+            return false; // test fault injection: the clear "fails", leaving the sequence as the failed read left it
+        }
+    }
+    llama_memory_t mem = get_memory();
+    return llama_memory_seq_rm(mem, seq_id, -1, -1) && llama_memory_seq_pos_max(mem, seq_id) < 0;
 }
 
 llama_snapshot_status llama_context::snapshot_free(uint64_t snapshot_id) {
@@ -4497,4 +4514,8 @@ void llama_state_seq_snapshot_test_fail_next_allocs(int n) {
 
 void llama_state_seq_snapshot_test_fail_next_load_commits(int n) {
     llama_io_read_device::fail_commits().store(n);
+}
+
+void llama_state_seq_snapshot_test_fail_next_quarantine_clears(int n) {
+    quarantine_clear_failures().store(n);
 }

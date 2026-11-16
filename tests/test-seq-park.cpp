@@ -233,6 +233,13 @@ int main(int argc, char ** argv) {
         llama_state_seq_snapshot_test_fail_next_load_commits(1);
         require(llama_state_seq_snapshot_load(sctx, 0, 42, P) == LLAMA_SNAPSHOT_COPY_FAILED, "a post-read failure is typed");
         require(llama_memory_seq_pos_max(smem, 0) == -1, "the quarantined target is empty, never half-restored");
+        // 2c. if the quarantine's own clear fails, the status says the target is UNDEFINED (not cold): the
+        //     caller keeps custody until its clear succeeds (regression for Codex's review of 16a02cca6: the
+        //     clear's result was ignored and COPY_FAILED claimed an empty target)
+        llama_state_seq_snapshot_test_fail_next_load_commits(1);
+        llama_state_seq_snapshot_test_fail_next_quarantine_clears(1);
+        require(llama_state_seq_snapshot_load(sctx, 0, 42, P) == LLAMA_SNAPSHOT_TARGET_UNCLEARED, "a failed clear is reported, never claimed cold");
+        require(llama_memory_seq_rm(smem, 0, -1, -1) && llama_memory_seq_pos_max(smem, 0) == -1, "the custodian clears it");
         require(llama_state_seq_snapshot_load(sctx, 0, 42, P) == LLAMA_SNAPSHOT_OK, "an empty target restores from the intact snapshot");
         // the recurrent row is back; attention for the prefix was cleared with the quarantine, so re-prefill it
         // (attention is trimmed/re-built by position, as the server does) and check the next token
