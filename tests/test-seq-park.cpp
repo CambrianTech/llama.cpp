@@ -202,7 +202,7 @@ int main(int argc, char ** argv) {
         const int64_t t_s0 = now_us();
         require(llama_state_seq_snapshot_save(sctx, 0, 42, P, &bytes) == LLAMA_SNAPSHOT_OK, "save");
         const int64_t t_save = now_us() - t_s0;
-        require(bytes == quoted, "the quote equals what the save holds (the pool reserves exactly this)");
+        require(bytes == quoted, "the physical quote equals what the save holds (the pool reserves exactly this)");
 
         // 1. a failed REPLACEMENT keeps the prior snapshot loadable
         require(decode(sctx, detour, N, 0), "detour");
@@ -219,6 +219,19 @@ int main(int argc, char ** argv) {
         require(llama_state_seq_snapshot_load(sctx, 0, 42, P) == LLAMA_SNAPSHOT_OK, "timed restore");
         const int64_t t_load = now_us() - t_l0; // the restore alone (it synchronizes on entry; nothing is in flight)
         const float d1 = restored_matches_cold(42, "the prior snapshot survived the failed replacement");
+
+        // 2b. a failure AFTER the read began (metadata mutated, copy not done) quarantines the target: it is
+        //     cleared whole, never half-restored; the snapshot itself is intact and restores it again
+        llama_state_seq_snapshot_test_fail_next_load_commits(1);
+        require(llama_state_seq_snapshot_load(sctx, 0, 42, P) == LLAMA_SNAPSHOT_COPY_FAILED, "a post-read failure is typed");
+        require(llama_memory_seq_pos_max(smem, 0) == -1, "the quarantined target is empty, never half-restored");
+        require(llama_state_seq_snapshot_load(sctx, 0, 42, P) == LLAMA_SNAPSHOT_OK, "an empty target restores from the intact snapshot");
+        // the recurrent row is back; attention for the prefix was cleared with the quarantine, so re-prefill it
+        // (attention is trimmed/re-built by position, as the server does) and check the next token
+        require(llama_memory_seq_rm(smem, 0, -1, -1), "clear for the prefix re-build");
+        require(decode(sctx, prefix, 0, 0), "re-prefill after quarantine");
+        llama_synchronize(sctx);
+        require(llama_state_seq_snapshot_save(sctx, 0, 42, P, &bytes) == LLAMA_SNAPSHOT_OK, "re-save after quarantine");
 
         // 3. save / free with backend work still in flight (no explicit synchronize by the caller)
         require(decode(sctx, detour, N, 0), "detour 2");               // submitted, not synchronized
