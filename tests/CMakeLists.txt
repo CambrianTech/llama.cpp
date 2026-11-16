@@ -217,6 +217,7 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-seq-park.cpp) # needs -m <model>: a checkpoint as a parked sequence id (CONTINUUM-ENGINE 4.7.11)
 llama_build_and_test(test-sampler-penalties.cpp)
+llama_build(test-sampler-coarse.cpp) # needs -m <model>: ballpark sampling picks exactly the full path's token
 
 # GGML_TENSOR_FLAG_GRAD: a leaf whose gradient the backward computes, never optimized (the walk reads the cached prefix K/V gradient)
 llama_build_and_test(test-grad-leaf.cpp)

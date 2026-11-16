@@ -121,13 +121,113 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // Continuum fork (CONTINUUM-ENGINE 4.7.13): BALLPARK FIRST, EXACT ON THE FEW. When every sampler before
+    // top-k can only LOWER a logit, the post-adjustment top-k lies inside the raw top-(k + h), h = how many
+    // tokens can be lowered, plus any token a bias raises. So the chain runs unchanged on the logits at or
+    // above a threshold that keeps at least `coarse_cap` of them: the same token as over the whole
+    // vocabulary. The threshold comes from the PREVIOUS step (consecutive tokens' logit distributions are
+    // close, frame-to-frame coherence); a sampled estimate seeds it, and a miss widens it. The scan asks
+    // per block "is any logit >= the threshold?" (an OR of comparisons, which vectorizes; a float max
+    // reduction does not without fast-math). 0 = disabled.
+    size_t                   coarse_cap = 0;
+    std::vector<llama_token> coarse_raised; // tokens a positive bias can raise: always candidates
+    std::vector<llama_token> coarse_ids;
+    std::vector<float>       coarse_vals;
+    // The cut is carried as an ABSOLUTE logit: the k-th largest of ~250k logits is a tail quantile of
+    // the bulk distribution, which is stable step to step, while the max (one confident token) spikes
+    // (measured: carrying it relative to the max tripled the misses). The margin below last step's cut
+    // is the measured step-to-step drift of that cut (a running mean of |change|), not a constant.
+    float                    coarse_thr   = 0.0f;
+    float                    coarse_cut   = 0.0f;  // last step's cap-th largest
+    float                    coarse_drift = 0.0f;  // running mean of |cut change| between steps
+    // which RANK of this step's logits becomes the next threshold (candidates scale with rank; a margin
+    // in logit units swept in thousands, measured). Balanced ONLINE between the two costs it trades (a
+    // miss = another full scan, ~23 us; each extra candidate ~ tens of ns through the chain): a miss
+    // raises it, a hit lowers it slowly, never below cap.
+    float                    coarse_margin = 2.0f; // rank = margin * cap
+    bool                     coarse_known = false;
+    struct coarse_stats_t { uint64_t calls = 0, reseeds = 0, widens = 0, candidates = 0; } coarse_stats;
+
+    // the ids of every logit >= thr, in id order; returns how many
+    size_t coarse_scan(const float * logits, int n_vocab, float thr) {
+        coarse_ids.clear();
+        constexpr int BLOCK = 32;
+        int i = 0;
+        for (; i + BLOCK <= n_vocab; i += BLOCK) {
+            int any = 0;
+            for (int j = 0; j < BLOCK; ++j) {
+                any |= logits[i + j] >= thr; // vectorizes: an OR of comparisons, no serial dependency
+            }
+            if (any) {
+                for (int j = 0; j < BLOCK; ++j) {
+                    if (logits[i + j] >= thr) coarse_ids.push_back(i + j);
+                }
+            }
+        }
+        for (; i < n_vocab; ++i) {
+            if (logits[i] >= thr) coarse_ids.push_back(i);
+        }
+        return coarse_ids.size();
+    }
+
+    // a first threshold from a strided sample (once, or after a miss): keeps ~2x cap on average
+    float coarse_seed(const float * logits, int n_vocab) {
+        constexpr int STRIDE = 16;
+        coarse_vals.clear();
+        for (int i = 0; i < n_vocab; i += STRIDE) coarse_vals.push_back(logits[i]);
+        const size_t want = std::min(coarse_vals.size() - 1, (coarse_cap * 2) / STRIDE + 1);
+        std::nth_element(coarse_vals.begin(), coarse_vals.begin() + (ptrdiff_t) want, coarse_vals.end(), std::greater<float>());
+        return coarse_vals[want];
+    }
+
+    void coarse_candidates(const float * logits, int n_vocab) {
+        const size_t cap = coarse_cap;
+        coarse_stats.calls++;
+        float thr = coarse_known ? coarse_thr : (coarse_stats.reseeds++, coarse_seed(logits, n_vocab));
+        size_t n = coarse_scan(logits, n_vocab, thr);
+        float step = 0.0f;
+        if (n < cap) {
+            coarse_margin *= 1.5f;                                   // a miss: keep more next time
+        } else {
+            coarse_margin = std::max(1.0f, coarse_margin * 0.97f);   // a hit: keep a little less
+        }
+        while (n < cap) { // a miss: re-seed from the strided-sample estimate (aims at ~2x cap), then double the gap
+            coarse_stats.widens++;
+            const float seeded = coarse_seed(logits, n_vocab);
+            step = step == 0.0f ? std::max(thr - seeded, 1e-3f) : step * 2.0f;
+            thr = std::min(seeded, thr - step);
+            n = coarse_scan(logits, n_vocab, thr);
+        }
+        // next step's threshold: the value at rank margin*cap among this step's logits (the candidates hold
+        // every logit at or above the threshold, so ranks up to their count are exact; past it, keep the
+        // threshold this step used)
+        coarse_vals.clear();
+        for (const auto id : coarse_ids) coarse_vals.push_back(logits[id]);
+        const size_t rank = std::min(coarse_vals.size(), (size_t) (coarse_margin * (float) cap));
+        if (rank >= 1) {
+            std::nth_element(coarse_vals.begin(), coarse_vals.begin() + (ptrdiff_t) (rank - 1), coarse_vals.end(), std::greater<float>());
+            coarse_thr = rank < (size_t) (coarse_margin * (float) cap) ? thr : coarse_vals[rank - 1];
+        }
+        coarse_known = true;
+        if (!coarse_raised.empty()) {
+            coarse_ids.insert(coarse_ids.end(), coarse_raised.begin(), coarse_raised.end());
+            std::sort(coarse_ids.begin(), coarse_ids.end());
+            coarse_ids.erase(std::unique(coarse_ids.begin(), coarse_ids.end()), coarse_ids.end());
+        }
+        coarse_stats.candidates += coarse_ids.size();
+        cur.resize(coarse_ids.size());
+        for (size_t k = 0; k < coarse_ids.size(); ++k) {
+            cur[k] = llama_token_data{ coarse_ids[k], logits[coarse_ids[k]], 0.0f };
+        }
+    }
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
+    void set_logits(struct llama_context * ctx, int idx, bool coarse = false) {
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
@@ -152,9 +252,13 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+            if (coarse && coarse_cap > 0 && coarse_cap < (size_t) n_vocab) {
+                coarse_candidates(logits, n_vocab);
+            } else {
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         }
 
@@ -432,7 +536,45 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .coarse_cap    = */ 0,
+        /* .coarse_raised = */ {},
+        /* .coarse_ids    = */ {},
+        /* .coarse_vals   = */ {},
+        /* .coarse_thr    = */ 0.0f,
+        /* .coarse_cut    = */ 0.0f,
+        /* .coarse_drift  = */ 0.0f,
+        /* .coarse_margin = */ 1.0f,
+        /* .coarse_known  = */ false,
+        /* .coarse_stats  = */ {},
     };
+
+    // ballpark-first eligibility (common_sampler::coarse_cap): exact only when everything before top-k can
+    // only lower a logit and needs no whole-vocabulary statistic, and no full distribution is wanted
+    {
+        bool eligible = params.mirostat == 0 && params.top_k > 0 && params.n_probs == 0 &&
+                        params.penalty_repeat >= 1.0f && params.penalty_freq >= 0.0f && params.penalty_present >= 0.0f;
+        size_t lowered = params.penalty_last_n > 0 ? (size_t) params.penalty_last_n : 0;
+        std::vector<llama_token> raised;
+        for (const auto & b : params.logit_bias) {
+            if (b.bias > 0.0f) raised.push_back(b.token); else lowered++;
+        }
+        bool has_top_k = false;
+        for (const auto t : params.samplers) {
+            if (t == COMMON_SAMPLER_TYPE_TOP_K) { has_top_k = true; break; }
+            switch (t) {
+                case COMMON_SAMPLER_TYPE_PENALTIES:   break;                                    // lowers only
+                case COMMON_SAMPLER_TYPE_DRY:         eligible &= params.dry_multiplier == 0.0f; break; // disabled = empty
+                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA: eligible &= params.top_n_sigma <= 0.0f; break;   // needs all-V stats
+                default:                              eligible = false; break;
+            }
+        }
+        if (eligible && has_top_k) {
+            int32_t n_suppress = 0;
+            llama_vocab_get_suppress_tokens(vocab, &n_suppress); // -inf biases: lowered
+            result->coarse_cap    = (size_t) params.top_k + lowered + (size_t) n_suppress;
+            result->coarse_raised = std::move(raised);
+        }
+    }
 
     return result;
 }
@@ -498,6 +640,12 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     gsmpl->prev.push_back(token);
 }
 
+// Continuum fork: the ballpark path's counters (cap, calls, reseeds, widens, mean candidates)
+void common_sampler_coarse_stats(const struct common_sampler * gsmpl, size_t * cap, uint64_t * calls, uint64_t * reseeds, uint64_t * widens, uint64_t * candidates) {
+    *cap = gsmpl->coarse_cap; *calls = gsmpl->coarse_stats.calls; *reseeds = gsmpl->coarse_stats.reseeds;
+    *widens = gsmpl->coarse_stats.widens; *candidates = gsmpl->coarse_stats.candidates;
+}
+
 void common_sampler_reset(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
@@ -515,6 +663,16 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .coarse_cap    = */ gsmpl->coarse_cap, // a clone (speculative verify) keeps the ballpark path
+        /* .coarse_raised = */ gsmpl->coarse_raised,
+        /* .coarse_ids    = */ {},
+        /* .coarse_vals   = */ {},
+        /* .coarse_thr    = */ gsmpl->coarse_thr,
+        /* .coarse_cut    = */ gsmpl->coarse_cut,
+        /* .coarse_drift  = */ gsmpl->coarse_drift,
+        /* .coarse_margin = */ gsmpl->coarse_margin,
+        /* .coarse_known  = */ gsmpl->coarse_known,
+        /* .coarse_stats  = */ {},
     };
 }
 
@@ -536,6 +694,13 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->t_total_us = src->t_total_us;
+    dst->coarse_cap    = src->coarse_cap;
+    dst->coarse_raised = src->coarse_raised;
+    dst->coarse_thr    = src->coarse_thr;
+    dst->coarse_cut    = src->coarse_cut;
+    dst->coarse_drift  = src->coarse_drift;
+    dst->coarse_margin = src->coarse_margin;
+    dst->coarse_known  = src->coarse_known;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -604,7 +769,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // ballpark first unless the grammar must see the whole vocabulary now; a grammar rejection below
+    // resamples over the full array
+    gsmpl->set_logits(ctx, idx, /*coarse=*/!(grammar_first && grammar_should_apply(gsmpl)));
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
