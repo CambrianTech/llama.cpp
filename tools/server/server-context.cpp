@@ -1,6 +1,7 @@
 #include <limits>
 #include "server-context.h"
 #include "server-checkpoint-policy.h"
+#include "server-view-end.h"
 #include "../../src/llama-ext.h"
 #include "server-train.h"
 #include "server-adapter-file.h"
@@ -4075,7 +4076,7 @@ private:
                     // saved page keeps (SLOT_SAVE). They describe the prompt these tokens now hold,
                     // so they travel with it (server_prompt).
                     const auto view_end_pos = slot.task->params.view_end_pos;
-                    slot.prompt.view_end = view_end_pos;
+                    slot.prompt.view_end = carried_view_end(view_end_pos, slot.prompt.view_end, slot.prompt.n_tokens());
                     slot.prompt.end_from = std::max(0, slot.task->n_tokens() - std::min(n_batch, 4 + n_ubatch));
 
                     // add prompt tokens for processing in the current batch
