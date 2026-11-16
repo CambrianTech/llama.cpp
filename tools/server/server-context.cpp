@@ -2661,6 +2661,23 @@ private:
         }
 
         const auto & kept = slot.prompt.checkpoints.emplace_back(std::move(cur));
+
+        // Continuum fork (CONTINUUM-ENGINE 4.7.3, placed checkpoints): her new view-end checkpoint
+        // supersedes every checkpoint an earlier act left on this prefix except her head's (the oldest,
+        // the restore point when her next prompt diverges before her view end). What stays per slot is
+        // her head, her newest view end, and this act's end checkpoints.
+        if (slot.prompt.view_end >= 0 && kept.n_tokens == slot.prompt.view_end) {
+            const common_prompt_checkpoint * head = &slot.prompt.checkpoints.front();
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                if (&*it != head && it->id_task != id_task) {
+                    SLT_TRC(slot, "erasing a checkpoint her view end supersedes (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                            it->n_tokens, (float) it->size() / 1024 / 1024);
+                    it = slot.prompt.checkpoints.erase(it);
+                    continue;
+                }
+                ++it;
+            }
+        }
         if (!keep_checkpoints_within_budget(&kept)) {
             SLT_WRN(slot, "a context checkpoint of %.3f MiB alone exceeds the checkpoint budget: not kept (a restore from here will be cold)\n",
                     (float) kept.size() / 1024 / 1024);
@@ -4477,8 +4494,11 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // break at the last user message, or at user messages at least min step past the last checkpoint.
+                        // Continuum fork: not when the request carries her view spans: then the view end below is
+                        // where her next prompt diverges, and blind step checkpoints only pile up (CONTINUUM-ENGINE
+                        // 4.7.2-4.7.3; the M5, 2026-11-16: up to 32 x ~110 MB per slot thrashed the host)
+                        if (do_checkpoint && view_end_pos < 0 && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
