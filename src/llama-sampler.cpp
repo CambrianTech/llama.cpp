@@ -2954,26 +2954,66 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
-    // Apply frequency and presence penalties to the cur_p
+    // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
+    // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
+    const auto penalize = [ctx](llama_token_data & d, int count) {
+        assert(count > 0 && count <= ctx->penalty_last_n);
+        if (d.logit <= 0) {
+            d.logit *= ctx->penalty_repeat;
+        } else {
+            d.logit /= ctx->penalty_repeat;
+        }
+        d.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+    };
+
+    // Continuum fork (CONTINUUM-ENGINE 4.7.13): only tokens in the recent history can be penalized, at most
+    // penalty_last_n of them, so walk THEM, not the whole vocabulary. While the candidates are still in
+    // token-id order (data[id].id == id: penalties ran first, as in the default chain) each one is applied
+    // in place at data[id]: O(history) per token instead of O(vocab) hash lookups.
+    if (cur_p->size > ctx->token_count.size()) {
+        bool aligned = true;
+        for (const auto & [id, count] : ctx->token_count) {
+            if (id < 0 || (size_t) id >= cur_p->size || cur_p->data[id].id != id) {
+                aligned = false;
+                break;
+            }
+        }
+        if (aligned) {
+            for (const auto & [id, count] : ctx->token_count) {
+                penalize(cur_p->data[id], count);
+            }
+            cur_p->sorted = false;
+            return;
+        }
+    }
+
+    // a candidate SUBSET still in token-id order (e.g. a ballpark cut, common/sampling.cpp): find each
+    // history token by binary search, O(history x log n), instead of a hash lookup per candidate
+    if (cur_p->size > 1) {
+        bool by_id = true;
+        for (size_t i = 1; i < cur_p->size; ++i) {
+            if (cur_p->data[i].id <= cur_p->data[i - 1].id) { by_id = false; break; }
+        }
+        if (by_id) {
+            const auto first = cur_p->data, last = cur_p->data + cur_p->size;
+            for (const auto & [id, count] : ctx->token_count) {
+                const auto it = std::lower_bound(first, last, id, [](const llama_token_data & d, llama_token v) { return d.id < v; });
+                if (it != last && it->id == id) {
+                    penalize(*it, count);
+                }
+            }
+            cur_p->sorted = false;
+            return;
+        }
+    }
+
+    // candidates reordered or truncated by an earlier sampler: the array is the smaller side
     for (size_t i = 0; i < cur_p->size; ++i) {
         const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
         if (token_iter == ctx->token_count.end()) {
             continue;
         }
-
-        const int count = token_iter->second;
-
-        assert(count > 0 && count <= ctx->penalty_last_n);
-
-        // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
-        // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
-        } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
-        }
-
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        penalize(cur_p->data[i], token_iter->second);
     }
 
     cur_p->sorted = false;
@@ -3921,12 +3961,13 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
         return;
     }
 
-    // search for the remaining candidates that were not found in the previous step
+    // search for the remaining candidates that were not found in the previous step. Every matching bias
+    // applies, as on the in-place path above: two biases on one token sum on both paths (Continuum fork:
+    // the subset path stopped at the first, which ballpark sampling exposed; Codex on #122)
     for (size_t i = 0; i < cur_p->size; ++i) {
         for (const auto & lb : ctx->to_search) {
             if (cur_p->data[i].id == lb.token) {
                 cur_p->data[i].logit += lb.bias;
-                break;
             }
         }
     }
