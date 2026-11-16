@@ -2010,10 +2010,10 @@ bool server_prompt_cache::evict_oldest_resident() {
     // a state larger than the whole RAM tier leaves first: it cannot stay, so evicting older
     // states for it would only push them to disk as well
     auto oldest = std::find_if(states.begin(), states.end(), [this](const server_prompt_cache_state & s) {
-        return !s.spilled() && limit_size > 0 && s.size() > limit_size;
+        return !s.spilled() && &s != keep && limit_size > 0 && s.size() > limit_size;
     });
     if (oldest == states.end()) {
-        oldest = std::find_if(states.begin(), states.end(), [](const server_prompt_cache_state & s) { return !s.spilled(); });
+        oldest = std::find_if(states.begin(), states.end(), [this](const server_prompt_cache_state & s) { return !s.spilled() && &s != keep; });
     }
     if (oldest == states.end()) {
         return false;
@@ -2027,8 +2027,29 @@ bool server_prompt_cache::evict_oldest_resident() {
     return true;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_tgt, size_t state_size_dft) {
+const server_prompt_cache_state * server_prompt_cache::leaving(const server_tokens & next, const lora_active_set & lora) const {
+    const server_prompt_cache_state * best = nullptr;
+    int lcp_best = 0;
+    for (const auto & s : states) {
+        if (s.lora != lora || s.prompt.tokens.size() == 0) {
+            continue;
+        }
+        const int lcp = s.prompt.tokens.get_common_prefix(next);
+        if (float(lcp) / s.prompt.tokens.size() >= 0.25f && lcp > lcp_best) { // load()'s "don't trash" floor
+            lcp_best = lcp;
+            best     = &s;
+        }
+    }
+    return best;
+}
+
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_tgt, size_t state_size_dft,
+                                                       const server_tokens * next, const lora_active_set * next_lora) {
     reap_spills();
+    // the resident the incoming request is about to load: evicting it to make room for this save would push
+    // the very mind arriving to disk and refuse the one leaving (two minds, a tier that holds one)
+    keep = next != nullptr && next_lora != nullptr ? leaving(*next, *next_lora) : nullptr;
+    struct keep_reset { const server_prompt_cache_state *& k; ~keep_reset() { k = nullptr; } } keep_reset_ { keep };
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (it->lora != lora) {
@@ -2075,12 +2096,15 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit; an entry
         // larger than the whole RAM tier goes to disk itself in `update`, displacing nothing
+        // The protected entry leaves with the load that follows this save (update() restores the cap right
+        // after if it does not), so it counts as gone: the swap holds both for that moment, bounded by one entry.
         const size_t room_needed = state_size_new > limit_size ? 0 : state_size_new;
-        while (size() + room_needed > limit_size && evict_oldest_resident()) {
+        auto kept = [this] { return keep != nullptr ? keep->size() : 0; };
+        while (size() - kept() + room_needed > limit_size && evict_oldest_resident()) {
         }
-        // every resident evicted and still over: bytes in flight to disk hold the rest, so this entry is
+        // every other resident evicted and still over: bytes in flight to disk hold the rest, so this entry is
         // not cached rather than breaching the cap (Codex on #124: cap 100, 80 in flight, a new 50)
-        if (size() + room_needed > limit_size) {
+        if (size() - kept() + room_needed > limit_size) {
             SRV_WRN(" - prompt state of %.3f MiB not cached: %.3f MiB in flight to disk leave no room under the %.3f MiB limit\n",
                     state_size_new / (1024.0 * 1024.0), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
             return nullptr;

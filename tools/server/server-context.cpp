@@ -317,7 +317,9 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    // `next` / `next_lora`: the request about to load from the cache after this save, when there is one
+    bool prompt_save(server_prompt_cache & prompt_cache, const server_tokens * next = nullptr,
+                     const lora_active_set * next_lora = nullptr) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -330,7 +332,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, lora_active(lora), cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, lora_active(lora), cur_size_tgt, cur_size_dft, next, next_lora);
         if (cur == nullptr) {
             return false;
         }
@@ -1852,10 +1854,10 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
-
                 const auto task_lora = task.params.lora.empty() ? params_base.lora_adapters
                                                                 : construct_lora_list(task.params.lora);
+                const auto next_lora = lora_active(task_lora);
+                ret->prompt_save(*prompt_cache, &task.tokens, &next_lora);
                 if (!ret->prompt_load(*prompt_cache, task.tokens, task_lora)) {
                     ret->prompt_clear();
                 }

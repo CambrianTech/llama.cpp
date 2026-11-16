@@ -899,13 +899,20 @@ struct server_prompt_cache {
     // read a spilled state's bytes back into RAM and remove its file
     bool unspill(server_prompt_cache_state & state);
 
+    // the resident the incoming request will load (load()'s own choice, by the same cheap prefix test)
+    const server_prompt_cache_state * leaving(const server_tokens & next, const lora_active_set & lora) const;
+    const server_prompt_cache_state * keep = nullptr; // set only for the duration of one alloc
+
     // remove a state, and its file if it has one
     std::list<server_prompt_cache_state>::iterator erase(std::list<server_prompt_cache_state>::iterator it);
 
     // make room in RAM: the oldest resident state goes to disk, or is dropped without a disk tier
     bool evict_oldest_resident();
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_main, size_t state_size_drft);
+    // `next`: the tokens of the request about to load from this cache (nullptr when none). The resident that
+    // request will take is never evicted to make room for this save: it is leaving the cache anyway.
+    server_prompt_cache_state * alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_main, size_t state_size_drft,
+                                      const server_tokens * next = nullptr, const lora_active_set * next_lora = nullptr);
 
     bool load(server_prompt & prompt, const lora_active_set & lora, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
