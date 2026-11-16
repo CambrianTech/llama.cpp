@@ -53,15 +53,15 @@ static void jobs_write_into_owner_storage_in_order() {
     adder module(128);
     std::thread::id worker{};
     auto t = module.submit([&worker](job_state) { worker = std::this_thread::get_id(); });
-    require(t.has_value(), "a running module takes a job");
-    module.wait(*t);
+    require(t.queued(), "a running module takes a job");
+    module.wait(t.ticket);
     require(worker != std::this_thread::get_id(), "the job ran on the module's own thread");
     std::vector<int64_t> totals(100, 0); // the owner's storage, allocated once
     job_ticket last = 0;
     for (int64_t n = 1; n <= 100; ++n) {
         auto ticket = module.add(n, &totals[(size_t) n - 1]);
-        require(ticket.has_value(), "queued");
-        last = *ticket;
+        require(ticket.queued(), "queued");
+        last = ticket.ticket;
     }
     module.wait(last); // one wait covers every earlier ticket: completion is in order
     int64_t expected = 0;
@@ -78,14 +78,14 @@ static void a_snapshot_never_waits_on_work() {
     adder module(4);
     std::atomic<bool> release{false};
     auto blocker = module.submit([&](job_state) { while (!release.load()) { std::this_thread::yield(); } });
-    require(blocker.has_value(), "queued");
+    require(blocker.queued(), "queued");
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 1000; ++i) {
         require(module.snapshot().total == 0, "a reader sees the last published state");
     }
     require(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50), "1,000 snapshot reads during a long job never wait on it");
     release = true;
-    module.wait(*blocker);
+    module.wait(blocker.ticket);
 }
 
 struct tracker {
@@ -112,8 +112,8 @@ static void a_stop_cancels_queued_jobs_and_no_waiter_hangs() {
     for (int i = 0; i < 3; ++i) {
         auto held = std::make_shared<tracker>(&alive); // a captured handle: released with its job
         auto t = module.submit([held, slot = &slots[(size_t) i]](job_state s) { *slot = s == job_state::run ? 1 : -1; });
-        require(t.has_value(), "queued behind the running job");
-        last = *t;
+        require(t.queued(), "queued behind the running job");
+        last = t.ticket;
     }
     require(alive.load() == 3, "the queued jobs hold their captures");
     std::thread waiter([&] { module.wait(last); }); // must return even though these never run
@@ -121,12 +121,12 @@ static void a_stop_cancels_queued_jobs_and_no_waiter_hangs() {
     int probes = 0;
     while (true) {
         auto probe = module.submit([](job_state) {});
-        if (!probe && probe.error() == module_refusal::full) {
+        if (!probe.queued() && probe.refusal == module_refusal::full) {
             std::this_thread::yield(); // the ring filled before the stop landed: the stop is coming
             continue;
         }
-        if (!probe) {
-            require(probe.error() == module_refusal::stopping, "a stopping module refuses typed");
+        if (!probe.queued()) {
+            require(probe.refusal == module_refusal::stopping, "a stopping module refuses typed");
             break;
         }
         ++probes;
@@ -142,7 +142,7 @@ static void a_stop_cancels_queued_jobs_and_no_waiter_hangs() {
     require(module.stats().cancelled == (uint64_t) (3 + probes), "every cancelled job is counted");
     require(module.stats().refused >= 1, "refusals are counted");
     require(module.stats().done == 1, "nothing queued ran after the stop");
-    require(module.completed() == *running + 3 + (uint64_t) probes, "the counter advanced past every ticket");
+    require(module.completed() == running.ticket + 3 + (uint64_t) probes, "the counter advanced past every ticket");
 }
 
 static void the_owners_capacity_bounds_the_ring() {
@@ -151,12 +151,12 @@ static void the_owners_capacity_bounds_the_ring() {
     auto running = module.submit([&](job_state) { started = true; while (!release.load()) { std::this_thread::yield(); } });
     while (!started.load()) { std::this_thread::yield(); }
     int64_t a = 0, b = 0, c = 0;
-    require(module.add(1, &a).has_value() && module.add(2, &b).has_value(), "two may wait");
+    require(module.add(1, &a).queued() && module.add(2, &b).queued(), "two may wait");
     auto third = module.add(3, &c);
-    require(!third && third.error() == module_refusal::full, "a full ring refuses typed, never grows");
+    require(!third.queued() && third.refusal == module_refusal::full, "a full ring refuses typed, never grows");
     require(module.stats().refused == 1, "the refusal is counted");
     release = true;
-    module.wait(*running + 2);
+    module.wait(running.ticket + 2);
     require(a == 1 && b == 3 && c == 0, "the queued jobs ran; the refused one never did");
 }
 
@@ -166,12 +166,12 @@ static void the_owners_capacity_bounds_the_ring() {
 static void a_throwing_job_ends_typed_in_its_owners_storage() {
     adder module(8);
     std::atomic<job_outcome> first{job_outcome::pending}, second{job_outcome::pending}, after{job_outcome::pending};
-    auto bad1 = module.submit([](job_state) { throw std::runtime_error("job failed"); }, &first);
-    auto bad2 = module.submit([](job_state) { throw 7; }, &second);
+    auto bad1 = module.submit([](job_state s) { if (s == job_state::run) throw std::runtime_error("job failed"); }, &first);
+    auto bad2 = module.submit([](job_state s) { if (s == job_state::run) throw 7; }, &second);
     int64_t out = 0;
     auto good = module.submit([&out](job_state s) { if (s == job_state::run) out = 7; }, &after);
-    require(bad1.has_value() && bad2.has_value() && good.has_value(), "all queued");
-    module.wait(*good);
+    require(bad1.queued() && bad2.queued() && good.queued(), "all queued");
+    module.wait(good.ticket);
     require(out == 7 && after.load() == job_outcome::ran, "the job after two faults still runs");
     require(first.load() == job_outcome::run_faulted && second.load() == job_outcome::run_faulted,
             "each fault is kept in its own owner's storage: none overwritten");
@@ -182,12 +182,12 @@ static void a_throwing_job_ends_typed_in_its_owners_storage() {
     std::atomic<job_outcome> doomed_out{job_outcome::pending};
     auto blocker = module.submit([&](job_state) { while (!release.load()) { std::this_thread::yield(); } });
     auto doomed  = module.submit([](job_state s) { if (s == job_state::cancelled) throw std::logic_error("cancel failed"); }, &doomed_out);
-    require(blocker.has_value() && doomed.has_value(), "queued");
+    require(blocker.queued() && doomed.queued(), "queued");
     std::thread stopper([&] { module.stop(); });
     while (!module.stopping()) std::this_thread::yield(); // the blocker still runs: `doomed` can only be cancelled
     release = true;
     stopper.join();
-    require(module.completed() >= *doomed, "no waiter hangs on a ticket whose cancel threw");
+    require(module.completed() >= doomed.ticket, "no waiter hangs on a ticket whose cancel threw");
     require(doomed_out.load() == job_outcome::cancel_faulted, "a cancel fault is typed too");
 }
 
@@ -196,14 +196,14 @@ static void an_empty_job_is_refused_typed() {
     adder module(4);
     adder::job empty;
     auto r = module.submit(std::move(empty));
-    require(!r.has_value() && r.error() == module_refusal::empty, "an empty job is refused, never queued");
+    require(!r.queued() && r.refusal == module_refusal::empty, "an empty job is refused, never queued");
     adder::job real([](job_state) {});
     adder::job moved = std::move(real);
     auto r2 = module.submit(std::move(real)); // NOLINT: deliberately the moved-from one
-    require(!r2.has_value() && r2.error() == module_refusal::empty, "a moved-from job is refused");
+    require(!r2.queued() && r2.refusal == module_refusal::empty, "a moved-from job is refused");
     auto r3 = module.submit(std::move(moved));
-    require(r3.has_value(), "the moved-to job queues");
-    module.wait(*r3);
+    require(r3.queued(), "the moved-to job queues");
+    module.wait(r3.ticket);
 }
 
 // what this catches (Codex on #135): std::function required a copyable target; a job owning a move-only
@@ -215,8 +215,8 @@ static void a_move_only_job_runs_once_and_releases_its_capture() {
     auto t = module.submit([h = std::move(handle), &value](job_state s) mutable {
         if (s == job_state::run) value = *h + 1;
     });
-    require(t.has_value(), "a move-only capture queues");
-    module.wait(*t);
+    require(t.queued(), "a move-only capture queues");
+    module.wait(t.ticket);
     require(value == 42, "it ran once with its owned handle");
 }
 
@@ -225,12 +225,14 @@ static void a_move_only_job_runs_once_and_releases_its_capture() {
 struct pair_state { uint64_t a = 0, b = 0; };
 static void a_snapshot_read_is_never_torn() {
     snapshot_cell<pair_state> cell(pair_state{});
-    std::atomic<bool> stop{false};
+    std::atomic<bool> stop{false}, reading{false};
     std::thread writer([&] {
+        while (!reading.load()) std::this_thread::yield(); // the reader is running before the first publish
         for (uint64_t i = 1; i <= 200000; ++i) cell.publish(pair_state{ i, ~i });
         stop = true;
     });
     uint64_t reads = 0;
+    reading = true;
     while (!stop.load()) {
         const auto v = cell.read();
         require(v.b == ~v.a || (v.a == 0 && v.b == 0), "a read is one whole published value");
