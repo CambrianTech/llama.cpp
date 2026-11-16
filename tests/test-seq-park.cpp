@@ -107,6 +107,39 @@ int main(int argc, char ** argv) {
     if (!decode(ctx, { next }, N, 0)) { std::fprintf(stderr, "FAILED: restored decode\n"); return 1; }
     const std::vector<float> got = last_logits(ctx, n_vocab);
 
+    // the server's form: a checkpoint holds only the PARTIAL state (recurrent / SWA), attention KV is
+    // trimmed by position. Park only the recurrent cell (an empty attention range [0, 0) copies no
+    // KV cells), advance, then restore the recurrent cell by id and trim attention past the prefix.
+    // start from a clean prefix: the recurrent state cannot be trimmed back past `next`
+    llama_memory_seq_rm(mem, 1, -1, -1);
+    llama_memory_seq_rm(mem, 0, -1, -1);
+    if (!decode(ctx, prefix, 0, 0)) { std::fprintf(stderr, "FAILED: second prefix decode\n"); return 1; }
+    llama_synchronize(ctx);
+    const int64_t t_ppark0 = now_us();
+    llama_memory_seq_cp(mem, 0, 1, 0, 0);
+    const int64_t t_ppark = now_us() - t_ppark0;
+    const llama_pos parked_kv_max = llama_memory_seq_pos_max(mem, 1);
+    if (!decode(ctx, detour, N, 0)) { std::fprintf(stderr, "FAILED: second detour\n"); return 1; }
+    llama_synchronize(ctx);
+    const int64_t t_prest0 = now_us();
+    llama_memory_seq_cp(mem, 1, 0, 0, 0);                       // the recurrent cell, by id
+    const bool trimmed = llama_memory_seq_rm(mem, 0, N, -1);    // attention past the prefix
+    const int64_t t_prest = now_us() - t_prest0;
+    if (!trimmed) { std::fprintf(stderr, "FAILED: attention trim after the partial restore\n"); return 1; }
+    if (!decode(ctx, { next }, N, 0)) { std::fprintf(stderr, "FAILED: partial restored decode\n"); return 1; }
+    const std::vector<float> got_partial = last_logits(ctx, n_vocab);
+    float max_diff_partial = 0.0f;
+    int   argmax_partial   = 0;
+    for (int i = 0; i < n_vocab; ++i) {
+        max_diff_partial = std::max(max_diff_partial, std::fabs(ref[i] - got_partial[i]));
+        if (got_partial[i] > got_partial[argmax_partial]) argmax_partial = i;
+    }
+    // today's partial checkpoint, for the same comparison (the size of the state it would copy)
+    const int64_t t_pser0 = now_us();
+    std::vector<uint8_t> pblob(llama_state_seq_get_size_ext(ctx, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    const size_t pwritten = llama_state_seq_get_data_ext(ctx, pblob.data(), pblob.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    const int64_t t_pser = now_us() - t_pser0;
+
     float max_diff = 0.0f;
     int   argmax_ref = 0, argmax_got = 0;
     for (int i = 0; i < n_vocab; ++i) {
@@ -117,12 +150,19 @@ int main(int argc, char ** argv) {
     std::printf("serialized checkpoint: %zu bytes in %lld us (host copy of the sequence)\n", written, (long long) t_ser);
     std::printf("parked checkpoint: 0 bytes moved, park %lld us, restore %lld us\n", (long long) t_park, (long long) t_rest);
     std::printf("restored vs cold logits: max |diff| = %.6g, argmax %d vs %d\n", max_diff, argmax_got, argmax_ref);
+    std::printf("partial (server form): serialized %zu bytes in %lld us; parked 0 bytes (attention cells held by the parked id: pos_max %d), park %lld us, restore %lld us\n",
+                pwritten, (long long) t_pser, (int) parked_kv_max, (long long) t_ppark, (long long) t_prest);
+    std::printf("partial restored vs cold logits: max |diff| = %.6g, argmax %d vs %d\n", max_diff_partial, argmax_partial, argmax_ref);
 
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
 
     // the same backend, the same tokens, the same positions: the restored state must be the cold one
+    if (argmax_partial != argmax_ref || max_diff_partial > 1e-2f) {
+        std::fprintf(stderr, "FAILED: the partial (recurrent-only) restore does not reproduce the cold run\n");
+        return 1;
+    }
     if (argmax_got != argmax_ref || max_diff > 1e-2f) {
         std::fprintf(stderr, "FAILED: the restored sequence does not reproduce the cold run\n");
         return 1;
