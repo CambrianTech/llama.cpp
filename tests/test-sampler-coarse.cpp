@@ -11,6 +11,7 @@
 #include "sampling.h"
 #include "llama.h"
 
+#include <cmath>
 #include <chrono>
 #include <clocale>
 #include <algorithm>
