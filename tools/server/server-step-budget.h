@@ -1,30 +1,29 @@
 #pragma once
 
-// Continuum fork: the decode loop's frame budget, measured on EVERY step (CONTINUUM-ENGINE 4.7.9).
+// Continuum fork: the decode loop's HOST timings, measured on every step (CONTINUUM-ENGINE 4.7.9).
 //
-// A one-off `sample` proved the GPU idles ~40-45% of the decode loop. This makes that a number the
-// engine reports continuously, so a regression is seen the step it happens and every speed change
-// carries its own before/after. Three timestamps per step, all already on the decode thread:
+// These are what the host thread does, never what the GPU does: llama_decode may enqueue command
+// buffers before it returns, and a sync wait is the host blocked, not device execution. GPU busy time
+// comes from the backend's own command-buffer timestamps (/props.gpu_time, `ggml_backend_gpu_time`);
+// utilization is that busy time over wall time, and these timings say where the host spends a step.
+// Three timestamps per step, all on the decode thread:
 //
-//   begin      llama_decode is called            (CPU starts building and submitting the graph)
-//   submitted  llama_decode returns              (the graph is queued on the GPU)
-//   synced     llama_synchronize returns         (the GPU finished; outputs are readable)
+//   begin      llama_decode is called
+//   submitted  llama_decode returns
+//   synced     llama_synchronize returns
 //
-//   build = submitted - begin           CPU work with the GPU waiting on it (inputs, mask, graph)
-//   gpu   = synced - submitted          the GPU computing (an upper bound of its idle-free time:
-//                                       it may finish early and wait for the sync call)
-//   gap   = next begin - synced         CPU work between steps (sampling, slot bookkeeping,
-//                                       checkpoints, the next batch) with the GPU idle
+//   decode_call_us = submitted - begin     host building and encoding the step
+//   sync_wait_us   = synced - submitted    host blocked until the outputs are readable
+//   inter_step_us  = next begin - synced   host work between steps while work is pending
+//                                          (sampling, slot bookkeeping, checkpoints, the next batch)
 //
-// A step without outputs is not synchronized (prefill chunks stream on); its time until the next
-// step is counted as `unsynced`, never as idle or busy, because neither is proven. A gap is counted
-// only when work was pending at the step's end: an engine waiting for requests is not stalling.
+// A step without outputs is not synchronized (prefill chunks stream on): its whole span, from begin
+// to the next begin, is `unsynced_us` and nothing else, so it never enters the synchronized timings.
+// Time while no work is pending is not counted at all: an engine waiting for requests is not stalling.
 //
-// The counters are cumulative and monotonic (microseconds and counts), written by the decode thread
-// with relaxed atomics and read from any thread without a lock; a reader differences two snapshots to
-// get a window, so the engine holds no window size and no threshold.
-//
-//   GPU idle share = (build + gap) / (build + gpu + gap)
+// The counters are cumulative and monotonic, written by the decode thread with relaxed atomics and
+// read from any thread without a lock; a reader differences two reads into a window, so the engine
+// holds no window size and no threshold.
 //
 // Pure and header-only, proven by tests/test-server-step-budget.cpp without a model.
 
@@ -37,25 +36,18 @@
 enum class step_kind : uint8_t { decode, with_prefill };
 
 struct step_budget_counters {
-    uint64_t steps        = 0;
-    uint64_t tokens       = 0;
-    uint64_t build_us     = 0;
-    uint64_t gpu_us       = 0;
-    uint64_t gap_us       = 0;
-    uint64_t unsynced_us  = 0;
-
-    // (build + gap) / (build + gpu + gap); empty when nothing synchronized was measured.
-    std::optional<double> gpu_idle_share() const {
-        const uint64_t total = build_us + gpu_us + gap_us;
-        if (total == 0) {
-            return std::nullopt;
-        }
-        return double(build_us + gap_us) / double(total);
-    }
+    uint64_t steps          = 0; // synchronized steps
+    uint64_t tokens         = 0; // tokens in synchronized steps
+    uint64_t decode_call_us = 0;
+    uint64_t sync_wait_us   = 0;
+    uint64_t inter_step_us  = 0;
+    uint64_t unsynced_steps = 0;
+    uint64_t unsynced_us    = 0;
 
     step_budget_counters operator-(const step_budget_counters & earlier) const {
-        return { steps - earlier.steps, tokens - earlier.tokens, build_us - earlier.build_us,
-                 gpu_us - earlier.gpu_us, gap_us - earlier.gap_us, unsynced_us - earlier.unsynced_us };
+        return { steps - earlier.steps, tokens - earlier.tokens, decode_call_us - earlier.decode_call_us,
+                 sync_wait_us - earlier.sync_wait_us, inter_step_us - earlier.inter_step_us,
+                 unsynced_steps - earlier.unsynced_steps, unsynced_us - earlier.unsynced_us };
     }
 };
 
@@ -88,14 +80,15 @@ public:
             return;
         }
         auto & c = of(kind_);
-        add(c.steps, 1);
-        add(c.tokens, n_tokens_);
-        add(c.build_us, span(begin_us_, submitted_));
         if (synced_) {
-            add(c.gpu_us, span(submitted_, *synced_));
-            add(c.gap_us, span(*synced_, now_us)); // sampling and bookkeeping after the sync
+            add(c.steps, 1);
+            add(c.tokens, n_tokens_);
+            add(c.decode_call_us, span(begin_us_, submitted_));
+            add(c.sync_wait_us, span(submitted_, *synced_));
+            add(c.inter_step_us, span(*synced_, now_us)); // sampling and bookkeeping after the sync
         } else {
-            add(c.unsynced_us, span(submitted_, now_us));
+            add(c.unsynced_steps, 1);
+            add(c.unsynced_us, span(begin_us_, now_us)); // the whole step: neither idle nor busy is proven
         }
         end_us_       = now_us;
         work_pending_ = work_pending;
@@ -108,7 +101,8 @@ public:
 
 private:
     struct atomic_counters {
-        std::atomic<uint64_t> steps{0}, tokens{0}, build_us{0}, gpu_us{0}, gap_us{0}, unsynced_us{0};
+        std::atomic<uint64_t> steps{0}, tokens{0}, decode_call_us{0}, sync_wait_us{0}, inter_step_us{0},
+                              unsynced_steps{0}, unsynced_us{0};
     };
 
     // The time from the previous step's end to this begin: a stall when work was pending, attributed
@@ -123,7 +117,7 @@ private:
         }
         auto & c = of(kind_);
         if (synced_kind_) {
-            add(c.gap_us, span(end_us_, now_us));
+            add(c.inter_step_us, span(end_us_, now_us));
         } else {
             add(c.unsynced_us, span(end_us_, now_us));
         }
@@ -134,9 +128,9 @@ private:
     static uint64_t span(int64_t from, int64_t to) { return to > from ? uint64_t(to - from) : 0; }
     static void add(std::atomic<uint64_t> & a, uint64_t v) { a.fetch_add(v, std::memory_order_relaxed); }
     static step_budget_counters read(const atomic_counters & a) {
-        return { a.steps.load(std::memory_order_relaxed), a.tokens.load(std::memory_order_relaxed),
-                 a.build_us.load(std::memory_order_relaxed), a.gpu_us.load(std::memory_order_relaxed),
-                 a.gap_us.load(std::memory_order_relaxed), a.unsynced_us.load(std::memory_order_relaxed) };
+        const auto r = [](const std::atomic<uint64_t> & v) { return v.load(std::memory_order_relaxed); };
+        return { r(a.steps), r(a.tokens), r(a.decode_call_us), r(a.sync_wait_us), r(a.inter_step_us),
+                 r(a.unsynced_steps), r(a.unsynced_us) };
     }
 
     atomic_counters decode_;

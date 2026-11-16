@@ -5592,20 +5592,40 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "memory_breakdown",            meta.memory_breakdown },
         { "context_geometry",            meta.context_geometry },
         { "step_budget",                 [&] {
-            // cumulative microseconds and counts; a reader differences two reads into a window
+            // host timings per step, cumulative; a reader differences two reads into a window. These are
+            // where the host spends a step, never GPU utilization (that is gpu_time below).
             auto counters = [](const step_budget_counters & c) {
-                json j = { {"steps", c.steps}, {"tokens", c.tokens}, {"build_us", c.build_us}, {"gpu_us", c.gpu_us},
-                           {"gap_us", c.gap_us}, {"unsynced_us", c.unsynced_us} };
-                if (auto share = c.gpu_idle_share()) {
-                    j["gpu_idle_share"] = *share;
-                }
-                return j;
+                return json { {"steps", c.steps}, {"tokens", c.tokens}, {"decode_call_us", c.decode_call_us},
+                              {"sync_wait_us", c.sync_wait_us}, {"inter_step_us", c.inter_step_us},
+                              {"unsynced_steps", c.unsynced_steps}, {"unsynced_us", c.unsynced_us} };
             };
             if (!meta.step_budget) {
                 return json(nullptr);
             }
             auto snap = meta.step_budget->snapshot();
             return json { {"decode", counters(snap.decode)}, {"with_prefill", counters(snap.with_prefill)} };
+        }() },
+        { "gpu_time",                    [] {
+            // device busy time from the backend's own command-buffer timestamps (overlap counted once),
+            // with the host clock it was read at: utilization = delta busy_us / delta clock_us
+            json devices = json::array();
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    continue;
+                }
+                using gpu_time_fn = bool (*)(ggml_backend_dev_t, uint64_t *, uint64_t *);
+                auto fn = (gpu_time_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_gpu_time");
+                uint64_t busy_ns = 0, cmd_bufs = 0;
+                if (fn == nullptr || !fn(dev, &busy_ns, &cmd_bufs)) {
+                    devices.push_back({ {"device", ggml_backend_dev_name(dev)}, {"measured", false} });
+                    continue;
+                }
+                devices.push_back({ {"device", ggml_backend_dev_name(dev)}, {"measured", true},
+                                    {"busy_us", busy_ns / 1000}, {"command_buffers", cmd_bufs},
+                                    {"clock_us", ggml_time_us()} });
+            }
+            return devices;
         }() },
         { "modalities",                  json {
             {"vision", meta.has_inp_image},
