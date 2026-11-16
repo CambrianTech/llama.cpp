@@ -3657,8 +3657,8 @@ private:
             int32_t depth;
             int32_t prefilled;
             int32_t generated;
-            int32_t n_gen;
-            int32_t n_accepted;
+            uint64_t n_gen;
+            uint64_t n_accepted;
         };
         std::vector<step_slot> step_slots;
         const bool     capturing = batch.size() > 0 && engine_steps.active();
@@ -3676,7 +3676,7 @@ private:
                     continue;
                 }
                 step_slots.push_back({ slot.id, slot.task->id, (int32_t) slot.prompt.n_tokens(), it->second.first, it->second.second,
-                                       slot.stats.n_gen, slot.stats.n_draft_accepted });
+                                       (uint64_t) slot.stats.n_gen, (uint64_t) slot.stats.n_draft_accepted });
                 chosen.push_back(slot.task->id);
             }
             engine_steps.push({ { "kind", "began" }, { "at_us", t_step_start }, { "step", step_id }, { "chosen", chosen } });
@@ -3733,9 +3733,9 @@ private:
                     { "task", s.task },
                     { "depth", s.depth },
                     { "prefilled", s.prefilled },
-                    { "decoded", same ? slot->stats.n_gen - s.n_gen : s.generated },
+                    { "decoded", same ? (uint64_t) slot->stats.n_gen - s.n_gen : (uint64_t) s.generated },
                 };
-                entry["accepted_draft"] = same ? json(slot->stats.n_draft_accepted - s.n_accepted) : json(nullptr);
+                entry["accepted_draft"] = same ? json((uint64_t) slot->stats.n_draft_accepted - s.n_accepted) : json(nullptr);
                 work.push_back(entry);
             }
             engine_steps.push({ { "kind", "ended" }, { "at_us", ggml_time_us() }, { "step", step_id }, { "work", work } });
