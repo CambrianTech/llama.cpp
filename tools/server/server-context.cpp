@@ -4109,12 +4109,11 @@ private:
                         // Continuum fork: not when the request carries her view spans: then the view end below is
                         // where her next prompt diverges, and blind step checkpoints only pile up (CONTINUUM-ENGINE
                         // 4.7.2-4.7.3; the M5, 2026-11-16: up to 32 x ~110 MB per slot thrashed the host)
-                        if (do_checkpoint && view_end_pos < 0 && spans.is_user_start(slot.prompt.n_tokens())) {
-                            const auto pos = slot.prompt.n_tokens();
+                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto & checkpoints = slot.prompt.checkpoints;
-
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + checkpoint_step(slot)) {
-                                break;
+                            if (checkpoint_at_user_start(view_end_pos >= 0, checkpoints.empty(), slot.prompt.n_tokens(), last_user_pos,
+                                                         checkpoints.empty() ? 0 : checkpoints.back().n_tokens, checkpoint_step(slot))) {
+                                break; // server-checkpoint-policy.h
                             }
                         }
 

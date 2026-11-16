@@ -112,7 +112,36 @@ static void without_view_spans_the_oldest_goes() {
     require(erase_superseded_checkpoints(s, s.back(), -1, 3, [](const ckpt &) {}) == 0, "and nothing is superseded");
 }
 
+// the caller's cold path (Codex on #127): a prompt filled from an empty store, with view spans, stopping
+// at user turns by checkpoint_at_user_start and creating a checkpoint at each stop, must make her head at
+// the FIRST user turn; later turns add none; the view end adds the next one
+static void a_cold_prompt_with_view_spans_makes_her_head() {
+    const int64_t user_starts[] = { 9655, 20000, 30000, 40000 };
+    const int64_t view_end = 45000;
+    store s;
+    int serial = 0;
+    for (const int64_t pos : user_starts) {
+        if (checkpoint_at_user_start(/*view_spans=*/true, s.empty(), pos, /*last_user_pos=*/40000,
+                                     s.empty() ? 0 : s.back().n_tokens, /*step=*/1024)) {
+            create(s, 32, view_end, { pos, 1, ++serial });
+        }
+    }
+    require(s.size() == 1 && s.front().n_tokens == 9655, "the head is made at the first user turn, and only there");
+    create(s, 32, view_end, { view_end, 1, ++serial }); // the view-end stop
+    require(s.size() == 2 && s.front().n_tokens == 9655 && s.back().n_tokens == view_end, "head, then her view end");
+    // the rule before this fix skipped every user-start stop when the request carried view spans, so the
+    // only checkpoint a cold prompt got was its view end's: no head
+    store before;
+    create(before, 32, view_end, { view_end, 1, 99 });
+    require(before.size() == 1 && before.front().n_tokens == view_end, "the pre-fix path's store has no head (the defect this guards)");
+    // without view spans, upstream: the last user message and step-spaced turns
+    require(checkpoint_at_user_start(false, false, 40000, 40000, 30000, 1024), "upstream: her last user message");
+    require(!checkpoint_at_user_start(false, false, 30500, 40000, 30000, 1024), "upstream: not within a step");
+    require(!checkpoint_at_user_start(true, false, 40000, 40000, 30000, 1024), "with view spans, no blind step checkpoint");
+}
+
 int main() {
+    a_cold_prompt_with_view_spans_makes_her_head();
     head_survives_a_full_store_across_many_acts();
     the_pre_fix_rule_loses_the_head();
     capacity_one_keeps_only_what_fits();

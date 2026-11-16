@@ -7,6 +7,23 @@
 #include <cstddef>
 #include <cstdint>
 
+// Whether the prompt fill stops at a user turn's start (at `pos`) so a checkpoint is made there. The
+// first boundary always gets one: with an empty store it is her head, her restore point when her next
+// prompt diverges before her view end (Codex on #127: with view spans the head was never made on a cold
+// prompt). After it, with view spans, the view end is where her next prompt diverges, so blind step
+// checkpoints are not made (up to 32 x ~110 MB per slot thrashed the M5's host); without view spans,
+// upstream's rule: at her last user message, or a step past the newest checkpoint.
+inline bool checkpoint_at_user_start(bool view_spans, bool store_empty, int64_t pos, int64_t last_user_pos,
+                                     int64_t newest, int64_t step) {
+    if (store_empty) {
+        return true;
+    }
+    if (view_spans) {
+        return false;
+    }
+    return pos == last_user_pos || pos > newest + step;
+}
+
 // The checkpoint to erase to make room for one more. With view spans (view_end >= 0) her head (the
 // oldest) is her restore point when her next prompt diverges before her view end, so the oldest AFTER
 // it goes first; the head goes only when it is all there is. Without view spans, the oldest goes.
