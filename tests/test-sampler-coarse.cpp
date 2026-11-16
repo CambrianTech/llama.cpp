@@ -134,10 +134,11 @@ int main(int argc, char ** argv) {
         const int n_v = llama_vocab_n_tokens(vocab);
         std::vector<float> logits(n_v);
         for (const int finite : { 0, 100, n_v - 1000 }) {
+          for (const float poison : { NAN, INFINITY }) {
             for (int i = 0; i < n_v; ++i) {
                 // distinct finite values (7919 is prime, so i*7919 mod finite permutes them): with ties, top-k's
                 // order among equals is unspecified on both paths and "the same token" means nothing
-                logits[i] = i < finite ? 10.0f * (float) (((int64_t) i * 7919) % finite) / (float) finite : NAN;
+                logits[i] = i < finite ? 10.0f * (float) (((int64_t) i * 7919) % finite) / (float) finite : poison;
             }
             common_sampler_row row;
             row.logits  = logits.data();
@@ -149,15 +150,43 @@ int main(int argc, char ** argv) {
             for (int step = 0; step < 8; ++step) {
                 const llama_token a = common_sampler_sample_row(coarse, row);
                 const llama_token b = common_sampler_sample_row(full, row);
-                if (a != b) {
-                    std::fprintf(stderr, "FAILED: NaN logits (%d finite): ballpark %d, full %d\n", finite, a, b);
+                // +inf ties every poisoned token at the maximum: top-k's order among equals is unspecified on
+                // both paths, so the meaningful identity is that both pick a maximal (+inf) token; NaN never ties
+                const bool same = std::isinf(poison) && finite < n_v ? (std::isinf(logits[a]) && std::isinf(logits[b])) : a == b;
+                if (!same) {
+                    std::fprintf(stderr, "FAILED: non-finite logits (%d finite): ballpark %d, full %d\n", finite, a, b);
                     return 1;
                 }
             }
             common_sampler_free(coarse);
             common_sampler_free(full);
-            std::printf("%-18s %d finite of %d: the ballpark step ended and matched the full array\n", "NaN logits", finite, n_v);
+            std::printf("%-18s %d finite of %d, the rest %s: the ballpark step ended and matched the full array (a maximal token under +inf ties)\n",
+                        "non-finite logits", finite, n_v, std::isnan(poison) ? "NaN" : "+inf");
+          }
         }
+    }
+
+    // a +inf seed (Codex on #122): +inf on exactly the strided seed sample's positions, fewer than cap tokens,
+    // so the seed is +inf, the first scan finds too few, and +inf - +inf made the widening step NaN forever
+    {
+        const int n_v = llama_vocab_n_tokens(vocab);
+        std::vector<float> logits(n_v);
+        for (int i = 0; i < n_v; ++i) {
+            logits[i] = (i % 16 == 0 && i < 16 * 40) ? INFINITY : 10.0f * (float) (((int64_t) i * 7919) % n_v) / (float) n_v;
+        }
+        common_sampler_row row;
+        row.logits  = logits.data();
+        row.n_vocab = n_v;
+        common_sampler * coarse = common_sampler_init(model, base);
+        for (int step = 0; step < 8; ++step) {
+            const llama_token a = common_sampler_sample_row(coarse, row);
+            if (!std::isinf(logits[a])) {
+                std::fprintf(stderr, "FAILED: +inf seed: picked %d, not one of the 40 maximal tokens\n", a);
+                return 1;
+            }
+        }
+        common_sampler_free(coarse);
+        std::printf("%-18s 40 +inf tokens on the seed's sample positions: the step ended on a maximal token\n", "+inf seed");
     }
 
     // speculative verify: the ballpark side samples through a clone every step
