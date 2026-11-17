@@ -17,11 +17,32 @@
 #include "../src/llama-context.h"
 
 #include <algorithm>
+#include <atomic>
+#include <new>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+
+// allocation fault injection: while armed, every allocation in this process throws std::bad_alloc
+static std::atomic<bool> g_fail_alloc { false };
+
+static void * checked_alloc(std::size_t n) {
+    if (g_fail_alloc.load(std::memory_order_relaxed)) {
+        throw std::bad_alloc();
+    }
+    if (void * p = std::malloc(n ? n : 1)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+void * operator new(std::size_t n) { return checked_alloc(n); }
+void * operator new[](std::size_t n) { return checked_alloc(n); }
+void operator delete(void * p) noexcept { std::free(p); }
+void operator delete[](void * p) noexcept { std::free(p); }
+void operator delete(void * p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void * p, std::size_t) noexcept { std::free(p); }
 
 static void require(bool condition, const char * message) {
     if (!condition) {
@@ -103,8 +124,19 @@ int main(int argc, char ** argv) {
     params.n_parallel      = 2;
     params.n_ctx           = 512;
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED; // V rows contiguous
+    // --test-rs-seq N: the speculative configuration serving uses (draft-mtp, n_max N), which gives the context N
+    // rollback snapshot groups (common_params_speculative::need_n_rs_seq); stripped before the common parse
+    std::vector<char *> args(argv, argv + argc);
+    for (size_t i = 1; i + 1 < args.size(); ++i) {
+        if (std::strcmp(args[i], "--test-rs-seq") == 0) {
+            params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            params.speculative.draft.n_max = std::atoi(args[i + 1]);
+            args.erase(args.begin() + i, args.begin() + i + 2);
+            break;
+        }
+    }
     common_init();
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    if (!common_params_parse((int) args.size(), args.data(), params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
     ggml_backend_load_all();
@@ -236,6 +268,69 @@ int main(int argc, char ** argv) {
                 "the streams are exchanged");
         f.require_continues("a after the exchange", 0, ref_a0);
         f.require_continues("b after the exchange", 1, ref_b1);
+    }
+
+    // 7. allocation faults: a commit allocates nothing (it runs with every allocation failing), and an allocation
+    //    failure in the reserve phase leaves her whole and continuing exactly
+    {
+        llama_memory_t mem = llama_get_memory(f.ctx);
+        llama_memory_clear(mem, true);
+        f.prompt(0, 1);
+        llama_synchronize(f.ctx);
+        llama_persona_blocks c;
+        require_move(ctx.persona_prepare(c), llama_persona_move::done, "prepare persona c");
+        require_move(mem->persona_check_save(0, c), llama_persona_move::done, "check (reserve) c's save");
+        g_fail_alloc = true;
+        mem->persona_commit_save(0, c); // must not allocate: any allocation throws and aborts the test
+        g_fail_alloc = false;
+        require(f.pos_max(0) < 0, "c's commit took her out");
+        llama_persona_slot slot;
+        require_move(mem->persona_check_load(0, 1 - mem->seq_stream(0), c, slot), llama_persona_move::done, "check c's load");
+        g_fail_alloc = true;
+        mem->persona_commit_load(0, slot, c);
+        g_fail_alloc = false;
+        f.require_continues("c after allocation-free commits", 0, ref_a0);
+
+        llama_memory_clear(mem, true);
+        f.prompt(0, 1);
+        llama_synchronize(f.ctx);
+        llama_persona_blocks d;
+        require_move(ctx.persona_prepare(d), llama_persona_move::done, "prepare persona d");
+        bool reserve_failed = false;
+        g_fail_alloc = true;
+        try {
+            (void) mem->persona_check_save(0, d);
+        } catch (const std::bad_alloc &) {
+            reserve_failed = true;
+        }
+        g_fail_alloc = false;
+        require(reserve_failed, "the reserve phase allocates (and here fails)");
+        require(f.pos_max(0) == f.n_prompt - 1, "a failed reserve leaves her in the memory");
+        f.require_continues("her after a failed reserve", 0, ref_a0);
+    }
+
+    // 6. with rollback snapshot groups (n_rs_seq > 0, e.g. --spec-type draft-mtp --spec-draft-n-max 4): her state is
+    //    moved while a rollback is pending (two drafted tokens, one taken back) and she continues exactly as in place
+    if (llama_n_rs_seq(f.ctx) > 0) {
+        auto drafted_then_rolled_back = [&]() {
+            llama_memory_clear(llama_get_memory(f.ctx), true);
+            f.prompt(0, 1);
+            f.decode_one(0, 3 % f.n_vocab, f.n_prompt);
+            f.decode_one(0, 5 % f.n_vocab, f.n_prompt + 1);
+            require(llama_memory_seq_rm(llama_get_memory(f.ctx), 0, f.n_prompt + 1, -1), "take the second draft back");
+        };
+        drafted_then_rolled_back();
+        const std::vector<float> in_place = f.decode_one(0, 7 % f.n_vocab, f.n_prompt + 1);
+
+        drafted_then_rolled_back();
+        llama_persona_blocks r;
+        require_move(ctx.persona_prepare(r), llama_persona_move::done, "prepare persona r");
+        require_move(ctx.persona_save(0, r), llama_persona_move::done, "r out with a rollback pending");
+        require(!r.rs.has_state || r.rs.rs_idx > 0, "her pending rollback travels with her");
+        require_move(ctx.persona_load(0, 1 - llama_get_memory(f.ctx)->seq_stream(0), r), llama_persona_move::done, "r in");
+        require_identical("continues after a move with a rollback pending", in_place,
+                          f.decode_one(0, 7 % f.n_vocab, f.n_prompt + 1));
+        fprintf(stderr, "rollback groups exercised: n_rs_seq=%u, her rs_idx=%u\n", llama_n_rs_seq(f.ctx), r.rs.rs_idx);
     }
 
     fprintf(stderr, "test-persona-blocks: ok (%zu attention layers, %zu recurrent layers)\n", a.kv.k.size(), a.rs.r.size());

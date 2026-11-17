@@ -125,6 +125,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
     }
+
+    persona_layout_id = compute_persona_layout(); // the allocation layout is immutable from here
 }
 
 void llama_memory_recurrent::clear(bool data) {
@@ -394,7 +396,7 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
 
 static uint64_t rs_layout_mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001b3ull; }
 
-uint64_t llama_memory_recurrent::persona_layout() const {
+uint64_t llama_memory_recurrent::compute_persona_layout() const {
     uint64_t h = rs_layout_mix(0xcbf29ce484222325ull, r_l.size());
     h = rs_layout_mix(h, size);
     h = rs_layout_mix(h, n_rs_seq);

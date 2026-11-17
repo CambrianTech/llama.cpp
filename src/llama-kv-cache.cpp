@@ -363,6 +363,8 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    persona_layout_id = compute_persona_layout(); // the allocation layout is immutable from here
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1239,7 +1241,7 @@ static bool cells_prepared(const llama_kv_cells & cells, uint32_t size) {
 // this memory's attention layout: what her rows' sizes and meaning depend on
 static uint64_t kv_layout_mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001b3ull; }
 
-uint64_t llama_kv_cache::persona_layout() const {
+uint64_t llama_kv_cache::compute_persona_layout() const {
     uint64_t h = kv_layout_mix(0xcbf29ce484222325ull, layers.size());
     h = kv_layout_mix(h, get_size());
     for (const auto & layer : layers) {
