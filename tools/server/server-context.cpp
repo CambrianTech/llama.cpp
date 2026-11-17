@@ -305,7 +305,7 @@ struct server_slot {
     llama_tokens generated_tokens;
 
     // Continuum fork: her last response, for the request that continues it (server-continuation.h):
-    // its completion id and how many of `prompt.tokens` were the prompt she was served for it. Kept
+    // the caller's id for that request and how many of `prompt.tokens` were the prompt she was served. Kept
     // across release; her held tokens are checked against the request, never trusted by id alone.
     std::string served_response;
     size_t      n_served = 0;
@@ -2376,7 +2376,7 @@ private:
         // Her slot now holds this response after the prompt she was served: the next request that
         // names it continues from these tokens (server-continuation.h).
         if (!slot.task->is_child()) {
-            slot.served_response = slot.task->params.oaicompat_cmpl_id;
+            slot.served_response = slot.task->params.request_id;
             slot.n_served        = slot.task->n_tokens();
         }
 
@@ -5037,6 +5037,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            task.params.request_id = json_value(data, "request_id", std::string());
             task.params.continues = json_value(data, "continues", std::string());
             // Continuum fork: where the caller's view ends, so the prompt is checkpointed there.
             if (data.contains("view_messages") && data.contains("messages")) {

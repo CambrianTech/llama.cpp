@@ -19,7 +19,7 @@
 // next request re-renders that response from its parsed message, without her reasoning, so its tokens
 // differ from hers at her own response; a hybrid model's recurrent state cannot truncate there and
 // rewinds to a checkpoint (the M5, 2026-11-17: 2,048 tokens recomputed on every act). A request that
-// names the response it continues (`continues`, the completion id her last response carried) is
+// names the response it continues (`continues`, the caller's id for the request her last response answered) is
 // instead served as her held tokens followed by the request's tokens from the end-of-turn that closes
 // that response: the template's own glue, then everything new.
 //
@@ -55,12 +55,12 @@ inline const char * continuation_miss_name(continuation_miss miss) {
 struct continuation_held {
     const llama_tokens & tokens;   // the prompt she was served, then what she generated
     size_t               n_served; // how many of `tokens` are the prompt she was served
-    const std::string &  response; // the completion id that response carried
+    const std::string &  response; // the caller's id for the request that response answered
 };
 
 // The request as rendered and tokenized.
 struct continuation_request {
-    const std::string &           continues; // the completion id it continues, or empty
+    const std::string &           continues; // the id of the request whose response it continues, or empty
     const llama_tokens &          tokens;
     const common_chat_msg_spans & spans; // its messages' token spans
 };

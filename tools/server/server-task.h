@@ -175,8 +175,10 @@ struct task_params {
     // is checkpointed exactly there and a saved page keeps that checkpoint. -1 = not given.
     int32_t view_end_pos = -1;
 
-    // Continuum fork: the completion id of the response this request continues (`continues`): her
-    // slot's held tokens stand for that response and everything before it (server-continuation.h).
+    // Continuum fork: the caller's own id for this request (`request_id`), and the id of the request
+    // whose response this one continues (`continues`): her slot's held tokens stand for that response
+    // and everything before it (server-continuation.h). Named by the caller, never by this server.
+    std::string request_id;
     std::string continues;
 
     // Embeddings
