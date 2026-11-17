@@ -392,15 +392,34 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+static uint64_t rs_layout_mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001b3ull; }
+
+uint64_t llama_memory_recurrent::persona_layout() const {
+    uint64_t h = rs_layout_mix(0xcbf29ce484222325ull, r_l.size());
+    h = rs_layout_mix(h, size);
+    h = rs_layout_mix(h, n_rs_seq);
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        for (const ggml_tensor * t : { r_l[il], s_l[il] }) {
+            h = rs_layout_mix(h, t ? (uint64_t) t->type : 0xffu);
+            h = rs_layout_mix(h, t ? (uint64_t) t->ne[0] : 0);
+        }
+    }
+    return h;
+}
+
 llama_persona_move llama_memory_recurrent::persona_prepare(llama_persona_blocks & blocks) const {
+    blocks.rs_layout = persona_layout();
     blocks.rs.r.resize(r_l.size());
     blocks.rs.s.resize(s_l.size());
     return llama_persona_move::done;
 }
 
-llama_persona_move llama_memory_recurrent::persona_check_save(llama_seq_id seq_id, const llama_persona_blocks & out) const {
+llama_persona_move llama_memory_recurrent::persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const {
     if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
         return llama_persona_move::invalid_seq;
+    }
+    if (out.rs_layout != persona_layout()) {
+        return llama_persona_move::layout_mismatch;
     }
     if (out.rs.r.size() != r_l.size() || out.rs.s.size() != s_l.size()) {
         return llama_persona_move::cells_not_prepared;
@@ -409,6 +428,12 @@ llama_persona_move llama_memory_recurrent::persona_check_save(llama_seq_id seq_i
     if (tail >= 0 && cells[tail].seq_id.size() != 1) {
         return llama_persona_move::shared_cell;
     }
+    // reserve: every byte the commit copies, so the commit never allocates
+    const uint32_t n_groups = 1 + n_rs_seq;
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        out.rs.r[il].resize((tail >= 0 && r_l[il]) ? ggml_row_size(r_l[il]->type, r_l[il]->ne[0]) * n_groups : 0);
+        out.rs.s[il].resize((tail >= 0 && s_l[il]) ? ggml_row_size(s_l[il]->type, s_l[il]->ne[0]) * n_groups : 0);
+    }
     return llama_persona_move::done;
 }
 
@@ -416,20 +441,17 @@ void llama_memory_recurrent::persona_commit_save(llama_seq_id seq_id, llama_pers
     auto & rs = out.rs;
     const int32_t tail = cells[seq_id].tail;
     rs.has_state = tail >= 0;
+    out.seq = seq_id;
     if (!rs.has_state) {
-        for (auto & v : rs.r) { v.clear(); }
-        for (auto & v : rs.s) { v.clear(); }
         return;
     }
     const uint32_t n_groups = 1 + n_rs_seq;
     for (size_t il = 0; il < r_l.size(); ++il) {
         for (auto [src, dst] : { std::make_pair(r_l[il], &rs.r[il]), std::make_pair(s_l[il], &rs.s[il]) }) {
-            if (src == nullptr) {
-                dst->clear();
+            if (src == nullptr || dst->empty()) {
                 continue;
             }
             const size_t row = ggml_row_size(src->type, src->ne[0]);
-            dst->resize(row * n_groups);
             for (uint32_t g = 0; g < n_groups; ++g) {
                 ggml_backend_tensor_get(src, dst->data() + g * row, (size_t) (g * size + tail) * src->nb[1], row);
             }
@@ -460,8 +482,17 @@ llama_persona_move llama_memory_recurrent::persona_check_load(llama_seq_id seq_i
     }
     const auto & rs = in.rs;
     slot.cell = -1;
+    if (in.rs_layout != persona_layout()) {
+        return llama_persona_move::layout_mismatch;
+    }
     if (!rs.has_state) {
         return llama_persona_move::done;
+    }
+    if (in.seq != seq_id) {
+        return llama_persona_move::wrong_persona;
+    }
+    if (rs.rs_idx > n_rs_seq) {
+        return llama_persona_move::invalid_rollback;
     }
     if (rs.r.size() != r_l.size() || rs.s.size() != s_l.size()) {
         return llama_persona_move::layout_mismatch;
@@ -477,13 +508,16 @@ llama_persona_move llama_memory_recurrent::persona_check_load(llama_seq_id seq_i
     for (uint32_t i = 0; i < size; ++i) {
         if (cells[i].is_empty() && cells[i].pos < 0) {
             slot.cell = (int32_t) i;
+            // reserve her cell's sequence-set node now, so the commit inserts it without allocating
+            std::set<llama_seq_id> node_source { seq_id };
+            slot.node = node_source.extract(node_source.begin());
             return llama_persona_move::done;
         }
     }
     return llama_persona_move::no_free_cell;
 }
 
-void llama_memory_recurrent::persona_commit_load(llama_seq_id seq_id, const llama_persona_slot & slot,
+void llama_memory_recurrent::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot,
                                                  llama_persona_blocks & in) {
     const auto & rs = in.rs;
     if (!rs.has_state) {
@@ -506,7 +540,7 @@ void llama_memory_recurrent::persona_commit_load(llama_seq_id seq_id, const llam
     cell.pos  = rs.pos;
     cell.src  = cell_id;
     cell.src0 = cell_id;
-    cell.seq_id.insert(seq_id);
+    cell.seq_id.insert(std::move(slot.node)); // the node reserved by check: no allocation
     cells[seq_id].tail = cell_id;
     rs_idx[seq_id] = rs.rs_idx;
     used += 1;

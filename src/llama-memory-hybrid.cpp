@@ -216,7 +216,7 @@ llama_persona_move llama_memory_hybrid::persona_prepare(llama_persona_blocks & b
     return attn != llama_persona_move::done ? attn : mem_recr->persona_prepare(blocks);
 }
 
-llama_persona_move llama_memory_hybrid::persona_check_save(llama_seq_id seq_id, const llama_persona_blocks & out) const {
+llama_persona_move llama_memory_hybrid::persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const {
     const llama_persona_move attn = mem_attn->persona_check_save(seq_id, out);
     return attn != llama_persona_move::done ? attn : mem_recr->persona_check_save(seq_id, out);
 }
@@ -232,7 +232,7 @@ void llama_memory_hybrid::persona_commit_save(llama_seq_id seq_id, llama_persona
     mem_recr->persona_commit_save(seq_id, out);
 }
 
-void llama_memory_hybrid::persona_commit_load(llama_seq_id seq_id, const llama_persona_slot & slot,
+void llama_memory_hybrid::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot,
                                               llama_persona_blocks & in) {
     mem_attn->persona_commit_load(seq_id, slot, in);
     mem_recr->persona_commit_load(seq_id, slot, in);

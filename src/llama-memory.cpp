@@ -71,6 +71,8 @@ const char * llama_persona_move_name(llama_persona_move m) {
         case llama_persona_move::seq_holds_state:    return "seq_holds_state";
         case llama_persona_move::shared_cell:        return "shared_cell";
         case llama_persona_move::no_free_cell:       return "no_free_cell";
+        case llama_persona_move::wrong_persona:      return "wrong_persona";
+        case llama_persona_move::invalid_rollback:   return "invalid_rollback";
     }
     return "unknown";
 }

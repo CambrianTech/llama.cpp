@@ -1236,17 +1236,34 @@ static bool cells_prepared(const llama_kv_cells & cells, uint32_t size) {
     return cells.size() == size && cells.get_used() == 0 && !cells.get_has_shift();
 }
 
+// this memory's attention layout: what her rows' sizes and meaning depend on
+static uint64_t kv_layout_mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001b3ull; }
+
+uint64_t llama_kv_cache::persona_layout() const {
+    uint64_t h = kv_layout_mix(0xcbf29ce484222325ull, layers.size());
+    h = kv_layout_mix(h, get_size());
+    for (const auto & layer : layers) {
+        h = kv_layout_mix(h, layer.il);
+        h = kv_layout_mix(h, layer.k ? (uint64_t) layer.k->type : 0xffu);
+        h = kv_layout_mix(h, layer.k ? (uint64_t) layer.k->ne[0] : 0);
+        h = kv_layout_mix(h, layer.v ? (uint64_t) layer.v->type : 0xffu);
+        h = kv_layout_mix(h, layer.v ? (uint64_t) layer.v->ne[0] : 0);
+    }
+    return h;
+}
+
 llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks) const {
     if (n_stream == 1) {
         return llama_persona_move::no_such_stream;
     }
+    blocks.kv_layout = persona_layout();
     blocks.kv.cells.resize(get_size()); // once per persona, at her creation
     blocks.kv.k.resize(layers.size());
     blocks.kv.v.resize(layers.size());
     return llama_persona_move::done;
 }
 
-llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, const llama_persona_blocks & out) const {
+llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const {
     if (n_stream == 1) {
         return llama_persona_move::no_such_stream;
     }
@@ -1256,30 +1273,36 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, const
     if (v_trans) {
         return llama_persona_move::transposed_v;
     }
+    if (out.kv_layout != persona_layout()) {
+        return llama_persona_move::layout_mismatch;
+    }
     if (!cells_prepared(out.kv.cells, get_size()) || out.kv.k.size() != layers.size() || out.kv.v.size() != layers.size()) {
         return llama_persona_move::cells_not_prepared;
     }
+    // reserve: every byte the commit copies, so the commit never allocates
+    const uint32_t n_rows = v_cells[seq_to_stream[seq_id]].used_max_p1();
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        out.kv.k[i].resize(ggml_row_size(layer.k->type, layer.k->ne[0]) * n_rows);
+        out.kv.v[i].resize(layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) * n_rows : 0);
+    }
+    out.kv.n_rows = n_rows;
     return llama_persona_move::done;
 }
 
 void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) {
     const uint32_t s = seq_to_stream[seq_id];
     auto & cells = v_cells[s];
-    const uint32_t n_rows = cells.used_max_p1();
-    out.kv.n_rows = n_rows;
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto & layer = layers[i];
-        const size_t k_bytes = ggml_row_size(layer.k->type, layer.k->ne[0]) * n_rows;
-        out.kv.k[i].resize(k_bytes);
-        if (k_bytes > 0) {
-            ggml_backend_tensor_get(layer.k_stream[s], out.kv.k[i].data(), 0, k_bytes);
+        if (!out.kv.k[i].empty()) {
+            ggml_backend_tensor_get(layer.k_stream[s], out.kv.k[i].data(), 0, out.kv.k[i].size());
         }
-        const size_t v_bytes = layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) * n_rows : 0;
-        out.kv.v[i].resize(v_bytes);
-        if (v_bytes > 0) {
-            ggml_backend_tensor_get(layer.v_stream[s], out.kv.v[i].data(), 0, v_bytes);
+        if (!out.kv.v[i].empty()) {
+            ggml_backend_tensor_get(layer.v_stream[s], out.kv.v[i].data(), 0, out.kv.v[i].size());
         }
     }
+    out.seq = seq_id;
     std::swap(out.kv.cells, cells); // hers out; the stream takes the prepared empty object
     v_heads[s] = 0;
 }
@@ -1301,6 +1324,12 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
     if (v_cells[seq_to_stream[seq_id]].seq_pos_max(seq_id) >= 0) {
         return llama_persona_move::seq_holds_state;
     }
+    if (in.kv_layout != persona_layout()) {
+        return llama_persona_move::layout_mismatch;
+    }
+    if (in.kv.n_rows > 0 && in.seq != seq_id) {
+        return llama_persona_move::wrong_persona;
+    }
     const auto & kv = in.kv;
     if (kv.cells.size() != get_size() || kv.n_rows > get_size() || kv.cells.used_max_p1() > kv.n_rows ||
         kv.k.size() != layers.size() || kv.v.size() != layers.size()) {
@@ -1318,7 +1347,7 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
     return llama_persona_move::done;
 }
 
-void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, const llama_persona_slot & slot, llama_persona_blocks & in) {
+void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) {
     const uint32_t s = slot.stream;
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto & layer = layers[i];
