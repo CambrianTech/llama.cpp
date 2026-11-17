@@ -7106,6 +7106,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_minds_prefetch(const
         res->error(result->to_json());
         return res;
     }
+    GGML_ASSERT(dynamic_cast<server_task_result_mind_prefetch*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }
@@ -7136,7 +7137,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
         return res;
     }
 
-    GGML_ASSERT(dynamic_cast<server_task_result_mind_prefetch*>(result.get()) != nullptr);
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }
