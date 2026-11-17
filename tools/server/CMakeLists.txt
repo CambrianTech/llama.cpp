@@ -14,6 +14,12 @@ add_library(${TARGET} STATIC
     server-common.cpp
     server-common.h
     server-context.cpp
+    server-routes-status.cpp
+    server-routes-generation.cpp
+    server-routes-tokens.cpp
+    server-routes-lora.cpp
+    server-routes-learn.cpp
+    server-routes-control.cpp
     server-mapped-file.cpp
     server-mapped-file.h
     server-mind.h
@@ -52,6 +58,10 @@ add_library(${TARGET}
     server-http.cpp
     server-http.h
     server-models.cpp
+    server-models-load.cpp
+    server-models-child.cpp
+    server-models-routes.cpp
+    server-http-proxy.cpp
     server-models.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)

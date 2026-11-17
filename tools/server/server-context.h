@@ -135,6 +135,14 @@ struct server_routes {
 
     void init_routes();
 
+    // the route families init_routes registers, each in its own translation unit (server-routes-*.cpp)
+    void init_routes_status();
+    void init_routes_generation();
+    void init_routes_tokens();
+    void init_routes_lora();
+    void init_routes_learn();
+    void init_routes_control();
+
     // note: this is not thread-safe and can only when ctx_http.is_ready is false
     void update_meta(const server_context & ctx_server) {
         this->meta = std::make_unique<server_context_meta>(ctx_server.get_meta());
