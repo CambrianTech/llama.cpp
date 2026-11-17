@@ -51,7 +51,7 @@ static void the_middle_slot_leaves_with_speculative_groups_on_both_sides() {
     b.render();
     require(b.batch.n_tokens == 9, "rendered before the failed decode");
 
-    const std::vector<int32_t> moved = b.remove_slot(mid.id);
+    const std::vector<int32_t> moved = b.remove_slot(mid.id, 0);
     require(moved.size() == 9, "one entry per old token");
     for (int i = 3; i <= 6; ++i) {
         require(moved[i] == -1, "the removed slot's tokens map nowhere");
@@ -84,7 +84,7 @@ static void embedding_rows_move_with_their_tokens() {
         }
     }
     b.render();
-    b.remove_slot(1);
+    b.remove_slot(1, 0);
     require(b.size() == 4 && b.embd.size() == 4 * (size_t) n_embd, "two tokens and their rows removed");
     require(b.embd[2 * n_embd] == 20.0f && b.embd[2 * n_embd + 2] == 20.2f, "slot 2's first row moved up whole");
     require(b.embd[n_embd] == 1.0f, "slot 0's rows untouched");
@@ -94,7 +94,23 @@ static void embedding_rows_move_with_their_tokens() {
     require(b.batch.token != nullptr, "the token array is restored after an embedding batch");
 }
 
+// a frame decodes in pieces: the slot whose prompt straddles a placed piece keeps the placed tokens; only the ones
+// at or after the failed piece leave
+static void only_the_unplaced_tokens_leave() {
+    server_batch b;
+    b.init(16, 0);
+    for (int i = 0; i < 6; ++i) {
+        require(b.add(1, 300 + i, i, false, true), "room in the batch"); // slot 1's prompt, tokens 0..5
+    }
+    require(b.add(0, 400, 80, true, false), "room in the batch"); // slot 0's next token, index 6
+    b.render();
+    const std::vector<int32_t> moved = b.remove_slot(1, 4); // the piece from index 4 found no room
+    require(moved[3] == 3 && moved[4] == -1 && moved[5] == -1 && moved[6] == 4, "placed tokens stay, the rest leave");
+    require(b.size() == 5 && b.tokens[4].id_slot == 0, "the other slot's token follows");
+}
+
 int main() {
+    only_the_unplaced_tokens_leave();
     the_middle_slot_leaves_with_speculative_groups_on_both_sides();
     embedding_rows_move_with_their_tokens();
     std::cout << "test-server-batch: ok\n";

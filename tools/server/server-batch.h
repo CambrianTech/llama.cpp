@@ -122,16 +122,18 @@ struct server_batch {
         alora_disabled_id = m.alora_disabled_id;
     }
 
-    // Remove every token of one slot from a frame decode could not place (CONTINUUM-ENGINE 4.11.10: that slot is
-    // preempted or deferred, the others decode). Order is kept, embedding rows move with their tokens, and the batch
-    // must be rendered again before it decodes. Returns old index -> new index (-1 for a removed token): the caller
-    // remaps every index it holds into this batch (each slot's i_batch and spec_i_batch) and clears slot_batched if
-    // it was this slot; the batch cannot, since it sees server_slot only as a declaration.
-    std::vector<int32_t> remove_slot(int32_t id_slot) {
+    // Remove one slot's tokens at index >= `from` from a frame decode could not place (CONTINUUM-ENGINE 4.11.10:
+    // that slot is preempted or deferred, the others decode). A frame decodes in pieces; when the piece at `from`
+    // finds no room, the pieces before it are already placed and computed, so only tokens from `from` on can leave,
+    // and the caller cuts the slot's own bookkeeping back to what was placed. Order is kept, embedding rows move with
+    // their tokens, and the batch must be rendered again before it decodes. Returns old index -> new index (-1 for a
+    // removed token): the caller remaps every index it holds into this batch (each slot's i_batch and spec_i_batch)
+    // and clears slot_batched if it was this slot; the batch cannot, since it sees server_slot only as a declaration.
+    std::vector<int32_t> remove_slot(int32_t id_slot, int32_t from) {
         std::vector<int32_t> moved(tokens.size(), -1);
         size_t kept = 0;
         for (size_t i = 0; i < tokens.size(); ++i) {
-            if (tokens[i].id_slot == id_slot) {
+            if (tokens[i].id_slot == id_slot && (int32_t) i >= from) {
                 continue;
             }
             if (has_embd && kept != i) {
