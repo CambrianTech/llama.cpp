@@ -131,3 +131,28 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
     for res in results:
         assert res.status_code == 200
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
+
+
+def test_frames_count_accepted_tokens_not_drafts():
+    # what this catches: the per-frame recorder counting draft proposals or verification inputs as output; with a
+    # draft model, rejected drafts must not appear in the accepted total, which equals what the requests received
+    global server
+    server.server_metrics = True
+    server.start()
+    n_predicted = 0
+    for seed in [1, 2, 3]:
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "I believe the meaning of life is", "temperature": 0.8, "seed": seed, "n_predict": 24,
+        })
+        assert res.status_code == 200
+        n_predicted += res.body["timings"]["predicted_n"]
+    res = server.make_request("GET", "/metrics")
+    assert res.status_code == 200
+    totals = {}
+    for line in res.body.splitlines():
+        if line.startswith("llamacpp:") and "{" not in line:
+            name, value = line.split(" ", 1)
+            totals[name] = float(value)
+    assert totals["llamacpp:frame_tokens_accepted_total"] == n_predicted
+    assert totals["llamacpp:spec_decode_num_draft_tokens_total"] > totals["llamacpp:spec_decode_num_accepted_tokens_total"], \
+        "some drafts were rejected, so the equality above is a real check"

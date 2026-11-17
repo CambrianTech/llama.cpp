@@ -225,3 +225,23 @@ def test_metrics_embedding_prompt_is_counted():
     assert metrics["llamacpp:prompt_tokens_total"][1] > 0
     assert metrics["llamacpp:n_decode_total"][1] > 0
     assert metrics["llamacpp:tokens_predicted_total"][1] == 0
+
+
+def test_frames_count_only_completed_work():
+    # what this catches: the per-frame recorder (server-frame-costs.h) counting requested batch inputs instead of
+    # accepted output, or missing the frame in which a slot completes and is released (n_predict=1 ends in its first
+    # generated frame); its accepted total must equal the completion owner's own count
+    global server
+    server.start()
+
+    n_predicted = 0
+    for n_predict in [1, 4, 16]:
+        res = server.make_request("POST", "/completion", data={"prompt": "I believe", "n_predict": n_predict})
+        assert res.status_code == 200
+        n_predicted += res.body["timings"]["predicted_n"]
+
+    metrics = parse_metrics(fetch_metrics(server))
+    assert metrics["llamacpp:frame_tokens_accepted_total"][1] == n_predicted
+    assert metrics["llamacpp:frames_total"][1] > 0
+    assert metrics["llamacpp:frames_failed_total"][1] == 0
+    assert metrics["llamacpp:frame_loop_seconds_total"][1] >= metrics["llamacpp:frame_batch_seconds_total"][1]

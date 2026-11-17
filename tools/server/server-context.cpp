@@ -1665,6 +1665,8 @@ private:
         });
 
         metrics.init();
+        frames = std::make_unique<frame_costs<4096>>(metrics.t_start);
+        frames_reported_us = metrics.t_start;
         publish_ledger(); // readable before the loop's first boundary
 
         if (params_base.cache_idle_slots) {
@@ -3438,9 +3440,12 @@ private:
     int64_t t_decode_owed_us = 0;
     int32_t n_batch_gen      = 0; // batch size before prompt tokens are added
     // CONTINUUM-ENGINE 4.13 step 1: where each frame's device time went, and a window summary every 10 s
-    frame_costs<4096> frames;
-    int64_t           frames_reported_us = 0;
-    uint64_t          frames_reported_at = 0; // frames.recorded() at the last summary, so ring overwrites are counted
+    // created when serving starts, so no window reaches back into host uptime
+    std::unique_ptr<frame_costs<4096>> frames;
+    // the frame in progress: completion owners add to it (prompt tokens of a successful decode, drafts proposed and
+    // accepted); accepted output comes from n_tokens_generated, the one accepted-token counter
+    frame_cost frame_now;
+    int64_t    frames_reported_us = 0;
     server_prefill_order prefill_order;
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
@@ -3464,6 +3469,9 @@ private:
 #endif
 
     void update_slots() {
+        const int64_t t_loop_start   = ggml_time_us();
+        const int64_t gen_at_start   = n_tokens_generated.load(std::memory_order_relaxed);
+        frame_now = {};
         if (minds_on()) {
             minds_reap(); // a landed flash write frees her RAM copy; a failed one is written again
         }
@@ -3547,6 +3555,7 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         const bool    has_prompt   = batch.size() > n_batch_gen;
+        frame_shape_before_decode();
         const int64_t t_step_start = ggml_time_us();
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);
@@ -3568,9 +3577,11 @@ private:
                     n_batch = llama_n_batch(ctx_tgt);
                 } else {
                     // try again with the updated n_batch
+                    frame_now.outcome = frame_outcome::retried;
                     continue;
                 }
             } catch (const std::exception & e) {
+                frame_now.outcome = frame_outcome::failed;
                 SRV_ERR("decode() failed: %s\n", e.what());
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
@@ -3580,6 +3591,7 @@ private:
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
+                frame_now.outcome = frame_outcome::failed;
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
@@ -3594,40 +3606,49 @@ private:
         // graph segment before the queued NEXT_RESPONSE lets serving run again.
         const int64_t t_learn_start = ggml_time_us();
         if (learning_at_start) { advance_learning(); }
-        record_frame(t_step, ggml_time_us() - t_learn_start, has_prompt);
+        const int64_t t_end = ggml_time_us();
+        frame_now.end_us        = t_end;
+        frame_now.host_loop_us  = t_end - t_loop_start;
+        frame_now.host_batch_us = t_step;
+        frame_now.host_learn_us = t_end - t_learn_start;
+        frame_now.gen_accepted  = (int32_t) (n_tokens_generated.load(std::memory_order_relaxed) - gen_at_start);
+        record_frame();
     }
 
-    void record_frame(int64_t step_us, int64_t learn_us, bool has_prompt) {
+    // the batch's shape before decode mutates anything: a slot its own completion releases is still counted
+    void frame_shape_before_decode() {
+        std::vector<bool> seen(slots.size(), false);
+        for (int32_t i = 0; i < batch.size(); ++i) {
+            const int id = batch.tokens[i].id_slot;
+            if (id >= 0 && (size_t) id < seen.size() && !seen[id]) {
+                seen[id] = true;
+                ++frame_now.sequences;
+                frame_now.max_context = std::max(frame_now.max_context, (int32_t) slots[id].prompt.n_tokens());
+            }
+        }
+    }
+
+    void record_frame() {
         const int64_t t_record_start = ggml_time_us();
-        frame_cost f;
-        f.at_us         = t_record_start;
-        f.step_us       = step_us;
-        f.learn_us      = learn_us;
-        f.gen_tokens    = n_batch_gen;
-        f.prompt_tokens = has_prompt ? batch.size() - n_batch_gen : 0;
-        for (const auto & slot : slots) {
-            if (slot.is_processing()) {
-                ++f.sequences;
-                f.max_context = std::max(f.max_context, (int32_t) slot.prompt.n_tokens());
-            }
-        }
-        frames.record(f);
-        if (f.at_us - frames_reported_us >= 10 * 1000 * 1000) {
-            const frame_window w = frames.window(frames_reported_us, f.at_us);
-            const uint64_t dropped = frames.recorded() - frames_reported_at - (uint64_t) w.frames;
-            frames_reported_us = f.at_us;
-            frames_reported_at = frames.recorded();
-            if (dropped > 0) {
-                SRV_WRN("frames: %" PRIu64 " frames overwrote the ring before this summary read them\n", dropped);
-            }
-            SRV_INF("frames: %" PRId64 " in %.1f s: decode %.1f%% prefill %.1f%% learn %.1f%% idle %.1f%%; "
-                    "gen %" PRId64 " tok (%.1f tok/s wall, %.1f tok/s stepping), prompt %" PRId64 " tok; "
+        frames->record(frame_now);
+        if (frame_now.end_us - frames_reported_us >= 10 * 1000 * 1000) {
+            // an export for people reading the log; the record itself is read through frames->drain
+            const frame_window w = frames->window(frames_reported_us, frame_now.end_us);
+            frames_reported_us = frame_now.end_us;
+            const double wall = std::max<double>(1.0, (double) w.wall_us);
+            SRV_INF("frames%s: %" PRId64 " in %.1f s; host batch: decode %.1f%% prefill %.1f%% mixed %.1f%% none %.1f%%, "
+                    "learn %.1f%%, unclassified %.1f%%, outside the loop %.1f%%; accepted %" PRId64 " tok (%.1f/s wall), "
+                    "prompt %" PRId64 " tok, drafts %" PRId64 "/%" PRId64 "; retried %" PRId64 " failed %" PRId64 "; "
                     "widest %" PRId64 " seq, longest context %" PRId64 "\n",
-                    w.frames, w.wall_us / 1e6, 100.0 * w.decode_us / w.wall_us, 100.0 * w.prefill_us / w.wall_us,
-                    100.0 * w.learn_us / w.wall_us, 100.0 * w.idle_us() / w.wall_us, w.gen_tokens, w.gen_tps(),
-                    w.decode_tps(), w.prompt_tokens, w.max_sequences, w.max_context);
+                    w.complete ? "" : " (INCOMPLETE: the ring overwrote part of this window)",
+                    w.frames, w.wall_us / 1e6,
+                    100.0 * w.batch_us[(size_t) frame_kind::decode] / wall, 100.0 * w.batch_us[(size_t) frame_kind::prefill] / wall,
+                    100.0 * w.batch_us[(size_t) frame_kind::mixed] / wall, 100.0 * w.batch_us[(size_t) frame_kind::none] / wall,
+                    100.0 * w.host_learn_us / wall, 100.0 * w.unclassified_us / wall, 100.0 * w.outside_loop_us() / wall,
+                    w.gen_accepted, w.gen_per_wall_s(), w.prompt_done, w.draft_accepted, w.draft_proposed,
+                    w.retried, w.failed, w.max_sequences, w.max_context);
         }
-        metrics.add_frame(step_us, has_prompt, learn_us, ggml_time_us() - t_record_start);
+        metrics.add_frame(frame_now, ggml_time_us() - t_record_start);
     }
 
     void pre_decode() {
@@ -3839,6 +3860,7 @@ private:
             }
 
             slot.stats.n_draft_tokens += draft.size();
+            frame_now.draft_proposed += (int32_t) draft.size();
         });
 
         // update the batch with the sampled/drafted tokens
@@ -4817,6 +4839,7 @@ private:
 
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
+            frame_now.draft_accepted += (int32_t) n_accepted;
             slot.stats.n_draft_verif_steps += 1;
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
@@ -4934,6 +4957,7 @@ private:
         }
 
         metrics_queue_prompt(n_prompt_tokens);
+        frame_now.prompt_done += (int32_t) n_prompt_tokens; // this decode succeeded: its prompt tokens are done
 
         if (has_output) {
             // the context is already synchronized, so the timings are correct

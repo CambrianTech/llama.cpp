@@ -499,19 +499,24 @@ struct server_metrics {
     uint64_t n_decode     = 0;
     uint64_t n_busy_slots = 0;
 
-    // where the device's time went, frame by frame (CONTINUUM-ENGINE 4.13 step 1); the per-frame ring itself lives in
-    // the server context (this struct is copied into every metrics result), these are its cumulative totals
-    uint64_t n_frames          = 0;
-    uint64_t t_frame_decode_us  = 0; // frames with no prefill
-    uint64_t t_frame_prefill_us = 0; // frames carrying prefill
-    uint64_t t_frame_learn_us   = 0; // learning work after the batch
-    uint64_t t_frame_record_us  = 0; // the recorder's own cost, so its overhead is measured, not assumed
+    // serving-loop frames (CONTINUUM-ENGINE 4.13 step 1, server-frame-costs.h): cumulative totals; the per-frame ring
+    // lives in the server context because this struct is copied into every metrics result. Host time, not device time.
+    uint64_t n_frames             = 0;
+    uint64_t n_frames_failed      = 0;
+    uint64_t n_frame_gen_accepted = 0;
+    uint64_t t_frame_loop_us      = 0;
+    uint64_t t_frame_batch_us     = 0;
+    uint64_t t_frame_learn_us     = 0;
+    uint64_t t_frame_record_us    = 0; // the recorder's own cost, so its overhead is measured, not assumed
 
-    void add_frame(uint64_t step_us, bool prefill, uint64_t learn_us, uint64_t record_us) {
+    template <typename Frame> void add_frame(const Frame & f, int64_t record_us) {
         ++n_frames;
-        (prefill ? t_frame_prefill_us : t_frame_decode_us) += step_us;
-        t_frame_learn_us  += learn_us;
-        t_frame_record_us += record_us;
+        n_frames_failed      += f.outcome == decltype(f.outcome)::failed;
+        n_frame_gen_accepted += (uint64_t) f.gen_accepted;
+        t_frame_loop_us      += (uint64_t) f.host_loop_us;
+        t_frame_batch_us     += (uint64_t) f.host_batch_us;
+        t_frame_learn_us     += (uint64_t) f.host_learn_us;
+        t_frame_record_us    += (uint64_t) record_us;
     }
 
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated

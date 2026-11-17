@@ -1605,19 +1605,27 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_draft_verif_steps
         }, {
             "frames_total",
-            "Serving-loop frames recorded",
+            "Serving-loop iterations that submitted a batch",
             (double) metrics.n_frames
         }, {
-            "frame_decode_seconds_total",
-            "Device time in frames with no prefill",
-            metrics.t_frame_decode_us / 1.e6
+            "frames_failed_total",
+            "Frames whose decode or post-decode failed",
+            (double) metrics.n_frames_failed
         }, {
-            "frame_prefill_seconds_total",
-            "Device time in frames carrying prefill",
-            metrics.t_frame_prefill_us / 1.e6
+            "frame_tokens_accepted_total",
+            "Accepted output tokens, counted per frame",
+            (double) metrics.n_frame_gen_accepted
+        }, {
+            "frame_loop_seconds_total",
+            "Host time of the loop iterations that submitted a batch",
+            metrics.t_frame_loop_us / 1.e6
+        }, {
+            "frame_batch_seconds_total",
+            "Host time of decode + post-decode (sampling synchronizes the device); not device busy time",
+            metrics.t_frame_batch_us / 1.e6
         }, {
             "frame_learn_seconds_total",
-            "Learning time after each frame's batch",
+            "Host time of learning work after each batch",
             metrics.t_frame_learn_us / 1.e6
         }, {
             "frame_record_seconds_total",
