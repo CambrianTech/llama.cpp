@@ -6,6 +6,7 @@
 
 #include "server-slot.h"
 #include "engine/memory_pool_llama.h"
+#include "engine/mind_table_resident.h"
 #include "engine/responder_http.h"
 #include "engine/turn_results.h"
 
@@ -120,6 +121,9 @@ private:
 
     // the engine's one memory allocator (CONTINUUM-ENGINE 4.12.1), built in load_model once both contexts exist
     std::unique_ptr<memory_pool> pool;
+    // where each resident mind lives and which to move (CONTINUUM-ENGINE 4.12.1), built in load_model after the pool
+    std::unique_ptr<mind_table> residents;
+    uint64_t learn_pin_clock = 0; // learn pins issued by this process (a pin's id; 0 is none); the learner's
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -362,7 +366,6 @@ private:
 #include "server-context-learn.inc"
 #include "server-context-learn-checkpoint.inc"
 #include "server-context-page.inc"
-#include "server-context-minds.inc"
 
 #include "server-context-checkpoint.inc"
 
@@ -437,8 +440,8 @@ private:
 #endif
 
     void update_slots() {
-        if (minds_on()) {
-            minds_reap(); // a landed flash write frees her RAM copy; a failed one is written again
+        if (residents->enabled()) {
+            residents->reap(); // a landed flash write frees her RAM copy; a failed one is written again
         }
         const bool learning_at_start = bool(learning);
         publish_busy_slots();

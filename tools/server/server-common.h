@@ -362,7 +362,7 @@ json format_response_rerank(
 //
 
 // shared between server_slot and server_task_result_*
-// Continuum fork: where the mind a request named came from when she took the lane (server-context-minds.inc)
+// Continuum fork: where the mind a request named came from when she took the lane (engine/mind_table_resident.cpp)
 enum class mind_from : uint8_t { none, lane, parked, flash, ram, fresh, adopted, flash_pool_full };
 
 struct server_slot_stats {

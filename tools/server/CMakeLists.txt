@@ -21,6 +21,7 @@ add_library(${TARGET} STATIC
     server-routes-learn.cpp
     server-routes-control.cpp
     engine/memory_pool_llama.cpp
+    engine/mind_table_resident.cpp
     engine/responder_http.cpp
     engine/turn_results.cpp
     server-mapped-file.cpp

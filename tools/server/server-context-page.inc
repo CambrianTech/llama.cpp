@@ -681,7 +681,7 @@
             return;
         }
         std::vector<uint8_t>().swap(job.body);
-        slot->page = mind_page{}; // a core page restore: the arriving request's mind adopts it (server-context-minds.inc)
+        slot->page = mind_page{}; // a core page restore: the arriving request's mind adopts it (engine/mind_table_resident.cpp)
 
         // The draft's KV comes back with the page (#79) when it covers exactly these tokens; otherwise the
         // draft sequence is cleared, never left holding another occupant's KV at these positions: it then

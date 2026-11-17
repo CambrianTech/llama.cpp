@@ -328,7 +328,7 @@ struct server_slot {
 
     server_prompt prompt;
 
-    // Continuum fork: the mind whose sequence this lane holds (server-context-minds.inc); invalid: anonymous
+    // Continuum fork: the mind whose sequence this lane holds (engine/mind_table_resident.cpp); invalid: anonymous
     mind_page page;
     uint64_t  page_generation = 0; // her state's generation on this lane
 

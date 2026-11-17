@@ -17,6 +17,18 @@
 
 struct server_slot;
 
+// which minds make_room may send to flash
+enum class room_from : uint8_t {
+    parked,                 // only minds parked in the pool
+    parked_then_idle_lanes, // parked first, then a mind on an idle lane
+};
+
+// which host bytes host_bytes counts
+enum class host_count : uint8_t {
+    resident,       // what stays: the parked minds' checkpoints
+    with_in_flight, // also a flashed mind's RAM copy until her file has landed (freed within ms of the write)
+};
+
 // What the table is built from: startup facts, never tuned at runtime.
 struct mind_table_config {
     int32_t     n_seq      = 0;     // sequence ids the pool has (lanes + parked)
@@ -40,15 +52,20 @@ public:
     // seated (the pool cannot hold her even after make_room); she stays where she was, never lost
     [[nodiscard]] virtual bool seat(server_slot & slot, mind_page page) = 0;
 
-    // free cells for a placement that found none: the coldest parked mind goes to flash, else an idle lane's mind
-    // does. false: no legal move exists (every mind is on a busy lane or pinned)
-    [[nodiscard]] virtual bool make_room() = 0;
+    // free room by sending a mind to flash: the coldest parked mind, and with parked_then_idle_lanes an idle lane's
+    // mind when none is parked. false: no move of that scope exists (none parked, every lane busy). Each caller names
+    // its scope: freeing host bytes for a checkpoint asks parked minds only; a placement that found no cells may also
+    // take an idle lane's mind.
+    [[nodiscard]] virtual bool make_room(room_from scope) = 0;
 
     // release a learn pin wherever her checkpoints are (a lane, parked, or on flash)
     virtual pin_release release_pin(mind_page page, uint64_t pin) = 0;
 
     // landed flash writes free their RAM copies; failed ones are written again
     virtual void reap() = 0;
+
+    // host bytes the table's minds hold outside the pool (their checkpoints; their RAM copies by `count`)
+    virtual size_t host_bytes(host_count count) const = 0;
 
     // parked sequence ids lent to a learning side sequence and given back
     [[nodiscard]] virtual std::optional<llama_seq_id> lend_id() = 0;

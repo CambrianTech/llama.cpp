@@ -189,7 +189,7 @@ struct server_routes {
     server_http_context::handler_t post_prompt_cache_limit;
     server_http_context::handler_t get_page_io, post_page_io_budget; // the KV page IO budget (server-page-io.h)
     server_http_context::handler_t post_learn_release;  // an abandoned turn's learn pin, released
-    server_http_context::handler_t post_minds_prefetch; // the next mind, from flash into the pool (server-context-minds.inc)
+    server_http_context::handler_t post_minds_prefetch; // the next mind, from flash into the pool (engine/mind_table_resident.cpp)
     server_http_context::handler_t get_train;
     server_http_context::handler_t post_train;
     server_http_context::handler_t post_train_cancel;

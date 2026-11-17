@@ -445,7 +445,7 @@
             }
         }
         // a side sequence: her own sequence is never touched (refused, typed, before anything is changed)
-        if (L.side && park_free.empty()) {
+        if (L.side && residents->free_ids() == 0) {
             return refused("no_side_sequence", "no side sequence is free to learn on (launch with --minds; every parked id holds a mind)");
         }
         // the tokens from the last prompt token on, each labelled with the next
@@ -478,8 +478,9 @@
             // her shared prefix [0, side_from) re-tagged onto a side sequence (attention cells, nothing copied),
             // the checkpoint's recurrent state loaded there, then the served prompt's own tokens [side_from, n0)
             // decoded on it; the learn's own restore re-decodes one token there. Her sequence is never touched.
-            learn_seq = park_free.back();
-            park_free.pop_back();
+            const std::optional<llama_seq_id> lent = residents->lend_id();
+            GGML_ASSERT(lent.has_value()); // free_ids() was checked above, on this thread
+            learn_seq = *lent;
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), learn_seq, -1, -1);
             llama_memory_seq_cp(llama_get_memory(ctx_tgt), slot.id, learn_seq, 0, side_from);
             if (cp != nullptr) {
@@ -499,7 +500,7 @@
             }
             if (rc != 0) {
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), learn_seq, -1, -1);
-                park_free.push_back(learn_seq);
+                residents->return_id(learn_seq);
                 ggml_opt_result_free(result);
                 common_set_adapter_lora(ctx_tgt, slot.lora);
                 settle_learning_residency(L.lora_id);
@@ -632,7 +633,7 @@
             // learned on a side sequence: it goes, her own sequence was never touched. The pin is released only
             // when the learn committed; an abandoned or failed one keeps it, so a retry still finds it.
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), pending.side, -1, -1);
-            park_free.push_back(pending.side);
+            residents->return_id(pending.side);
             if (pending.began && ok && !pending.drained) {
                 for (auto & c : slot.prompt.checkpoints) {
                     if (c.pin != 0 && c.n_tokens == n0) {
