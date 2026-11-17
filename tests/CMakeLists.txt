@@ -7,6 +7,11 @@ target_compile_features(test-server-checkpoint-policy PRIVATE cxx_std_17)
 add_test(NAME test-server-checkpoint-policy COMMAND test-server-checkpoint-policy)
 set_tests_properties(test-server-checkpoint-policy PROPERTIES LABELS "main")
 
+add_executable(test-server-media-range test-server-media-range.cpp)
+target_compile_features(test-server-media-range PRIVATE cxx_std_17)
+add_test(NAME test-server-media-range COMMAND test-server-media-range)
+set_tests_properties(test-server-media-range PROPERTIES LABELS "main")
+
 add_executable(test-server-prefill test-server-prefill.cpp)
 target_compile_features(test-server-prefill PRIVATE cxx_std_17)
 add_test(NAME test-server-prefill COMMAND test-server-prefill)

@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "server-media-range.h"
 
 #include <random>
 #include <sstream>
@@ -566,6 +567,19 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 const llama_tokens & server_tokens::get_tokens() const {
     GGML_ASSERT(!has_mtmd);
     return tokens;
+}
+
+bool server_tokens::has_media_from(size_t from) const {
+    return media_reaches(map_idx_to_media, from, [](const mtmd::input_chunk_ptr & chunk) {
+        return mtmd_input_chunk_get_n_tokens(chunk.get());
+    });
+}
+
+const llama_token * server_tokens::text_from(size_t from) const {
+    if (from > tokens.size() || has_media_from(from)) {
+        return nullptr;
+    }
+    return tokens.data() + from;
 }
 
 std::vector<char> server_tokens::serialize() const {

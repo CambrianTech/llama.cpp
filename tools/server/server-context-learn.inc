@@ -416,6 +416,15 @@
                     + std::to_string(n0) + "): the lane learns only with --train-dir, which keeps one");
             }
         }
+        // her served tokens from n0 on, read in place: a media chunk there has no ids to learn over, so the
+        // step is refused before anything is admitted or changed, never an abort of the engine (the M5,
+        // 2026-11-17 22:09:33Z: get_tokens() asserts text-only on a vision-loaded server, and the abort took
+        // every mind's KV with it)
+        const llama_token * served = slot.prompt.tokens.text_from(n0);
+        if (served == nullptr) {
+            return refused("slot " + std::to_string(slot.id) + " holds media in its served range from token "
+                + std::to_string(n0) + ": a learning step reads token ids only");
+        }
         // the tokens from the last prompt token on, each labelled with the next
         std::vector<llama_token> toks;
         toks.push_back(slot.prompt.tokens[n0]);
@@ -442,10 +451,9 @@
         if (cp != nullptr) {
             cp->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
-        const auto & served_tokens = slot.prompt.tokens.get_tokens();
         ggml_opt_result_t result = ggml_opt_result_init();
         const bool begun = llama_opt_learn_begin(ctx_tgt, slot.id, n0, toks.data(), labels.data(), (int32_t) toks.size(),
-            served_tokens.data() + n0, (int32_t) served_tokens.size() - n0, result);
+            served, (int32_t) slot.prompt.tokens.size() - n0, result);
         common_set_adapter_lora(ctx_tgt, slot.lora);
         learning = std::make_unique<pending_learn>(&slot, cp, std::move(set), result,
             toks[0], L.n_prefix, (int32_t) toks.size() - 1, loras[L.lora_id].ptr, t0);
