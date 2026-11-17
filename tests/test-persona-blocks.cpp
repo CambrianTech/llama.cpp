@@ -1,15 +1,16 @@
-// what this catches: moving a persona's WHOLE state on a hybrid model (attention stream + recurrent rows,
-// llama_memory_hybrid::persona_save / persona_load, CONTINUUM-ENGINE 4.14) changing her state: after her state goes
-// out of stream 0 and her recurrent cell to host memory and back into stream 1 bound to her own sequence id, her next
-// two tokens' logits must be byte-identical to decoding them in place. Nothing is recomputed; a lost or misplaced row
-// or record changes the logits. The model argument is a hybrid (e.g. a tiny random qwen35moe from
-// `test-llama-archs -a qwen35moe -o DIR`).
+// what this catches: moving a persona's state between the memory and host memory (llama_context::persona_save /
+// persona_load, CONTINUUM-ENGINE 4.14) changing her state, or a refused move changing anything. Every move must leave
+// her next tokens' logits byte-identical to decoding in place: out of one stream and into another bound to her own
+// sequence id, the mirror direction, a same-stream round trip, and two live personas exchanging streams. Refusals
+// (stream holding state, blocks not prepared, layout mismatch, sequence holding state) must be typed and change
+// nothing. Runs on a plain KV model and on a hybrid (attention + recurrent, e.g. a tiny random qwen35moe from
+// `test-llama-archs -a qwen35moe -o DIR`); the same interface covers both.
 
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
 
-#include "../src/llama-memory-hybrid.h"
+#include "../src/llama-context.h"
 
 #include <algorithm>
 #include <cmath>
@@ -25,26 +26,68 @@ static void require(bool condition, const char * message) {
     }
 }
 
-static std::vector<float> next_logits(llama_context * ctx, llama_seq_id seq, llama_token token, llama_pos pos) {
-    llama_batch b = llama_batch_init(1, 0, 1);
-    common_batch_add(b, token, pos, { seq }, true);
-    require(llama_decode(ctx, b) == 0, "decode the next token");
-    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
-    const float * l = llama_get_logits_ith(ctx, 0);
-    std::vector<float> out(l, l + n_vocab);
-    llama_batch_free(b);
-    return out;
+static void require_move(llama_persona_move got, llama_persona_move want, const char * what) {
+    if (got != want) {
+        fprintf(stderr, "FAILED: %s: got %s, want %s\n", what, llama_persona_move_name(got), llama_persona_move_name(want));
+        std::exit(1);
+    }
 }
 
-static bool same(const char * what, const std::vector<float> & a, const std::vector<float> & b) {
+static void require_identical(const char * what, const std::vector<float> & want, const std::vector<float> & got) {
     float max_diff = 0.0f;
-    for (size_t i = 0; i < a.size(); ++i) {
-        max_diff = std::max(max_diff, std::fabs(a[i] - b[i]));
+    for (size_t i = 0; i < std::min(want.size(), got.size()); ++i) {
+        max_diff = std::max(max_diff, std::fabs(want[i] - got[i]));
     }
-    const bool identical = a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+    const bool identical = want.size() == got.size() && std::memcmp(want.data(), got.data(), want.size() * sizeof(float)) == 0;
     fprintf(stderr, "%s: byte-identical=%d max|diff|=%g\n", what, identical ? 1 : 0, max_diff);
-    return identical;
+    require(identical, what);
 }
+
+struct fixture {
+    llama_context * ctx     = nullptr;
+    int             n_vocab = 0;
+    int             n_prompt = 24;
+
+    std::vector<float> decode_one(llama_seq_id seq, llama_token token, llama_pos pos) {
+        llama_batch b = llama_batch_init(1, 0, 1);
+        common_batch_add(b, token, pos, { seq }, true);
+        require(llama_decode(ctx, b) == 0, "decode a token");
+        const float * l = llama_get_logits_ith(ctx, 0);
+        std::vector<float> out(l, l + n_vocab);
+        llama_batch_free(b);
+        return out;
+    }
+
+    // her prompt (salt makes two personas' prompts differ)
+    void prompt(llama_seq_id seq, int salt) {
+        llama_batch b = llama_batch_init(n_prompt, 0, 1);
+        for (int i = 0; i < n_prompt; ++i) {
+            common_batch_add(b, 1 + (i * 7 + salt * 13) % (n_vocab - 1), i, { seq }, false);
+        }
+        require(llama_decode(ctx, b) == 0, "decode a prompt");
+        llama_batch_free(b);
+    }
+
+    // her next two tokens decoded in place from a clear memory: the reference
+    std::vector<std::vector<float>> reference(llama_seq_id seq, int salt) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+        prompt(seq, salt);
+        std::vector<std::vector<float>> out;
+        out.push_back(decode_one(seq, 3 % n_vocab, n_prompt));
+        out.push_back(decode_one(seq, 5 % n_vocab, n_prompt + 1));
+        return out;
+    }
+
+    void require_continues(const char * what, llama_seq_id seq, const std::vector<std::vector<float>> & ref) {
+        char label[160];
+        snprintf(label, sizeof(label), "%s: first token", what);
+        require_identical(label, ref[0], decode_one(seq, 3 % n_vocab, n_prompt));
+        snprintf(label, sizeof(label), "%s: second token", what);
+        require_identical(label, ref[1], decode_one(seq, 5 % n_vocab, n_prompt + 1));
+    }
+
+    llama_pos pos_max(llama_seq_id seq) const { return llama_memory_seq_pos_max(llama_get_memory(ctx), seq); }
+};
 
 int main(int argc, char ** argv) {
     common_params params;
@@ -58,45 +101,86 @@ int main(int argc, char ** argv) {
     }
     ggml_backend_load_all();
     common_init_result_ptr init = common_init_from_params(params);
-    llama_context * ctx = init->context();
-    require(ctx != nullptr, "context");
-    auto * mem = dynamic_cast<llama_memory_hybrid *>(llama_get_memory(ctx));
-    require(mem != nullptr, "a hybrid memory (attention + recurrent)");
-    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    fixture f;
+    f.ctx = init->context();
+    require(f.ctx != nullptr, "context");
+    f.n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(f.ctx)));
+    llama_context & ctx = *f.ctx;
 
-    const int n_prompt = 24;
-    auto prompt_on = [&](llama_seq_id seq) {
-        llama_batch b = llama_batch_init(n_prompt, 0, 1);
-        for (int i = 0; i < n_prompt; ++i) {
-            common_batch_add(b, 1 + (i * 7) % (n_vocab - 1), i, { seq }, false);
-        }
-        require(llama_decode(ctx, b) == 0, "decode her prompt");
-        llama_batch_free(b);
-    };
-    const llama_token t1 = 3 % n_vocab;
-    const llama_token t2 = 5 % n_vocab;
+    llama_persona_blocks a, b;
+    require_move(ctx.persona_prepare(a), llama_persona_move::done, "prepare persona a");
+    require_move(ctx.persona_prepare(b), llama_persona_move::done, "prepare persona b");
 
-    // the reference: her prompt, then her next two tokens decoded in place
-    prompt_on(0);
-    const std::vector<float> ref1 = next_logits(ctx, 0, t1, n_prompt);
-    const std::vector<float> ref2 = next_logits(ctx, 0, t2, n_prompt + 1);
+    const auto ref_a0 = f.reference(0, 1); // persona a on sequence 0
+    const auto ref_b1 = f.reference(1, 2); // persona b on sequence 1
 
-    // the same prompt again from a clear memory, then her whole state moved out and into stream 1, bound to her id
-    llama_memory_clear(llama_get_memory(ctx), true);
-    prompt_on(0);
-    llama_synchronize(ctx); // the completion fence before raw copies
-    llama_persona_blocks blocks;
-    require(mem->persona_save(0, blocks), "her state out");
-    require(blocks.rs.has_state, "she has recurrent state");
-    require(llama_memory_seq_pos_max(llama_get_memory(ctx), 0) < 0, "nothing of her is left in the pool");
-    require(mem->persona_load(0, 1, blocks), "her state into stream 1 and a free recurrent cell");
-    require(llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == n_prompt - 1, "her sequence holds her prompt again");
+    // 1. out of stream 0, into stream 1 bound to her own sequence 0
+    llama_memory_clear(llama_get_memory(f.ctx), true);
+    f.prompt(0, 1);
+    require_move(ctx.persona_save(0, a), llama_persona_move::done, "a out");
+    require(f.pos_max(0) < 0, "nothing of a is left in the memory");
+    require_move(ctx.persona_load(0, 1, a), llama_persona_move::done, "a into stream 1");
+    require(f.pos_max(0) == f.n_prompt - 1, "a's sequence holds her prompt");
+    f.require_continues("a moved to stream 1", 0, ref_a0);
 
-    const bool ok1 = same("first token after the move", ref1, next_logits(ctx, 0, t1, n_prompt));
-    const bool ok2 = same("second token after the move", ref2, next_logits(ctx, 0, t2, n_prompt + 1));
-    require(ok1 && ok2, "her logits are byte-identical after her whole state moved");
+    // 2. the mirror: b's sequence 1 out of its stream and into the other
+    llama_memory_clear(llama_get_memory(f.ctx), true);
+    f.prompt(1, 2);
+    const uint32_t b_stream = llama_get_memory(f.ctx)->seq_stream(1);
+    require_move(ctx.persona_save(1, b), llama_persona_move::done, "b out");
+    require_move(ctx.persona_load(1, 1 - b_stream, b), llama_persona_move::done, "b into the other stream");
+    f.require_continues("b moved to the other stream", 1, ref_b1);
 
-    fprintf(stderr, "test-persona-blocks: ok (%zu attention layers, %zu recurrent layers, moved raw)\n",
-            blocks.kv.k.size(), blocks.rs.r.size());
+    // 3. same-stream round trip
+    llama_memory_clear(llama_get_memory(f.ctx), true);
+    f.prompt(0, 1);
+    const uint32_t a_stream = llama_get_memory(f.ctx)->seq_stream(0);
+    require_move(ctx.persona_save(0, a), llama_persona_move::done, "a out (round trip)");
+    require_move(ctx.persona_load(0, a_stream, a), llama_persona_move::done, "a back into her own stream");
+    f.require_continues("a same-stream round trip", 0, ref_a0);
+
+    // 4. refusals are typed and change nothing
+    {
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 1);
+        f.prompt(1, 2);
+        llama_persona_blocks unprepared;
+        require(ctx.persona_save(0, unprepared) != llama_persona_move::done, "an unprepared save is refused");
+        require(f.pos_max(0) == f.n_prompt - 1, "a refused save leaves her in place");
+
+        require_move(ctx.persona_save(0, a), llama_persona_move::done, "a out (refusal setup)");
+        const uint32_t occupied = llama_get_memory(f.ctx)->seq_stream(1);
+        require_move(ctx.persona_load(0, occupied, a), llama_persona_move::stream_not_empty, "load over b's stream");
+        require(f.pos_max(1) == f.n_prompt - 1, "b untouched by the refused load");
+
+        llama_persona_blocks bad = a; // the same persona with one layer's rows missing
+        bad.kv.k.pop_back();
+        require_move(ctx.persona_load(0, 1 - occupied, bad), llama_persona_move::layout_mismatch, "a layout mismatch");
+        require(f.pos_max(0) < 0, "a refused load writes nothing");
+
+        require_move(ctx.persona_load(0, 1 - occupied, a), llama_persona_move::done, "a back after the refusals");
+        f.require_continues("a after the refusals", 0, ref_a0);
+        f.require_continues("b untouched by a's refusals", 1, ref_b1);
+    }
+
+    // 5. two live personas exchange streams: the map stays a permutation and each keeps her own state
+    {
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 1);
+        f.prompt(1, 2);
+        const uint32_t sa = llama_get_memory(f.ctx)->seq_stream(0);
+        const uint32_t sb = llama_get_memory(f.ctx)->seq_stream(1);
+        require(sa != sb, "two personas, two streams");
+        require_move(ctx.persona_save(0, a), llama_persona_move::done, "a out (exchange)");
+        require_move(ctx.persona_save(1, b), llama_persona_move::done, "b out (exchange)");
+        require_move(ctx.persona_load(0, sb, a), llama_persona_move::done, "a into b's stream");
+        require_move(ctx.persona_load(1, sa, b), llama_persona_move::done, "b into a's stream");
+        require(llama_get_memory(f.ctx)->seq_stream(0) == sb && llama_get_memory(f.ctx)->seq_stream(1) == sa,
+                "the streams are exchanged");
+        f.require_continues("a after the exchange", 0, ref_a0);
+        f.require_continues("b after the exchange", 1, ref_b1);
+    }
+
+    fprintf(stderr, "test-persona-blocks: ok (%zu attention layers, %zu recurrent layers)\n", a.kv.k.size(), a.rs.r.size());
     return 0;
 }

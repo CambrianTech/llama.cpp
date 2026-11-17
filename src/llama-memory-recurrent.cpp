@@ -392,25 +392,40 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
-llama_rs_seq_move llama_memory_recurrent::seq_save(llama_seq_id seq_id, llama_rs_seq_blocks & out) {
+llama_persona_move llama_memory_recurrent::persona_prepare(llama_persona_blocks & blocks) const {
+    blocks.rs.r.resize(r_l.size());
+    blocks.rs.s.resize(s_l.size());
+    return llama_persona_move::done;
+}
+
+llama_persona_move llama_memory_recurrent::persona_check_save(llama_seq_id seq_id, const llama_persona_blocks & out) const {
     if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
-        return llama_rs_seq_move::invalid_seq;
+        return llama_persona_move::invalid_seq;
+    }
+    if (out.rs.r.size() != r_l.size() || out.rs.s.size() != s_l.size()) {
+        return llama_persona_move::cells_not_prepared;
     }
     const int32_t tail = cells[seq_id].tail;
-    out.has_state = tail >= 0;
-    out.r.assign(r_l.size(), {});
-    out.s.assign(s_l.size(), {});
-    if (!out.has_state) {
-        return llama_rs_seq_move::done;
+    if (tail >= 0 && cells[tail].seq_id.size() != 1) {
+        return llama_persona_move::shared_cell;
     }
-    auto & cell = cells[tail];
-    if (cell.seq_id.size() != 1) {
-        return llama_rs_seq_move::shared_cell;
+    return llama_persona_move::done;
+}
+
+void llama_memory_recurrent::persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) {
+    auto & rs = out.rs;
+    const int32_t tail = cells[seq_id].tail;
+    rs.has_state = tail >= 0;
+    if (!rs.has_state) {
+        for (auto & v : rs.r) { v.clear(); }
+        for (auto & v : rs.s) { v.clear(); }
+        return;
     }
     const uint32_t n_groups = 1 + n_rs_seq;
     for (size_t il = 0; il < r_l.size(); ++il) {
-        for (auto [src, dst] : { std::make_pair(r_l[il], &out.r[il]), std::make_pair(s_l[il], &out.s[il]) }) {
+        for (auto [src, dst] : { std::make_pair(r_l[il], &rs.r[il]), std::make_pair(s_l[il], &rs.s[il]) }) {
             if (src == nullptr) {
+                dst->clear();
                 continue;
             }
             const size_t row = ggml_row_size(src->type, src->ne[0]);
@@ -420,45 +435,65 @@ llama_rs_seq_move llama_memory_recurrent::seq_save(llama_seq_id seq_id, llama_rs
             }
         }
     }
-    out.pos    = cell.pos;
-    out.rs_idx = rs_idx[seq_id];
-
+    auto & cell = cells[tail];
+    rs.pos    = cell.pos;
+    rs.rs_idx = rs_idx[seq_id];
     // her cell leaves with her
     cell.seq_id.clear();
-    cell.pos = -1;
-    cell.src = -1;
+    cell.pos  = -1;
+    cell.src  = -1;
     cell.src0 = -1;
     cells[seq_id].tail = -1;
     rs_idx[seq_id] = 0;
     used -= 1;
     head = std::min<uint32_t>(head, (uint32_t) tail);
-    return llama_rs_seq_move::done;
 }
 
-llama_rs_seq_move llama_memory_recurrent::seq_load(llama_seq_id seq_id, const llama_rs_seq_blocks & in) {
+llama_persona_move llama_memory_recurrent::persona_check_load(llama_seq_id seq_id, uint32_t stream,
+                                                             const llama_persona_blocks & in, llama_persona_slot & slot) const {
+    (void) stream; // recurrent state is found through her sequence's tail, in any cell
     if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
-        return llama_rs_seq_move::invalid_seq;
+        return llama_persona_move::invalid_seq;
     }
     if (cells[seq_id].tail >= 0) {
-        return llama_rs_seq_move::seq_holds_state;
+        return llama_persona_move::seq_holds_state;
     }
-    if (!in.has_state) {
-        return llama_rs_seq_move::done;
+    const auto & rs = in.rs;
+    slot.cell = -1;
+    if (!rs.has_state) {
+        return llama_persona_move::done;
     }
-    int32_t cell_id = -1;
-    for (uint32_t i = 0; i < size; ++i) {
-        if (cells[i].is_empty() && cells[i].pos < 0) {
-            cell_id = (int32_t) i;
-            break;
-        }
-    }
-    if (cell_id < 0) {
-        return llama_rs_seq_move::no_free_cell;
+    if (rs.r.size() != r_l.size() || rs.s.size() != s_l.size()) {
+        return llama_persona_move::layout_mismatch;
     }
     const uint32_t n_groups = 1 + n_rs_seq;
     for (size_t il = 0; il < r_l.size(); ++il) {
-        for (auto [dst, src] : { std::make_pair(r_l[il], &in.r[il]), std::make_pair(s_l[il], &in.s[il]) }) {
-            if (dst == nullptr || src->empty()) {
+        const size_t r_bytes = r_l[il] ? ggml_row_size(r_l[il]->type, r_l[il]->ne[0]) * n_groups : 0;
+        const size_t s_bytes = s_l[il] ? ggml_row_size(s_l[il]->type, s_l[il]->ne[0]) * n_groups : 0;
+        if (rs.r[il].size() != r_bytes || rs.s[il].size() != s_bytes) {
+            return llama_persona_move::layout_mismatch;
+        }
+    }
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].is_empty() && cells[i].pos < 0) {
+            slot.cell = (int32_t) i;
+            return llama_persona_move::done;
+        }
+    }
+    return llama_persona_move::no_free_cell;
+}
+
+void llama_memory_recurrent::persona_commit_load(llama_seq_id seq_id, const llama_persona_slot & slot,
+                                                 llama_persona_blocks & in) {
+    const auto & rs = in.rs;
+    if (!rs.has_state) {
+        return;
+    }
+    const int32_t cell_id = slot.cell;
+    const uint32_t n_groups = 1 + n_rs_seq;
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        for (auto [dst, src] : { std::make_pair(r_l[il], &rs.r[il]), std::make_pair(s_l[il], &rs.s[il]) }) {
+            if (dst == nullptr) {
                 continue;
             }
             const size_t row = ggml_row_size(dst->type, dst->ne[0]);
@@ -468,14 +503,13 @@ llama_rs_seq_move llama_memory_recurrent::seq_load(llama_seq_id seq_id, const ll
         }
     }
     auto & cell = cells[cell_id];
-    cell.pos  = in.pos;
+    cell.pos  = rs.pos;
     cell.src  = cell_id;
     cell.src0 = cell_id;
     cell.seq_id.insert(seq_id);
     cells[seq_id].tail = cell_id;
-    rs_idx[seq_id] = in.rs_idx;
+    rs_idx[seq_id] = rs.rs_idx;
     used += 1;
-    return llama_rs_seq_move::done;
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {

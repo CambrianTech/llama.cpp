@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-graph.h"
+#include "llama-persona-blocks.h"
 
 #include <map>
 #include <vector>
@@ -150,6 +151,28 @@ struct llama_memory_i {
     // the physical attention stream holding this sequence (Continuum fork: a persona's sequence can be bound to any
     // stream, so a stream is never assumed from the sequence id). Memories with no stream map hold it by identity.
     virtual uint32_t seq_stream(llama_seq_id seq_id) const { return (uint32_t) seq_id; }
+
+    // Continuum fork (CONTINUUM-ENGINE 4.14): a persona's state moved raw between this memory and host memory, two
+    // phases. persona_prepare runs once per persona (sizes her blocks). check_* are const: every condition of the move
+    // is decided and the destination reserved there; commit_* only copy and write records, and cannot fail. Callers go
+    // through llama_context::persona_save / persona_load, which fence the queued device work first.
+    virtual llama_persona_move persona_prepare(llama_persona_blocks & blocks) const {
+        (void) blocks;
+        return llama_persona_move::unsupported;
+    }
+    virtual llama_persona_move persona_check_save(llama_seq_id seq_id, const llama_persona_blocks & out) const {
+        (void) seq_id; (void) out;
+        return llama_persona_move::unsupported;
+    }
+    virtual llama_persona_move persona_check_load(llama_seq_id seq_id, uint32_t stream, const llama_persona_blocks & in,
+                                                  llama_persona_slot & slot) const {
+        (void) seq_id; (void) stream; (void) in; (void) slot;
+        return llama_persona_move::unsupported;
+    }
+    virtual void persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) { (void) seq_id; (void) out; }
+    virtual void persona_commit_load(llama_seq_id seq_id, const llama_persona_slot & slot, llama_persona_blocks & in) {
+        (void) seq_id; (void) slot; (void) in;
+    }
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 

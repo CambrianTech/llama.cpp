@@ -1231,87 +1231,115 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
-llama_kv_stream_move llama_kv_cache::stream_save(uint32_t s, llama_kv_stream_blocks & out) {
-    if (s >= n_stream || n_stream == 1) {
-        return llama_kv_stream_move::no_such_stream;
+// an empty, stream-sized cells object: O(1) (used is a set; has_shift a flag); freed cells hold no sequence position
+static bool cells_prepared(const llama_kv_cells & cells, uint32_t size) {
+    return cells.size() == size && cells.get_used() == 0 && !cells.get_has_shift();
+}
+
+llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks) const {
+    if (n_stream == 1) {
+        return llama_persona_move::no_such_stream;
+    }
+    blocks.kv.cells.resize(get_size()); // once per persona, at her creation
+    blocks.kv.k.resize(layers.size());
+    blocks.kv.v.resize(layers.size());
+    return llama_persona_move::done;
+}
+
+llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, const llama_persona_blocks & out) const {
+    if (n_stream == 1) {
+        return llama_persona_move::no_such_stream;
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return llama_persona_move::invalid_seq;
     }
     if (v_trans) {
-        return llama_kv_stream_move::transposed_v;
+        return llama_persona_move::transposed_v;
     }
+    if (!cells_prepared(out.kv.cells, get_size()) || out.kv.k.size() != layers.size() || out.kv.v.size() != layers.size()) {
+        return llama_persona_move::cells_not_prepared;
+    }
+    return llama_persona_move::done;
+}
+
+void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) {
+    const uint32_t s = seq_to_stream[seq_id];
     auto & cells = v_cells[s];
     const uint32_t n_rows = cells.used_max_p1();
-    out.n_rows = n_rows;
-    out.k.resize(layers.size());
-    out.v.resize(layers.size());
+    out.kv.n_rows = n_rows;
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto & layer = layers[i];
         const size_t k_bytes = ggml_row_size(layer.k->type, layer.k->ne[0]) * n_rows;
-        out.k[i].resize(k_bytes);
+        out.kv.k[i].resize(k_bytes);
         if (k_bytes > 0) {
-            ggml_backend_tensor_get(layer.k_stream[s], out.k[i].data(), 0, k_bytes);
+            ggml_backend_tensor_get(layer.k_stream[s], out.kv.k[i].data(), 0, k_bytes);
         }
-        if (layer.v) {
-            const size_t v_bytes = ggml_row_size(layer.v->type, layer.v->ne[0]) * n_rows;
-            out.v[i].resize(v_bytes);
-            if (v_bytes > 0) {
-                ggml_backend_tensor_get(layer.v_stream[s], out.v[i].data(), 0, v_bytes);
-            }
-        } else {
-            out.v[i].clear();
+        const size_t v_bytes = layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) * n_rows : 0;
+        out.kv.v[i].resize(v_bytes);
+        if (v_bytes > 0) {
+            ggml_backend_tensor_get(layer.v_stream[s], out.kv.v[i].data(), 0, v_bytes);
         }
     }
-    // her metadata leaves with her by swap; the stream takes an empty one of its own size
-    if (out.cells.size() != cells.size()) {
-        out.cells.resize(cells.size());
-    } else {
-        out.cells.reset();
-    }
-    std::swap(out.cells, cells);
+    std::swap(out.kv.cells, cells); // hers out; the stream takes the prepared empty object
     v_heads[s] = 0;
-    return llama_kv_stream_move::done;
 }
 
-llama_kv_stream_move llama_kv_cache::stream_bind(llama_seq_id seq, uint32_t s) {
-    if (n_stream == 1 || s >= n_stream || seq < 0 || (size_t) seq >= seq_to_stream.size()) {
-        return llama_kv_stream_move::no_such_stream;
+llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint32_t stream,
+                                                     const llama_persona_blocks & in, llama_persona_slot & slot) const {
+    if (n_stream == 1 || stream >= n_stream) {
+        return llama_persona_move::no_such_stream;
     }
-    const uint32_t old = seq_to_stream[seq];
-    for (auto & st : seq_to_stream) {
-        if (st == s) {
-            st = old; // the sequence that held `s` takes her old stream
-            break;
-        }
-    }
-    seq_to_stream[seq] = s;
-    return llama_kv_stream_move::done;
-}
-
-llama_kv_stream_move llama_kv_cache::stream_load(uint32_t s, llama_kv_stream_blocks & in) {
-    if (s >= n_stream || n_stream == 1) {
-        return llama_kv_stream_move::no_such_stream;
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return llama_persona_move::invalid_seq;
     }
     if (v_trans) {
-        return llama_kv_stream_move::transposed_v;
+        return llama_persona_move::transposed_v;
     }
-    auto & cells = v_cells[s];
-    if (cells.get_used() != 0) {
-        return llama_kv_stream_move::stream_not_empty;
+    if (v_cells[stream].get_used() != 0) {
+        return llama_persona_move::stream_not_empty;
     }
-    if (in.n_rows > cells.size() || in.cells.size() != cells.size()) {
-        return llama_kv_stream_move::too_long;
+    if (v_cells[seq_to_stream[seq_id]].seq_pos_max(seq_id) >= 0) {
+        return llama_persona_move::seq_holds_state;
+    }
+    const auto & kv = in.kv;
+    if (kv.cells.size() != get_size() || kv.n_rows > get_size() || kv.cells.used_max_p1() > kv.n_rows ||
+        kv.k.size() != layers.size() || kv.v.size() != layers.size()) {
+        return llama_persona_move::layout_mismatch;
     }
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto & layer = layers[i];
-        if (!in.k[i].empty()) {
-            ggml_backend_tensor_set(layer.k_stream[s], in.k[i].data(), 0, in.k[i].size());
-        }
-        if (layer.v && !in.v[i].empty()) {
-            ggml_backend_tensor_set(layer.v_stream[s], in.v[i].data(), 0, in.v[i].size());
+        const size_t k_bytes = ggml_row_size(layer.k->type, layer.k->ne[0]) * kv.n_rows;
+        const size_t v_bytes = layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) * kv.n_rows : 0;
+        if (kv.k[i].size() != k_bytes || kv.v[i].size() != v_bytes) {
+            return llama_persona_move::layout_mismatch;
         }
     }
-    std::swap(in.cells, cells); // her metadata back in; `in` keeps the stream's empty cells for reuse
+    slot.stream = stream;
+    return llama_persona_move::done;
+}
+
+void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, const llama_persona_slot & slot, llama_persona_blocks & in) {
+    const uint32_t s = slot.stream;
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        if (!in.kv.k[i].empty()) {
+            ggml_backend_tensor_set(layer.k_stream[s], in.kv.k[i].data(), 0, in.kv.k[i].size());
+        }
+        if (!in.kv.v[i].empty()) {
+            ggml_backend_tensor_set(layer.v_stream[s], in.kv.v[i].data(), 0, in.kv.v[i].size());
+        }
+    }
+    std::swap(in.kv.cells, v_cells[s]); // hers in; her blocks keep the stream's empty object for her next save
     v_heads[s] = 0;
-    return llama_kv_stream_move::done;
+    // bind her own sequence id to stream s; the sequence that held s takes her old stream (both empty of others)
+    const uint32_t old = seq_to_stream[seq_id];
+    for (auto & st : seq_to_stream) {
+        if (st == s) {
+            st = old;
+            break;
+        }
+    }
+    seq_to_stream[seq_id] = s;
 }
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {

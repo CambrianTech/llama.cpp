@@ -2567,6 +2567,37 @@ llm_graph_type llama_context::graph_type() const {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+llama_persona_move llama_context::persona_prepare(llama_persona_blocks & blocks) const {
+    return memory ? memory->persona_prepare(blocks) : llama_persona_move::unsupported;
+}
+
+llama_persona_move llama_context::persona_save(llama_seq_id seq_id, llama_persona_blocks & out) {
+    if (!memory) {
+        return llama_persona_move::unsupported;
+    }
+    synchronize(); // a decode returns before its writes land; the raw copies read the same device memory
+    const llama_persona_move checked = memory->persona_check_save(seq_id, out);
+    if (checked != llama_persona_move::done) {
+        return checked;
+    }
+    memory->persona_commit_save(seq_id, out);
+    return llama_persona_move::done;
+}
+
+llama_persona_move llama_context::persona_load(llama_seq_id seq_id, uint32_t stream, llama_persona_blocks & in) {
+    if (!memory) {
+        return llama_persona_move::unsupported;
+    }
+    synchronize();
+    llama_persona_slot slot;
+    const llama_persona_move checked = memory->persona_check_load(seq_id, stream, in, slot);
+    if (checked != llama_persona_move::done) {
+        return checked;
+    }
+    memory->persona_commit_load(seq_id, slot, in);
+    return llama_persona_move::done;
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,

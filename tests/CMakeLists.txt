@@ -355,13 +355,10 @@ llama_build_and_test(test-dup-quantized.cpp)
 llama_build_and_test(test-state-restore-streams.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-streams PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# a persona's KV moved between a stream and host memory by raw copies is byte-identical (CONTINUUM-ENGINE 4.14)
-llama_build_and_test(test-kv-stream-blocks.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-kv-stream-blocks PROPERTIES FIXTURES_REQUIRED test-download-model)
-
-# a persona's whole hybrid state (attention stream + recurrent rows) moved raw is byte-identical (CONTINUUM-ENGINE 4.14);
-# takes a hybrid model, e.g. one written by `test-llama-archs -a qwen35moe -o DIR`
-llama_build(test-persona-blocks.cpp)
+# a persona's state moved raw between the memory and host memory is byte-identical, and a refused move changes nothing
+# (CONTINUUM-ENGINE 4.14); also run on a hybrid model written by `test-llama-archs -a qwen35moe -o DIR`
+llama_build_and_test(test-persona-blocks.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-persona-blocks PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
