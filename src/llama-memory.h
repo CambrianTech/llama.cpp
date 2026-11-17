@@ -147,6 +147,10 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // the physical attention stream holding this sequence (Continuum fork: a persona's sequence can be bound to any
+    // stream, so a stream is never assumed from the sequence id). Memories with no stream map hold it by identity.
+    virtual uint32_t seq_stream(llama_seq_id seq_id) const { return (uint32_t) seq_id; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     // the occupancy of every cell holder this memory owns (see llama_memory_cells)

@@ -86,6 +86,8 @@ public:
     //
 
     llama_kv_cache * get_mem_attn() const;
+
+    uint32_t seq_stream(llama_seq_id seq_id) const override { return mem_attn->seq_stream(seq_id); }
     llama_memory_recurrent * get_mem_recr() const;
 
 private:

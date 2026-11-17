@@ -829,6 +829,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // the physical attention stream of each of the ubatch's unique sequences (seq_id_unq order): the graph's K/V views
+    // are built at these streams, so a graph is reused only when they match, not merely the sequence ids
+    std::vector<uint32_t> streams = {};
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -858,6 +862,9 @@ struct llm_graph_params {
                 }
             }
         }
+
+        // the graph's K/V views are built at these physical streams, whatever the split: never reuse across streams
+        can_reuse_ubatch = can_reuse_ubatch && streams == other.streams;
 
         if (!can_reuse_ubatch) {
             return false;

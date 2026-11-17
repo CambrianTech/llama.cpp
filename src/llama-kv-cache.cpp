@@ -1231,6 +1231,89 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+llama_kv_stream_move llama_kv_cache::stream_save(uint32_t s, llama_kv_stream_blocks & out) {
+    if (s >= n_stream || n_stream == 1) {
+        return llama_kv_stream_move::no_such_stream;
+    }
+    if (v_trans) {
+        return llama_kv_stream_move::transposed_v;
+    }
+    auto & cells = v_cells[s];
+    const uint32_t n_rows = cells.used_max_p1();
+    out.n_rows = n_rows;
+    out.k.resize(layers.size());
+    out.v.resize(layers.size());
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        const size_t k_bytes = ggml_row_size(layer.k->type, layer.k->ne[0]) * n_rows;
+        out.k[i].resize(k_bytes);
+        if (k_bytes > 0) {
+            ggml_backend_tensor_get(layer.k_stream[s], out.k[i].data(), 0, k_bytes);
+        }
+        if (layer.v) {
+            const size_t v_bytes = ggml_row_size(layer.v->type, layer.v->ne[0]) * n_rows;
+            out.v[i].resize(v_bytes);
+            if (v_bytes > 0) {
+                ggml_backend_tensor_get(layer.v_stream[s], out.v[i].data(), 0, v_bytes);
+            }
+        } else {
+            out.v[i].clear();
+        }
+    }
+    // her metadata leaves with her by swap; the stream takes an empty one of its own size
+    if (out.cells.size() != cells.size()) {
+        out.cells.resize(cells.size());
+    } else {
+        out.cells.reset();
+    }
+    std::swap(out.cells, cells);
+    v_heads[s] = 0;
+    return llama_kv_stream_move::done;
+}
+
+llama_kv_stream_move llama_kv_cache::stream_bind(llama_seq_id seq, uint32_t s) {
+    if (n_stream == 1 || s >= n_stream || seq < 0 || (size_t) seq >= seq_to_stream.size()) {
+        return llama_kv_stream_move::no_such_stream;
+    }
+    const uint32_t old = seq_to_stream[seq];
+    for (auto & st : seq_to_stream) {
+        if (st == s) {
+            st = old; // the sequence that held `s` takes her old stream
+            break;
+        }
+    }
+    seq_to_stream[seq] = s;
+    return llama_kv_stream_move::done;
+}
+
+llama_kv_stream_move llama_kv_cache::stream_load(uint32_t s, llama_kv_stream_blocks & in) {
+    if (s >= n_stream || n_stream == 1) {
+        return llama_kv_stream_move::no_such_stream;
+    }
+    if (v_trans) {
+        return llama_kv_stream_move::transposed_v;
+    }
+    auto & cells = v_cells[s];
+    if (cells.get_used() != 0) {
+        return llama_kv_stream_move::stream_not_empty;
+    }
+    if (in.n_rows > cells.size() || in.cells.size() != cells.size()) {
+        return llama_kv_stream_move::too_long;
+    }
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        if (!in.k[i].empty()) {
+            ggml_backend_tensor_set(layer.k_stream[s], in.k[i].data(), 0, in.k[i].size());
+        }
+        if (layer.v && !in.v[i].empty()) {
+            ggml_backend_tensor_set(layer.v_stream[s], in.v[i].data(), 0, in.v[i].size());
+        }
+    }
+    std::swap(in.cells, cells); // her metadata back in; `in` keeps the stream's empty cells for reuse
+    v_heads[s] = 0;
+    return llama_kv_stream_move::done;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 

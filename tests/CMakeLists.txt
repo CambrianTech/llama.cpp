@@ -355,6 +355,10 @@ llama_build_and_test(test-dup-quantized.cpp)
 llama_build_and_test(test-state-restore-streams.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-streams PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# a persona's KV moved between a stream and host memory by raw copies is byte-identical (CONTINUUM-ENGINE 4.14)
+llama_build_and_test(test-kv-stream-blocks.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-kv-stream-blocks PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)

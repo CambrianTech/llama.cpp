@@ -2572,7 +2572,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -2591,6 +2591,13 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+    if (memory) {
+        params.streams.reserve(ubatch.n_seqs_unq);
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            params.streams.push_back(memory->seq_stream(ubatch.seq_id_unq[s]));
+        }
+    }
+    return params;
 }
 
 ggml_status llama_context::graph_compute(

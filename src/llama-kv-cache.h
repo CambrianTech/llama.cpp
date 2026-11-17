@@ -17,6 +17,26 @@ struct llama_context;
 // llama_kv_cache
 //
 
+// Continuum fork (CONTINUUM-ENGINE 4.14): a persona's KV, out of the pool: per KV layer, her K and V rows of one stream
+// copied raw (the rows she uses, in the stream's own row layout), and her stream's cell metadata OWNED here (moved by
+// swap, never copied or rebuilt). Moving a persona between a stream and host memory is these raw copies plus one swap;
+// nothing walks a cell, serializes or recomputes.
+struct llama_kv_stream_blocks {
+    uint32_t                          n_rows = 0; // rows she uses (the stream's used_max_p1 when saved)
+    std::vector<std::vector<uint8_t>> k;          // per KV layer: n_rows rows of K
+    std::vector<std::vector<uint8_t>> v;          // per KV layer: n_rows rows of V (empty for a layer without V)
+    llama_kv_cells                    cells;      // her cell metadata; sized to the stream when first used
+};
+
+// the outcome of moving a persona's KV between a stream and host memory
+enum class llama_kv_stream_move {
+    done,
+    no_such_stream,   // s >= n_stream (or the cache is unified: one stream holds every sequence)
+    transposed_v,     // V is stored transposed (flash attention off): her V rows are not contiguous; not supported
+    stream_not_empty, // a load requires an empty stream
+    too_long,         // her rows exceed the stream's size
+};
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -174,6 +194,20 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    // Continuum fork (CONTINUUM-ENGINE 4.14): stream `s` -> `out` (her rows copied raw, her cells swapped out: the
+    // stream is left empty), and `in` -> empty stream `s` (rows copied raw, cells swapped in). A per-sequence stream
+    // exists only with unified KV off.
+    // FENCE: the caller must have completed the context's queued device work first (llama_synchronize): a decode
+    // returns before its KV writes land, and these copies touch the same device memory.
+    llama_kv_stream_move stream_save(uint32_t s, llama_kv_stream_blocks & out);
+    llama_kv_stream_move stream_load(uint32_t s, llama_kv_stream_blocks & in);
+    // bind sequence `seq` (a persona's own, stable id) to physical stream `s`: the map stays a permutation (the
+    // sequence that held `s` takes `seq`'s old stream). Her cells keep their sequence id, so nothing is retagged.
+    // Between batches only: every lookup reads the map at call time.
+    llama_kv_stream_move stream_bind(llama_seq_id seq, uint32_t s);
+
+    uint32_t seq_stream(llama_seq_id seq_id) const override { return seq_to_stream[seq_id]; }
 
     //
     // graph_build API
