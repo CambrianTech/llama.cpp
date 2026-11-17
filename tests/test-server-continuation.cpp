@@ -1,6 +1,6 @@
-// A persona's next request continues the tokens her slot holds (tools/server/server-continuation.h).
-// Synthetic tokens: 1 = <|im_start|>user, 2 = <|im_start|>assistant, 9 = <|im_end|> (end of turn),
-// 3 = "\n", 7 = her generation prompt's <think>, 40.. = words.
+// A persona's next request carries only what is new, and continues the tokens her slot holds
+// (tools/server/server-continuation.h). Synthetic tokens: 1 = <|im_start|>user,
+// 2 = <|im_start|>assistant, 9 = <|im_end|> (end of turn), 3 = "\n", 7 = <think>, 40.. = words.
 
 #include "server-continuation.h"
 
@@ -23,74 +23,85 @@ static common_chat_msg_spans spans_of(const llama_tokens & tokens) {
     return spans;
 }
 
-static continuation run(const llama_tokens & held, const std::vector<continuation_response> & responses,
-                        const std::string & continues, const llama_tokens & sent) {
-    const auto spans = spans_of(sent);
-    return continue_from({ held, responses }, { continues, sent, spans }, is_eot);
+// The server's rendering of a continuing request: the stub (a user line, an assistant turn), then
+// the request's new messages and the generation prompt; its delta starts at the stub's end of turn.
+static llama_tokens delta_of(const llama_tokens & new_messages) {
+    llama_tokens rendered = { 1, 30, 9, 3, 2, 31, 9, 3 };
+    rendered.insert(rendered.end(), new_messages.begin(), new_messages.end());
+    rendered.insert(rendered.end(), { 2, 3, 7 });
+    const auto d = delta_after_stub(rendered, spans_of(rendered), is_eot);
+    if (d.miss != continuation_miss::none) {
+        fprintf(stderr, "delta missed: %s\n", continuation_miss_name(d.miss));
+        exit(1);
+    }
+    return llama_tokens(rendered.begin() + d.from, rendered.end());
 }
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
 
 int main() {
-    // The prompt she was served: a user turn, then her generation prompt.
-    const llama_tokens served = { 1, 40, 41, 9, 3, 2, 3, 7 };
-    // What she generated after it: her reasoning (50, 51), her words (60), her call (61). No end of turn.
-    llama_tokens held = served;
-    held.insert(held.end(), { 50, 51, 60, 61 });
-    const std::vector<continuation_response> act = { { "act-1", served.size(), held.size() } };
-
-    // Her next request re-renders her response WITHOUT her reasoning (60, 61), then her result and the new turn.
-    const llama_tokens sent = { 1, 40, 41, 9, 3, 2, 3, 60, 61, 9, 3, 1, 70, 71, 9, 3, 2, 3, 7 };
-
-    // what this catches: her generated tokens (her reasoning) discarded and recomputed every act.
+    // what this catches: the stub itself (or anything before its end of turn) entering her tokens.
     {
-        const auto c = run(held, act, "act-1", sent);
-        CHECK(c.miss == continuation_miss::none);
-        llama_tokens expect = held;
-        expect.insert(expect.end(), { 9, 3, 1, 70, 71, 9, 3, 2, 3, 7 });
-        CHECK(c.tokens == expect);
-        CHECK(c.from == 9); // the end of turn closing her response
-        CHECK(c.kept == held.size() && c.generated == 4);
-        CHECK(c.shift == (int64_t) held.size() - 9);
-        // A position past her response moves with the tail; one inside it is unknown; one before is kept.
-        CHECK(continued_position(c, 11) == 11 + c.shift);
-        CHECK(continued_position(c, 7) == -1);
-        CHECK(continued_position(c, 3) == 3);
+        const llama_tokens delta = delta_of({ 1, 70, 9, 3 });
+        CHECK((delta == llama_tokens{ 9, 3, 1, 70, 9, 3, 2, 3, 7 })); // her turn's glue, the new turn, the generation prompt
     }
-    // what this catches: a warm pass during her tool (one token generated after her response's glue)
-    // making her real request miss, or its token leaking into her prompt. Both continue act-1: the
-    // slot's lineage still holds act-1, and only act-1's tokens are kept; the cache finds the glue.
+    // what this catches: Codex's act-3 miss. Three consecutive acts, each generating reasoning the
+    // caller never sends back: every act continues from her own tokens, nothing of hers is
+    // re-rendered or compared, and her slot after act 3 is exactly what she generated plus what was new.
     {
-        llama_tokens warmed = held;
-        warmed.insert(warmed.end(), { 9, 3, 2, 3, 7, 80 });
-        const std::vector<continuation_response> lineage = { act[0], { "warm-1", warmed.size() - 1, warmed.size() } };
-        const auto c = run(warmed, lineage, "act-1", sent);
-        CHECK(c.miss == continuation_miss::none);
-        CHECK(c.kept == held.size());
-        llama_tokens expect = held;
-        expect.insert(expect.end(), { 9, 3, 1, 70, 71, 9, 3, 2, 3, 7 });
+        llama_tokens slot = { 1, 40, 9, 3, 2, 3, 7 }; // act 1's prompt
+        std::vector<continuation_response> lineage;
+        llama_tokens expect = slot;
+        for (llama_token act = 1; act <= 3; act++) {
+            const size_t served = slot.size();
+            const llama_tokens generated = { (llama_token) (50 + act), (llama_token) (60 + act) }; // her reasoning, then her call
+            slot.insert(slot.end(), generated.begin(), generated.end());
+            expect.insert(expect.end(), generated.begin(), generated.end());
+            lineage.push_back({ "act-" + std::to_string(act), served, slot.size() });
+            // Her next request: only her result and the room's new line.
+            const llama_tokens delta = delta_of({ 1, (llama_token) (70 + act), 9, 3 });
+            const auto c = continue_from(slot, lineage, "act-" + std::to_string(act), delta);
+            CHECK(c.miss == continuation_miss::none);
+            CHECK(c.kept == slot.size() && c.generated == 2);
+            expect.insert(expect.end(), delta.begin(), delta.end());
+            CHECK(c.tokens == expect);
+            slot = c.tokens; // served: her slot holds the continued prompt, her next generation follows it
+        }
+    }
+    // what this catches: a warm pass during her tool (one token generated after her response's
+    // glue) making her real request miss, or its token leaking into her prompt.
+    {
+        llama_tokens slot = { 1, 40, 9, 3, 2, 3, 7, 51, 61 };
+        std::vector<continuation_response> lineage = { { "act-1", 7, slot.size() } };
+        slot.insert(slot.end(), { 9, 3, 2, 3, 7, 80 });
+        lineage.push_back({ "warm-1", slot.size() - 1, slot.size() });
+        const llama_tokens delta = delta_of({ 1, 71, 9, 3 });
+        const auto c = continue_from(slot, lineage, "act-1", delta);
+        CHECK(c.miss == continuation_miss::none && c.kept == 9);
+        llama_tokens expect = { 1, 40, 9, 3, 2, 3, 7, 51, 61 };
+        expect.insert(expect.end(), delta.begin(), delta.end());
         CHECK(c.tokens == expect);
     }
-    // what this catches: a request naming no response is served as sent.
-    CHECK(run(held, act, "", sent).miss == continuation_miss::not_requested);
+    const llama_tokens held = { 1, 40, 9, 3, 2, 3, 7, 51, 61 };
+    const std::vector<continuation_response> act = { { "act-1", 7, held.size() } };
+    // what this catches: a request naming no response treated as a continuation.
+    CHECK(continue_from(held, act, "", { 9 }).miss == continuation_miss::not_requested);
     // what this catches: another response's tokens standing in for the one the request continues.
-    CHECK(run(held, act, "act-2", sent).miss == continuation_miss::other_response);
+    CHECK(continue_from(held, act, "act-2", { 9 }).miss == continuation_miss::other_response);
     // what this catches: a lineage that outlived its tokens (the slot was cut shorter than her response).
-    CHECK(run(served, act, "act-1", sent).miss == continuation_miss::other_response);
-    // what this catches: a slot that holds someone else's history (a different first turn) used as hers.
-    {
-        llama_tokens theirs = held;
-        theirs[1] = 99;
-        CHECK(run(theirs, act, "act-1", sent).miss == continuation_miss::not_hers);
-    }
+    CHECK(continue_from(llama_tokens(held.begin(), held.begin() + 5), act, "act-1", { 9 }).miss == continuation_miss::other_response);
     // what this catches: a response that generated nothing treated as holding her response.
-    CHECK(run(held, { { "act-1", held.size(), held.size() } }, "act-1", sent).miss == continuation_miss::not_generated);
-    // what this catches: a response whose served prompt ended before the request's response begins.
-    CHECK(run(held, { { "act-1", 3, held.size() } }, "act-1", sent).miss == continuation_miss::not_hers);
-    // what this catches: the generation prompt (the request's last span) taken for her response.
-    CHECK(run(held, act, "act-1", { 1, 40, 41, 9, 3, 2, 3, 7 }).miss == continuation_miss::no_response);
-    // what this catches: a template whose response carries no end of turn spliced at a guessed point.
-    CHECK(run(held, act, "act-1", { 1, 40, 41, 9, 3, 2, 3, 60, 61, 1, 70, 2, 3 }).miss == continuation_miss::no_end_of_turn);
+    CHECK(continue_from(held, { { "act-1", held.size(), held.size() } }, "act-1", { 9 }).miss == continuation_miss::not_generated);
+    // what this catches: a template with no assistant delimiter cut at a guessed point.
+    {
+        const llama_tokens no_assistant = { 1, 30, 9, 3, 1, 70, 9, 3 };
+        CHECK(delta_after_stub(no_assistant, spans_of(no_assistant), is_eot).miss == continuation_miss::no_stub);
+    }
+    // what this catches: a stub turn with no end of turn cut at a guessed point.
+    {
+        const llama_tokens open = { 1, 30, 9, 3, 2, 31, 1, 70 };
+        CHECK(delta_after_stub(open, spans_of(open), is_eot).miss == continuation_miss::no_end_of_turn);
+    }
     fprintf(stderr, "test-server-continuation: ok\n");
     return 0;
 }

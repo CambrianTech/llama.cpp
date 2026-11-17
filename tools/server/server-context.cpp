@@ -1952,26 +1952,20 @@ private:
         if (task.tokens.has_mtmd || slot.prompt.tokens.has_mtmd) {
             return refuse(continuation_miss::has_media);
         }
-        const llama_tokens & held = slot.prompt.tokens.get_tokens();
-        const llama_tokens & sent = task.tokens.get_tokens();
-        const continuation c = continue_from(
-            continuation_held{ held, slot.responses },
-            continuation_request{ task.params.continues, sent, task.params.message_spans },
-            [this](llama_token tok) { return llama_vocab_is_eog(vocab, tok); });
+        // The task's tokens are only its delta (cut at launch from the stub's rendering).
+        const llama_tokens & delta = task.tokens.get_tokens();
+        const continuation c = continue_from(slot.prompt.tokens.get_tokens(), slot.responses, task.params.continues, delta);
         if (c.miss != continuation_miss::none) {
             return refuse(c.miss);
         }
         for (auto & span : task.params.message_spans.spans) {
-            if (span.pos >= c.from) {
-                span.pos += c.shift;
-            } else if (span.pos + span.len > c.from) {
-                span.len += c.shift; // her response's span now ends where her held tokens and the glue do
-            }
+            span.pos += c.kept;
         }
-        task.params.view_end_pos = (int32_t) continued_position(c, task.params.view_end_pos);
-        SLT_INF(slot, "continuing %s: %zu held tokens (%zu generated) kept, %zu new, %zu re-rendered tokens of her response not sent\n",
-                task.params.continues.c_str(), c.kept, c.generated,
-                sent.size() - c.from, c.from - c.response);
+        if (task.params.view_end_pos >= 0) {
+            task.params.view_end_pos += (int32_t) c.kept;
+        }
+        SLT_INF(slot, "continuing %s: %zu held tokens (%zu generated) kept, %zu new\n",
+                task.params.continues.c_str(), c.kept, c.generated, delta.size());
         task.tokens = server_tokens(c.tokens, false);
         return true;
     }
@@ -5055,6 +5049,29 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             data.at("view_messages").dump().c_str(), refusal.c_str());
                 }
             }
+            if (!task.params.continues.empty()) {
+                const continuation_delta d = task.tokens.has_mtmd
+                    ? continuation_delta{ continuation_miss::has_media, 0 }
+                    : delta_after_stub(task.tokens.get_tokens(), task.params.message_spans,
+                                       [&](llama_token tok) { return llama_vocab_is_eog(ctx_server.vocab, tok); });
+                if (d.miss != continuation_miss::none) {
+                    res->error(format_error_response(string_format("continuation of %s refused (%s): her slot keeps her held tokens",
+                                                                   task.params.continues.c_str(), continuation_miss_name(d.miss)),
+                                                     ERROR_TYPE_CONTINUATION_REFUSED));
+                    return res;
+                }
+                const llama_tokens & rendered = task.tokens.get_tokens();
+                task.tokens = server_tokens(llama_tokens(rendered.begin() + d.from, rendered.end()), false);
+                // Her view end moves with the cut; one inside the stub names nothing of hers.
+                task.params.view_end_pos = task.params.view_end_pos >= (int32_t) d.from ? task.params.view_end_pos - (int32_t) d.from : -1;
+                common_chat_msg_spans kept;
+                for (const auto & span : task.params.message_spans.spans) {
+                    if (span.pos >= d.from) {
+                        kept.add(span.role, span.pos - d.from, span.len);
+                    }
+                }
+                task.params.message_spans = kept;
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -5274,6 +5291,38 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
     queue_tasks.on_sleeping_state([this](bool is_sleeping) {
         update_cached_responses(is_sleeping);
     });
+}
+
+// A continuing request (`continues`) carries only the messages after her held response. They are
+// rendered behind a short stub of that response, never the response itself: a user line, then an
+// assistant turn whose tool calls are the ones the new tool results answer (a template may require
+// a tool result to follow its call). The delta is cut at the stub's end-of-turn (server-continuation.h).
+static void stub_her_response(json & body) {
+    if (json_value(body, "continues", std::string()).empty() || !body.contains("messages") || !body.at("messages").is_array()) {
+        return;
+    }
+    json calls = json::array();
+    for (const auto & msg : body.at("messages")) {
+        if (json_value(msg, "role", std::string()) == "tool") {
+            calls.push_back({ { "id", json_value(msg, "tool_call_id", std::string()) },
+                              { "type", "function" },
+                              { "function", { { "name", "continue" }, { "arguments", "{}" } } } });
+        }
+    }
+    json stub = json::array();
+    stub.push_back({ { "role", "user" }, { "content", "." } });
+    json assistant = { { "role", "assistant" }, { "content", "." } };
+    if (!calls.empty()) {
+        assistant["tool_calls"] = calls;
+    }
+    stub.push_back(assistant);
+    for (const auto & msg : body.at("messages")) {
+        stub.push_back(msg);
+    }
+    body["messages"] = stub;
+    if (body.contains("view_messages") && body.at("view_messages").is_number_integer()) {
+        body["view_messages"] = body.at("view_messages").get<int64_t>() + 2; // the stub's two messages lead
+    }
 }
 
 static json get_res_model_info(const server_context_meta & meta) {
@@ -5715,6 +5764,7 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+        stub_her_response(body);
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
