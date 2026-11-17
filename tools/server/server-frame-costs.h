@@ -47,6 +47,8 @@ struct frame_cost {
     int32_t       draft_accepted  = 0;
     int32_t       sequences       = 0; // distinct sequences in the batch, before decode
     int32_t       max_context     = 0; // longest of them, before decode
+    int32_t       slot_failures   = 0; // slots whose own work threw and was released inside this frame
+    int64_t       instrument_us   = 0; // the shape snapshot's cost; the record's own write is added to the exported total
     frame_outcome outcome         = frame_outcome::ok;
 
     frame_kind kind() const {
@@ -80,6 +82,8 @@ struct frame_window {
     int64_t draft_accepted   = 0;
     int64_t retried          = 0;
     int64_t failed           = 0;
+    int64_t slot_failures    = 0;
+    int64_t instrument_us    = 0;
     int64_t max_sequences    = 0;
     int64_t max_context      = 0;
     bool    complete         = true; // false: the ring overwrote frames of this window; its totals undercount
@@ -146,6 +150,8 @@ public:
             w.draft_accepted  += f.draft_accepted;
             w.retried         += f.outcome == frame_outcome::retried;
             w.failed          += f.outcome == frame_outcome::failed;
+            w.slot_failures   += f.slot_failures;
+            w.instrument_us   += f.instrument_us;
             w.max_sequences = std::max<int64_t>(w.max_sequences, f.sequences);
             w.max_context   = std::max<int64_t>(w.max_context, f.max_context);
             if (s - 1 == oldest && oldest > 0) {

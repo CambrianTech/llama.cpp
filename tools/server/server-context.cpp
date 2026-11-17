@@ -1666,6 +1666,7 @@ private:
 
         metrics.init();
         frames = std::make_unique<frame_costs<4096>>(metrics.t_start);
+        frame_slot_stamp.assign(slots.size(), UINT64_MAX);
         frames_reported_us = metrics.t_start;
         publish_ledger(); // readable before the loop's first boundary
 
@@ -3398,6 +3399,7 @@ private:
             try {
                 callback(slot);
             } catch (const std::exception & e) {
+                ++frame_now.slot_failures;
                 SLT_ERR(slot, "got exception: %s\n", e.what());
                 send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot.release();
@@ -3410,6 +3412,7 @@ private:
             try {
                 callback(*slot);
             } catch (const std::exception & e) {
+                ++frame_now.slot_failures;
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
                 send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                 slot->release();
@@ -3446,6 +3449,8 @@ private:
     // accepted); accepted output comes from n_tokens_generated, the one accepted-token counter
     frame_cost frame_now;
     int64_t    frames_reported_us = 0;
+    // per-slot stamp of the last frame that counted it: the shape snapshot needs no per-frame allocation or clearing
+    std::vector<uint64_t> frame_slot_stamp;
     server_prefill_order prefill_order;
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
@@ -3518,11 +3523,20 @@ private:
             }
         }
 
+        // from here the iteration is a frame: it is recorded on every way out, including a failed pre_decode
+        struct frame_guard {
+            server_context_impl * s;
+            int64_t               t_loop_start;
+            int64_t               gen_at_start;
+            ~frame_guard() { s->finish_frame(t_loop_start, gen_at_start); }
+        } frame_guard_{ this, t_loop_start, gen_at_start };
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
             batch.render();
         } catch (const std::exception & e) {
+            frame_now.outcome = frame_outcome::failed;
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
 
@@ -3604,28 +3618,33 @@ private:
         // Completion-triggered learning can begin inside post_decode. Its entry
         // preparation is already one measured blocking segment; do not append a
         // graph segment before the queued NEXT_RESPONSE lets serving run again.
+        frame_now.host_batch_us = t_step;
         const int64_t t_learn_start = ggml_time_us();
         if (learning_at_start) { advance_learning(); }
+        frame_now.host_learn_us = ggml_time_us() - t_learn_start;
+    }
+
+    void finish_frame(int64_t t_loop_start, int64_t gen_at_start) {
         const int64_t t_end = ggml_time_us();
-        frame_now.end_us        = t_end;
-        frame_now.host_loop_us  = t_end - t_loop_start;
-        frame_now.host_batch_us = t_step;
-        frame_now.host_learn_us = t_end - t_learn_start;
-        frame_now.gen_accepted  = (int32_t) (n_tokens_generated.load(std::memory_order_relaxed) - gen_at_start);
+        frame_now.end_us       = t_end;
+        frame_now.host_loop_us = t_end - t_loop_start;
+        frame_now.gen_accepted = (int32_t) (n_tokens_generated.load(std::memory_order_relaxed) - gen_at_start);
         record_frame();
     }
 
     // the batch's shape before decode mutates anything: a slot its own completion releases is still counted
     void frame_shape_before_decode() {
-        std::vector<bool> seen(slots.size(), false);
+        const int64_t  t0    = ggml_time_us();
+        const uint64_t stamp = frames->recorded(); // this frame's sequence number, once recorded
         for (int32_t i = 0; i < batch.size(); ++i) {
             const int id = batch.tokens[i].id_slot;
-            if (id >= 0 && (size_t) id < seen.size() && !seen[id]) {
-                seen[id] = true;
+            if (id >= 0 && (size_t) id < frame_slot_stamp.size() && frame_slot_stamp[id] != stamp) {
+                frame_slot_stamp[id] = stamp;
                 ++frame_now.sequences;
                 frame_now.max_context = std::max(frame_now.max_context, (int32_t) slots[id].prompt.n_tokens());
             }
         }
+        frame_now.instrument_us += ggml_time_us() - t0;
     }
 
     void record_frame() {
@@ -3638,17 +3657,19 @@ private:
             const double wall = std::max<double>(1.0, (double) w.wall_us);
             SRV_INF("frames%s: %" PRId64 " in %.1f s; host batch: decode %.1f%% prefill %.1f%% mixed %.1f%% none %.1f%%, "
                     "learn %.1f%%, unclassified %.1f%%, outside the loop %.1f%%; accepted %" PRId64 " tok (%.1f/s wall), "
-                    "prompt %" PRId64 " tok, drafts %" PRId64 "/%" PRId64 "; retried %" PRId64 " failed %" PRId64 "; "
-                    "widest %" PRId64 " seq, longest context %" PRId64 "\n",
+                    "prompt %" PRId64 " tok, drafts %" PRId64 "/%" PRId64 "; retried %" PRId64 " failed %" PRId64
+                    " slot failures %" PRId64 "; widest %" PRId64 " seq, longest context %" PRId64
+                    "; recording cost %.3f%% of loop time\n",
                     w.complete ? "" : " (INCOMPLETE: the ring overwrote part of this window)",
                     w.frames, w.wall_us / 1e6,
                     100.0 * w.batch_us[(size_t) frame_kind::decode] / wall, 100.0 * w.batch_us[(size_t) frame_kind::prefill] / wall,
                     100.0 * w.batch_us[(size_t) frame_kind::mixed] / wall, 100.0 * w.batch_us[(size_t) frame_kind::none] / wall,
                     100.0 * w.host_learn_us / wall, 100.0 * w.unclassified_us / wall, 100.0 * w.outside_loop_us() / wall,
                     w.gen_accepted, w.gen_per_wall_s(), w.prompt_done, w.draft_accepted, w.draft_proposed,
-                    w.retried, w.failed, w.max_sequences, w.max_context);
+                    w.retried, w.failed, w.slot_failures, w.max_sequences, w.max_context,
+                    100.0 * w.instrument_us / std::max<double>(1.0, (double) w.host_loop_us));
         }
-        metrics.add_frame(frame_now, ggml_time_us() - t_record_start);
+        metrics.add_frame(frame_now, frame_now.instrument_us + (ggml_time_us() - t_record_start));
     }
 
     void pre_decode() {
