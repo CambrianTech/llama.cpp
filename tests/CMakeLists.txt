@@ -7,6 +7,11 @@ target_compile_features(test-server-checkpoint-policy PRIVATE cxx_std_17)
 add_test(NAME test-server-checkpoint-policy COMMAND test-server-checkpoint-policy)
 set_tests_properties(test-server-checkpoint-policy PROPERTIES LABELS "main")
 
+add_executable(test-server-frame-costs test-server-frame-costs.cpp)
+target_compile_features(test-server-frame-costs PRIVATE cxx_std_17)
+add_test(NAME test-server-frame-costs COMMAND test-server-frame-costs)
+set_tests_properties(test-server-frame-costs PROPERTIES LABELS "main")
+
 add_executable(test-server-prefill test-server-prefill.cpp)
 target_compile_features(test-server-prefill PRIVATE cxx_std_17)
 add_test(NAME test-server-prefill COMMAND test-server-prefill)
