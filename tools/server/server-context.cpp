@@ -304,11 +304,10 @@ struct server_slot {
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
 
-    // Continuum fork: her last response, for the request that continues it (server-continuation.h):
-    // the caller's id for that request and how many of `prompt.tokens` were the prompt she was served. Kept
-    // across release; her held tokens are checked against the request, never trusted by id alone.
-    std::string served_response;
-    size_t      n_served = 0;
+    // Continuum fork: the responses her slot's tokens hold, for the request that continues one
+    // (server-continuation.h). Valid only while every task since was a continuation of them: any other
+    // task clears it at launch, and a response is added at its final result.
+    std::vector<continuation_response> responses;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
 
     std::vector<completion_token_output> generated_token_probs;
@@ -1936,9 +1935,11 @@ private:
     // Runs after the adapter check, so a slot cleared for an adapter change never continues.
     void continue_her_response(server_slot & slot, server_task & task) {
         if (task.params.continues.empty()) {
+            slot.responses.clear(); // a new lineage: what this task does to her tokens is not a continuation
             return;
         }
         if (task.tokens.has_mtmd || slot.prompt.tokens.has_mtmd) {
+            slot.responses.clear();
             SLT_WRN(slot, "continuation of %s missed (%s): served as sent\n", task.params.continues.c_str(),
                     continuation_miss_name(continuation_miss::has_media));
             return;
@@ -1946,13 +1947,11 @@ private:
         const llama_tokens & held = slot.prompt.tokens.get_tokens();
         const llama_tokens & sent = task.tokens.get_tokens();
         const continuation c = continue_from(
-            continuation_held{ held, slot.n_served, slot.served_response },
+            continuation_held{ held, slot.responses },
             continuation_request{ task.params.continues, sent, task.params.message_spans },
             [this](llama_token tok) { return llama_vocab_is_eog(vocab, tok); });
-        if (c.miss == continuation_miss::not_requested) {
-            return;
-        }
         if (c.miss != continuation_miss::none) {
+            slot.responses.clear();
             SLT_WRN(slot, "continuation of %s missed (%s): served as sent, her held tokens past the shared prefix are recomputed\n",
                     task.params.continues.c_str(), continuation_miss_name(c.miss));
             return;
@@ -1966,7 +1965,7 @@ private:
         }
         task.params.view_end_pos = (int32_t) continued_position(c, task.params.view_end_pos);
         SLT_INF(slot, "continuing %s: %zu held tokens (%zu generated) kept, %zu new, %zu re-rendered tokens of her response not sent\n",
-                task.params.continues.c_str(), held.size(), held.size() - slot.n_served,
+                task.params.continues.c_str(), c.kept, c.generated,
                 sent.size() - c.from, c.from - c.response);
         task.tokens = server_tokens(c.tokens, false);
     }
@@ -2375,9 +2374,8 @@ private:
 
         // Her slot now holds this response after the prompt she was served: the next request that
         // names it continues from these tokens (server-continuation.h).
-        if (!slot.task->is_child()) {
-            slot.served_response = slot.task->params.request_id;
-            slot.n_served        = slot.task->n_tokens();
+        if (!slot.task->is_child() && !slot.task->params.request_id.empty() && slot.stats.n_gen > 0) {
+            slot.responses.push_back({ slot.task->params.request_id, (size_t) slot.task->n_tokens(), (size_t) slot.prompt.n_tokens() });
         }
 
         res->id      = slot.task->id;

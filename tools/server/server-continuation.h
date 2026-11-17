@@ -52,10 +52,18 @@ inline const char * continuation_miss_name(continuation_miss miss) {
 }
 
 // What her slot holds from her last response.
+// One response her slot holds: the caller's id for the request it answered, where the prompt she was
+// served for it ends and where her response ends in the slot's tokens. A slot holds a lineage of them:
+// a continuation keeps every earlier one as its prefix, any other request starts a new lineage.
+struct continuation_response {
+    std::string id;
+    size_t      n_served = 0;
+    size_t      n_end    = 0;
+};
+
 struct continuation_held {
-    const llama_tokens & tokens;   // the prompt she was served, then what she generated
-    size_t               n_served; // how many of `tokens` are the prompt she was served
-    const std::string &  response; // the caller's id for the request that response answered
+    const llama_tokens &                       tokens;    // her slot's tokens
+    const std::vector<continuation_response> & responses; // the responses they hold, oldest first
 };
 
 // The request as rendered and tokenized.
@@ -68,7 +76,9 @@ struct continuation_request {
 struct continuation {
     continuation_miss miss = continuation_miss::not_requested;
     llama_tokens      tokens; // her held tokens, then the request's from the response's end-of-turn
-    size_t            response = 0; // where her response starts in the request's tokens
+    size_t            response  = 0; // where her response starts in the request's tokens
+    size_t            kept      = 0; // her held tokens kept: the prompt she was served and her response
+    size_t            generated = 0; // of those, the tokens she generated
     size_t            from  = 0; // where in the request's tokens the kept tail starts
     int64_t           shift = 0; // how far every request position at or after `from` moved
 };
@@ -79,7 +89,13 @@ inline continuation continue_from(const continuation_held & held, const continua
     if (request.continues.empty()) {
         return out;
     }
-    if (request.continues != held.response) {
+    const continuation_response * answered = nullptr;
+    for (const auto & r : held.responses) {
+        if (r.id == request.continues) {
+            answered = &r;
+        }
+    }
+    if (answered == nullptr || answered->n_end > held.tokens.size()) {
         out.miss = continuation_miss::other_response;
         return out;
     }
@@ -98,12 +114,12 @@ inline continuation continue_from(const continuation_held & held, const continua
     }
     // Her slot holds the request's history up to her response: the prompt she was served began with it.
     const size_t start = response->pos;
-    if (held.n_served < start || held.tokens.size() < start ||
+    if (answered->n_served < start ||
         !std::equal(request.tokens.begin(), request.tokens.begin() + start, held.tokens.begin())) {
         out.miss = continuation_miss::not_hers;
         return out;
     }
-    if (held.tokens.size() <= held.n_served) {
+    if (answered->n_end <= answered->n_served) {
         out.miss = continuation_miss::not_generated;
         return out;
     }
@@ -120,11 +136,15 @@ inline continuation continue_from(const continuation_held & held, const continua
         return out;
     }
     out.miss = continuation_miss::none;
-    out.response = start;
+    out.response  = start;
+    out.kept      = answered->n_end;
+    out.generated = answered->n_end - answered->n_served;
     out.from = end_of_turn;
-    out.shift = (int64_t) held.tokens.size() - (int64_t) end_of_turn;
-    out.tokens.reserve(held.tokens.size() + request.tokens.size() - end_of_turn);
-    out.tokens.insert(out.tokens.end(), held.tokens.begin(), held.tokens.end());
+    // Her tokens up to her response's end: whatever the slot holds after it (a warm pass's glue) is
+    // found again by the prompt cache, never trusted here.
+    out.shift = (int64_t) answered->n_end - (int64_t) end_of_turn;
+    out.tokens.reserve(answered->n_end + request.tokens.size() - end_of_turn);
+    out.tokens.insert(out.tokens.end(), held.tokens.begin(), held.tokens.begin() + answered->n_end);
     out.tokens.insert(out.tokens.end(), request.tokens.begin() + end_of_turn, request.tokens.end());
     return out;
 }
