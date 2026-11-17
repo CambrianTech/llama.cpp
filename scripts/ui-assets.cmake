@@ -328,11 +328,19 @@ endif()
 if(NOT provisioned AND HF_ENABLED)
     resolve_version(VERSION)
 
+    # The cache receipt names what was verified: the version and, when the repo records one, its sha256 (Continuum
+    # fork, card aecdb2f2). A cache stamped by another version or digest, or by a version alone before a digest was
+    # recorded, is fetched and verified again, never reused unchecked.
+    set(receipt "${VERSION}")
+    if(NOT "${HF_SHA256}" STREQUAL "")
+        set(receipt "${VERSION} sha256=${HF_SHA256}")
+    endif()
+
     set(stamp_ok FALSE)
     if(EXISTS "${STAMP_FILE}" AND NOT "${VERSION}" STREQUAL "")
         file(READ "${STAMP_FILE}" stamped)
         string(STRIP "${stamped}" stamped)
-        if("${stamped}" STREQUAL "${VERSION}")
+        if("${stamped}" STREQUAL "${receipt}")
             set(stamp_ok TRUE)
         endif()
     endif()
@@ -347,8 +355,9 @@ if(NOT provisioned AND HF_ENABLED)
     else()
         hf_download("${VERSION}" HF_OK HF_RESOLVED)
         if(HF_OK)
-            file(WRITE "${STAMP_FILE}" "${HF_RESOLVED}")
-            message(STATUS "UI: HF download succeeded, stamp updated (${HF_RESOLVED})")
+            # written only after hf_download verified the archive against the recorded digest
+            file(WRITE "${STAMP_FILE}" "${receipt}")
+            message(STATUS "UI: HF download succeeded, stamp updated (${receipt})")
             set(provisioned TRUE)
         elseif(NOT "${HF_SHA256}" STREQUAL "")
             # A bundle recorded by version and sha256 is required, never replaced by a build without the UI.
