@@ -4237,3 +4237,34 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+
+// Continuum fork (CONTINUUM-ENGINE 4.14): the public seam of a persona's move (llama-persona-blocks.h).
+
+struct llama_persona {
+    llama_persona_blocks blocks;
+};
+
+llama_persona * llama_persona_init(llama_context * ctx) {
+    auto * persona = new llama_persona();
+    if (ctx->persona_prepare(persona->blocks) != llama_persona_move::done) {
+        delete persona;
+        return nullptr;
+    }
+    return persona;
+}
+
+void llama_persona_free(llama_persona * persona) {
+    delete persona;
+}
+
+int32_t llama_persona_save(llama_context * ctx, llama_seq_id seq_id, llama_persona * persona) {
+    return (int32_t) ctx->persona_save(seq_id, persona->blocks);
+}
+
+int32_t llama_persona_load(llama_context * ctx, llama_seq_id seq_id, uint32_t stream, llama_persona * persona) {
+    return (int32_t) ctx->persona_load(seq_id, stream, persona->blocks);
+}
+
+const char * llama_persona_status_name(int32_t status) {
+    return llama_persona_move_name((llama_persona_move) status);
+}

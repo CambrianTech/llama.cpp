@@ -927,6 +927,25 @@ extern "C" {
             struct llama_memory_cells_report * out,
             int32_t n_max);
 
+    // A persona's execution state as native blocks in host memory (Continuum fork, CONTINUUM-ENGINE 4.14). A switch
+    // between personas is raw row copies and a swap of her cell records: nothing tokenized, serialized, walked or
+    // recomputed. Her blocks stay tagged with the sequence they were saved from and load back under it, into any empty
+    // stream; the memory must hold one stream per sequence (not unified) with V not transposed (flash attention on).
+    struct llama_persona;
+
+    // Blocks prepared once for this context's memory (sized to a stream), empty. NULL when the memory has no persona move.
+    LLAMA_API struct llama_persona * llama_persona_init(struct llama_context * ctx);
+    LLAMA_API void llama_persona_free(struct llama_persona * persona);
+
+    // Move sequence seq_id's state out of the memory into persona's blocks; her stream is left empty. Two-phase: a
+    // refusal leaves both sides as they were. 0 when done, else a status for llama_persona_status_name.
+    LLAMA_API int32_t llama_persona_save(struct llama_context * ctx, llama_seq_id seq_id, struct llama_persona * persona);
+
+    // Bind persona's blocks into the empty stream as sequence seq_id (the sequence they were saved from). 0 when done.
+    LLAMA_API int32_t llama_persona_load(struct llama_context * ctx, llama_seq_id seq_id, uint32_t stream, struct llama_persona * persona);
+
+    LLAMA_API const char * llama_persona_status_name(int32_t status);
+
     //
     // State / sessions
     //
