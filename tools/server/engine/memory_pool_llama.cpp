@@ -7,7 +7,16 @@
 memory_pool_llama::memory_pool_llama(llama_context * tgt, llama_context * dft, size_t host_budget)
     : tgt_(tgt), dft_(dft), host_budget_(host_budget) {
     GGML_ASSERT(tgt_ != nullptr);
-    edits_.init(tgt_, dft_);
+}
+
+template <typename F> edit_outcome memory_pool_llama::each(kv_contexts in, F && f) {
+    if (in != kv_contexts::draft && !f(llama_get_memory(tgt_))) {
+        return edit_outcome::refused;
+    }
+    if (in != kv_contexts::target && dft_ != nullptr && !f(llama_get_memory(dft_))) {
+        return edit_outcome::refused;
+    }
+    return edit_outcome::done;
 }
 
 placement memory_pool_llama::place(const llama_batch & piece) {
@@ -28,16 +37,26 @@ placement memory_pool_llama::place(const llama_batch & piece) {
     return placement::compute_error;
 }
 
-void memory_pool_llama::remove(llama_seq_id seq, llama_pos p0, llama_pos p1) {
-    edits_.seq_rm(seq, p0, p1);
+edit_outcome memory_pool_llama::remove(llama_seq_id seq, llama_pos p0, llama_pos p1, kv_contexts in) {
+    return each(in, [&](llama_memory_t mem) { return llama_memory_seq_rm(mem, seq, p0, p1); });
 }
 
-void memory_pool_llama::shift(llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos delta) {
-    edits_.seq_add(seq, p0, p1, delta);
+edit_outcome memory_pool_llama::shift(llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos delta, kv_contexts in) {
+    return each(in, [&](llama_memory_t mem) { llama_memory_seq_add(mem, seq, p0, p1, delta); return true; });
 }
 
-void memory_pool_llama::copy(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) {
-    edits_.seq_cp(src, dst, p0, p1);
+edit_outcome memory_pool_llama::copy(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1, kv_contexts in) {
+    return each(in, [&](llama_memory_t mem) { llama_memory_seq_cp(mem, src, dst, p0, p1); return true; });
+}
+
+edit_outcome memory_pool_llama::move(llama_seq_id src, llama_seq_id dst) {
+    return each(kv_contexts::both, [&](llama_memory_t mem) {
+        if (!llama_memory_seq_rm(mem, dst, -1, -1)) {
+            return false;
+        }
+        llama_memory_seq_cp(mem, src, dst, -1, -1);
+        return llama_memory_seq_rm(mem, src, -1, -1);
+    });
 }
 
 seq_range memory_pool_llama::range(llama_seq_id seq) const {
@@ -75,8 +94,8 @@ load_outcome memory_pool_llama::load(llama_seq_id seq, llama_state_seq_flags fla
     }
     if (dft_ != nullptr && llama_state_seq_set_data_ext(dft_, dft, n_dft, seq, flags) != n_dft) {
         // the target took its half and the draft refused: the target's half goes, so the sequence is not left half
-        // loaded (both contexts hold it, or neither does)
-        edits_.seq_rm(seq, -1, -1);
+        // loaded (both contexts hold it, or neither does); a whole-sequence removal is never refused
+        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(tgt_), seq, -1, -1));
         return load_outcome::refused;
     }
     return load_outcome::loaded;

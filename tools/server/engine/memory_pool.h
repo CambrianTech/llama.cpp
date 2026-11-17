@@ -27,6 +27,21 @@ enum class placement : uint8_t {
     compute_error, // the backend failed while computing; the pool's state for this piece is uncertain
 };
 
+// Which of the pool's contexts an edit applies to. A slot's sequence lives in both; a learning side sequence lives in
+// the target only; repairing a draft state touches the draft only. Always named, never defaulted.
+enum class kv_contexts : uint8_t {
+    both,
+    target,
+    draft,
+};
+
+// The result of a sequence edit. A partial removal can be refused (recurrent memory cannot drop a tail it did not
+// checkpoint); the caller decides what a refusal means, so edits are [[nodiscard]].
+enum class edit_outcome : uint8_t {
+    done,
+    refused, // nothing changed in the context that refused; a context listed before it in `both` may have changed
+};
+
 // The result of loading a saved sequence state back into the pool.
 // llama reports a failed load as one result (no room for it, or bytes that are not this pool's state); the pool does
 // not guess which.
@@ -69,11 +84,13 @@ public:
     // placement
     virtual placement place(const llama_batch & piece) = 0;
 
-    // sequence edits, applied to the target and (when present) the draft together
-    virtual void      remove(llama_seq_id seq, llama_pos p0, llama_pos p1)                   = 0;
-    virtual void      shift(llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos delta)   = 0;
-    virtual void      copy(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1)    = 0;
-    virtual seq_range range(llama_seq_id seq) const                                           = 0;
+    // sequence edits, in the named contexts (the draft only when the pool has one)
+    [[nodiscard]] virtual edit_outcome remove(llama_seq_id seq, llama_pos p0, llama_pos p1, kv_contexts in) = 0;
+    [[nodiscard]] virtual edit_outcome shift(llama_seq_id seq, llama_pos p0, llama_pos p1, llama_pos delta, kv_contexts in) = 0;
+    [[nodiscard]] virtual edit_outcome copy(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1, kv_contexts in) = 0;
+    // a whole sequence moved to another id in both contexts (dst cleared first, src cleared after)
+    [[nodiscard]] virtual edit_outcome move(llama_seq_id src, llama_seq_id dst) = 0;
+    virtual seq_range range(llama_seq_id seq) const = 0;
 
     // a sequence's whole state, target and draft together, moved out of and back into the pool (park, flash, page
     // restore, preemption); buffers are the caller's, sized from state_size
