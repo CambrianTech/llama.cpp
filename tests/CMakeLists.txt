@@ -189,6 +189,10 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build_and_test(test-server-view-end.cpp)
 
+# a persona's next request continues the tokens her slot holds (CONTINUUM-ENGINE 4.14)
+llama_build_and_test(test-server-continuation.cpp)
+target_include_directories(test-server-continuation PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+
 # GGML_TENSOR_FLAG_GRAD: a leaf whose gradient the backward computes, never optimized (the walk reads the cached prefix K/V gradient)
 llama_build_and_test(test-grad-leaf.cpp)
 

@@ -1,6 +1,7 @@
 #include <limits>
 #include "server-context.h"
 #include "server-checkpoint-policy.h"
+#include "server-continuation.h"
 #include "server-view-end.h"
 #include "../../src/llama-ext.h"
 #include "server-train.h"
@@ -302,6 +303,12 @@ struct server_slot {
     std::string  generated_text;
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
+
+    // Continuum fork: her last response, for the request that continues it (server-continuation.h):
+    // its completion id and how many of `prompt.tokens` were the prompt she was served for it. Kept
+    // across release; her held tokens are checked against the request, never trusted by id alone.
+    std::string served_response;
+    size_t      n_served = 0;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
 
     std::vector<completion_token_output> generated_token_probs;
@@ -1924,6 +1931,46 @@ private:
         return output;
     }
 
+    // A request that continues her last response is served from the tokens her slot holds: her
+    // generated tokens stay, and only what follows her response is new (server-continuation.h).
+    // Runs after the adapter check, so a slot cleared for an adapter change never continues.
+    void continue_her_response(server_slot & slot, server_task & task) {
+        if (task.params.continues.empty()) {
+            return;
+        }
+        if (task.tokens.has_mtmd || slot.prompt.tokens.has_mtmd) {
+            SLT_WRN(slot, "continuation of %s missed (%s): served as sent\n", task.params.continues.c_str(),
+                    continuation_miss_name(continuation_miss::has_media));
+            return;
+        }
+        const llama_tokens & held = slot.prompt.tokens.get_tokens();
+        const llama_tokens & sent = task.tokens.get_tokens();
+        const continuation c = continue_from(
+            continuation_held{ held, slot.n_served, slot.served_response },
+            continuation_request{ task.params.continues, sent, task.params.message_spans },
+            [this](llama_token tok) { return llama_vocab_is_eog(vocab, tok); });
+        if (c.miss == continuation_miss::not_requested) {
+            return;
+        }
+        if (c.miss != continuation_miss::none) {
+            SLT_WRN(slot, "continuation of %s missed (%s): served as sent, her held tokens past the shared prefix are recomputed\n",
+                    task.params.continues.c_str(), continuation_miss_name(c.miss));
+            return;
+        }
+        for (auto & span : task.params.message_spans.spans) {
+            if (span.pos >= c.from) {
+                span.pos += c.shift;
+            } else if (span.pos + span.len > c.from) {
+                span.len += c.shift; // her response's span now ends where her held tokens and the glue do
+            }
+        }
+        task.params.view_end_pos = (int32_t) continued_position(c, task.params.view_end_pos);
+        SLT_INF(slot, "continuing %s: %zu held tokens (%zu generated) kept, %zu new, %zu re-rendered tokens of her response not sent\n",
+                task.params.continues.c_str(), held.size(), held.size() - slot.n_served,
+                sent.size() - c.from, c.from - c.response);
+        task.tokens = server_tokens(c.tokens, false);
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         page_slot_reassigned(slot); // a restore buffered for this slot is dropped, never applied over it (server-context-page.inc)
         // process per-request lora adapters
@@ -1944,6 +1991,8 @@ private:
                 slot.lora = task_loras;
             }
         }
+
+        continue_her_response(slot, task);
 
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
@@ -2323,6 +2372,13 @@ private:
             return;
         }
         auto res = std::make_unique<server_task_result_cmpl_final>();
+
+        // Her slot now holds this response after the prompt she was served: the next request that
+        // names it continues from these tokens (server-continuation.h).
+        if (!slot.task->is_child()) {
+            slot.served_response = slot.task->params.oaicompat_cmpl_id;
+            slot.n_served        = slot.task->n_tokens();
+        }
 
         res->id      = slot.task->id;
         res->id_slot = slot.id;
@@ -4981,6 +5037,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            task.params.continues = json_value(data, "continues", std::string());
             // Continuum fork: where the caller's view ends, so the prompt is checkpointed there.
             if (data.contains("view_messages") && data.contains("messages")) {
                 std::string refusal;
