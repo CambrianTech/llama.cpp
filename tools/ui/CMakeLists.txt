@@ -23,10 +23,13 @@ if(DEFINED ENV{HF_WEBUI_VERSION})
     message(DEPRECATION "HF_WEBUI_VERSION env var is deprecated, use HF_UI_VERSION instead")
 elseif(DEFINED ENV{HF_UI_VERSION})
     set(HF_UI_VERSION "$ENV{HF_UI_VERSION}")
-elseif(DEFINED LLAMA_BUILD_NUMBER)
-    set(HF_UI_VERSION "b${LLAMA_BUILD_NUMBER}")
 else()
-    set(HF_UI_VERSION "")
+    # Continuum fork (card aecdb2f2): the bundle this fork's llama-ui-embed is proven against, by version AND by the
+    # sha256 recorded here, never derived from a build number (a fork checkout's number names no upstream bundle) and
+    # never "latest" (upstream's latest dropped workbox[hash].js on 2026-11-17 and the embed refuses it). Moving the
+    # pin is a reviewed change to these two lines, proven by building the UI step.
+    set(HF_UI_VERSION "b10909")
+    set(HF_UI_SHA256 "e549e4cc01c0312d3fffdf6d4e431bb84c294a95ddf10fa40c8c643fc5f6a776")
 endif()
 
 if(NOT "${HF_UI_VERSION}" STREQUAL "" AND NOT HF_UI_VERSION MATCHES "^[A-Za-z0-9._-]+$")
@@ -99,6 +102,7 @@ add_custom_target(llama-ui-assets ALL
         "-DLLAMA_BUILD_NUMBER=${LLAMA_BUILD_NUMBER}"
         "-DHF_BUCKET=${LLAMA_UI_HF_BUCKET}"
         "-DHF_VERSION=${HF_UI_VERSION}"
+        "-DHF_SHA256=${HF_UI_SHA256}"
         "-DHF_ENABLED=${LLAMA_USE_PREBUILT_UI}"
         "-DBUILD_UI=${LLAMA_BUILD_UI}"
         "-DLLAMA_UI_EMBED=${LLAMA_UI_EMBED_EXE}"
