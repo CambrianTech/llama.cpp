@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <vector>
 
 // A persona's token history: one contiguous, reserved buffer of her token ids, owned with her blocks
 // (CONTINUUM-ENGINE 4.14, "the persona is one contiguous structure; a request appends token ids").
@@ -48,7 +47,7 @@ enum class llama_persona_append_status {
     out_of_order,  // not her next sequence: a gap, or a sequence she never committed
     moved,         // her next sequence, but her history does not end where the request expects
     changed,       // a committed sequence with another identity or delta: refused, never overwritten
-    no_room,       // her reserved capacity cannot hold the delta: her owner grows it first
+    no_room,       // her reserved tokens or receipts cannot hold this append: her owner grows them first
     invalid,       // no identity, no sequence, or a null delta with a length
 };
 
@@ -76,13 +75,16 @@ struct llama_persona_receipt {
 
 class llama_persona_tokens {
 public:
-    llama_persona_tokens(uint64_t persona, uint64_t epoch, size_t capacity)
-        : persona_(persona), epoch_(epoch), capacity_(capacity), ids_(new llama_token[capacity]) {}
+    // Both arrays are reserved here, by her admitted owner: an accepted append writes into them and never
+    // allocates (`capacity` token ids, `receipts` committed appends, one per request sequence).
+    llama_persona_tokens(uint64_t persona, uint64_t epoch, size_t capacity, size_t receipts)
+        : persona_(persona), epoch_(epoch), capacity_(capacity), ids_(new llama_token[capacity]),
+          receipt_capacity_(receipts), committed_(new commit_record[receipts]) {}
 
     uint64_t persona() const { return persona_; }
     uint64_t epoch() const { return epoch_; }
     uint64_t frontier() const { return n_; }
-    uint64_t committed() const { return committed_.size(); }
+    uint64_t committed() const { return n_committed_; }
     size_t capacity() const { return capacity_; }
     const llama_token * data() const { return ids_.get(); }
 
@@ -112,7 +114,7 @@ public:
             return r;
         }
         // A committed sequence: its own receipt for the same request and delta, refused for anything else.
-        if (h.seq <= committed_.size()) {
+        if (h.seq <= n_committed_) {
             const commit_record & c = committed_[h.seq - 1];
             const bool same = c.request == h.request && c.expected == h.frontier && n_delta == c.to - c.from &&
                               (n_delta == 0 || std::memcmp(ids_.get() + c.from, delta, n_delta * sizeof(llama_token)) == 0);
@@ -121,7 +123,7 @@ public:
             r.to     = c.to;
             return r;
         }
-        if (h.seq != committed_.size() + 1) {
+        if (h.seq != n_committed_ + 1) {
             r.status = llama_persona_append_status::out_of_order;
             return r;
         }
@@ -130,7 +132,8 @@ public:
             r.to     = n_;
             return r;
         }
-        if (n_delta > capacity_ - n_) { // n_ <= capacity_ always: no overflow
+        // Both reservations are checked before anything is written: a refusal leaves her exactly as she was.
+        if (n_delta > capacity_ - n_ || n_committed_ == receipt_capacity_) { // n_ <= capacity_ always: no overflow
             r.status = llama_persona_append_status::no_room;
             r.to     = n_;
             return r;
@@ -141,7 +144,7 @@ public:
         r.status = llama_persona_append_status::appended;
         r.from   = n_;
         r.to     = n_ + n_delta;
-        committed_.push_back({ h.request, h.frontier, r.from, r.to });
+        committed_[n_committed_++] = { h.request, h.frontier, r.from, r.to };
         n_ = r.to;
         return r;
     }
@@ -160,5 +163,7 @@ private:
     size_t                         capacity_;
     std::unique_ptr<llama_token[]> ids_;
     uint64_t                       n_ = 0;
-    std::vector<commit_record>     committed_;
+    size_t                           receipt_capacity_;
+    std::unique_ptr<commit_record[]> committed_;
+    uint64_t                         n_committed_ = 0;
 };

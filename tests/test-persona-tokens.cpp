@@ -30,7 +30,7 @@ int main() {
     // what this catches: her history rebuilt per act. Three acts: each request appends only its new ids
     // after what she generated; her history is exactly served + generated + new, in order.
     {
-        llama_persona_tokens her(7, 1, 64);
+        llama_persona_tokens her(7, 1, 64, 16);
         const llama_token prompt[] = { 1, 40, 9, 2, 7 };
         CHECK(her.append(header(7, 1, 1, 0, id(1)), prompt, 5).status == status::appended);
         std::vector<llama_token> expect(prompt, prompt + 5);
@@ -51,7 +51,7 @@ int main() {
     // A then B commit; a delayed retry of A (after B) gets A's original receipt and writes nothing; so does a
     // duplicate of B; A's sequence with another request or delta is refused.
     {
-        llama_persona_tokens her(7, 1, 16);
+        llama_persona_tokens her(7, 1, 16, 16);
         const llama_token a[] = { 1, 2, 3 }, b[] = { 4, 5 }, other[] = { 1, 2, 4 };
         const auto ra = her.append(header(7, 1, 1, 0, id(1)), a, 3);
         const auto rb = her.append(header(7, 1, 2, 3, id(2)), b, 2);
@@ -66,7 +66,7 @@ int main() {
     // what this catches: empty appends at the same frontier letting a retried request be accepted twice.
     // Each empty append commits its own sequence; a retry of the first is its receipt, never a new append.
     {
-        llama_persona_tokens her(7, 1, 16);
+        llama_persona_tokens her(7, 1, 16, 16);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), nullptr, 0).status == status::appended);
         CHECK(her.append(header(7, 1, 2, 0, id(2)), nullptr, 0).status == status::appended);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), nullptr, 0).status == status::replayed);
@@ -74,7 +74,7 @@ int main() {
     }
     // what this catches: a reordered request (a later sequence arriving first) appended out of order.
     {
-        llama_persona_tokens her(7, 1, 16);
+        llama_persona_tokens her(7, 1, 16, 16);
         const llama_token d[] = { 1 };
         CHECK(her.append(header(7, 1, 2, 0, id(2)), d, 1).status == status::out_of_order);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 1).status == status::appended);
@@ -83,7 +83,7 @@ int main() {
     }
     // what this catches: a stale, foreign or malformed request appended to her history.
     {
-        llama_persona_tokens her(7, 2, 16);
+        llama_persona_tokens her(7, 2, 16, 16);
         const llama_token d[] = { 1 };
         CHECK(her.append(header(8, 2, 1, 0, id(1)), d, 1).status == status::wrong_persona);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 1).status == status::wrong_epoch);
@@ -96,15 +96,28 @@ int main() {
     // what this catches: an append past her reserved capacity growing it in place (an allocation and a copy
     // of what she holds on the hot path): refused, her owner grows first; a length that would overflow too.
     {
-        llama_persona_tokens her(7, 1, 4);
+        llama_persona_tokens her(7, 1, 4, 16);
         const llama_token d[] = { 1, 2, 3, 4, 5 };
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 5).status == status::no_room && her.frontier() == 0);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, SIZE_MAX).status == status::no_room);
     }
+    // what this catches: an accepted append allocating its receipt on the hot path, or a refused one leaving
+    // a half-written append. Receipts are reserved; when they are used up the append is refused before any
+    // write, an empty append included, and her tokens, frontier and commits are unchanged.
+    {
+        llama_persona_tokens her(7, 1, 16, 2);
+        const llama_token d[] = { 1, 2 };
+        CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 2).status == status::appended);
+        CHECK(her.append(header(7, 1, 2, 2, id(2)), nullptr, 0).status == status::appended);
+        CHECK(her.append(header(7, 1, 3, 2, id(3)), d, 2).status == status::no_room);
+        CHECK(her.append(header(7, 1, 3, 2, id(3)), nullptr, 0).status == status::no_room);
+        CHECK(her.frontier() == 2 && her.committed() == 2 && her.data()[0] == 1 && her.data()[1] == 2);
+        CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 2).status == status::replayed);
+    }
     // The cost of an act's append at her real size: a 100k-token history, a 2k-token delta. Printed, not
     // asserted; the writes are read back so the optimizer cannot remove them.
     {
-        llama_persona_tokens her(7, 1, 1 << 20);
+        llama_persona_tokens her(7, 1, 1 << 20, 128);
         std::vector<llama_token> prompt(100000, 5);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), prompt.data(), prompt.size()).status == status::appended);
         std::vector<llama_token> delta(2048, 6);
