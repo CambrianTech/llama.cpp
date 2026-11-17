@@ -713,7 +713,7 @@
         slot->prompt.tokens = std::move(*restored);
         slot->lora = std::move(page_lora);
         if (job.checkpoints_ok) {
-            slot->prompt.checkpoints = std::move(job.checkpoints);
+            slot->prompt.checkpoints.replace(std::move(job.checkpoints));
             SLT_INF(*slot, "restored %zu context checkpoints from the sidecar: %s\n", slot->prompt.checkpoints.size(), job.ckpt_path.c_str());
         } else {
             slot->prompt.checkpoints.clear();

@@ -634,11 +634,7 @@
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), pending.side, -1, -1);
             park_free.push_back(pending.side);
             if (pending.began && ok && !pending.drained) {
-                for (auto & c : slot.prompt.checkpoints) {
-                    if (c.pin != 0 && c.n_tokens == n0) {
-                        c.pin = 0;
-                    }
-                }
+                slot.prompt.checkpoints.learned_at(n0);
             }
         } else if (!pending.began || !ok) {
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, n0, -1);
@@ -648,7 +644,7 @@
                 if (cp) { cp->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); }
             }
             slot.prompt.tokens.keep_first(n0);
-            slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & c) { return c.n_tokens > n0; });
+            slot.prompt.checkpoints.cut_back_to(n0);
         }
         learn_outcome out;
         out.learned_on = pending.side >= 0 ? learn_outcome::learned_on_kind::side_sequence : learn_outcome::learned_on_kind::slot;

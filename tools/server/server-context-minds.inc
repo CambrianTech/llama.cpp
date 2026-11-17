@@ -25,23 +25,12 @@
         std::vector<uint64_t>                 released;        // pins released while she was on flash
     };
 
-    // release learn pin `pin` in `cks`; true when a checkpoint held it
-    static bool unpin(std::list<common_prompt_checkpoint> & cks, uint64_t pin) {
-        for (auto & c : cks) {
-            if (c.pin == pin) {
-                c.pin = 0;
-                return true;
-            }
-        }
-        return false;
-    }
-
     // An abandoned turn's learn pin, released wherever she is: on a lane, parked, or on flash (applied when her
     // checkpoints come back). The checkpoint stays as an ordinary one: the budget may now evict it.
     pin_release learn_release(mind_page page, uint64_t pin) {
         for (auto & s : slots) {
             if (s.page == page) {
-                return unpin(s.prompt.checkpoints, pin) ? pin_release::released : pin_release::not_pinned;
+                return s.prompt.checkpoints.release(pin) ? pin_release::released : pin_release::not_pinned;
             }
         }
         resident_mind * m = find_mind(page);
@@ -52,7 +41,7 @@
             m->released.push_back(pin); // her checkpoints are in her flash bytes
             return pin_release::released_on_flash;
         }
-        return unpin(m->prompt.checkpoints, pin) ? pin_release::released : pin_release::not_pinned;
+        return m->prompt.checkpoints.release(pin) ? pin_release::released : pin_release::not_pinned;
     }
 
     // her checkpoints as bytes beside her state: count, then per checkpoint its position fields, three sizes and
@@ -190,14 +179,14 @@
         const uint64_t h[3] = { n_tgt, n_dft, n_ck };
         std::memcpy(w, h, sizeof(h));
         w += sizeof(h);
-        ckpt_write(cold->prompt.checkpoints, w + n_tgt + n_dft);
+        ckpt_write(cold->prompt.checkpoints.all(), w + n_tgt + n_dft);
         if (llama_state_seq_get_data_ext(ctx_tgt, w, n_tgt, seq, LLAMA_STATE_SEQ_FLAGS_NONE) != n_tgt ||
             (ctx_dft && llama_state_seq_get_data_ext(ctx_dft, w + n_tgt, n_dft, seq, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft)) {
             SRV_ERR("mind %016llx: her state could not be copied out of the pool; she stays where she is\n", (unsigned long long) cold->page.hi);
             return false;
         }
         const int64_t t_copy = ggml_time_us() - t0;
-        std::list<common_prompt_checkpoint>().swap(cold->prompt.checkpoints); // their bytes are in hers now
+        cold->prompt.checkpoints.clear(); // their bytes are in hers now
         llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq, -1, -1);
         if (ctx_dft) {
             llama_memory_seq_rm(llama_get_memory(ctx_dft), seq, -1, -1);
@@ -307,9 +296,9 @@
         }
         SRV_INF("mind %016llx%016llx back from %s: %.1f MiB inserted in %.2f ms\n", (unsigned long long) m.page.hi,
                 (unsigned long long) m.page.lo, ram ? "RAM" : "flash", size / (1024.0 * 1024.0), (ggml_time_us() - t0) / 1000.0);
-        m.prompt.checkpoints = std::move(checkpoints);
+        m.prompt.checkpoints.replace(std::move(checkpoints));
         for (const uint64_t pin : m.released) {
-            unpin(m.prompt.checkpoints, pin); // released while she was on flash
+            m.prompt.checkpoints.release(pin); // released while she was on flash
         }
         m.released.clear();
         // her file is removed on the page-IO worker, ordered after its own write (it may still be landing)
