@@ -6,6 +6,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <vector>
 
 struct server_slot; // forward declaration
@@ -119,6 +120,39 @@ struct server_batch {
         slot_batched      = m.slot_batched;
         alora_scale       = m.alora_scale;
         alora_disabled_id = m.alora_disabled_id;
+    }
+
+    // Remove every token of one slot from a frame decode could not place (CONTINUUM-ENGINE 4.11.10: that slot is
+    // preempted or deferred, the others decode). Order is kept, embedding rows move with their tokens, and the batch
+    // must be rendered again before it decodes. Returns old index -> new index (-1 for a removed token): the caller
+    // remaps every index it holds into this batch (each slot's i_batch and spec_i_batch) and clears slot_batched if
+    // it was this slot; the batch cannot, since it sees server_slot only as a declaration.
+    std::vector<int32_t> remove_slot(int32_t id_slot) {
+        std::vector<int32_t> moved(tokens.size(), -1);
+        size_t kept = 0;
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            if (tokens[i].id_slot == id_slot) {
+                continue;
+            }
+            if (has_embd && kept != i) {
+                std::copy_n(embd.begin() + i * n_embd, n_embd, embd.begin() + kept * n_embd);
+            }
+            tokens[kept] = tokens[i];
+            moved[i] = (int32_t) kept++;
+        }
+        tokens.resize(kept);
+        if (has_embd) {
+            embd.resize(kept * n_embd);
+        }
+        if (batch_rendered) {
+            common_batch_clear(batch);
+            if (batch.token == nullptr) {
+                batch.token = tokens_ptr;
+                batch.embd  = nullptr;
+            }
+            batch_rendered = false;
+        }
+        return moved;
     }
 
     void set_output(int32_t idx, bool output) {

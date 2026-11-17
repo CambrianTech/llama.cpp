@@ -7,6 +7,13 @@ target_compile_features(test-server-checkpoint-policy PRIVATE cxx_std_17)
 add_test(NAME test-server-checkpoint-policy COMMAND test-server-checkpoint-policy)
 set_tests_properties(test-server-checkpoint-policy PROPERTIES LABELS "main")
 
+# Model-free: removing one slot's tokens from a frame keeps every index into the batch right (4.11.10).
+add_executable(test-server-batch test-server-batch.cpp)
+target_compile_features(test-server-batch PRIVATE cxx_std_17)
+target_link_libraries(test-server-batch PRIVATE llama llama-common)
+add_test(NAME test-server-batch COMMAND test-server-batch)
+set_tests_properties(test-server-batch PROPERTIES LABELS "main")
+
 add_executable(test-server-prefill test-server-prefill.cpp)
 target_compile_features(test-server-prefill PRIVATE cxx_std_17)
 add_test(NAME test-server-prefill COMMAND test-server-prefill)
