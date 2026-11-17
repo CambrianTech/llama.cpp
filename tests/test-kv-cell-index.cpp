@@ -184,14 +184,14 @@ struct measured {
 };
 
 template <typename Cells>
-measured workload(uint32_t n) {
+measured workload(uint32_t n, bool count) {
     Cells cells;
     cells.resize(n);
     volatile llama_pos sink = 0;
     const llama_pos d = -llama_pos(n / 2);
     auto read = [&] { sink = cells.seq_pos_min(0) + cells.seq_pos_max(0) + llama_pos(cells.get_used()); };
     allocations = 0;
-    counting    = true;
+    counting    = count;
     const auto t0 = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < n; ++i) {
         cells.pos_set(i, llama_pos(i));
@@ -213,10 +213,14 @@ measured workload(uint32_t n) {
 }
 
 void cost(uint32_t n) {
-    const measured before = workload<llama_kv_cells_previous>(n);
-    const measured now    = workload<llama_kv_cells>(n);
+    // Timed with the counter off (its atomic add per allocation would charge the side that allocates more), and the
+    // allocations counted in a separate pass of the identical workload.
+    const double before_ms = workload<llama_kv_cells_previous>(n, false).ms;
+    const double now_ms    = workload<llama_kv_cells>(n, false).ms;
+    const uint64_t before_allocs = workload<llama_kv_cells_previous>(n, true).allocations;
+    const uint64_t now_allocs    = workload<llama_kv_cells>(n, true).allocations;
     printf("RECEIPT kv-cell-index n=%u: previous %.3f ms, %llu allocations | native %.3f ms, %llu allocations\n", n,
-           before.ms, (unsigned long long) before.allocations, now.ms, (unsigned long long) now.allocations);
+           before_ms, (unsigned long long) before_allocs, now_ms, (unsigned long long) now_allocs);
 }
 
 } // namespace
