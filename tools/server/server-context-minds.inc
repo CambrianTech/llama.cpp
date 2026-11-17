@@ -73,6 +73,18 @@
         }
     }
 
+    // whether lengths `lens`, taken in order, fit within `room` bytes: each is checked against what is left, so no
+    // sum is formed and a corrupt or crafted length cannot wrap past 2^64 into a "fitting" total (Codex on #139)
+    static bool lengths_fit(uint64_t room, std::initializer_list<uint64_t> lens) {
+        for (const uint64_t n : lens) {
+            if (n > room) {
+                return false;
+            }
+            room -= n;
+        }
+        return true;
+    }
+
     static bool ckpt_read(const uint8_t * r, uint64_t n, std::list<common_prompt_checkpoint> & out) {
         const uint8_t * end = r + n;
         auto get = [&](void * p, size_t k) { if ((size_t) (end - r) < k) { return false; } std::memcpy(p, r, k); r += k; return true; };
@@ -84,7 +96,7 @@
             common_prompt_checkpoint c;
             int32_t id, mn, mx; uint64_t pin, a, b, d;
             if (!get(&c.n_tokens, sizeof(c.n_tokens)) || !get(&id, 4) || !get(&mn, 4) || !get(&mx, 4) || !get(&pin, 8) ||
-                !get(&a, 8) || !get(&b, 8) || !get(&d, 8) || (uint64_t) (end - r) < a + b + d) {
+                !get(&a, 8) || !get(&b, 8) || !get(&d, 8) || !lengths_fit((uint64_t) (end - r), { a, b, d })) {
                 return false;
             }
             c.id_task = id; c.pos_min = mn; c.pos_max = mx; c.pin = pin;
@@ -185,6 +197,14 @@
         for (const auto & c : cold->prompt.checkpoints) {
             n_ck += ckpt_header_bytes + c.data_tgt.size() + c.data_dft.size() + c.data_spec.size();
         }
+        // admitted before it is allocated: her checkpoints are host bytes already counted, so what this copy adds is
+        // her state and the header; over the host budget she is not copied out and stays where she is (Codex on #139)
+        const size_t adds = 3 * sizeof(uint64_t) + n_tgt + n_dft;
+        if (host_budget > 0 && checkpoint_bytes(true) + adds > host_budget) {
+            SRV_WRN("mind %016llx: copying her out would exceed the host budget (%zu + %zu > %zu); she stays where she is\n",
+                    (unsigned long long) cold->page.hi, checkpoint_bytes(true), adds, host_budget);
+            return false;
+        }
         bytes->resize(3 * sizeof(uint64_t) + n_tgt + n_dft + n_ck);
         uint8_t * w = bytes->data();
         const uint64_t h[3] = { n_tgt, n_dft, n_ck };
@@ -271,7 +291,9 @@
         }
         uint64_t h[3];
         std::memcpy(h, base, sizeof(h));
-        if (size != 3 * sizeof(uint64_t) + h[0] + h[1] + h[2]) {
+        // exact: the three parts fill the rest of her bytes, checked part by part (no overflowing sum)
+        const uint64_t body = size - 3 * sizeof(uint64_t);
+        if (!lengths_fit(body, { h[0], h[1], h[2] }) || h[0] + h[1] + h[2] != body) {
             return false;
         }
         const uint8_t * r = base + sizeof(h);

@@ -2682,7 +2682,10 @@ private:
             for (const auto & c : m.prompt.checkpoints) {
                 b += c.size();
             }
-            if (in_flight && m.ram) {
+            // a RAM copy whose flash write FAILED is where she lives now (minds_reap dropped `written`): resident,
+            // counted always; one whose write is still in flight is transient, counted with `in_flight` (Codex on #139)
+            const bool failed_write = m.ram && !m.written;
+            if (m.ram && (in_flight || failed_write)) {
                 b += m.ram->size();
             }
         }
