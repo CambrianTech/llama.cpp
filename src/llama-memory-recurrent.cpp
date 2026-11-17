@@ -448,16 +448,19 @@ void llama_memory_recurrent::persona_commit_save(llama_seq_id seq_id, llama_pers
         return;
     }
     const uint32_t n_groups = 1 + n_rs_seq;
-    for (size_t il = 0; il < r_l.size(); ++il) {
-        for (auto [src, dst] : { std::make_pair(r_l[il], &rs.r[il]), std::make_pair(s_l[il], &rs.s[il]) }) {
-            if (src == nullptr || dst->empty()) {
-                continue;
-            }
-            const size_t row = ggml_row_size(src->type, src->ne[0]);
-            for (uint32_t g = 0; g < n_groups; ++g) {
-                ggml_backend_tensor_get(src, dst->data() + g * row, (size_t) (g * size + tail) * src->nb[1], row);
-            }
+    // her row of one state tensor, in every snapshot group, into her reserved bytes
+    const auto rows_out = [&](const ggml_tensor * src, std::vector<uint8_t> & dst) {
+        if (src == nullptr || dst.empty()) {
+            return;
         }
+        const size_t row = ggml_row_size(src->type, src->ne[0]);
+        for (uint32_t g = 0; g < n_groups; ++g) {
+            ggml_backend_tensor_get(src, dst.data() + g * row, (size_t) (g * size + tail) * src->nb[1], row);
+        }
+    };
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        rows_out(r_l[il], rs.r[il]);
+        rows_out(s_l[il], rs.s[il]);
     }
     auto & cell = cells[tail];
     rs.pos    = cell.pos;
@@ -527,16 +530,19 @@ void llama_memory_recurrent::persona_commit_load(llama_seq_id seq_id, llama_pers
     }
     const int32_t cell_id = slot.cell;
     const uint32_t n_groups = 1 + n_rs_seq;
-    for (size_t il = 0; il < r_l.size(); ++il) {
-        for (auto [dst, src] : { std::make_pair(r_l[il], &rs.r[il]), std::make_pair(s_l[il], &rs.s[il]) }) {
-            if (dst == nullptr) {
-                continue;
-            }
-            const size_t row = ggml_row_size(dst->type, dst->ne[0]);
-            for (uint32_t g = 0; g < n_groups; ++g) {
-                ggml_backend_tensor_set(dst, src->data() + g * row, (size_t) (g * size + cell_id) * dst->nb[1], row);
-            }
+    // her row of one state tensor, in every snapshot group, from her bytes into the reserved cell
+    const auto rows_in = [&](ggml_tensor * dst, const std::vector<uint8_t> & src) {
+        if (dst == nullptr) {
+            return;
         }
+        const size_t row = ggml_row_size(dst->type, dst->ne[0]);
+        for (uint32_t g = 0; g < n_groups; ++g) {
+            ggml_backend_tensor_set(dst, src.data() + g * row, (size_t) (g * size + cell_id) * dst->nb[1], row);
+        }
+    };
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        rows_in(r_l[il], rs.r[il]);
+        rows_in(s_l[il], rs.s[il]);
     }
     auto & cell = cells[cell_id];
     cell.pos  = rs.pos;
