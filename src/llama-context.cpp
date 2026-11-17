@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-persona-tokens.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -4241,8 +4242,48 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
 // Continuum fork (CONTINUUM-ENGINE 4.14): the public seam of a persona's move (llama-persona-blocks.h).
 
 struct llama_persona {
-    llama_persona_blocks blocks;
+    llama_persona_blocks                  blocks;
+    std::unique_ptr<llama_persona_tokens> tokens; // her token history, beside her blocks (llama-persona-tokens.h)
 };
+
+int32_t llama_persona_reserve_tokens(llama_persona * persona, uint64_t persona_id, uint64_t epoch, size_t n_tokens, size_t n_receipts) {
+    persona->tokens = std::make_unique<llama_persona_tokens>(persona_id, epoch, n_tokens, n_receipts);
+    return 0;
+}
+
+llama_persona_append_receipt llama_persona_append(llama_persona * persona, const llama_persona_append_header * header,
+                                                  const llama_token * delta, size_t n) {
+    llama_persona_append_receipt out = { (int32_t) llama_persona_append_status::invalid, 0, 0, 0 };
+    if (persona->tokens == nullptr || header == nullptr) {
+        return out;
+    }
+    llama_persona_append_request h;
+    h.persona    = header->persona;
+    h.epoch      = header->epoch;
+    h.seq        = header->seq;
+    h.frontier   = header->frontier;
+    h.request.hi = header->request_hi;
+    h.request.lo = header->request_lo;
+    const llama_persona_receipt r = persona->tokens->append(h, delta, n);
+    out.status = (int32_t) r.status;
+    out.seq    = r.seq;
+    out.from   = r.from;
+    out.to     = r.to;
+    return out;
+}
+
+const llama_token * llama_persona_token_ids(const llama_persona * persona, uint64_t * n) {
+    if (persona->tokens == nullptr) {
+        *n = 0;
+        return nullptr;
+    }
+    *n = persona->tokens->frontier();
+    return persona->tokens->data();
+}
+
+const char * llama_persona_append_status_name(int32_t status) {
+    return llama_persona_append_status_name((llama_persona_append_status) status);
+}
 
 llama_persona * llama_persona_init(llama_context * ctx) {
     auto * persona = new llama_persona();

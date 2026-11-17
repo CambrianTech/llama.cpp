@@ -31,7 +31,7 @@ struct llama_persona_request_id {
 };
 
 // A fixed-width header: what a request asserts about her history before its delta is appended.
-struct llama_persona_append {
+struct llama_persona_append_request {
     uint64_t                 persona  = 0;
     uint64_t                 epoch    = 0;
     uint64_t                 seq      = 0; // her request sequence in this epoch, from 1
@@ -99,7 +99,7 @@ public:
 
     // One validated transaction: check her identity, epoch, sequence and frontier, then write the delta
     // into the reserved tail. `delta` is read in place (the caller's buffer, valid for the call).
-    llama_persona_receipt append(const llama_persona_append & h, const llama_token * delta, size_t n_delta) {
+    llama_persona_receipt append(const llama_persona_append_request & h, const llama_token * delta, size_t n_delta) {
         llama_persona_receipt r;
         r.seq = h.seq;
         if (h.request.empty() || h.seq == 0 || (delta == nullptr && n_delta != 0)) {

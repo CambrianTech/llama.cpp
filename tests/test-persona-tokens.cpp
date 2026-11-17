@@ -16,8 +16,8 @@ using status = llama_persona_append_status;
 
 static llama_persona_request_id id(uint64_t n) { return { 1, n }; }
 
-static llama_persona_append header(uint64_t persona, uint64_t epoch, uint64_t seq, uint64_t frontier, llama_persona_request_id request) {
-    llama_persona_append h;
+static llama_persona_append_request header(uint64_t persona, uint64_t epoch, uint64_t seq, uint64_t frontier, llama_persona_request_id request) {
+    llama_persona_append_request h;
     h.persona  = persona;
     h.epoch    = epoch;
     h.seq      = seq;

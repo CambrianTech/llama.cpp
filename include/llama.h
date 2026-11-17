@@ -946,6 +946,41 @@ extern "C" {
 
     LLAMA_API const char * llama_persona_status_name(int32_t status);
 
+    // Her token history, held in the persona beside her blocks (so it moves with them by reference, never copied):
+    // one reserved buffer of her token ids and one of her append receipts. A request appends only its new ids, in
+    // one validated transaction (see llama_persona_append). Reserved once by her admitted owner; 0 when done.
+    LLAMA_API int32_t llama_persona_reserve_tokens(struct llama_persona * persona, uint64_t persona_id, uint64_t epoch,
+                                                   size_t n_tokens, size_t n_receipts);
+
+    // What an append asserts about her history: her persona, her epoch, her request sequence (1, 2, 3, ...), the
+    // frontier it expects her history to end at, and the request's own 128-bit identity.
+    struct llama_persona_append_header {
+        uint64_t persona;
+        uint64_t epoch;
+        uint64_t seq;
+        uint64_t frontier;
+        uint64_t request_hi;
+        uint64_t request_lo;
+    };
+
+    struct llama_persona_append_receipt {
+        int32_t  status; // llama_persona_append_status_name; 0 = appended, 1 = replayed (its original receipt)
+        uint64_t seq;
+        uint64_t from;   // where the delta starts in her history
+        uint64_t to;     // her frontier after it
+    };
+
+    // Append `delta` (n ids, read in place; null only when n is 0) to her history after validating `header`. A retry
+    // of a committed sequence returns its original receipt and writes nothing; nothing allocates.
+    LLAMA_API struct llama_persona_append_receipt llama_persona_append(struct llama_persona * persona,
+                                                                       const struct llama_persona_append_header * header,
+                                                                       const llama_token * delta, size_t n);
+
+    // Her history as held: the ids and their count (her frontier). NULL before llama_persona_reserve_tokens.
+    LLAMA_API const llama_token * llama_persona_token_ids(const struct llama_persona * persona, uint64_t * n);
+
+    LLAMA_API const char * llama_persona_append_status_name(int32_t status);
+
     //
     // State / sessions
     //
