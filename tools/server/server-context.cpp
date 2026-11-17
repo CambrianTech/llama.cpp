@@ -3440,6 +3440,7 @@ private:
     // CONTINUUM-ENGINE 4.13 step 1: where each frame's device time went, and a window summary every 10 s
     frame_costs<4096> frames;
     int64_t           frames_reported_us = 0;
+    uint64_t          frames_reported_at = 0; // frames.recorded() at the last summary, so ring overwrites are counted
     server_prefill_order prefill_order;
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
@@ -3597,8 +3598,9 @@ private:
     }
 
     void record_frame(int64_t step_us, int64_t learn_us, bool has_prompt) {
+        const int64_t t_record_start = ggml_time_us();
         frame_cost f;
-        f.at_us         = ggml_time_us();
+        f.at_us         = t_record_start;
         f.step_us       = step_us;
         f.learn_us      = learn_us;
         f.gen_tokens    = n_batch_gen;
@@ -3612,7 +3614,12 @@ private:
         frames.record(f);
         if (f.at_us - frames_reported_us >= 10 * 1000 * 1000) {
             const frame_window w = frames.window(frames_reported_us, f.at_us);
+            const uint64_t dropped = frames.recorded() - frames_reported_at - (uint64_t) w.frames;
             frames_reported_us = f.at_us;
+            frames_reported_at = frames.recorded();
+            if (dropped > 0) {
+                SRV_WRN("frames: %" PRIu64 " frames overwrote the ring before this summary read them\n", dropped);
+            }
             SRV_INF("frames: %" PRId64 " in %.1f s: decode %.1f%% prefill %.1f%% learn %.1f%% idle %.1f%%; "
                     "gen %" PRId64 " tok (%.1f tok/s wall, %.1f tok/s stepping), prompt %" PRId64 " tok; "
                     "widest %" PRId64 " seq, longest context %" PRId64 "\n",
@@ -3620,6 +3627,7 @@ private:
                     100.0 * w.learn_us / w.wall_us, 100.0 * w.idle_us() / w.wall_us, w.gen_tokens, w.gen_tps(),
                     w.decode_tps(), w.prompt_tokens, w.max_sequences, w.max_context);
         }
+        metrics.add_frame(step_us, has_prompt, learn_us, ggml_time_us() - t_record_start);
     }
 
     void pre_decode() {

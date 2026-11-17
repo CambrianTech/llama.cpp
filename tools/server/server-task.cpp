@@ -1603,6 +1603,26 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "frames_total",
+            "Serving-loop frames recorded",
+            (double) metrics.n_frames
+        }, {
+            "frame_decode_seconds_total",
+            "Device time in frames with no prefill",
+            metrics.t_frame_decode_us / 1.e6
+        }, {
+            "frame_prefill_seconds_total",
+            "Device time in frames carrying prefill",
+            metrics.t_frame_prefill_us / 1.e6
+        }, {
+            "frame_learn_seconds_total",
+            "Learning time after each frame's batch",
+            metrics.t_frame_learn_us / 1.e6
+        }, {
+            "frame_record_seconds_total",
+            "The frame recorder's own cost",
+            metrics.t_frame_record_us / 1.e6
         },
     };
 
