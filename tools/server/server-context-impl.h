@@ -5,6 +5,7 @@
 // family compiles in its own translation unit (server-routes-*.cpp).
 
 #include "server-slot.h"
+#include "engine/memory_pool_llama.h"
 #include "engine/responder_http.h"
 #include "engine/turn_results.h"
 
@@ -116,6 +117,9 @@ private:
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
+
+    // the engine's one memory allocator (CONTINUUM-ENGINE 4.12.1), built in load_model once both contexts exist
+    std::unique_ptr<memory_pool> pool;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;

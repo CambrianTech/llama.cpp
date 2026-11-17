@@ -43,8 +43,8 @@
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
-                slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                GGML_ASSERT(slot.mem->remove(slot.id, n_keep, n_keep + n_discard, kv_contexts::both) == edit_outcome::done);
+                GGML_ASSERT(slot.mem->shift(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard, kv_contexts::both) == edit_outcome::done);
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -404,8 +404,8 @@
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
-                                            slot.mem.seq_rm (slot.id, head_p, head_c);
-                                            slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
+                                            GGML_ASSERT(slot.mem->remove(slot.id, head_p, head_c, kv_contexts::both) == edit_outcome::done);
+                                            GGML_ASSERT(slot.mem->shift(slot.id, head_c, head_c + n_match, kv_shift, kv_contexts::both) == edit_outcome::done);
 
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
@@ -606,7 +606,7 @@
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    GGML_ASSERT(slot.mem->remove(slot.id, p0, -1, kv_contexts::both) == edit_outcome::done);
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the

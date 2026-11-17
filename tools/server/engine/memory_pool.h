@@ -3,9 +3,17 @@
 // Continuum fork (CONTINUUM-ENGINE 4.12.1, 4.11.10): the engine's ONE memory allocator. Every change to what the KV
 // pool holds goes through it: a frame's placement (decode), a sequence's removal, shift and copy, and a sequence's
 // state saved out and loaded back (park, flash, page restore, preemption). The host bytes checkpoints and the prompt
-// cache hold join it, with a typed budget, when those charges migrate (no verb before it has a caller). Nothing else in the engine calls llama_decode, llama_memory_seq_*
-// or llama_state_seq_* on the serving contexts; owners ask this interface, so placement and every move share one
-// custody (Codex's singular-allocator condition).
+// cache hold join it, with a typed budget, when those charges migrate (no verb before it has a caller). Owners ask
+// this interface, so placement and every move share one custody (Codex's singular-allocator condition).
+//
+// Migrated: every slot edit (server_slot::mem) and the resident minds (move, flash-out save, removal, insert).
+// Still calling llama directly, each moving with the owner that redesigns it (CONTINUUM-ENGINE 4.12.1):
+//   frame decode (server-context-decode.inc)                      -> frame_batcher, with 4.11.10 admission
+//   learning side sequences, partial removal + checkpoint restore  -> learner, checkpoint_store
+//     (server-context-learn.inc; server-context-prefill.inc draft trim)
+//   page restore of the draft state (server-context-page.inc)      -> tier_store
+//   prompt cache save/load (server_slot::prompt_save, server-task)  -> the typed host budget
+// The list shrinks to empty; a new direct call is a defect.
 //
 // Outcomes are typed and exhaustive; a caller matches every one. Nothing here retries, halves, purges or falls back:
 // a piece that does not fit returns no_room with nothing placed, and making room is the caller's decision

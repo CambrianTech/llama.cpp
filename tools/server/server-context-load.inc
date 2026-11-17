@@ -258,13 +258,15 @@
             model_dft = nullptr;
         }
 
+        pool = std::make_unique<memory_pool_llama>(ctx_tgt, ctx_dft);
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
-            slot.mem.init(ctx_tgt, ctx_dft);
+            slot.mem     = pool.get();
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
 

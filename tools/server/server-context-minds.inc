@@ -137,14 +137,7 @@
     }
 
     void seq_move(llama_seq_id from, llama_seq_id to) {
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), to, -1, -1);
-        llama_memory_seq_cp(llama_get_memory(ctx_tgt), from, to, -1, -1);
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), from, -1, -1);
-        if (ctx_dft) {
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), to, -1, -1);
-            llama_memory_seq_cp(llama_get_memory(ctx_dft), from, to, -1, -1);
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), from, -1, -1);
-        }
+        GGML_ASSERT(pool->move(from, to) == edit_outcome::done); // whole-sequence removals are never refused
     }
 
     std::string mind_file(mind_page page) const {
@@ -178,8 +171,9 @@
         resident_mind * cold = &m;
         const int64_t t0 = ggml_time_us();
         auto bytes = std::make_shared<std::vector<uint8_t>>();
-        const size_t n_tgt = llama_state_seq_get_size_ext(ctx_tgt, seq, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t n_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, seq, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const seq_state_size n_state = pool->state_size(seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_tgt = n_state.tgt;
+        const size_t n_dft = n_state.dft;
         // her checkpoints go down with her (they are host bytes too: ~100 MB each on a 35B hybrid)
         size_t n_ck = sizeof(uint64_t);
         for (const auto & c : cold->prompt.checkpoints) {
@@ -191,17 +185,13 @@
         std::memcpy(w, h, sizeof(h));
         w += sizeof(h);
         ckpt_write(cold->prompt.checkpoints, w + n_tgt + n_dft);
-        if (llama_state_seq_get_data_ext(ctx_tgt, w, n_tgt, seq, LLAMA_STATE_SEQ_FLAGS_NONE) != n_tgt ||
-            (ctx_dft && llama_state_seq_get_data_ext(ctx_dft, w + n_tgt, n_dft, seq, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft)) {
+        if (pool->save(seq, LLAMA_STATE_SEQ_FLAGS_NONE, w, w + n_tgt) != save_outcome::saved) {
             SRV_ERR("mind %016llx: her state could not be copied out of the pool; she stays where she is\n", (unsigned long long) cold->page.hi);
             return false;
         }
         const int64_t t_copy = ggml_time_us() - t0;
         std::list<common_prompt_checkpoint>().swap(cold->prompt.checkpoints); // their bytes are in hers now
-        llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq, -1, -1);
-        if (ctx_dft) {
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq, -1, -1);
-        }
+        GGML_ASSERT(pool->remove(seq, -1, -1, kv_contexts::both) == edit_outcome::done);
         cold->seq     = -1;
         cold->file    = mind_file(cold->page);
         cold->ram     = bytes; // the record holds her bytes until her file has landed
@@ -281,26 +271,17 @@
         }
         // her cells come from the pool: when it is full, the coldest parked mind goes down to flash first, and the
         // insert is tried again (a level above makes room for the level below, never a drop)
+        // both contexts take her state or neither does (memory_pool::load); a refusal makes room by sending the
+        // coldest parked mind to flash, and stops when none is left to send
         bool ok = false;
         while (true) {
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq, -1, -1);
-            ok = llama_state_seq_set_data_ext(ctx_tgt, r, h[0], seq, LLAMA_STATE_SEQ_FLAGS_NONE) == h[0];
-            if (ok || !flash_coldest()) {
-                break;
-            }
-        }
-        while (ok && ctx_dft && h[1] > 0) {
-            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq, -1, -1);
-            ok = llama_state_seq_set_data_ext(ctx_dft, r + h[0], h[1], seq, LLAMA_STATE_SEQ_FLAGS_NONE) == h[1];
+            GGML_ASSERT(pool->remove(seq, -1, -1, kv_contexts::both) == edit_outcome::done);
+            ok = pool->load(seq, LLAMA_STATE_SEQ_FLAGS_NONE, r, h[0], r + h[0], h[1]) == load_outcome::loaded;
             if (ok || !flash_coldest()) {
                 break;
             }
         }
         if (!ok) {
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq, -1, -1);
-            if (ctx_dft) {
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq, -1, -1);
-            }
             SRV_WRN("mind %016llx%016llx: the pool cannot hold her even with every other mind on flash; she stays on flash\n",
                     (unsigned long long) m.page.hi, (unsigned long long) m.page.lo);
             return false; // her file and record are kept: she is still on flash, never lost

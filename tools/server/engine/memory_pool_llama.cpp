@@ -91,7 +91,7 @@ load_outcome memory_pool_llama::load(llama_seq_id seq, llama_state_seq_flags fla
     if (llama_state_seq_set_data_ext(tgt_, tgt, n_tgt, seq, flags) != n_tgt) {
         return load_outcome::refused;
     }
-    if (dft_ != nullptr && llama_state_seq_set_data_ext(dft_, dft, n_dft, seq, flags) != n_dft) {
+    if (dft_ != nullptr && n_dft > 0 && llama_state_seq_set_data_ext(dft_, dft, n_dft, seq, flags) != n_dft) {
         // the target took its half and the draft refused: the target's half goes, so the sequence is not left half
         // loaded (both contexts hold it, or neither does); a whole-sequence removal is never refused
         GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(tgt_), seq, -1, -1));
