@@ -180,6 +180,8 @@ struct server_routes {
     server_http_context::handler_t get_learn_events;
     server_http_context::handler_t post_prompt_cache_limit;
     server_http_context::handler_t get_page_io, post_page_io_budget; // the KV page IO budget (server-page-io.h)
+    server_http_context::handler_t post_learn_release;  // an abandoned turn's learn pin, released
+    server_http_context::handler_t post_minds_prefetch; // the next mind, from flash into the pool (server-context-minds.inc)
     server_http_context::handler_t get_train;
     server_http_context::handler_t post_train;
     server_http_context::handler_t post_train_cancel;
@@ -200,6 +202,8 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot, bool size_only);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
+    std::unique_ptr<server_res_generator> handle_minds_prefetch(const server_http_req &);
+    std::unique_ptr<server_res_generator> handle_learn_release(const server_http_req &);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const server_http_req & req, task_response_type res_type);
 

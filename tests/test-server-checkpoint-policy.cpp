@@ -22,6 +22,7 @@ struct ckpt {
     int64_t n_tokens;
     int     id_task;
     int     serial; // identity: a checkpoint is the same one only if its serial matches
+    uint64_t pin = 0; // nonzero: held for learning (common.h server_prompt_checkpoint::pin)
 };
 
 using store = std::list<ckpt>;
@@ -49,6 +50,23 @@ static void head_survives_a_full_store_across_many_acts() {
         require(s.front().serial == head_serial && s.front().n_tokens == 9655,
                 "her exact head checkpoint (position 9655, the one pinned before filling) survives every act");
     }
+}
+
+// regression for the pin added on #139: a checkpoint pinned for learning is never the victim, and a store whose
+// every candidate is pinned yields end() so the caller defers instead of erasing a learner's checkpoint
+static void a_pinned_checkpoint_is_never_evicted() {
+    store s;
+    for (int i = 0; i < 4; ++i) {
+        s.push_back({ 9655 + i * 1000, i, i });
+    }
+    s.front().pin = 0;
+    std::next(s.begin(), 1)->pin = 7;
+    auto victim = checkpoint_to_evict(s, /*view_end=*/100000);
+    require(victim != s.end() && victim->pin == 0, "the victim is unpinned");
+    for (auto & c : s) {
+        c.pin = 1 + (uint64_t) c.serial;
+    }
+    require(checkpoint_to_evict(s, 100000) == s.end(), "all pinned: no victim");
 }
 
 static void the_pre_fix_rule_loses_the_head() {
@@ -142,6 +160,7 @@ static void a_cold_prompt_with_view_spans_makes_her_head() {
 
 int main() {
     a_cold_prompt_with_view_spans_makes_her_head();
+    a_pinned_checkpoint_is_never_evicted();
     head_survives_a_full_store_across_many_acts();
     the_pre_fix_rule_loses_the_head();
     capacity_one_keeps_only_what_fits();

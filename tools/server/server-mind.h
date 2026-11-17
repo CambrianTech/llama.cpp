@@ -1,0 +1,86 @@
+#pragma once
+
+// Continuum fork: a MIND, named by the request (the core's PageKey::Mind, a 128-bit id), never guessed from her
+// tokens. Text exists only at the JSON edge: a request's "page" is parsed here once, into two integers.
+//
+// Switching minds costs almost nothing (Joel, 2026-11-16: "This is the entire difference between a multi mind
+// system and a POS"): a mind leaving a lane is PARKED as a sequence of the unified KV pool (seq_cp + seq_rm:
+// attention cells re-tagged, the recurrent state moved by id, nothing serialized), and a mind arriving is moved
+// back the same way, continuing at her own end. server-context.cpp holds the parked table (sized once at load
+// from the context's sequence capacity) and performs the moves.
+
+#include <cstdint>
+#include <random>
+#include <string>
+
+// This engine incarnation's token, drawn once per process and reported on /props (resident_minds.incarnation).
+// The core sends it back with a prefetch, so a stream meant for a replaced engine is refused: issued by the engine
+// itself, never inferred from an OS pid (which the OS reuses).
+inline uint64_t mind_incarnation() {
+    static const uint64_t token = [] {
+        std::random_device rd;
+        const uint64_t t = ((uint64_t) rd() << 32) ^ (uint64_t) rd();
+        return t != 0 ? t : 1;
+    }();
+    return token;
+}
+
+struct mind_page {
+    uint64_t hi = 0, lo = 0;
+    bool valid() const { return hi != 0 || lo != 0; }
+    bool operator==(const mind_page & o) const { return hi == o.hi && lo == o.lo; }
+    bool operator!=(const mind_page & o) const { return !(*this == o); }
+};
+
+// Where a prefetch left her (POST /minds/prefetch's "mind"; frozen spellings in mind_place_name). lane / parked: she
+// is in the pool and her switch is a sequence move. unknown: the engine has never served her (her first turn builds
+// her). deferred_no_parked_id / deferred_pool_full: she stays on flash and her turn switches through it.
+// minds_off: the engine was launched without --minds.
+enum class mind_place : uint8_t { lane, parked, unknown, deferred_no_parked_id, deferred_pool_full, minds_off };
+
+inline const char * mind_place_name(mind_place p) {
+    static const char * names[] = { "lane", "parked", "unknown", "deferred_no_parked_id", "deferred_pool_full", "minds_off" };
+    return names[(size_t) p];
+}
+
+// What POST /learn/release did with a learn pin (frozen spellings): released: the checkpoint is unpinned now;
+// released_on_flash: she is on flash, and it is unpinned when her checkpoints come back; not_pinned: no checkpoint
+// of hers holds that pin (already learned, released, or invalidated by a prompt that diverged before it);
+// unknown_mind: the engine holds no mind by that page. A pin is its id (mind.pin on the turn receipt), never a
+// position: two turns of the same length never share one.
+enum class pin_release : uint8_t { released, released_on_flash, not_pinned, unknown_mind };
+
+inline const char * pin_release_name(pin_release r) {
+    static const char * names[] = { "released", "released_on_flash", "not_pinned", "unknown_mind" };
+    return names[(size_t) r];
+}
+
+// "page": 32 hexadecimal digits, dashes allowed (a UUID). Anything else is no page (the request is anonymous).
+inline mind_page mind_page_parse(const std::string & s) {
+    mind_page p;
+    int n = 0;
+    for (char c : s) {
+        if (c == '-') {
+            continue;
+        }
+        int v;
+        if (c >= '0' && c <= '9') {
+            v = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            v = c - 'a' + 10;
+        } else if (c >= 'A' && c <= 'F') {
+            v = c - 'A' + 10;
+        } else {
+            return mind_page{};
+        }
+        if (n < 16) {
+            p.hi = (p.hi << 4) | (uint64_t) v;
+        } else if (n < 32) {
+            p.lo = (p.lo << 4) | (uint64_t) v;
+        } else {
+            return mind_page{};
+        }
+        ++n;
+    }
+    return n == 32 ? p : mind_page{};
+}

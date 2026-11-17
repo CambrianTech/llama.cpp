@@ -446,6 +446,7 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    int32_t n_minds               =     0; // continuum: minds kept resident beside the lanes (parked sequences); the core's count
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
@@ -1154,6 +1155,10 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;
+
+    // continuum: held for a turn the core will learn (its served prompt's end, n_prefix - 1): never evicted or
+    // superseded until that turn is learned on a side sequence or abandoned
+    uint64_t pin = 0; // continuum: the learn pin holding it (unique per engine process; 0: not pinned)
 
     // (optional) id of the task that created the checkpoint
     int id_task = -1;

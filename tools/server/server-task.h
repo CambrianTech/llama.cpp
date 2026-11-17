@@ -1,5 +1,6 @@
 #pragma once
 
+#include "server-mind.h"
 #include "common.h"
 #include "llama.h"
 
@@ -59,6 +60,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_MIND_PREFETCH,
+    SERVER_TASK_TYPE_LEARN_RELEASE, // Continuum fork: an abandoned turn's learn pin, released (server-context-minds.inc) // Continuum fork: the next mind, from flash into a parked sequence, ahead of her turn
     SERVER_TASK_TYPE_SLOT_PAGE_IO_DONE, // Continuum fork: a save's or restore's file IO finished on its worker
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_LOAD_LORA,
@@ -100,6 +103,10 @@ struct learn_request {
     std::vector<llama_token> prompt;            // the served prompt, when known: her slot must hold exactly it
     int32_t                  lora_id  = -1;     // the trainable adapter (the shadow), loaded dormant
     float                    lr       = 1e-4f;
+    // continuum: learn on a side sequence (her prefix re-tagged, the pinned checkpoint's recurrent state loaded):
+    // her own sequence is never cut, reloaded or truncated; refused, typed, when no side sequence or no pinned
+    // checkpoint at n_prefix - 1 exists (never a fallback to her slot)
+    bool                     side     = false;
 };
 
 struct learn_outcome {
@@ -107,6 +114,12 @@ struct learn_outcome {
     bool        effects_uncertain = false;
     std::string refusal = "none";
     bool        ok       = false;
+    // continuum: where it learned, typed. none: no learning ran (a refusal or deferral before custody);
+    // side_sequence: on a side sequence; slot: on her own sequence (cut back to the learned turn's prefix).
+    enum class learned_on_kind : uint8_t { none, slot, side_sequence } learned_on = learned_on_kind::none;
+    // whether her live sequence is exactly as it was: stated by the path that ran, never inferred from success
+    // (true for every refusal before custody and every side-sequence learn; false only when the slot path cut it)
+    bool        live_sequence_preserved = true;
     bool        deferred = false;
     int64_t     retry_after_ms = 0;
     std::string failure;
@@ -174,6 +187,11 @@ struct task_params {
     // append-only part of the prompt the caller's next request sends again unchanged. The prompt
     // is checkpointed exactly there and a saved page keeps that checkpoint. -1 = not given.
     int32_t view_end_pos = -1;
+    // Continuum fork: the mind this request is (the core's PageKey::Mind; server-mind.h). Invalid: anonymous.
+    mind_page page;
+    // Continuum fork: the core will learn this turn later: pin the checkpoint at its prompt's end - 1
+    bool learn_pin = false;
+    uint64_t learn_release_pin = 0; // /learn/release: the pin to release (the turn receipt's mind.pin)
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -704,6 +722,25 @@ struct server_task_result_control : server_task_result {
             out["message"] = message;
         }
         return out;
+    }
+};
+
+// continuum: POST /learn/release's reply, typed (`release`: a pin_release_name spelling)
+struct server_task_result_learn_release : server_task_result {
+    pin_release outcome = pin_release::unknown_mind;
+
+    virtual json to_json() override {
+        return json { { "release", pin_release_name(outcome) } };
+    }
+};
+
+// continuum: POST /minds/prefetch's reply, typed (`mind`: a mind_place_name spelling)
+struct server_task_result_mind_prefetch : server_task_result {
+    mind_place place = mind_place::minds_off;
+    double     elapsed_ms = 0.0;
+
+    virtual json to_json() override {
+        return json { { "mind", mind_place_name(place) }, { "elapsed_ms", elapsed_ms } };
     }
 };
 

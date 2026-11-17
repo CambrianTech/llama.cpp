@@ -2,6 +2,9 @@
 #include "server-context.h"
 #include "server-checkpoint-policy.h"
 #include "server-view-end.h"
+#include "server-mapped-file.h"
+#include <filesystem>
+#include <thread>
 #include "../../src/llama-ext.h"
 #include "server-train.h"
 #include "server-adapter-file.h"
@@ -318,6 +321,10 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+
+    // Continuum fork: the mind whose sequence this lane holds (server-context-minds.inc); invalid: anonymous
+    mind_page page;
+    uint64_t  page_generation = 0; // her state's generation on this lane
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -1058,6 +1065,7 @@ private:
         bool began = false;
         std::string grant;
         int32_t lora_id = -1;
+        llama_seq_id side = -1; // learning on a side sequence: her own sequence is never touched
         std::string refusal = "none";
         bool drained = false;
         uint64_t restoration_reservation = 0;
@@ -1244,7 +1252,9 @@ private:
 
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
-        params_base.n_outputs_max = output_limits.total;
+        // the context reserves at least one output row per sequence: parked minds are sequences (they produce no
+        // outputs, but the reserve counts them)
+        params_base.n_outputs_max = std::max<int32_t>(output_limits.total, params_base.n_parallel + std::max<int32_t>(0, params_base.n_minds));
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
@@ -1463,6 +1473,9 @@ private:
         if (!page_io) {
             page_io = std::make_unique<server_page_io_pool>((size_t) params_base.n_parallel);
         }
+        if (!minds_init()) {
+            return false;
+        }
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1567,6 +1580,14 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // Continuum fork (CONTINUUM-ENGINE 4.7.6, step 1): --cache-ram is the ONE host budget of the prompt
+            // cache AND every slot's checkpoints. They were sized apart and nothing held their sum: on the M5
+            // (2026-11-16) a 9.5 GB cache plus up to 32 x ~100 MB checkpoints x 5 slots swapped 16 GB out of the
+            // engine and decode fell to 1.3 tok/s (par ~56).
+            if (params_base.cache_ram_mib > 0) {
+                host_budget = 1024ull * 1024ull * (size_t) params_base.cache_ram_mib;
+                SRV_INF("host budget (prompt cache + checkpoints, all slots): %d MiB\n", params_base.cache_ram_mib);
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1850,6 +1871,14 @@ private:
             }
         }
 
+        // a named mind switches by sequence moves (server-context-minds.inc), never through the prompt cache
+        if (ret && minds_on() && task.params.page.valid()) {
+            if (!mind_switch(*ret, task.params.page)) {
+                return nullptr; // the switch could not complete intact: this request waits (never runs cold)
+            }
+            update_cache = false;
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
@@ -1861,6 +1890,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                fit_prompt_cache_to_budget(); // its share of the one host budget, before it takes a new entry
                 ret->prompt_save(*prompt_cache);
 
                 const auto task_lora = task.params.lora.empty() ? params_base.lora_adapters
@@ -1890,8 +1920,38 @@ private:
             return res;
         }
 
+        // resident minds: the pool's coldest parked mind goes to flash, whole; an idle lane's mind is never purged
+        if (minds_on()) {
+            if (flash_coldest()) {
+                return true;
+            }
+            for (auto & slot : slots) {
+                if (!slot.is_processing() && slot.page.valid() && slot.prompt.n_tokens() > 0) {
+                    resident_mind m;
+                    m.page     = slot.page;
+                    m.lora     = slot.lora;
+                    m.last_use   = ++mind_clock;
+                    m.generation = slot.page_generation + 1;
+                    m.prompt = std::move(slot.prompt);
+                    slot.prompt.clear();
+                    if (flash_out(m, slot.id)) {
+                        slot.page = mind_page{};
+                        minds.push_back(std::move(m));
+                        return true;
+                    }
+                    slot.prompt = std::move(m.prompt); // she stays whole on her lane
+                }
+            }
+        }
+
         for (auto & slot : slots) {
             if (slot.is_processing()) {
+                continue;
+            }
+            // a mind is never purged: when neither a parked mind nor an idle lane's mind could go to flash above,
+            // there is no legal move for her and this returns false (Codex on #139); an anonymous slot's cached
+            // prompt (no mind) may still be cleared
+            if (minds_on() && slot.page.valid()) {
                 continue;
             }
 
@@ -2309,6 +2369,7 @@ private:
 #include "server-context-learn.inc"
 #include "server-context-learn-checkpoint.inc"
 #include "server-context-page.inc"
+#include "server-context-minds.inc"
 
     void send_final_response(server_slot & slot) {
         if (slot.task->params.learn_only) {
@@ -2601,6 +2662,107 @@ private:
         }
     }
 
+    // ---- the one host budget (CONTINUUM-ENGINE 4.7.6, step 1) ------------------------------------------
+    // 0: no budget (--cache-ram -1 or 0). Checkpoints are charged first (they serve the minds in the slots);
+    // the prompt cache holds what is left and evicts down to it.
+    size_t host_budget = 0;
+
+    // every host byte the engine holds beside the prompt cache: the lanes' checkpoints, the parked minds'
+    // checkpoints, and a flashed mind's RAM copy until her file has landed (server-context-minds.inc)
+    // `in_flight`: also a flashed mind's RAM copy (freed within ms of its write landing). The make-room decision
+    // counts only what stays resident, so sending one mind down is seen to free her checkpoints.
+    size_t checkpoint_bytes(bool in_flight = true) const {
+        size_t b = 0;
+        for (const auto & s : slots) {
+            for (const auto & c : s.prompt.checkpoints) {
+                b += c.size();
+            }
+        }
+        for (const auto & m : minds) {
+            for (const auto & c : m.prompt.checkpoints) {
+                b += c.size();
+            }
+            // a RAM copy whose flash write FAILED is where she lives now (minds_reap dropped `written`): resident,
+            // counted always; one whose write is still in flight is transient, counted with `in_flight` (Codex on #139)
+            const bool failed_write = m.ram && !m.written;
+            if (m.ram && (in_flight || failed_write)) {
+                b += m.ram->size();
+            }
+        }
+        return b;
+    }
+
+    // The prompt cache's share: the budget less every checkpoint (1 byte, not 0, when none is left: the
+    // cache reads 0 as "no limit").
+    void fit_prompt_cache_to_budget() {
+        if (!prompt_cache || host_budget == 0) {
+            return;
+        }
+        const size_t ck = checkpoint_bytes();
+        prompt_cache->limit_size = host_budget > ck ? host_budget - ck : 1;
+        prompt_cache->update();
+    }
+
+    // Room for a checkpoint of `bytes` under the budget: the slot holding the most checkpoint bytes gives up its
+    // least valuable one (checkpoint_to_evict keeps her head while anything else is left), until it fits. False:
+    // it cannot fit even with every checkpoint gone (larger than the budget); the caller makes none.
+    bool make_room_for_checkpoint(size_t bytes) {
+        if (host_budget == 0) {
+            return true;
+        }
+        if (bytes > host_budget) {
+            return false;
+        }
+        // the coldest parked mind goes down to flash first (her checkpoints with her): the minds acting keep theirs
+        while (checkpoint_bytes(false) + bytes > host_budget && minds_on() && flash_coldest()) {
+        }
+        size_t held = checkpoint_bytes(false); // what stays resident: copies on their way to flash are leaving
+        while (held + bytes > host_budget) {
+            server_slot * from = nullptr;
+            size_t        most = 0;
+            for (auto & s : slots) {
+                size_t b = 0;
+                for (const auto & c : s.prompt.checkpoints) {
+                    b += c.size();
+                }
+                if (b > most) {
+                    most = b;
+                    from = &s;
+                }
+            }
+            if (from == nullptr) {
+                return false;
+            }
+            // her newest checkpoint is where her next act resumes (her context only appends): it goes last.
+            // Otherwise the store's own order (her head kept while anything else is left), never a pinned one.
+            auto & cks = from->prompt.checkpoints;
+            auto newest = cks.end();
+            for (auto it = cks.begin(); it != cks.end(); ++it) {
+                if (newest == cks.end() || it->n_tokens > newest->n_tokens) {
+                    newest = it;
+                }
+            }
+            auto victim = cks.end();
+            for (auto it = cks.begin(); it != cks.end(); ++it) {
+                if (it != newest && it->pin == 0) {
+                    victim = it;
+                    break;
+                }
+            }
+            if (victim == cks.end() && newest != cks.end() && newest->pin == 0) {
+                victim = newest; // all that is left
+            }
+            if (victim == cks.end()) {
+                return false; // every checkpoint left is pinned for learning
+            }
+            SLT_WRN(*from, "host budget: erasing a checkpoint (n_tokens = %" PRId64 ", %.3f MiB) for a new one of %.3f MiB\n",
+                    victim->n_tokens, (float) victim->size() / 1024 / 1024, (float) bytes / 1024 / 1024);
+            held -= victim->size();
+            from->prompt.checkpoints.erase(victim);
+        }
+        return true;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2610,7 +2772,8 @@ private:
         const int64_t step = checkpoint_step(slot);
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + step) {
+            // a checkpoint pinned for learning stays until learned or released, however close (/learn/release)
+            if (it->id_task != id_task && it->pin == 0 && last >= 0 && it->n_tokens <= last + step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
@@ -2626,11 +2789,27 @@ private:
             // make room for the new checkpoint, if needed: her head stays while there is anything else
             // to evict (server-checkpoint-policy.h)
             auto victim = checkpoint_to_evict(slot.prompt.checkpoints, slot.prompt.view_end);
+            if (victim == slot.prompt.checkpoints.end()) {
+                break; // every checkpoint is pinned for learning: the store holds one more until they are learned
+            }
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     victim->pos_min, victim->pos_max, victim->n_tokens, (float) victim->size() / 1024 / 1024);
 
             slot.prompt.checkpoints.erase(victim);
+        }
+
+        // under the one host budget: quote the copy before making it (its peak), and make room first
+        {
+            size_t quote = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (ctx_dft && ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                quote += llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+            if (!make_room_for_checkpoint(quote)) {
+                SLT_WRN(slot, "host budget: a checkpoint of %.3f MiB does not fit beside what stays resident (budget %.3f MiB); none is made\n",
+                        (float) quote / 1024 / 1024, (float) host_budget / 1024 / 1024);
+                return;
+            }
         }
 
         // the copy is made aside and kept only once complete
@@ -2648,7 +2827,12 @@ private:
             return;
         }
 
-        const auto & kept = slot.prompt.checkpoints.emplace_back(std::move(cur));
+        auto & kept = slot.prompt.checkpoints.emplace_back(std::move(cur));
+        if (slot.task->params.learn_pin && kept.n_tokens == (int64_t) slot.task->n_tokens() - 1) {
+            kept.pin = ++learn_pin_clock; // the core will learn this turn: kept until learned or released (/learn/release)
+            slot.stats.mind_pin       = kept.pin;
+            slot.stats.mind_pinned_at = kept.n_tokens;
+        }
 
         // Continuum fork (CONTINUUM-ENGINE 4.7.3, placed checkpoints): her new view-end checkpoint
         // supersedes every checkpoint an earlier act left on this prefix except her head's (the oldest,
@@ -2659,6 +2843,8 @@ private:
                 SLT_TRC(slot, "erasing a checkpoint her view end supersedes (n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it.n_tokens, (float) it.size() / 1024 / 1024);
             });
+
+        fit_prompt_cache_to_budget(); // the cache yields what the checkpoints now hold
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -2883,6 +3069,22 @@ private:
                 {
                     page_io_done(std::move(task));
                 } break;
+            case SERVER_TASK_TYPE_LEARN_RELEASE:
+                {
+                    auto res = std::make_unique<server_task_result_learn_release>();
+                    res->id      = task.id;
+                    res->outcome = learn_release(task.params.page, task.params.learn_release_pin);
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_MIND_PREFETCH:
+                {
+                    const int64_t t0 = ggml_time_us();
+                    auto res = std::make_unique<server_task_result_mind_prefetch>();
+                    res->id         = task.id;
+                    res->place      = minds_on() ? mind_prefetch(task.params.page) : mind_place::minds_off;
+                    res->elapsed_ms = (ggml_time_us() - t0) / 1000.0;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -2902,6 +3104,7 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear();
+                    slot->page = mind_page{}; // erased: no mind's sequence is here now
                     page_slot_reassigned(*slot); // a restore buffered for this slot is dropped, never applied over it
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
@@ -3265,6 +3468,9 @@ private:
 #endif
 
     void update_slots() {
+        if (minds_on()) {
+            minds_reap(); // a landed flash write frees her RAM copy; a failed one is written again
+        }
         const bool learning_at_start = bool(learning);
         publish_busy_slots();
         struct publish_on_exit { server_context_impl * s; ~publish_on_exit() { s->publish_busy_slots(); } } publish_guard{this};
@@ -4874,6 +5080,19 @@ server_context_meta server_context::get_meta() const {
             { "allocated_tokens",        llama_n_ctx(impl->ctx_tgt) },
             { "max_tokens_per_sequence", impl->n_ctx_slot },
             { "sequence_capacity",       llama_n_seq_max(impl->ctx_tgt) },
+            // the engine owns mind switches (server-context-minds.inc): a request naming its "page" is switched by
+            // sequence moves; the core reads this BEFORE dispatch to skip its own page save/restore (Codex on #139)
+            { "resident_minds", json {
+                { "enabled",    impl->minds_on() },
+                { "lanes",      impl->params_base.n_parallel },
+                // fixed capacity (the context's sequences beyond the lanes, while minds are on): the core compares it
+                // across discoveries, so it must not move when a mind parks (Codex on #139/#6087); the free count is
+                // its own field
+                { "parked_ids",  (int64_t) (impl->params_base.n_minds > 0
+                                                ? llama_n_seq_max(impl->ctx_tgt) - impl->params_base.n_parallel : 0) },
+                { "parked_free", (int64_t) impl->park_free.size() },
+                { "incarnation", mind_incarnation() },
+            } },
         },
     };
 }
@@ -4993,6 +5212,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
 
             task.id_slot = json_value(data, "id_slot", -1);
+            task.params.page = mind_page_parse(json_value(data, "page", std::string())); // text only at this edge
+            task.params.learn_pin = json_value(data, "learn_pin", false);
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
@@ -6459,6 +6680,8 @@ void server_routes::init_routes() {
         res->ok(page_io_snapshot());
         return res;
     };
+    this->post_minds_prefetch = [this](const server_http_req & req) { return handle_minds_prefetch(req); };
+    this->post_learn_release  = [this](const server_http_req & req) { return handle_learn_release(req); };
     this->post_learn_grants = [grant_route](const server_http_req & req) { return grant_route(req, "register"); };
     this->revoke_learn_grant = [grant_route](const server_http_req & req) { return grant_route(req, "revoke"); };
 
@@ -6482,6 +6705,7 @@ void server_routes::init_routes() {
         task.learn.n_prefix = json_value(body, "n_prefix", 0);
         task.learn.lora_id  = json_value(body, "lora_id",  -1);
         task.learn.lr       = json_value(body, "lr",       1e-4f);
+        task.learn.side     = json_value(body, "side_sequence", false);
         if (body.contains("messages")) {
             try {
                 const auto example = render_learn_example(body);
@@ -6510,6 +6734,25 @@ void server_routes::init_routes() {
                 rd.post_task(std::move(task));
                 auto result = rd.next(req.should_stop);
                 if (result) { res->ok(result->to_json()); }
+                return res;
+            }
+            // A side-sequence learn never serves the example on her slot (that would cut her context back to the
+            // example's prompt): her slot must already hold the prompt as a prefix of what she has now, and the
+            // learn runs on a side sequence (server-context-learn.inc), refused typed otherwise
+            if (task.learn.side) {
+                auto & rd = res->rd;
+                task.id = rd.get_new_id();
+                rd.post_task(std::move(task));
+                auto result = rd.next(req.should_stop);
+                if (!result) {
+                    GGML_ASSERT(req.should_stop());
+                    return res;
+                }
+                if (result->is_error()) {
+                    res->error(result->to_json());
+                    return res;
+                }
+                res->ok(result->to_json());
                 return res;
             }
             // A past example (S4 (f); fork #89): her slot may no longer hold this prompt. Serve it
@@ -6809,6 +7052,75 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_save_load*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+// Continuum fork: POST /minds/prefetch {"page": "<mind>"}: her state comes from flash into a parked sequence now,
+// ahead of her turn (server-context-minds.inc). The reply names where she is.
+// an abandoned turn's learn pin, released (the core sends the turn receipt's mind.page and mind.pin)
+std::unique_ptr<server_res_generator> server_routes::handle_learn_release(const server_http_req & req) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    const json body = req.body.empty() ? json::object() : json::parse(req.body);
+    {
+        server_task task(SERVER_TASK_TYPE_LEARN_RELEASE);
+        task.id = rd.get_new_id();
+        task.params.page = mind_page_parse(json_value(body, "page", std::string()));
+        task.params.learn_release_pin = json_value(body, "pin", (uint64_t) 0);
+        if (json_value(body, "incarnation", (uint64_t) 0) != mind_incarnation()) {
+            res->error(format_error_response("incarnation names another engine: this release was for a replaced engine", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!task.params.page.valid() || task.params.learn_release_pin == 0) {
+            res->error(format_error_response("page must name a mind and pin the turn receipt's mind.pin", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        rd.post_task(std::move(task));
+    }
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    GGML_ASSERT(dynamic_cast<server_task_result_learn_release*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_minds_prefetch(const server_http_req & req) {
+    auto res = create_response();
+    auto & rd = res->rd;
+    const json body = req.body.empty() ? json::object() : json::parse(req.body);
+    {
+        server_task task(SERVER_TASK_TYPE_MIND_PREFETCH);
+        task.id = rd.get_new_id();
+        task.params.page = mind_page_parse(json_value(body, "page", std::string()));
+        // a stream meant for another incarnation of this engine (a replacement after a restart) is refused, typed
+        if (json_value(body, "incarnation", (uint64_t) 0) != mind_incarnation()) {
+            res->error(format_error_response("incarnation names another engine: this prefetch was for a replaced engine", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!task.params.page.valid()) {
+            res->error(format_error_response("page must name a mind (32 hexadecimal digits, a UUID)", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        rd.post_task(std::move(task));
+    }
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+    GGML_ASSERT(dynamic_cast<server_task_result_mind_prefetch*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }
