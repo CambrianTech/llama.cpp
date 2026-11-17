@@ -392,6 +392,92 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     return result;
 }
 
+llama_rs_seq_move llama_memory_recurrent::seq_save(llama_seq_id seq_id, llama_rs_seq_blocks & out) {
+    if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
+        return llama_rs_seq_move::invalid_seq;
+    }
+    const int32_t tail = cells[seq_id].tail;
+    out.has_state = tail >= 0;
+    out.r.assign(r_l.size(), {});
+    out.s.assign(s_l.size(), {});
+    if (!out.has_state) {
+        return llama_rs_seq_move::done;
+    }
+    auto & cell = cells[tail];
+    if (cell.seq_id.size() != 1) {
+        return llama_rs_seq_move::shared_cell;
+    }
+    const uint32_t n_groups = 1 + n_rs_seq;
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        for (auto [src, dst] : { std::make_pair(r_l[il], &out.r[il]), std::make_pair(s_l[il], &out.s[il]) }) {
+            if (src == nullptr) {
+                continue;
+            }
+            const size_t row = ggml_row_size(src->type, src->ne[0]);
+            dst->resize(row * n_groups);
+            for (uint32_t g = 0; g < n_groups; ++g) {
+                ggml_backend_tensor_get(src, dst->data() + g * row, (size_t) (g * size + tail) * src->nb[1], row);
+            }
+        }
+    }
+    out.pos    = cell.pos;
+    out.rs_idx = rs_idx[seq_id];
+
+    // her cell leaves with her
+    cell.seq_id.clear();
+    cell.pos = -1;
+    cell.src = -1;
+    cell.src0 = -1;
+    cells[seq_id].tail = -1;
+    rs_idx[seq_id] = 0;
+    used -= 1;
+    head = std::min<uint32_t>(head, (uint32_t) tail);
+    return llama_rs_seq_move::done;
+}
+
+llama_rs_seq_move llama_memory_recurrent::seq_load(llama_seq_id seq_id, const llama_rs_seq_blocks & in) {
+    if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
+        return llama_rs_seq_move::invalid_seq;
+    }
+    if (cells[seq_id].tail >= 0) {
+        return llama_rs_seq_move::seq_holds_state;
+    }
+    if (!in.has_state) {
+        return llama_rs_seq_move::done;
+    }
+    int32_t cell_id = -1;
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].is_empty() && cells[i].pos < 0) {
+            cell_id = (int32_t) i;
+            break;
+        }
+    }
+    if (cell_id < 0) {
+        return llama_rs_seq_move::no_free_cell;
+    }
+    const uint32_t n_groups = 1 + n_rs_seq;
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        for (auto [dst, src] : { std::make_pair(r_l[il], &in.r[il]), std::make_pair(s_l[il], &in.s[il]) }) {
+            if (dst == nullptr || src->empty()) {
+                continue;
+            }
+            const size_t row = ggml_row_size(dst->type, dst->ne[0]);
+            for (uint32_t g = 0; g < n_groups; ++g) {
+                ggml_backend_tensor_set(dst, src->data() + g * row, (size_t) (g * size + cell_id) * dst->nb[1], row);
+            }
+        }
+    }
+    auto & cell = cells[cell_id];
+    cell.pos  = in.pos;
+    cell.src  = cell_id;
+    cell.src0 = cell_id;
+    cell.seq_id.insert(seq_id);
+    cells[seq_id].tail = cell_id;
+    rs_idx[seq_id] = in.rs_idx;
+    used += 1;
+    return llama_rs_seq_move::done;
+}
+
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);

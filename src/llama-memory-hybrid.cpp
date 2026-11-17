@@ -211,6 +211,17 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
+bool llama_memory_hybrid::persona_save(llama_seq_id seq_id, llama_persona_blocks & out) {
+    return mem_attn->stream_save(mem_attn->seq_stream(seq_id), out.kv) == llama_kv_stream_move::done &&
+           mem_recr->seq_save(seq_id, out.rs) == llama_rs_seq_move::done;
+}
+
+bool llama_memory_hybrid::persona_load(llama_seq_id seq_id, uint32_t s, llama_persona_blocks & in) {
+    return mem_attn->stream_load(s, in.kv) == llama_kv_stream_move::done &&
+           mem_attn->stream_bind(seq_id, s) == llama_kv_stream_move::done &&
+           mem_recr->seq_load(seq_id, in.rs) == llama_rs_seq_move::done;
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }

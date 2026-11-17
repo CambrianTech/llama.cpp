@@ -359,6 +359,10 @@ set_tests_properties(test-state-restore-streams PROPERTIES FIXTURES_REQUIRED tes
 llama_build_and_test(test-kv-stream-blocks.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-kv-stream-blocks PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# a persona's whole hybrid state (attention stream + recurrent rows) moved raw is byte-identical (CONTINUUM-ENGINE 4.14);
+# takes a hybrid model, e.g. one written by `test-llama-archs -a qwen35moe -o DIR`
+llama_build(test-persona-blocks.cpp)
+
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)

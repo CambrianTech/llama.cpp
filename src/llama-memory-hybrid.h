@@ -16,6 +16,13 @@
 // utilizes instances of llama_memory_recurrent and llama_kv_cache to
 //   support models where each layer may be either attention-based or recurrent
 
+// Continuum fork (CONTINUUM-ENGINE 4.14): a persona out of the hybrid pool: her attention stream's rows and cells, and
+// her recurrent rows and record, all raw.
+struct llama_persona_blocks {
+    llama_kv_stream_blocks kv;
+    llama_rs_seq_blocks    rs;
+};
+
 class llama_memory_hybrid : public llama_memory_i {
 public:
     llama_memory_hybrid(
@@ -86,6 +93,11 @@ public:
     //
 
     llama_kv_cache * get_mem_attn() const;
+
+    // her whole state out of her stream and cell (both left empty), and back into empty stream `s` bound to her own
+    // sequence id. FENCE: the caller completes the context's queued device work first.
+    bool persona_save(llama_seq_id seq_id, llama_persona_blocks & out);
+    bool persona_load(llama_seq_id seq_id, uint32_t s, llama_persona_blocks & in);
 
     uint32_t seq_stream(llama_seq_id seq_id) const override { return mem_attn->seq_stream(seq_id); }
     llama_memory_recurrent * get_mem_recr() const;

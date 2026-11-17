@@ -14,6 +14,25 @@
 
 // TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
 //       see the implementation of llama_kv_cache_context_i for an example how to do it
+// Continuum fork (CONTINUUM-ENGINE 4.14): a persona's recurrent state, out of the pool: per layer, her row in every
+// snapshot group (live group 0, then the n_rs_seq rollback groups) copied raw, plus her cell's small record. Restoring
+// it into any free cell is these raw copies and that record; nothing is recomputed.
+struct llama_rs_seq_blocks {
+    bool                              has_state = false;
+    llama_pos                         pos       = -1;
+    uint32_t                          rs_idx    = 0;   // her pending rollback index
+    std::vector<std::vector<uint8_t>> r;               // per layer: (1 + n_rs_seq) rows of r, group-major
+    std::vector<std::vector<uint8_t>> s;               // per layer: (1 + n_rs_seq) rows of s, group-major
+};
+
+enum class llama_rs_seq_move {
+    done,
+    invalid_seq,     // seq_id out of range
+    seq_holds_state, // a load requires her sequence to hold no state
+    shared_cell,     // her state cell is shared with another sequence: not hers alone to move
+    no_free_cell,    // no free cell to load into
+};
+
 class llama_memory_recurrent : public llama_memory_i {
 public:
     llama_memory_recurrent(
@@ -84,6 +103,11 @@ public:
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // Continuum fork (CONTINUUM-ENGINE 4.14): her state out (rows copied raw, her cell freed) and in (raw rows into a
+    // free cell, her record restored). FENCE: the caller completes the context's queued device work first.
+    llama_rs_seq_move seq_save(llama_seq_id seq_id, llama_rs_seq_blocks & out);
+    llama_rs_seq_move seq_load(llama_seq_id seq_id, const llama_rs_seq_blocks & in);
 
     // an undo of a draft is pending on this sequence: its next read takes a snapshot group, not the
     // live state (group 0) a training graph reads and writes (llm_graph_context::rs_keep)
