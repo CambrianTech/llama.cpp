@@ -92,6 +92,20 @@ public:
         return pos[i] == -1;
     }
 
+    // Continuum fork (CONTINUUM-ENGINE 4.14): recompute every stale sequence index now. A persona's blocks leave a
+    // stream only with valid indices (her save's reserve phase calls this, where allocation may fail), so a bind or
+    // any query after it never scans or sorts: a recomputation is never deferred across a freeze.
+    void settle_all() const {
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            settled(s);
+        }
+    }
+
+    // how many index recomputations this object has made
+    uint64_t settles() const {
+        return n_settles;
+    }
+
     uint32_t get_used() const {
         return used.size();
     }
@@ -505,10 +519,14 @@ private:
     // its O(1) paths and recomputed from the cells at the next query after any other change (`settled`).
     mutable llama_kv_seq_pos seq_pos[LLAMA_MAX_SEQ];
 
+    // how many times an index was recomputed from the cells (the freeze and restore fixtures count them)
+    mutable uint64_t n_settles = 0;
+
     // sequence seq_id's index, recomputed from the cells first if a change left it stale
     const llama_kv_seq_pos & settled(llama_seq_id seq_id) const {
         llama_kv_seq_pos & index = seq_pos[seq_id];
         if (index.is_stale()) {
+            ++n_settles;
             std::vector<llama_pos> positions;
             for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
                 if (seq[i].test(seq_id)) {

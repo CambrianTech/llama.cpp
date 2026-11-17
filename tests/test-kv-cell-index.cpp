@@ -141,6 +141,34 @@ void equivalence(uint32_t n_cells, int n_seq, int steps, uint32_t seed) {
     }
 }
 
+// what this catches (Codex's review of 2d54d4869): an index left stale by a genuine change (a division that merges
+// positions, a removal inside the range) carried across her freeze and recomputed only at her next query after the
+// bind. Her save settles every index (llama_kv_cache::persona_check_save calls settle_all); the object bound to a stream
+// then answers every query with no scan and no sort, and answers as the node-container indices do.
+void freeze_then_bind() {
+    const uint32_t n = 64;
+    llama_kv_cells cells;
+    cells.resize(n);
+    reference ref(n);
+    for (uint32_t i = 0; i < 32; ++i) {
+        cells.pos_set(i, llama_pos(i)); ref.pos_set(i, llama_pos(i));
+        cells.seq_add(i, llama_seq_id(i % 2)); ref.seq_add(i, llama_seq_id(i % 2));
+    }
+    for (uint32_t i = 0; i < 32; ++i) {
+        cells.pos_div(i, 3); ref.pos_div(i, 3);
+    }
+    cells.rm(5); ref.rm(5);
+    const uint64_t before = cells.settles();
+    cells.settle_all(); // her save's reserve phase
+    expect(cells.settles() > before, "the change was paid for at the freeze", -1);
+
+    llama_kv_cells bound;
+    bound.resize(n);
+    bound.swap(cells); // her blocks bound to a stream
+    compare(bound, ref, 2, -1);
+    expect(bound.settles() == 0, "a query after the bind recomputed nothing", -1);
+}
+
 // The same workload on both, timed: her context appended token by token, its front half dropped (a context shift's
 // discard), the rest shifted down, and her extrema read after each phase.
 template <typename T, typename Append, typename Remove, typename Shift, typename Read>
@@ -181,6 +209,7 @@ int main(int argc, char ** argv) {
     for (uint32_t seed = 1; seed <= 8 && !failures; ++seed) {
         equivalence(256, 4, 20000, seed);
     }
+    freeze_then_bind();
     if (failures) {
         fprintf(stderr, "kv-cell-index: %d mismatches against the node-container indices\n", failures);
         return 1;

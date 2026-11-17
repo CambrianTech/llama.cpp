@@ -1281,6 +1281,8 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama
     if (!cells_prepared(out.kv.cells, get_size()) || out.kv.k.size() != layers.size() || out.kv.v.size() != layers.size()) {
         return llama_persona_move::cells_not_prepared;
     }
+    // her indices leave valid: any recomputation a change left owed is paid here, never at her bind or later query
+    v_cells[seq_to_stream[seq_id]].settle_all();
     // reserve: every byte the commit copies, so the commit never allocates
     const uint32_t n_rows = v_cells[seq_to_stream[seq_id]].used_max_p1();
     for (size_t i = 0; i < layers.size(); ++i) {
