@@ -205,7 +205,7 @@ void cost(uint32_t n) {
 
 } // namespace
 
-int main(int argc, char ** argv) {
+int main(int argc, char ** /* argv: only the flag count is read */) {
     for (uint32_t seed = 1; seed <= 8 && !failures; ++seed) {
         equivalence(256, 4, 20000, seed);
     }
