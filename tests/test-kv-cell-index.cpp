@@ -139,9 +139,38 @@ void equivalence(uint32_t n_cells, int n_seq, int steps, uint32_t seed) {
                 break;
             }
         }
+        // a stale index is answered from the cells, correct, before anything settles it
         compare(cells, ref, n_seq, step);
+        // what llama_kv_cache does as the operation returns; after it every answer is the index's, none from the cells
+        cells.settle_all();
+        const uint64_t answered_from_cells = cells.stale_queries();
+        compare(cells, ref, n_seq, step);
+        expect(!cells.has_stale(), "settling leaves no stale index", step);
+        expect(cells.stale_queries() == answered_from_cells, "a settled index answers every query", step);
         if (failures) { return; }
     }
+}
+
+// what this catches: a query that writes. llama-server answers /slots and /metrics on another thread while a decode
+// changes the cells, so a query that recomputed a stale index in place would race the decode. A query on a stale index
+// answers correctly from the cells, counted, and leaves the index exactly as stale as it found it.
+void queries_never_write() {
+    const uint32_t n = 64;
+    llama_kv_cells cells;
+    cells.resize(n);
+    reference ref(n);
+    for (uint32_t i = 0; i < 16; ++i) {
+        cells.pos_set(i, llama_pos(i)); ref.pos_set(i, llama_pos(i));
+        cells.seq_add(i, 0); ref.seq_add(i, 0);
+    }
+    cells.rm(3); ref.rm(3); // inside the range: stale
+    expect(cells.has_stale(), "a removal inside the range leaves the index stale", -2);
+    for (int q = 0; q < 4; ++q) {
+        expect(cells.seq_pos_min(0) == ref.min(0) && cells.seq_pos_max(0) == ref.max(0), "a stale query is exact", -2);
+    }
+    expect(cells.has_stale(), "a query left the index stale (it wrote nothing)", -2);
+    expect(cells.settles() == 0, "a query recomputed nothing", -2);
+    expect(cells.stale_queries() == 8, "each stale query is counted", -2);
 }
 
 // what this catches (Codex's review of 2d54d4869): an index left stale by a genuine change (a division that merges
@@ -162,15 +191,19 @@ void freeze_then_bind() {
     }
     cells.rm(5); ref.rm(5);
     const uint64_t before = cells.settles();
-    cells.settle_all(); // her save's reserve phase
-    expect(cells.settles() > before, "the change was paid for at the freeze", -1);
+    cells.settle_all(); // the cache's operation returning, before her save
+    expect(cells.settles() > before, "the change was paid for before the freeze", -1);
 
     llama_kv_cells bound;
     bound.resize(n);
     bound.swap(cells); // her blocks bound to a stream
     compare(bound, ref, 2, -1);
-    expect(bound.settles() == 0, "a query after the bind recomputed nothing", -1);
+    expect(bound.settles() == 0 && bound.stale_queries() == 0, "a query after the bind answered from the index", -1);
 }
+
+// the native cells settle as the cache's operation returns; the previous indices had nothing to settle
+void settle(llama_kv_cells_previous &) {}
+void settle(llama_kv_cells & cells) { cells.settle_all(); }
 
 // The same workload on the previous implementation (kv-cells-previous.h, verbatim) and the native one, timed and with
 // the allocations it makes counted: her context appended token by token, its front half dropped (a context shift's
@@ -189,7 +222,7 @@ measured workload(uint32_t n, bool count) {
     cells.resize(n);
     volatile llama_pos sink = 0;
     const llama_pos d = -llama_pos(n / 2);
-    auto read = [&] { sink = cells.seq_pos_min(0) + cells.seq_pos_max(0) + llama_pos(cells.get_used()); };
+    auto read = [&] { settle(cells); sink =cells.seq_pos_min(0) + cells.seq_pos_max(0) + llama_pos(cells.get_used()); };
     allocations = 0;
     counting    = count;
     const auto t0 = std::chrono::steady_clock::now();
@@ -249,6 +282,7 @@ int main(int argc, char ** /* argv: only the flag count is read */) {
         equivalence(256, 4, 20000, seed);
     }
     freeze_then_bind();
+    queries_never_write();
     if (failures) {
         fprintf(stderr, "kv-cell-index: %d mismatches against the node-container indices\n", failures);
         return 1;

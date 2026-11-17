@@ -44,6 +44,7 @@ public:
         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].swap(other.seq_pos[s]);
         }
+        std::swap(stale, other.stale);
     }
 
     void reset() {
@@ -61,6 +62,7 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
+        stale.reset();
     }
 
     void reset_shift() {
@@ -92,18 +94,35 @@ public:
         return pos[i] == -1;
     }
 
-    // Continuum fork (CONTINUUM-ENGINE 4.14): recompute every stale sequence index now. A persona's blocks leave a
-    // stream only with valid indices (her save's reserve phase calls this, where allocation may fail), so a bind or
-    // any query after it never scans or sorts: a recomputation is never deferred across a freeze.
-    void settle_all() const {
-        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            settled(s);
+    // Continuum fork (CONTINUUM-ENGINE 4.14): recompute every stale sequence index now, on the thread that changed the
+    // cells. llama_kv_cache calls this as each of its operations returns, so a query never writes an index: queries
+    // arrive from other threads while a decode runs, and a persona's blocks leave a stream with valid indices.
+    void settle_all() {
+        if (stale.none()) {
+            return;
         }
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (stale.test(s)) {
+                settle(s);
+            }
+        }
+        stale.reset();
+    }
+
+    // any sequence index a change left stale and nothing has settled yet
+    bool has_stale() const {
+        return stale.any();
     }
 
     // how many index recomputations this object has made
     uint64_t settles() const {
         return n_settles;
+    }
+
+    // how many queries were answered from the cells because an index was stale: a missed settle, 0 when every change
+    // was settled by its operation
+    uint64_t stale_queries() const {
+        return n_stale_queries.load();
     }
 
     uint32_t get_used() const {
@@ -365,7 +384,10 @@ public:
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
 
-        const llama_kv_seq_pos & index = settled(seq_id);
+        const llama_kv_seq_pos & index = seq_pos[seq_id];
+        if (index.is_stale()) {
+            return unsettled_extremum(seq_id, false);
+        }
         return index.empty() ? -1 : index.min();
     }
 
@@ -375,7 +397,10 @@ public:
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
 
-        const llama_kv_seq_pos & index = settled(seq_id);
+        const llama_kv_seq_pos & index = seq_pos[seq_id];
+        if (index.is_stale()) {
+            return unsettled_extremum(seq_id, true);
+        }
         return index.empty() ? -1 : index.max();
     }
 
@@ -516,36 +541,57 @@ private:
     //  - some vision models have input embeddings with repeating positions
     //
     // Continuum fork: each sequence's positions as a native sorted array with counts (llama-kv-cell-index.h), exact on
-    // its O(1) paths and recomputed from the cells at the next query after any other change (`settled`).
-    mutable llama_kv_seq_pos seq_pos[LLAMA_MAX_SEQ];
+    // its O(1) paths; any other change marks it stale (`stale`), and the operation that made the change settles it.
+    llama_kv_seq_pos seq_pos[LLAMA_MAX_SEQ];
+
+    // the sequences whose index a change left stale, so settling visits only those
+    std::bitset<LLAMA_MAX_SEQ> stale;
 
     // how many times an index was recomputed from the cells (the freeze and restore fixtures count them)
-    mutable uint64_t n_settles = 0;
+    uint64_t n_settles = 0;
 
-    // sequence seq_id's index, recomputed from the cells first if a change left it stale
-    const llama_kv_seq_pos & settled(llama_seq_id seq_id) const {
-        llama_kv_seq_pos & index = seq_pos[seq_id];
-        if (index.is_stale()) {
-            ++n_settles;
-            std::vector<llama_pos> positions;
-            for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
-                if (seq[i].test(seq_id)) {
-                    positions.push_back(pos[i]);
-                }
+    // queries answered from the cells because an index was stale (the only thing a query writes)
+    llama_kv_query_count n_stale_queries;
+
+    // recompute sequence seq_id's index from the cells
+    void settle(llama_seq_id seq_id) {
+        ++n_settles;
+        std::vector<llama_pos> positions;
+        for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
+            if (seq[i].test(seq_id)) {
+                positions.push_back(pos[i]);
             }
-            index.settle(positions);
         }
-        return index;
+        seq_pos[seq_id].settle(positions);
+    }
+
+    // a stale sequence's min or max read from the cells without writing its index, counted: correct, and a defect
+    // (the operation that changed the cells did not settle them)
+    llama_pos unsettled_extremum(llama_seq_id seq_id, bool want_max) const {
+        n_stale_queries.add();
+        llama_pos found = -1;
+        for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
+            if (seq[i].test(seq_id) && (found == -1 || (want_max ? pos[i] > found : pos[i] < found))) {
+                found = pos[i];
+            }
+        }
+        return found;
     }
 
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, llama_pos p) {
         seq_pos[s].dec(p);
+        if (seq_pos[s].is_stale()) {
+            stale.set(s);
+        }
     }
 
     void seq_pos_inc(llama_seq_id s, llama_pos p) {
         seq_pos[s].inc(p);
+        if (seq_pos[s].is_stale()) {
+            stale.set(s);
+        }
     }
 
     // remove cell i

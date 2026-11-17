@@ -13,6 +13,17 @@
 #include <map>
 #include <stdexcept>
 
+// Continuum fork (CONTINUUM-ENGINE 4.14): settles every index a change left stale as the operation that made it returns,
+// on the thread that made it, so a query (from any thread) never writes an index.
+struct llama_kv_settle_on_return {
+    llama_kv_cells_vec & v_cells;
+    ~llama_kv_settle_on_return() {
+        for (auto & cells : v_cells) {
+            cells.settle_all();
+        }
+    }
+};
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -381,6 +392,7 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -450,6 +462,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -542,6 +555,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -569,6 +583,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -619,6 +634,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -754,6 +770,7 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    const llama_kv_settle_on_return settle{ v_cells };
     llama_kv_cache::slot_info_vec_t res;
 
     struct state_t {
@@ -1100,6 +1117,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1281,8 +1299,6 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama
     if (!cells_prepared(out.kv.cells, get_size()) || out.kv.k.size() != layers.size() || out.kv.v.size() != layers.size()) {
         return llama_persona_move::cells_not_prepared;
     }
-    // her indices leave valid: any recomputation a change left owed is paid here, never at her bind or later query
-    v_cells[seq_to_stream[seq_id]].settle_all();
     // reserve: every byte the commit copies, so the commit never allocates
     const uint32_t n_rows = v_cells[seq_to_stream[seq_id]].used_max_p1();
     for (size_t i = 0; i < layers.size(); ++i) {
@@ -2205,6 +2221,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;

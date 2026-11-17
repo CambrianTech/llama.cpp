@@ -19,6 +19,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <utility>
@@ -235,4 +236,23 @@ public:
 private:
     std::vector<llama_kv_pos_count> runs;
     bool stale = false;
+};
+
+// A count any thread may add to (a query answered from the cells because its index was stale), copied with its object.
+// Queries arrive from other threads (llama-server answers /slots and /metrics while a decode runs), so the count is the
+// one thing a query writes.
+class llama_kv_query_count {
+public:
+    llama_kv_query_count() = default;
+    llama_kv_query_count(const llama_kv_query_count & other) : n(other.load()) {}
+    llama_kv_query_count & operator=(const llama_kv_query_count & other) {
+        n.store(other.load(), std::memory_order_relaxed);
+        return *this;
+    }
+
+    void add() const { n.fetch_add(1, std::memory_order_relaxed); }
+    uint64_t load() const { return n.load(std::memory_order_relaxed); }
+
+private:
+    mutable std::atomic<uint64_t> n{ 0 };
 };
