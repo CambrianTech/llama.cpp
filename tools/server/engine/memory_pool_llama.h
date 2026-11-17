@@ -2,14 +2,14 @@
 
 // Continuum fork (CONTINUUM-ENGINE 4.12.1): the memory pool over a target llama_context and an optional draft context
 // that share sequence ids. Edits go to the named contexts and report a refusal; a sequence's state moves for both
-// together; host bytes are charged against the budget given at construction.
+// together.
 
 #include "memory_pool.h"
 
 
 class memory_pool_llama final : public memory_pool {
 public:
-    memory_pool_llama(llama_context * tgt, llama_context * dft, size_t host_budget);
+    memory_pool_llama(llama_context * tgt, llama_context * dft);
 
     placement place(const llama_batch & piece) override;
 
@@ -24,15 +24,9 @@ public:
     load_outcome   load(llama_seq_id seq, llama_state_seq_flags flags, const uint8_t * tgt, size_t n_tgt,
                         const uint8_t * dft, size_t n_dft) override;
 
-    host_charge charge(size_t bytes) override;
-    void        release(size_t bytes) override;
-    size_t      host_held() const override { return host_held_; }
-
 private:
     // the contexts `in` names, target first; the draft only when the pool has one
     template <typename F> edit_outcome each(kv_contexts in, F && f);
     llama_context * tgt_;
     llama_context * dft_;
-    size_t          host_budget_;
-    size_t          host_held_ = 0;
 };

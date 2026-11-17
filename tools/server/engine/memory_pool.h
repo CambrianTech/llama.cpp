@@ -1,9 +1,9 @@
 #pragma once
 
 // Continuum fork (CONTINUUM-ENGINE 4.12.1, 4.11.10): the engine's ONE memory allocator. Every change to what the KV
-// pool holds goes through it: a frame's placement (decode), a sequence's removal, shift and copy (target and draft
-// together), a sequence's state saved out and loaded back (park, flash, page restore, preemption), and the host
-// bytes that checkpoints and the prompt cache hold. Nothing else in the engine calls llama_decode, llama_memory_seq_*
+// pool holds goes through it: a frame's placement (decode), a sequence's removal, shift and copy, and a sequence's
+// state saved out and loaded back (park, flash, page restore, preemption). The host bytes checkpoints and the prompt
+// cache hold join it, with a typed budget, when those charges migrate (no verb before it has a caller). Nothing else in the engine calls llama_decode, llama_memory_seq_*
 // or llama_state_seq_* on the serving contexts; owners ask this interface, so placement and every move share one
 // custody (Codex's singular-allocator condition).
 //
@@ -64,12 +64,6 @@ struct seq_state_size {
     size_t total() const { return tgt + dft; }
 };
 
-// The result of charging host bytes (checkpoints, prompt cache) to the pool's host budget.
-enum class host_charge : uint8_t {
-    granted,
-    denied, // over budget; nothing was charged
-};
-
 // Positions a sequence holds in the target context; empty when it holds none.
 struct seq_range {
     llama_pos min   = -1;
@@ -98,9 +92,4 @@ public:
     virtual save_outcome   save(llama_seq_id seq, llama_state_seq_flags flags, uint8_t * tgt, uint8_t * dft) const = 0;
     virtual load_outcome   load(llama_seq_id seq, llama_state_seq_flags flags, const uint8_t * tgt, size_t n_tgt,
                                 const uint8_t * dft, size_t n_dft) = 0;
-
-    // host bytes held for sequences outside the pool (checkpoints, prompt cache)
-    virtual host_charge charge(size_t bytes)  = 0;
-    virtual void        release(size_t bytes) = 0;
-    virtual size_t      host_held() const     = 0;
 };

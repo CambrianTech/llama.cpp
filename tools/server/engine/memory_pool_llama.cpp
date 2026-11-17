@@ -4,8 +4,7 @@
 
 #include "ggml.h"
 
-memory_pool_llama::memory_pool_llama(llama_context * tgt, llama_context * dft, size_t host_budget)
-    : tgt_(tgt), dft_(dft), host_budget_(host_budget) {
+memory_pool_llama::memory_pool_llama(llama_context * tgt, llama_context * dft) : tgt_(tgt), dft_(dft) {
     GGML_ASSERT(tgt_ != nullptr);
 }
 
@@ -99,17 +98,4 @@ load_outcome memory_pool_llama::load(llama_seq_id seq, llama_state_seq_flags fla
         return load_outcome::refused;
     }
     return load_outcome::loaded;
-}
-
-host_charge memory_pool_llama::charge(size_t bytes) {
-    if (bytes > host_budget_ - host_held_) {
-        return host_charge::denied;
-    }
-    host_held_ += bytes;
-    return host_charge::granted;
-}
-
-void memory_pool_llama::release(size_t bytes) {
-    GGML_ASSERT(bytes <= host_held_);
-    host_held_ -= bytes;
 }
