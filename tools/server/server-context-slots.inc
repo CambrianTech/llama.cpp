@@ -254,7 +254,7 @@
             // for all requested alora activation strings and then either keep
             // only the last one, or reject if multiple are found.
             if (enabled_ids.size() != 1) {
-                send_error(task, "Cannot run multiple aLoRAs in a single request", ERROR_TYPE_INVALID_REQUEST);
+                turn_sink->deliver(turn_error(task, "Cannot run multiple aLoRAs in a single request", ERROR_TYPE_INVALID_REQUEST));
                 return false;
             }
             const auto & lora = slot.lora[enabled_ids[0]].ptr;
@@ -294,7 +294,7 @@
         }
 
         if (!task.tokens.validate(ctx_tgt)) {
-            send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
+            turn_sink->deliver(turn_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST));
             return false;
         }
 
@@ -306,7 +306,7 @@
                 slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
-                send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
+                turn_sink->deliver(turn_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST));
                 return false;
             }
 
@@ -393,7 +393,7 @@
 
             slot.add_token(result);
             if (slot.task->params.stream) {
-                send_partial_response(slot, result, false);
+                turn_sink->deliver(turn_partial(slot, result, false));
             }
         }
 
@@ -535,4 +535,86 @@
                 });
             }
         }
+    }
+
+
+    // staged here from the deleted respond fragment until slot_registry owns them (4.12.1)
+    //
+    // Functions to process the task
+    //
+
+    // tokenize the input if it's set by CLI, return false on error
+    bool tokenize_cli_input(server_task & task) {
+        try {
+            auto & prompt = task.cli_prompt;
+            if (mctx != nullptr) {
+                task.tokens = process_mtmd_prompt(mctx, prompt, task.cli_files);
+            } else {
+                task.tokens = std::move(tokenize_input_prompts(vocab, mctx, prompt, true, true)[0]);
+            }
+            task.cli_prompt.clear();
+            task.cli_files.clear();
+        } catch (const std::exception & e) {
+            turn_sink->deliver(turn_error(task, std::string("Failed to format input: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return false;
+        }
+        return true;
+    }
+
+    std::vector<server_slot *> get_free_slots(size_t n_slots_needed, int exclude_id_slot) {
+        std::vector<server_slot *> free_slots;
+        for (auto & slot : slots) {
+            if (!slot.is_processing() && slot.id != exclude_id_slot) {
+                free_slots.push_back(&slot);
+            }
+            if (free_slots.size() >= n_slots_needed) {
+                break;
+            }
+        }
+        return free_slots;
+    }
+
+    // launch multiple slots for parent + child tasks
+    bool launch_slots_with_parent_task(server_slot & parent_slot, std::vector<server_slot *> & child_slots, server_task && parent_task) {
+        GGML_ASSERT(!parent_slot.is_processing());
+        GGML_ASSERT(parent_task.is_parent());
+        GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
+
+        int id_parent = parent_task.id;
+
+        SRV_TRC("launching slots for parent task id_task = %d with %zu child tasks\n", id_parent, parent_task.child_tasks.size());
+
+        // to be called in case of failure to release all launched slots
+        auto release_slots = [this, id_parent]() {
+            for (auto & slot : slots) {
+                if (slot.is_processing() && (
+                        slot.task->id == id_parent ||
+                        slot.task->id_parent == id_parent
+                )) {
+                    slot.release();
+                }
+            }
+        };
+
+        // launch all child tasks first
+        size_t idx = 0;
+        GGML_ASSERT(child_slots.size() == parent_task.child_tasks.size());
+        for (auto * slot : child_slots) {
+            int id_child = parent_task.child_tasks[idx].id;
+            if (!launch_slot_with_task(*slot, std::move(parent_task.child_tasks[idx]))) {
+                SRV_ERR("failed to launch slot with child task, id_task = %d\n", id_child);
+                release_slots();
+                return false;
+            }
+            idx++;
+        }
+
+        // finally, launch the parent task
+        if (!launch_slot_with_task(parent_slot, std::move(parent_task))) {
+            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_parent);
+            release_slots();
+            return false;
+        }
+
+        return true;
     }

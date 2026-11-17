@@ -102,7 +102,7 @@
                                 task.params.control_action.c_str(), task.params.control_cmpl_id.c_str());
                         res->success = false;
                         res->message = "no active completion for this id";
-                        queue_results.send(std::move(res));
+                        turn_sink->deliver(std::move(res));
                         break;
                     }
 
@@ -111,7 +111,7 @@
                         if (!slot->task->params.sampling.reasoning_control) {
                             res->success = false;
                             res->message = "reasoning control not enabled for this completion";
-                            queue_results.send(std::move(res));
+                            turn_sink->deliver(std::move(res));
                             break;
                         }
                         // act on the live slot mid generation, never defer
@@ -122,7 +122,7 @@
                         res->message = "unknown control action";
                     }
 
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
                 {
@@ -148,7 +148,7 @@
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_GET:
                 {
@@ -186,14 +186,14 @@
                         res->cells = std::move(cells);
                     }
 
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_CELLS_NEEDED:
                 {
                     // read-only: the slot's cached prompt against the request's tokens
                     server_slot * slot = get_slot_by_id(task.slot_action.id_slot);
                     if (slot == nullptr) {
-                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        turn_sink->deliver(turn_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
                         break;
                     }
                     auto res = std::make_unique<server_task_result_cells_needed>();
@@ -204,7 +204,7 @@
                     // a page-out can empty the sequence and keep prompt.tokens (Cormac on #92).
                     const llama_pos held = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id) + 1;
                     res->n_cached = std::min(slot->prompt.tokens.get_common_prefix(task.tokens), (size_t) std::max<llama_pos>(held, 0));
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
@@ -223,7 +223,7 @@
                     auto res = std::make_unique<server_task_result_learn_release>();
                     res->id      = task.id;
                     res->outcome = learn_release(task.params.page, task.params.learn_release_pin);
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_MIND_PREFETCH:
                 {
@@ -232,14 +232,14 @@
                     res->id         = task.id;
                     res->place      = minds_on() ? mind_prefetch(task.params.page) : mind_place::minds_off;
                     res->elapsed_ms = (ggml_time_us() - t0) / 1000.0;
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
-                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        turn_sink->deliver(turn_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
                         break;
                     }
                     if (slot->is_processing()) {
@@ -260,7 +260,7 @@
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SET_LORA:
                 {
@@ -274,24 +274,24 @@
                     publish_lora_report();
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SAVE_LORA:
                 {
                     if (!task.save_checkpoint.is_null() && task.save_checkpoint.at("engine").get<std::string>() != learn_engine) {
-                        send_error(task, "stale_engine", ERROR_TYPE_INVALID_REQUEST);
+                        turn_sink->deliver(turn_error(task, "stale_engine", ERROR_TYPE_INVALID_REQUEST));
                         break;
                     }
                     const auto & loras = params_base.lora_adapters;
                     const int32_t id = task.save_lora;
                     if (id < 0 || (size_t) id >= loras.size() || loras[id].ptr == nullptr) {
-                        send_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST);
+                        turn_sink->deliver(turn_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST));
                         break;
                     }
                     // Queue ownership excludes concurrent writes, but a resumable reply
                     // retains this shadow between chunks through stable-tail restoration.
                     if (learning && (learning->shadow == loras[id].ptr || !task.save_checkpoint.is_null())) {
-                        send_error(task, "shadow snapshot awaits learning restoration", ERROR_TYPE_UNAVAILABLE);
+                        turn_sink->deliver(turn_error(task, "shadow snapshot awaits learning restoration", ERROR_TYPE_UNAVAILABLE));
                         break;
                     }
                     const int64_t steps = llama_opt_shadow_steps(ctx_tgt, loras[id].ptr);
@@ -306,7 +306,7 @@
                             refused->id = task.id;
                             refused->receipt = {{"success", false}, {"refusal", "no_optimizer_state"},
                                 {"engine", learn_engine}, {"id", id}};
-                            queue_results.send(std::move(refused));
+                            turn_sink->deliver(std::move(refused));
                             break;
                         }
                     }
@@ -341,7 +341,7 @@
                         checkpoint["path"] = generation;
                     }
                     if (!error.empty()) {
-                        send_error(task, error, ERROR_TYPE_INVALID_REQUEST);
+                        turn_sink->deliver(turn_error(task, error, ERROR_TYPE_INVALID_REQUEST));
                         break;
                     }
                     auto res = std::make_unique<server_task_result_lora_change>();
@@ -351,7 +351,7 @@
                     // read on the loop between steps, beside the write: the file holds exactly these
                     res->steps = steps;
                     res->checkpoint = std::move(checkpoint);
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_LOAD_LORA:
                 {
@@ -376,7 +376,7 @@
                         res->id      = task.id;
                         res->lora_id = existing;
                         res->path    = task.load_lora_path;
-                        queue_results.send(std::move(res));
+                        turn_sink->deliver(std::move(res));
                         break;
                     }
                     char buf[1024];
@@ -396,7 +396,7 @@
                     res->id      = task.id;
                     res->lora_id = (int32_t) params_base.lora_adapters.size() - 1;
                     res->path    = la.path;
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_LEARN_GRANTS:
                 process_learn_grants(task);
@@ -419,7 +419,7 @@
                             {"held_bytes", prompt_cache->size()}, {"freed_bytes", before - std::min(before, prompt_cache->size())},
                             {"states", prompt_cache->states.size()}};
                     }
-                    queue_results.send(std::move(result));
+                    turn_sink->deliver(std::move(result));
                 } break;
             case SERVER_TASK_TYPE_LEARN:
                 {
@@ -427,7 +427,7 @@
                         auto result = std::make_unique<server_task_result_learn_grants>();
                         result->id = task.id;
                         result->receipt = restore_learning_checkpoint(task.learn, task.restore_checkpoint);
-                        queue_results.send(std::move(result));
+                        turn_sink->deliver(std::move(result));
                         break;
                     }
                     auto res = std::make_unique<server_task_result_learn>();
@@ -439,7 +439,7 @@
                         res->outcome.ok      = false;
                         res->outcome.failure = why;
                         SRV_WRN("learn refused: %s\n", why.c_str());
-                        queue_results.send(std::move(res));
+                        turn_sink->deliver(std::move(res));
                     };
                     if (slot == nullptr) {
                         refuse("no slot " + std::to_string(L.id_slot));
@@ -455,32 +455,32 @@
                         learning->separate_request = true;
                         slot->task = std::make_unique<const server_task>(std::move(task));
                     } else {
-                        queue_results.send(std::move(res));
+                        turn_sink->deliver(std::move(res));
                     }
                 } break;
             case SERVER_TASK_TYPE_UNLOAD_LORA:
                 {
                     if (task.unload_engine != learn_engine) {
-                        send_error(task, "stale_engine: unload must name this engine incarnation", ERROR_TYPE_INVALID_REQUEST);
+                        turn_sink->deliver(turn_error(task, "stale_engine: unload must name this engine incarnation", ERROR_TYPE_INVALID_REQUEST));
                         break;
                     }
                     auto & loras = params_base.lora_adapters;
                     const int32_t id = task.unload_lora;
                     if (id < 0 || (size_t) id >= loras.size() || loras[id].ptr == nullptr) {
-                        send_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST);
+                        turn_sink->deliver(turn_error(task, "no loaded LoRA adapter with id " + std::to_string(id), ERROR_TYPE_INVALID_REQUEST));
                         break;
                     }
                     llama_adapter_lora * ptr = loras[id].ptr;
                     if (loras[id].scale != 0.0f) {
-                        send_error(task, "LoRA adapter " + std::to_string(id) + " is active by default (scale " +
-                                   std::to_string(loras[id].scale) + "); set its scale to 0 first", ERROR_TYPE_INVALID_REQUEST);
+                        turn_sink->deliver(turn_error(task, "LoRA adapter " + std::to_string(id) + " is active by default (scale " +
+                                   std::to_string(loras[id].scale) + "); set its scale to 0 first", ERROR_TYPE_INVALID_REQUEST));
                         break;
                     }
                     for (const auto & slot : slots) {
                         if (slot.is_processing() && (size_t) id < slot.lora.size() && slot.lora[id].ptr == ptr &&
                             slot.lora[id].scale != 0.0f) {
-                            send_error(task, "LoRA adapter " + std::to_string(id) + " is in use by slot " +
-                                       std::to_string(slot.id) + "; retry when it finishes", ERROR_TYPE_UNAVAILABLE);
+                            turn_sink->deliver(turn_error(task, "LoRA adapter " + std::to_string(id) + " is in use by slot " +
+                                       std::to_string(slot.id) + "; retry when it finishes", ERROR_TYPE_UNAVAILABLE));
                             ptr = nullptr;
                             break;
                         }
@@ -492,15 +492,15 @@
                     // optimizer and accumulators reference its tensors between chunks), whether or not
                     // any slot's stable set names it
                     if (learning && learning->shadow == ptr) {
-                        send_error(task, "LoRA adapter " + std::to_string(id) + " is the shadow a learn is training on slot " +
-                                   std::to_string(learning->slot->id) + "; retry when its restoration finishes", ERROR_TYPE_UNAVAILABLE);
+                        turn_sink->deliver(turn_error(task, "LoRA adapter " + std::to_string(id) + " is the shadow a learn is training on slot " +
+                                   std::to_string(learning->slot->id) + "; retry when its restoration finishes", ERROR_TYPE_UNAVAILABLE));
                         break;
                     }
                     // a shadow that learned holds an optimizer referencing its tensors: release it
                     // first (its moments go; a snapshot is the durable form of what it learned)
                     if (!llama_opt_release(ctx_tgt, ptr)) {
-                        send_error(task, "LoRA adapter " + std::to_string(id) + " cannot be unloaded yet: " + llama_opt_failure(ctx_tgt),
-                                   ERROR_TYPE_UNAVAILABLE);
+                        turn_sink->deliver(turn_error(task, "LoRA adapter " + std::to_string(id) + " cannot be unloaded yet: " + llama_opt_failure(ctx_tgt),
+                                   ERROR_TYPE_UNAVAILABLE));
                         break;
                     }
                     // An idle slot that last ran with it keeps KV computed WITH the adapter;
@@ -541,7 +541,7 @@
                     loras[id].path.clear();
                     publish_lora_report();
                     SRV_INF("retired lora adapter id=%d path=%s\n", id, res->path.c_str());
-                    queue_results.send(std::move(res));
+                    turn_sink->deliver(std::move(res));
                 } break;
         }
 

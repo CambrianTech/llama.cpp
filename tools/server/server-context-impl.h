@@ -5,6 +5,8 @@
 // family compiles in its own translation unit (server-routes-*.cpp).
 
 #include "server-slot.h"
+#include "engine/responder_http.h"
+#include "engine/turn_results.h"
 
 struct server_context_impl {
     friend struct server_context;
@@ -70,6 +72,8 @@ public:
 
     server_queue    queue_tasks;
     server_response queue_results;
+    // where every turn result goes (CONTINUUM-ENGINE 4.12.1); built by turn_results.h
+    std::unique_ptr<responder> turn_sink = std::make_unique<responder_http>(queue_results);
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
@@ -355,7 +359,6 @@ private:
 #include "server-context-learn-checkpoint.inc"
 #include "server-context-page.inc"
 #include "server-context-minds.inc"
-#include "server-context-respond.inc"
 
 #include "server-context-checkpoint.inc"
 
@@ -367,7 +370,7 @@ private:
                 callback(slot);
             } catch (const std::exception & e) {
                 SLT_ERR(slot, "got exception: %s\n", e.what());
-                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                turn_sink->deliver(turn_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER));
                 slot.release();
             }
         }
@@ -379,7 +382,7 @@ private:
                 callback(*slot);
             } catch (const std::exception & e) {
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
-                send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                turn_sink->deliver(turn_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER));
                 slot->release();
             }
         }
@@ -388,7 +391,7 @@ private:
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
             if (slot.is_processing()) {
-                send_error(slot, reason, ERROR_TYPE_SERVER);
+                turn_sink->deliver(turn_error(slot, reason, ERROR_TYPE_SERVER));
                 slot.release();
             }
         }

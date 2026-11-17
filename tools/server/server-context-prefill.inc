@@ -9,7 +9,7 @@
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
-                    send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
+                    turn_sink->deliver(turn_error(slot, "context shift is disabled", ERROR_TYPE_SERVER));
                     slot.release();
                     return;
                 }
@@ -21,7 +21,7 @@
                 }
 
                 if (slot.task->is_parent() || slot.task->is_child()) {
-                    send_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER);
+                    turn_sink->deliver(turn_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER));
                     slot.release();
                     return;
                 }
@@ -305,7 +305,7 @@
                                 slot.learned = learn_outcome{};
                                 slot.learned->failure = "the request had no prompt to learn the reply after";
                             }
-                            send_final_response(slot);
+                            turn_sink->deliver(turn_final(slot, ctx_tgt, slots_debug));
                             slot.release();
 
                             return;
@@ -313,40 +313,40 @@
 
                         // TODO: support memory-less logits computation
                         if (slot.task->need_logits() && !llama_get_memory(ctx_tgt)) {
-                            send_error(slot, "the current context does not logits computation. skipping", ERROR_TYPE_SERVER);
+                            turn_sink->deliver(turn_error(slot, "the current context does not logits computation. skipping", ERROR_TYPE_SERVER));
                             slot.release();
                             return;
                         }
 
                         if (!slot.can_split()) {
                             if (slot.task->n_tokens() > n_ubatch) {
-                                send_error(slot,
+                                turn_sink->deliver(turn_error(slot,
                                            string_format(
                                                "input (%d tokens) is too large to process. increase the physical batch "
                                                "size (current batch size: %d)",
                                                slot.task->n_tokens(), n_ubatch),
-                                           ERROR_TYPE_SERVER);
+                                           ERROR_TYPE_SERVER));
                                 slot.release();
                                 return;
                             }
 
                             if (slot.task->n_tokens() > slot.n_ctx) {
-                                send_error(
+                                turn_sink->deliver(turn_error(
                                     slot,
                                     string_format(
                                         "input (%d tokens) is larger than the max context size (%d tokens). skipping",
                                         slot.task->n_tokens(), slot.n_ctx),
-                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE));
                                 slot.release();
                                 return;
                             }
                         } else {
                             if (slot.task->n_tokens() >= slot.n_ctx) {
-                                send_error(slot,
+                                turn_sink->deliver(turn_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
                                                          slot.task->n_tokens(), slot.n_ctx),
-                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+                                           ERROR_TYPE_EXCEED_CONTEXT_SIZE));
                                 slot.release();
                                 return;
                             }
@@ -582,10 +582,10 @@
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
                                 // send initial 0% progress update if needed
-                                send_partial_response(slot, {}, true);
+                                turn_sink->deliver(turn_partial(slot, {}, true));
                             } else {
                                 // otherwise, for streaming without progress, signal HTTP to send the headers (i.e. 200 status)
-                                send_partial_response(slot, {}, false, true);
+                                turn_sink->deliver(turn_partial(slot, {}, false, true));
                             }
                         }
                     } // end of SLOT_STATE_STARTED
@@ -663,7 +663,7 @@
 
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process mtmd chunk, res = %d\n", res);
-                            send_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER);
+                            turn_sink->deliver(turn_error(slot, "failed to process mtmd chunk", ERROR_TYPE_SERVER));
                             slot.release();
                             return; // the slot is done, skip it entirely
                         }
