@@ -1948,6 +1948,12 @@ private:
             if (slot.is_processing()) {
                 continue;
             }
+            // a mind is never purged: when neither a parked mind nor an idle lane's mind could go to flash above,
+            // there is no legal move for her and this returns false (Codex on #139); an anonymous slot's cached
+            // prompt (no mind) may still be cleared
+            if (minds_on() && slot.page.valid()) {
+                continue;
+            }
 
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
@@ -5076,7 +5082,12 @@ server_context_meta server_context::get_meta() const {
             { "resident_minds", json {
                 { "enabled",    impl->minds_on() },
                 { "lanes",      impl->params_base.n_parallel },
-                { "parked_ids", (int64_t) impl->park_free.size() },
+                // fixed capacity (the context's sequences beyond the lanes, while minds are on): the core compares it
+                // across discoveries, so it must not move when a mind parks (Codex on #139/#6087); the free count is
+                // its own field
+                { "parked_ids",  (int64_t) (impl->params_base.n_minds > 0
+                                                ? llama_n_seq_max(impl->ctx_tgt) - impl->params_base.n_parallel : 0) },
+                { "parked_free", (int64_t) impl->park_free.size() },
                 { "incarnation", mind_incarnation() },
             } },
         },
