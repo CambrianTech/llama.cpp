@@ -3,6 +3,7 @@
 #include "server-checkpoint-policy.h"
 #include "server-view-end.h"
 #include "server-mapped-file.h"
+#include "server-frame-costs.h"
 #include <filesystem>
 #include <thread>
 #include "../../src/llama-ext.h"
@@ -3436,6 +3437,9 @@ private:
     // time-fair interleave: after a prefill step, generating slots are owed decode-only time equal to that step
     int64_t t_decode_owed_us = 0;
     int32_t n_batch_gen      = 0; // batch size before prompt tokens are added
+    // CONTINUUM-ENGINE 4.13 step 1: where each frame's device time went, and a window summary every 10 s
+    frame_costs<4096> frames;
+    int64_t           frames_reported_us = 0;
     server_prefill_order prefill_order;
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
@@ -3587,7 +3591,35 @@ private:
         // Completion-triggered learning can begin inside post_decode. Its entry
         // preparation is already one measured blocking segment; do not append a
         // graph segment before the queued NEXT_RESPONSE lets serving run again.
+        const int64_t t_learn_start = ggml_time_us();
         if (learning_at_start) { advance_learning(); }
+        record_frame(t_step, ggml_time_us() - t_learn_start, has_prompt);
+    }
+
+    void record_frame(int64_t step_us, int64_t learn_us, bool has_prompt) {
+        frame_cost f;
+        f.at_us         = ggml_time_us();
+        f.step_us       = step_us;
+        f.learn_us      = learn_us;
+        f.gen_tokens    = n_batch_gen;
+        f.prompt_tokens = has_prompt ? batch.size() - n_batch_gen : 0;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                ++f.sequences;
+                f.max_context = std::max(f.max_context, (int32_t) slot.prompt.n_tokens());
+            }
+        }
+        frames.record(f);
+        if (f.at_us - frames_reported_us >= 10 * 1000 * 1000) {
+            const frame_window w = frames.window(frames_reported_us, f.at_us);
+            frames_reported_us = f.at_us;
+            SRV_INF("frames: %" PRId64 " in %.1f s: decode %.1f%% prefill %.1f%% learn %.1f%% idle %.1f%%; "
+                    "gen %" PRId64 " tok (%.1f tok/s wall, %.1f tok/s stepping), prompt %" PRId64 " tok; "
+                    "widest %" PRId64 " seq, longest context %" PRId64 "\n",
+                    w.frames, w.wall_us / 1e6, 100.0 * w.decode_us / w.wall_us, 100.0 * w.prefill_us / w.wall_us,
+                    100.0 * w.learn_us / w.wall_us, 100.0 * w.idle_us() / w.wall_us, w.gen_tokens, w.gen_tps(),
+                    w.decode_tps(), w.prompt_tokens, w.max_sequences, w.max_context);
+        }
     }
 
     void pre_decode() {
