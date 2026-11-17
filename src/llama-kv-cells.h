@@ -2,12 +2,11 @@
 
 #include "llama.h"
 #include "llama-cparams.h"
+#include "llama-kv-cell-index.h"
 
 #include <bitset>
 #include <cassert>
 #include <cstring>
-#include <map>
-#include <set>
 #include <vector>
 
 struct llama_kv_cell_ext {
@@ -81,6 +80,7 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+        used.resize(n);
 
         reset();
     }
@@ -99,13 +99,13 @@ public:
     // the index of the first cell that is used
     // return 0 if no cells are used
     uint32_t used_min() const {
-        return used.empty() ? 0 : *used.begin();
+        return used.min();
     }
 
     // the index of the last cell that is used + 1
     // return 0 if no cells are used
     uint32_t used_max_p1() const {
-        return used.empty() ? 0 : *used.rbegin() + 1;
+        return used.max_p1();
     }
 
     bool get_has_shift() const {
@@ -351,13 +351,8 @@ public:
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
 
-        if (seq_pos[seq_id].empty()) {
-            return -1;
-        }
-
-        assert(seq_pos[seq_id].begin()->second > 0);
-
-        return seq_pos[seq_id].begin()->first;
+        const llama_kv_seq_pos & index = settled(seq_id);
+        return index.empty() ? -1 : index.min();
     }
 
     // the maximum position of sequence seq_id currently present in any of the cells
@@ -366,13 +361,8 @@ public:
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
 
-        if (seq_pos[seq_id].empty()) {
-            return -1;
-        }
-
-        assert(seq_pos[seq_id].rbegin()->second > 0);
-
-        return seq_pos[seq_id].rbegin()->first;
+        const llama_kv_seq_pos & index = settled(seq_id);
+        return index.empty() ? -1 : index.max();
     }
 
     // note: call only if the cell is not empty
@@ -474,8 +464,8 @@ public:
 private:
     bool has_shift = false;
 
-    // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
-    std::set<uint32_t> used;
+    // the occupied cells (i.e. pos[i] != -1, allowed to not have any seq_id): a bitmap with its count and extrema
+    llama_kv_used used;
 
     std::vector<llama_pos> pos;
 
@@ -504,29 +494,40 @@ private:
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
 
-    // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
-    // if the position p is not present, seq_pos[s][p] is not set
-    // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache
+    // seq_pos[s] holds each position p currently present for sequence s with how many cells hold it, sorted, so its
+    // first and last entries are the min/max positions currently in the cache
     //
-    // note that we cannot a use an std::set because in some cases a position can occur more than once for the same seq:
+    // note that a position needs a count, not just presence, because in some cases a position can occur more than once for the same seq:
     //  - during performing a cache reuse via (rm + add)
     //  - some vision models have input embeddings with repeating positions
     //
-    std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
+    // Continuum fork: each sequence's positions as a native sorted array with counts (llama-kv-cell-index.h), exact on
+    // its O(1) paths and recomputed from the cells at the next query after any other change (`settled`).
+    mutable llama_kv_seq_pos seq_pos[LLAMA_MAX_SEQ];
+
+    // sequence seq_id's index, recomputed from the cells first if a change left it stale
+    const llama_kv_seq_pos & settled(llama_seq_id seq_id) const {
+        llama_kv_seq_pos & index = seq_pos[seq_id];
+        if (index.is_stale()) {
+            std::vector<llama_pos> positions;
+            for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
+                if (seq[i].test(seq_id)) {
+                    positions.push_back(pos[i]);
+                }
+            }
+            index.settle(positions);
+        }
+        return index;
+    }
 
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, llama_pos p) {
-        auto it = seq_pos[s].find(p);
-        assert(it != seq_pos[s].end());
-
-        if (--it->second == 0) {
-            seq_pos[s].erase(it);
-        }
+        seq_pos[s].dec(p);
     }
 
     void seq_pos_inc(llama_seq_id s, llama_pos p) {
-        seq_pos[s][p]++;
+        seq_pos[s].inc(p);
     }
 
     // remove cell i

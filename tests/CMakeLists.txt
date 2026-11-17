@@ -189,6 +189,9 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build_and_test(test-server-view-end.cpp)
 
+# llama_kv_cells' derived indices held natively answer exactly as the node containers they replace (CONTINUUM-ENGINE 4.14)
+llama_build_and_test(test-kv-cell-index.cpp)
+
 # GGML_TENSOR_FLAG_GRAD: a leaf whose gradient the backward computes, never optimized (the walk reads the cached prefix K/V gradient)
 llama_build_and_test(test-grad-leaf.cpp)
 
