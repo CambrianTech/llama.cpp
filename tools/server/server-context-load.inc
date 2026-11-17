@@ -233,9 +233,6 @@
         if (!page_io) {
             page_io = std::make_unique<server_page_io_pool>((size_t) params_base.n_parallel);
         }
-        if (!minds_init()) {
-            return false;
-        }
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -259,6 +256,20 @@
         }
 
         pool = std::make_unique<memory_pool_llama>(ctx_tgt, ctx_dft);
+        {
+            mind_table_config mcfg;
+            mcfg.n_seq      = (int32_t) llama_n_seq_max(ctx_tgt);
+            mcfg.n_lanes    = params_base.n_parallel;
+            mcfg.n_minds    = params_base.n_minds;
+            mcfg.kv_unified = params_base.kv_unified;
+            mcfg.page_dir   = params_base.slot_save_path;
+            mind_table_build built = make_resident_minds(mcfg, *pool, *page_io, slots);
+            if (!built.table) {
+                SRV_ERR("%s\n", built.refusal.c_str());
+                return false;
+            }
+            residents = std::move(built.table);
+        }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];

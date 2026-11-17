@@ -1,3 +1,6 @@
+// Continuum fork (CONTINUUM-ENGINE 4.12.1): the resident-minds table of #139 behind mind_table. Moved here whole from
+// server-context-minds.inc (deleted); the engine's fields it read became its dependencies (mind_table_config, the
+// memory pool, the page-IO worker, the slots).
 // Methods of server_context_impl: resident minds and the switch between them (server-mind.h).
 //
 // Every mind the core names has exactly one home:
@@ -9,6 +12,93 @@
 // A switch moves her between homes; it never serializes her into a cache, never drops her, never truncates her.
 // The pool runs out of CELLS, not of minds: when a decode finds no room, the coldest parked mind goes to flash
 // (was: the idle slot's mind was purged). A mind on flash comes back by mapping her file and inserting it.
+
+#include "mind_table_resident.h"
+
+#include "../server-mapped-file.h"
+#include "../server-page-io.h"
+#include "../server-slot.h"
+
+#include <cstring>
+#include <filesystem>
+
+namespace {
+
+class mind_table_resident final : public mind_table {
+public:
+    mind_table_resident(const mind_table_config & cfg, memory_pool & pool, server_page_io_pool & page_io,
+                        std::vector<server_slot> & slots)
+        : cfg_(cfg), pool_(pool), page_io_(page_io), slots_(slots) {
+        if (cfg_.n_minds <= 0) {
+            return; // the table is off: no parked ids, enabled() is false
+        }
+        // the parked ids are what the context reports beyond the lanes (llama_n_seq_max), never assumed
+        for (int32_t s = cfg_.n_seq - 1; s >= cfg_.n_lanes; --s) {
+            park_free.push_back(s);
+        }
+        minds.reserve((size_t) cfg_.n_minds * 2);
+        SRV_INF("resident minds: %d lanes, %zu parked sequence ids (context reports %d), flash at %s\n",
+                cfg_.n_lanes, park_free.size(), cfg_.n_seq, cfg_.page_dir.c_str());
+    }
+
+private:
+    const mind_table_config    cfg_;
+    memory_pool &              pool_;
+    server_page_io_pool &      page_io_;
+    std::vector<server_slot> & slots_;
+
+    // the coldest parked mind goes to flash; else an idle lane's mind does (moved here from the slots fragment's
+    // try_clear_idle_slots: one make-room policy, one owner)
+    bool make_room(room_from scope) override {
+        if (flash_coldest()) {
+            return true;
+        }
+        if (scope == room_from::parked) {
+            return false;
+        }
+        for (auto & slot : slots_) {
+            if (!slot.is_processing() && slot.page.valid() && slot.prompt.n_tokens() > 0) {
+                resident_mind m;
+                m.page       = slot.page;
+                m.lora       = slot.lora;
+                m.last_use   = ++mind_clock;
+                m.generation = slot.page_generation + 1;
+                m.prompt     = std::move(slot.prompt);
+                slot.prompt.clear();
+                if (flash_out(m, slot.id)) {
+                    slot.page = mind_page{};
+                    minds.push_back(std::move(m));
+                    return true;
+                }
+                slot.prompt = std::move(m.prompt); // she stays whole on her lane
+            }
+        }
+        return false;
+    }
+
+    std::optional<llama_seq_id> lend_id() override {
+        if (park_free.empty()) {
+            return std::nullopt;
+        }
+        const llama_seq_id id = park_free.back();
+        park_free.pop_back();
+        return id;
+    }
+    void   return_id(llama_seq_id id) override { park_free.push_back(id); }
+
+    size_t host_bytes(host_count count) const override {
+        size_t b = 0;
+        for (const auto & m : minds) {
+            for (const auto & c : m.prompt.checkpoints) {
+                b += c.size();
+            }
+            if (count == host_count::with_in_flight && m.ram) {
+                b += m.ram->size();
+            }
+        }
+        return b;
+    }
+    size_t free_ids() const override { return park_free.size(); }
 
     struct resident_mind {
         mind_page                             page;
@@ -38,8 +128,8 @@
 
     // An abandoned turn's learn pin, released wherever she is: on a lane, parked, or on flash (applied when her
     // checkpoints come back). The checkpoint stays as an ordinary one: the budget may now evict it.
-    pin_release learn_release(mind_page page, uint64_t pin) {
-        for (auto & s : slots) {
+    pin_release release_pin(mind_page page, uint64_t pin) override {
+        for (auto & s : slots_) {
             if (s.page == page) {
                 return unpin(s.prompt.checkpoints, pin) ? pin_release::released : pin_release::not_pinned;
             }
@@ -99,33 +189,9 @@
     std::vector<int32_t>       park_free;  // free parked sequence ids (sized once at load)
     std::vector<resident_mind> minds;      // parked and flashed minds (reserved once at load)
     uint64_t                   mind_clock = 0;
-    uint64_t                   learn_pin_clock = 0; // learn pins issued by this process (a pin's id; 0 is none)
 
-    // At load: the parked ids are what the context reports beyond the lanes (llama_n_seq_max), never assumed.
-    bool minds_init() {
-        const int32_t n_seq  = (int32_t) llama_n_seq_max(ctx_tgt);
-        const int32_t n_lane = params_base.n_parallel;
-        if (params_base.n_minds <= 0) {
-            return true;
-        }
-        if (!params_base.kv_unified) {
-            SRV_ERR("%s", "--minds needs --kv-unified: a parked mind shares the pool's cells by sequence id\n");
-            return false;
-        }
-        if (params_base.slot_save_path.empty()) {
-            SRV_ERR("%s", "--minds needs --slot-save-path: a mind the pool cannot hold goes to flash, never dropped\n");
-            return false;
-        }
-        for (int32_t s = n_seq - 1; s >= n_lane; --s) {
-            park_free.push_back(s);
-        }
-        minds.reserve((size_t) params_base.n_minds * 2);
-        SRV_INF("resident minds: %d lanes, %zu parked sequence ids (context reports %d), flash at %s\n",
-                n_lane, park_free.size(), n_seq, params_base.slot_save_path.c_str());
-        return true;
-    }
 
-    bool minds_on() const { return !park_free.empty() || !minds.empty(); }
+    bool enabled() const override { return !park_free.empty() || !minds.empty(); }
 
     resident_mind * find_mind(mind_page page) {
         for (auto & m : minds) {
@@ -137,13 +203,13 @@
     }
 
     void seq_move(llama_seq_id from, llama_seq_id to) {
-        GGML_ASSERT(pool->move(from, to) == edit_outcome::done); // whole-sequence removals are never refused
+        GGML_ASSERT(pool_.move(from, to) == edit_outcome::done); // whole-sequence removals are never refused
     }
 
     std::string mind_file(mind_page page) const {
         char name[64];
         std::snprintf(name, sizeof(name), "mind-%016llx%016llx.bin", (unsigned long long) page.hi, (unsigned long long) page.lo);
-        return params_base.slot_save_path + name;
+        return cfg_.page_dir + name;
     }
 
     // The coldest parked mind leaves the pool for flash. False: nothing is parked.
@@ -171,7 +237,7 @@
         resident_mind * cold = &m;
         const int64_t t0 = ggml_time_us();
         auto bytes = std::make_shared<std::vector<uint8_t>>();
-        const seq_state_size n_state = pool->state_size(seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const seq_state_size n_state = pool_.state_size(seq, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t n_tgt = n_state.tgt;
         const size_t n_dft = n_state.dft;
         // her checkpoints go down with her (they are host bytes too: ~100 MB each on a 35B hybrid)
@@ -185,13 +251,13 @@
         std::memcpy(w, h, sizeof(h));
         w += sizeof(h);
         ckpt_write(cold->prompt.checkpoints, w + n_tgt + n_dft);
-        if (pool->save(seq, LLAMA_STATE_SEQ_FLAGS_NONE, { w, n_tgt }, { w + n_tgt, n_dft }) != save_outcome::saved) {
+        if (pool_.save(seq, LLAMA_STATE_SEQ_FLAGS_NONE, { w, n_tgt }, { w + n_tgt, n_dft }) != save_outcome::saved) {
             SRV_ERR("mind %016llx: her state could not be copied out of the pool; she stays where she is\n", (unsigned long long) cold->page.hi);
             return false;
         }
         const int64_t t_copy = ggml_time_us() - t0;
         std::list<common_prompt_checkpoint>().swap(cold->prompt.checkpoints); // their bytes are in hers now
-        GGML_ASSERT(pool->remove(seq, -1, -1, kv_contexts::both) == edit_outcome::done);
+        GGML_ASSERT(pool_.remove(seq, -1, -1, kv_contexts::both) == edit_outcome::done);
         cold->seq     = -1;
         cold->file    = mind_file(cold->page);
         cold->ram     = bytes; // the record holds her bytes until her file has landed
@@ -209,7 +275,7 @@
         auto bytes = m.ram;
         auto done  = m.written;
         done->store(0, std::memory_order_release);
-        page_io->submit(path, [path, bytes, done] {
+        page_io_.submit(path, [path, bytes, done] {
             FILE * f = std::fopen(path.c_str(), "wb");
             bool ok = f != nullptr && std::fwrite(bytes->data(), 1, bytes->size(), f) == bytes->size();
             ok = (f != nullptr && std::fclose(f) == 0) && ok;
@@ -219,7 +285,7 @@
 
     // Between steps: a landed file releases her RAM copy; a failed write keeps it (she lives in RAM) and is
     // written again. Never waits.
-    void minds_reap() {
+    void reap() override {
         for (auto & m : minds) {
             if (!m.ram || !m.written) {
                 continue;
@@ -275,8 +341,8 @@
         // coldest parked mind to flash, and stops when none is left to send
         bool ok = false;
         while (true) {
-            GGML_ASSERT(pool->remove(seq, -1, -1, kv_contexts::both) == edit_outcome::done);
-            ok = pool->load(seq, LLAMA_STATE_SEQ_FLAGS_NONE, { r, h[0] }, { r + h[0], h[1] }) == load_outcome::loaded;
+            GGML_ASSERT(pool_.remove(seq, -1, -1, kv_contexts::both) == edit_outcome::done);
+            ok = pool_.load(seq, LLAMA_STATE_SEQ_FLAGS_NONE, { r, h[0] }, { r + h[0], h[1] }) == load_outcome::loaded;
             if (ok || !flash_coldest()) {
                 break;
             }
@@ -295,7 +361,7 @@
         m.released.clear();
         // her file is removed on the page-IO worker, ordered after its own write (it may still be landing)
         const std::string path = m.file;
-        page_io->submit(path, [path] { std::error_code ec; std::filesystem::remove(path, ec); });
+        page_io_.submit(path, [path] { std::error_code ec; std::filesystem::remove(path, ec); });
         m.file.clear();
         m.ram.reset();
         return true;
@@ -303,8 +369,8 @@
 
     // Ahead of her turn (the core names who is next): a mind on flash is inserted into a free parked sequence
     // now, while the others decode, so her switch is the sequence move. Returns where she is afterwards.
-    mind_place mind_prefetch(mind_page page) {
-        for (const auto & s : slots) {
+    mind_place prefetch(mind_page page) override {
+        for (const auto & s : slots_) {
             if (s.page == page) {
                 return mind_place::lane;
             }
@@ -339,7 +405,7 @@
     // `slot` serves `page` next. The mind it holds (if any) is parked; hers comes back from where she is.
     // false: the switch could not complete (the leaving mind could not leave intact, or the arriving mind's state
     // could not be inserted): the request waits for a lane, never runs cold beside a stored version of her.
-    bool mind_switch(server_slot & slot, mind_page page) {
+    bool seat(server_slot & slot, mind_page page) override {
         slot.stats.mind_hi = page.hi;
         slot.stats.mind_lo = page.lo;
         if (slot.page == page) {
@@ -427,3 +493,21 @@
                 (ggml_time_us() - t0 - t_out) / 1000.0, slot.prompt.n_tokens());
         return true;
     }
+};
+
+} // namespace
+
+mind_table_build make_resident_minds(const mind_table_config & cfg, memory_pool & pool, server_page_io_pool & page_io,
+                                     std::vector<server_slot> & slots) {
+    mind_table_build out;
+    if (cfg.n_minds > 0 && !cfg.kv_unified) {
+        out.refusal = "--minds needs --kv-unified: a parked mind shares the pool's cells by sequence id";
+        return out;
+    }
+    if (cfg.n_minds > 0 && cfg.page_dir.empty()) {
+        out.refusal = "--minds needs --slot-save-path: a mind the pool cannot hold goes to flash, never dropped";
+        return out;
+    }
+    out.table = std::make_unique<mind_table_resident>(cfg, pool, page_io, slots);
+    return out;
+}

@@ -67,7 +67,7 @@
     size_t host_budget = 0;
 
     // every host byte the engine holds beside the prompt cache: the lanes' checkpoints, the parked minds'
-    // checkpoints, and a flashed mind's RAM copy until her file has landed (server-context-minds.inc)
+    // checkpoints, and a flashed mind's RAM copy until her file has landed (engine/mind_table_resident.cpp)
     // `in_flight`: also a flashed mind's RAM copy (freed within ms of its write landing). The make-room decision
     // counts only what stays resident, so sending one mind down is seen to free her checkpoints.
     size_t checkpoint_bytes(bool in_flight = true) const {
@@ -77,15 +77,7 @@
                 b += c.size();
             }
         }
-        for (const auto & m : minds) {
-            for (const auto & c : m.prompt.checkpoints) {
-                b += c.size();
-            }
-            if (in_flight && m.ram) {
-                b += m.ram->size();
-            }
-        }
-        return b;
+        return b + residents->host_bytes(in_flight ? host_count::with_in_flight : host_count::resident);
     }
 
     // The prompt cache's share: the budget less every checkpoint (1 byte, not 0, when none is left: the
@@ -110,7 +102,7 @@
             return false;
         }
         // the coldest parked mind goes down to flash first (her checkpoints with her): the minds acting keep theirs
-        while (checkpoint_bytes(false) + bytes > host_budget && minds_on() && flash_coldest()) {
+        while (checkpoint_bytes(false) + bytes > host_budget && residents->enabled() && residents->make_room(room_from::parked)) {
         }
         size_t held = checkpoint_bytes(false); // what stays resident: copies on their way to flash are leaving
         while (held + bytes > host_budget) {

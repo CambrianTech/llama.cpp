@@ -222,7 +222,7 @@
                 {
                     auto res = std::make_unique<server_task_result_learn_release>();
                     res->id      = task.id;
-                    res->outcome = learn_release(task.params.page, task.params.learn_release_pin);
+                    res->outcome = residents->release_pin(task.params.page, task.params.learn_release_pin);
                     turn_sink->deliver(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_MIND_PREFETCH:
@@ -230,7 +230,7 @@
                     const int64_t t0 = ggml_time_us();
                     auto res = std::make_unique<server_task_result_mind_prefetch>();
                     res->id         = task.id;
-                    res->place      = minds_on() ? mind_prefetch(task.params.page) : mind_place::minds_off;
+                    res->place      = residents->enabled() ? residents->prefetch(task.params.page) : mind_place::minds_off;
                     res->elapsed_ms = (ggml_time_us() - t0) / 1000.0;
                     turn_sink->deliver(std::move(res));
                 } break;

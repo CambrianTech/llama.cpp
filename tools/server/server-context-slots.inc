@@ -117,9 +117,9 @@
             }
         }
 
-        // a named mind switches by sequence moves (server-context-minds.inc), never through the prompt cache
-        if (ret && minds_on() && task.params.page.valid()) {
-            if (!mind_switch(*ret, task.params.page)) {
+        // a named mind switches by sequence moves (engine/mind_table_resident.cpp), never through the prompt cache
+        if (ret && residents->enabled() && task.params.page.valid()) {
+            if (!residents->seat(*ret, task.params.page)) {
                 return nullptr; // the switch could not complete intact: this request waits (never runs cold)
             }
             update_cache = false;
@@ -166,28 +166,9 @@
             return res;
         }
 
-        // resident minds: the pool's coldest parked mind goes to flash, whole; an idle lane's mind is never purged
-        if (minds_on()) {
-            if (flash_coldest()) {
-                return true;
-            }
-            for (auto & slot : slots) {
-                if (!slot.is_processing() && slot.page.valid() && slot.prompt.n_tokens() > 0) {
-                    resident_mind m;
-                    m.page     = slot.page;
-                    m.lora     = slot.lora;
-                    m.last_use   = ++mind_clock;
-                    m.generation = slot.page_generation + 1;
-                    m.prompt = std::move(slot.prompt);
-                    slot.prompt.clear();
-                    if (flash_out(m, slot.id)) {
-                        slot.page = mind_page{};
-                        minds.push_back(std::move(m));
-                        return true;
-                    }
-                    slot.prompt = std::move(m.prompt); // she stays whole on her lane
-                }
-            }
+        // resident minds: the coldest parked mind goes to flash, else an idle lane's mind does (mind_table)
+        if (residents->enabled() && residents->make_room(room_from::parked_then_idle_lanes)) {
+            return true;
         }
 
         for (auto & slot : slots) {

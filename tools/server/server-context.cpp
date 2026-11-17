@@ -128,12 +128,12 @@ server_context_meta server_context::get_meta() const {
             { "allocated_tokens",        llama_n_ctx(impl->ctx_tgt) },
             { "max_tokens_per_sequence", impl->n_ctx_slot },
             { "sequence_capacity",       llama_n_seq_max(impl->ctx_tgt) },
-            // the engine owns mind switches (server-context-minds.inc): a request naming its "page" is switched by
+            // the engine owns mind switches (engine/mind_table_resident.cpp): a request naming its "page" is switched by
             // sequence moves; the core reads this BEFORE dispatch to skip its own page save/restore (Codex on #139)
             { "resident_minds", json {
-                { "enabled",    impl->minds_on() },
+                { "enabled",    impl->residents->enabled() },
                 { "lanes",      impl->params_base.n_parallel },
-                { "parked_ids", (int64_t) impl->park_free.size() },
+                { "parked_ids", (int64_t) impl->residents->free_ids() },
                 { "incarnation", mind_incarnation() },
             } },
         },
@@ -614,7 +614,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
 }
 
 // Continuum fork: POST /minds/prefetch {"page": "<mind>"}: her state comes from flash into a parked sequence now,
-// ahead of her turn (server-context-minds.inc). The reply names where she is.
+// ahead of her turn (engine/mind_table_resident.cpp). The reply names where she is.
 // an abandoned turn's learn pin, released (the core sends the turn receipt's mind.page and mind.pin)
 std::unique_ptr<server_res_generator> server_routes::handle_learn_release(const server_http_req & req) {
     auto res = create_response();
