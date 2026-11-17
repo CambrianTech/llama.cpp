@@ -132,7 +132,7 @@
         const int id_slot = task.slot_action.id_slot;
         server_slot * slot = get_slot_by_id(id_slot);
         if (slot == nullptr) {
-            send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+            turn_sink->deliver(turn_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
             return;
         }
 
@@ -140,7 +140,7 @@
         try {
             packed = slot->prompt.tokens.serialize();
         } catch (const std::exception & err) {
-            send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
+            turn_sink->deliver(turn_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED));
             return;
         }
         GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
@@ -151,7 +151,7 @@
                 ctx_tgt, slot->id, reinterpret_cast<const llama_token *>(packed.data()),
                 packed.size() / sizeof(llama_token));
             if (projected_bytes == 0) {
-                send_error(task, "Unable to size slot state", ERROR_TYPE_SERVER);
+                turn_sink->deliver(turn_error(task, "Unable to size slot state", ERROR_TYPE_SERVER));
                 return;
             }
             bool size_overflow = false;
@@ -168,7 +168,7 @@
                 count(nullptr, page_dft_header + llama_state_seq_get_size_ext(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_NONE));
             }
             if (size_overflow) {
-                send_error(task, "Slot file size overflow", ERROR_TYPE_SERVER);
+                turn_sink->deliver(turn_error(task, "Slot file size overflow", ERROR_TYPE_SERVER));
                 return;
             }
             if (task.slot_action.size_only) {
@@ -179,12 +179,12 @@
                 res->is_save = true;
                 res->size_only = true;
                 res->n_bytes = projected_bytes;
-                queue_results.send(std::move(res));
+                turn_sink->deliver(std::move(res));
                 return;
             }
             // Recheck at this task boundary: decode may have advanced after the quote.
             if (task.slot_action.has_byte_ceiling && projected_bytes > task.slot_action.byte_ceiling) {
-                send_error(task, "Slot state exceeds admitted file bytes", ERROR_TYPE_INVALID_REQUEST);
+                turn_sink->deliver(turn_error(task, "Slot state exceeds admitted file bytes", ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
         }
@@ -192,7 +192,7 @@
         // The bytes this switch will hold, admitted against the page IO budget before any is allocated.
         const size_t n_body = llama_state_seq_file_body_size(ctx_tgt, slot->id);
         if (n_body == 0) {
-            send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+            turn_sink->deliver(turn_error(task, "Unable to save slot", ERROR_TYPE_SERVER));
             return;
         }
         size_t n_ckpt = 0, n_lora = 0;
@@ -229,7 +229,7 @@
         job->n_tokens = slot->prompt.tokens.size();
         job->body.resize(n_body);
         if (llama_state_seq_get_file_body(ctx_tgt, slot->id, job->body.data(), n_body) != n_body) {
-            send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+            turn_sink->deliver(turn_error(task, "Unable to save slot", ERROR_TYPE_SERVER));
             return;
         }
         job->tokens.resize(packed.size() / sizeof(llama_token));
@@ -310,14 +310,14 @@
         const int id_slot = task.slot_action.id_slot;
         server_slot * slot = get_slot_by_id(id_slot);
         if (slot == nullptr) {
-            send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+            turn_sink->deliver(turn_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
             return;
         }
         auto progress = task.slot_action.progress;
         if (progress) {
             auto expected = server_restore_progress::queued;
             if (!progress->phase.compare_exchange_strong(expected, server_restore_progress::state)) {
-                send_error(task, "Restore operation cancelled", ERROR_TYPE_INVALID_REQUEST);
+                turn_sink->deliver(turn_error(task, "Restore operation cancelled", ERROR_TYPE_INVALID_REQUEST));
                 return;
             }
         }
@@ -571,14 +571,14 @@
         res->err_type = ERROR_TYPE_INVALID_REQUEST;
         res->err_msg  = message;
         res->refusal  = refusal;
-        queue_results.send(std::move(res));
+        turn_sink->deliver(std::move(res));
     }
 
     void page_io_done(server_task && task) {
         const auto job = task.slot_action.page;
         if (job->is_save) {
             if (!job->error.empty()) {
-                send_error(task, "Unable to save slot: " + job->error, ERROR_TYPE_SERVER);
+                turn_sink->deliver(turn_error(task, "Unable to save slot: " + job->error, ERROR_TYPE_SERVER));
                 return;
             }
             auto res = std::make_unique<server_task_result_slot_save_load>();
@@ -592,7 +592,7 @@
             res->io_ms    = job->io_ms;
             res->t_ms     = job->copy_ms + job->io_ms;
             page_io_receipt(*res, *job);
-            queue_results.send(std::move(res));
+            turn_sink->deliver(std::move(res));
             return;
         }
         if (job->answered) {
@@ -609,7 +609,7 @@
                 progress->phase.store(progress->cancel_requested.load(std::memory_order_relaxed)
                     ? server_restore_progress::cancelled : server_restore_progress::failed, std::memory_order_relaxed);
             }
-            send_error(task, "Unable to restore slot: " + why, ERROR_TYPE_INVALID_REQUEST);
+            turn_sink->deliver(turn_error(task, "Unable to restore slot: " + why, ERROR_TYPE_INVALID_REQUEST));
         };
         server_slot * slot = get_slot_by_id(job.id_slot);
         if (slot == nullptr) {
@@ -736,7 +736,7 @@
         res->io_ms    = job.io_ms;
         res->t_ms     = job.copy_ms + job.io_ms;
         page_io_receipt(*res, job);
-        queue_results.send(std::move(res));
+        turn_sink->deliver(std::move(res));
     }
 
     // The page IO budget as this switch's receipt reports it.

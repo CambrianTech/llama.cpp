@@ -70,7 +70,7 @@
 
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
-                            send_error(slot, err);
+                            turn_sink->deliver(turn_error(slot, err));
                             slot.release();
 
                             // note: it's complicated to keep track of how much of the current batch has been
@@ -165,7 +165,7 @@
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
-                    send_partial_response(slot, {}, true);
+                    turn_sink->deliver(turn_partial(slot, {}, true));
                 }
             }
 
@@ -177,14 +177,14 @@
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
-                    send_embedding(slot, batch_view);
+                    turn_sink->deliver(turn_embedding(slot, batch_view, model_tgt));
                     slot.release();
                     slot.i_batch = -1;
                     return;
                 }
 
                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
-                    send_rerank(slot, batch_view);
+                    turn_sink->deliver(turn_rerank(slot, batch_view, ctx_tgt));
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -247,7 +247,7 @@
                 slot.print_timings();
                 learn_if_asked(slot);
                 if (slot.state != SLOT_STATE_LEARNING) {
-                    send_final_response(slot);
+                    turn_sink->deliver(turn_final(slot, ctx_tgt, slots_debug));
                     slot.release();
                 }
 
@@ -371,7 +371,7 @@
                     slot.print_timings();
                     learn_if_asked(slot);
                     if (slot.state != SLOT_STATE_LEARNING) {
-                        send_final_response(slot);
+                        turn_sink->deliver(turn_final(slot, ctx_tgt, slots_debug));
                         slot.release();
                     }
 

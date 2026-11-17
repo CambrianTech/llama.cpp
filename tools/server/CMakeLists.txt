@@ -20,6 +20,8 @@ add_library(${TARGET} STATIC
     server-routes-lora.cpp
     server-routes-learn.cpp
     server-routes-control.cpp
+    engine/responder_http.cpp
+    engine/turn_results.cpp
     server-mapped-file.cpp
     server-mapped-file.h
     server-mind.h

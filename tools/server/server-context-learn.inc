@@ -193,7 +193,7 @@
         const auto op = body.value("op", std::string());
         if (op == "preflight") {
             result->receipt = learn_preflight(body);
-            queue_results.send(std::move(result));
+            turn_sink->deliver(std::move(result));
             return;
         }
         if (op == "residency_register") {
@@ -230,7 +230,7 @@
         for (const auto & entry : receipt.items()) { out[entry.key()] = entry.value(); }
         out["residencies"] = residency_snapshot();
         result->receipt = std::move(out);
-        queue_results.send(std::move(result));
+        turn_sink->deliver(std::move(result));
     }
 
     // The loop-owned half of the ledger (grants, their use, the memory the optimizer holds), read
@@ -700,10 +700,10 @@
                 auto res = std::make_unique<server_task_result_learn>();
                 res->id = slot.task->id;
                 res->outcome = std::move(out);
-                queue_results.send(std::move(res));
+                turn_sink->deliver(std::move(res));
             } else {
                 slot.learned = std::move(out);
-                send_final_response(slot);
+                turn_sink->deliver(turn_final(slot, ctx_tgt, slots_debug));
             }
         }
         slot.release();
