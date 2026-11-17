@@ -17,21 +17,36 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <vector>
 
 // The result of asking the pool to place one piece of a frame (one llama_decode call).
 enum class placement : uint8_t {
     placed,        // the piece's tokens hold cells and were computed
     no_room,       // nothing of this piece was placed; earlier pieces of the frame stand
+    aborted,       // the decode's abort callback stopped it; the pool's state for this piece is uncertain
     invalid,       // the piece was malformed (a caller defect)
     compute_error, // the backend failed while computing; the pool's state for this piece is uncertain
 };
 
 // The result of loading a saved sequence state back into the pool.
+// llama reports a failed load as one result (no room for it, or bytes that are not this pool's state); the pool does
+// not guess which.
 enum class load_outcome : uint8_t {
-    loaded,  // the sequence holds exactly the saved state
-    no_room, // nothing was loaded; the saved bytes are untouched and remain the sequence's custody
-    corrupt, // the bytes do not decode as this pool's sequence state
+    loaded,  // the sequence holds exactly the saved state, in both contexts
+    refused, // nothing was loaded; the saved bytes are untouched and remain the caller's custody
+};
+
+// The result of saving a sequence's state out of the pool.
+enum class save_outcome : uint8_t {
+    saved,  // both contexts' state written in full into the caller's buffers
+    failed, // a context wrote short; the buffers hold nothing usable and the pool is unchanged
+};
+
+// A sequence's state size in each context: the caller sizes its own buffers (RAM, an mmap'd page) from this, so a
+// save writes straight into where the state will live.
+struct seq_state_size {
+    size_t tgt = 0;
+    size_t dft = 0; // 0 when the pool has no draft context
+    size_t total() const { return tgt + dft; }
 };
 
 // The result of charging host bytes (checkpoints, prompt cache) to the pool's host budget.
@@ -60,10 +75,12 @@ public:
     virtual void      copy(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1)    = 0;
     virtual seq_range range(llama_seq_id seq) const                                           = 0;
 
-    // a sequence's whole state moved out of and back into the pool (park, flash, page restore, preemption)
-    virtual size_t       state_size(llama_seq_id seq, llama_state_seq_flags flags) const                           = 0;
-    virtual size_t       save(llama_seq_id seq, llama_state_seq_flags flags, std::vector<uint8_t> & out) const    = 0;
-    virtual load_outcome load(llama_seq_id seq, llama_state_seq_flags flags, const uint8_t * bytes, size_t n)     = 0;
+    // a sequence's whole state, target and draft together, moved out of and back into the pool (park, flash, page
+    // restore, preemption); buffers are the caller's, sized from state_size
+    virtual seq_state_size state_size(llama_seq_id seq, llama_state_seq_flags flags) const = 0;
+    virtual save_outcome   save(llama_seq_id seq, llama_state_seq_flags flags, uint8_t * tgt, uint8_t * dft) const = 0;
+    virtual load_outcome   load(llama_seq_id seq, llama_state_seq_flags flags, const uint8_t * tgt, size_t n_tgt,
+                                const uint8_t * dft, size_t n_dft) = 0;
 
     // host bytes held for sequences outside the pool (checkpoints, prompt cache)
     virtual host_charge charge(size_t bytes)  = 0;
