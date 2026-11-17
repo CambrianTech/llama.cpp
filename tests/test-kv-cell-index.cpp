@@ -10,11 +10,14 @@
 #include "llama.h"
 
 #include "../src/llama-kv-cells.h"
+#include "kv-cells-previous.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <new>
 #include <random>
 #include <set>
 #include <vector>
@@ -169,41 +172,73 @@ void freeze_then_bind() {
     expect(bound.settles() == 0, "a query after the bind recomputed nothing", -1);
 }
 
-// The same workload on both, timed: her context appended token by token, its front half dropped (a context shift's
-// discard), the rest shifted down, and her extrema read after each phase.
-template <typename T, typename Append, typename Remove, typename Shift, typename Read>
-double timed(T & t, uint32_t n, Append append, Remove remove, Shift shift, Read read) {
+// The same workload on the previous implementation (kv-cells-previous.h, verbatim) and the native one, timed and with
+// the allocations it makes counted: her context appended token by token, its front half dropped (a context shift's
+// discard), the rest shifted down, and her extrema read after each phase (so a deferred recomputation is charged).
+std::atomic<bool>     counting{ false };
+std::atomic<uint64_t> allocations{ 0 };
+
+struct measured {
+    double   ms;
+    uint64_t allocations;
+};
+
+template <typename Cells>
+measured workload(uint32_t n) {
+    Cells cells;
+    cells.resize(n);
+    volatile llama_pos sink = 0;
+    const llama_pos d = -llama_pos(n / 2);
+    auto read = [&] { sink = cells.seq_pos_min(0) + cells.seq_pos_max(0) + llama_pos(cells.get_used()); };
+    allocations = 0;
+    counting    = true;
     const auto t0 = std::chrono::steady_clock::now();
-    for (uint32_t i = 0; i < n; ++i) { append(t, i); }
-    read(t);
-    for (uint32_t i = 0; i < n / 2; ++i) { remove(t, i); }
-    read(t);
-    for (uint32_t i = n / 2; i < n; ++i) { shift(t, i); }
-    read(t);
-    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    for (uint32_t i = 0; i < n; ++i) {
+        cells.pos_set(i, llama_pos(i));
+        cells.seq_add(i, 0);
+    }
+    read();
+    for (uint32_t i = 0; i < n / 2; ++i) {
+        cells.rm(i);
+    }
+    read();
+    for (uint32_t i = n / 2; i < n; ++i) {
+        cells.pos_add(i, d);
+    }
+    read();
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    counting = false;
+    (void) sink;
+    return { ms, allocations.load() };
 }
 
 void cost(uint32_t n) {
-    llama_kv_cells cells;
-    cells.resize(n);
-    reference ref(n);
-    volatile llama_pos sink = 0;
-    const llama_pos d = -llama_pos(n / 2);
-    const double now = timed(cells, n,
-        [](llama_kv_cells & c, uint32_t i) { c.pos_set(i, llama_pos(i)); c.seq_add(i, 0); },
-        [](llama_kv_cells & c, uint32_t i) { c.rm(i); },
-        [d](llama_kv_cells & c, uint32_t i) { c.pos_add(i, d); },
-        [&sink](llama_kv_cells & c) { sink = c.seq_pos_min(0) + c.seq_pos_max(0) + llama_pos(c.get_used()); });
-    const double before = timed(ref, n,
-        [](reference & r, uint32_t i) { r.pos_set(i, llama_pos(i)); r.seq_add(i, 0); },
-        [](reference & r, uint32_t i) { r.rm(i); },
-        [d](reference & r, uint32_t i) { r.pos_add(i, d); },
-        [&sink](reference & r) { sink = r.min(0) + r.max(0) + llama_pos(r.used.size()); });
-    printf("RECEIPT kv-cell-index n=%u: node containers %.3f ms, native %.3f ms\n", n, before, now);
-    (void) sink;
+    const measured before = workload<llama_kv_cells_previous>(n);
+    const measured now    = workload<llama_kv_cells>(n);
+    printf("RECEIPT kv-cell-index n=%u: previous %.3f ms, %llu allocations | native %.3f ms, %llu allocations\n", n,
+           before.ms, (unsigned long long) before.allocations, now.ms, (unsigned long long) now.allocations);
 }
 
 } // namespace
+
+// Counts this binary's allocations while a workload runs (counting is off otherwise).
+void * operator new(std::size_t size) {
+    if (counting.load(std::memory_order_relaxed)) {
+        allocations.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (void * p = std::malloc(size == 0 ? 1 : size)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+
+void operator delete(void * p) noexcept {
+    std::free(p);
+}
+
+void operator delete(void * p, std::size_t) noexcept {
+    std::free(p);
+}
 
 int main(int argc, char ** /* argv: only the flag count is read */) {
     for (uint32_t seed = 1; seed <= 8 && !failures; ++seed) {
