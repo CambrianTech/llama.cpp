@@ -4,6 +4,7 @@
 // the 1,000-line rule). Included by server-context-impl.h.
 
 #include <limits>
+#include "engine/memory_pool.h"
 #include "server-context.h"
 #include "server-checkpoint-policy.h"
 #include "server-view-end.h"
@@ -270,7 +271,7 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
-    common_memory mem;
+    memory_pool * mem = nullptr; // the engine's allocator (engine/memory_pool.h); every KV edit of this slot goes through it
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -374,7 +375,7 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        mem.seq_rm(id, -1, -1);
+        GGML_ASSERT(mem->remove(id, -1, -1, kv_contexts::both) == edit_outcome::done);
 
         prompt.clear();
     }
@@ -798,8 +799,8 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        mem.seq_rm(other.id,     -1, -1);
-        mem.seq_cp(id, other.id, -1, -1);
+        GGML_ASSERT(mem->remove(other.id,     -1, -1, kv_contexts::both) == edit_outcome::done);
+        GGML_ASSERT(mem->copy(id, other.id, -1, -1, kv_contexts::both) == edit_outcome::done);
 
         other.i_batch = i_batch;
 

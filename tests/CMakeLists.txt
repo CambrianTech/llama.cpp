@@ -355,6 +355,13 @@ llama_build_and_test(test-dup-quantized.cpp)
 llama_build_and_test(test-state-restore-streams.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-streams PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# the server engine's memory pool against a real model: loads both contexts or none, refuses bad buffers (4.12.1)
+add_executable(test-memory-pool test-memory-pool.cpp ../tools/server/engine/memory_pool_llama.cpp)
+target_compile_features(test-memory-pool PRIVATE cxx_std_17)
+target_link_libraries(test-memory-pool PRIVATE llama llama-common)
+add_test(NAME test-memory-pool COMMAND test-memory-pool -m "${MODEL_DEST}")
+set_tests_properties(test-memory-pool PROPERTIES LABELS "model" FIXTURES_REQUIRED test-download-model)
+
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)

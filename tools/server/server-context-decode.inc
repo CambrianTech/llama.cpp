@@ -306,7 +306,7 @@
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        GGML_ASSERT(slot.mem->remove(slot.id, ckpt.pos_max + 1, -1, kv_contexts::both) == edit_outcome::done);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -353,7 +353,7 @@
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            GGML_ASSERT(slot.mem->remove(slot.id, slot.prompt.tokens.pos_next(), -1, kv_contexts::both) == edit_outcome::done);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
