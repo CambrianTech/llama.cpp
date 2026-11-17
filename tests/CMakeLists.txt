@@ -260,6 +260,25 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
+    # a persona's state moved raw between the memory and host memory is byte-identical, and a refused move changes
+    # nothing (CONTINUUM-ENGINE 4.14): on a plain KV model, on the generated hybrid (qwen35moe: attention + recurrent),
+    # and on the hybrid with the rollback groups serving's draft-mtp configuration creates
+    llama_build(test-persona-blocks.cpp)
+    llama_test(
+        test-persona-blocks
+        NAME test-persona-blocks-hybrid
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35moe-moe.gguf"
+    )
+    set_tests_properties(test-persona-blocks-hybrid PROPERTIES FIXTURES_REQUIRED generate-models)
+    llama_test(
+        test-persona-blocks
+        NAME test-persona-blocks-rollback
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35moe-moe.gguf" --test-rs-seq 4
+    )
+    set_tests_properties(test-persona-blocks-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
+
     llama_test(
         test-recurrent-state-rollback
         LABEL main
@@ -355,10 +374,11 @@ llama_build_and_test(test-dup-quantized.cpp)
 llama_build_and_test(test-state-restore-streams.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-streams PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# a persona's state moved raw between the memory and host memory is byte-identical, and a refused move changes nothing
-# (CONTINUUM-ENGINE 4.14); also run on a hybrid model written by `test-llama-archs -a qwen35moe -o DIR`
-llama_build_and_test(test-persona-blocks.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-persona-blocks PROPERTIES FIXTURES_REQUIRED test-download-model)
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # test-persona-blocks (built above with the internal-API tests) on the downloaded plain KV model
+    llama_test(test-persona-blocks LABEL "model" ARGS -m "${MODEL_DEST}")
+    set_tests_properties(test-persona-blocks PROPERTIES FIXTURES_REQUIRED test-download-model)
+endif()
 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
