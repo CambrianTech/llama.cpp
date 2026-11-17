@@ -2979,6 +2979,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TRAIN_DIR"));
     add_opt(common_arg(
+        {"--frame-costs"},
+        "record each serving-loop frame's completed work and host time into a fixed ring, with totals on /metrics "
+        "and a summary line every 10 s (off unless set, so its own cost is measured against a run without it)",
+        [](common_params & params) {
+            params.frame_costs = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_FRAME_COSTS"));
+    add_opt(common_arg(
         {"--lora"}, "FNAME",
         "path to LoRA adapter (use comma-separated values to load multiple adapters)",
         [](common_params & params, const std::string & value) {

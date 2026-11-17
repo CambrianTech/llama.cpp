@@ -1665,8 +1665,10 @@ private:
         });
 
         metrics.init();
-        frames = std::make_unique<frame_costs<4096>>(metrics.t_start);
-        frame_slot_stamp.assign(slots.size(), UINT64_MAX);
+        if (params_base.frame_costs) {
+            frames = std::make_unique<frame_costs<4096>>(metrics.t_start);
+            frame_slot_stamp.assign(slots.size(), UINT64_MAX);
+        }
         frames_reported_us = metrics.t_start;
         publish_ledger(); // readable before the loop's first boundary
 
@@ -3528,7 +3530,11 @@ private:
             server_context_impl * s;
             int64_t               t_loop_start;
             int64_t               gen_at_start;
-            ~frame_guard() { s->finish_frame(t_loop_start, gen_at_start); }
+            ~frame_guard() {
+                if (s->frames) {
+                    s->finish_frame(t_loop_start, gen_at_start);
+                }
+            }
         } frame_guard_{ this, t_loop_start, gen_at_start };
 
         try {
@@ -3569,7 +3575,9 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         const bool    has_prompt   = batch.size() > n_batch_gen;
-        frame_shape_before_decode();
+        if (frames) {
+            frame_shape_before_decode();
+        }
         const int64_t t_step_start = ggml_time_us();
         for (int32_t off = 0; off < batch.size(); off = off_next) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - off);

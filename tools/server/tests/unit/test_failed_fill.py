@@ -82,6 +82,8 @@ def test_a_refused_checkpoint_copy_is_not_a_slot_failure(monkeypatch):
 def test_a_failed_fill_leaves_the_batch_and_its_prompt_clean(monkeypatch):
     global server
     server = configure(ServerPreset.tinyllama2())
+    server.server_metrics = True
+    server.frame_costs = True
     start_with_fault(monkeypatch, "LLAMA_SERVER_TEST_FAIL_PROMPT_FILLS", 1)
 
     results = complete_both()
@@ -89,6 +91,17 @@ def test_a_failed_fill_leaves_the_batch_and_its_prompt_clean(monkeypatch):
     assert len(failed) == 1, [res.body for res in results]
     good = results[1 - failed[0]]
     assert server.make_request("GET", "/health").status_code == 200
+
+    # the frame recorder through a real slot failure: the failed slot is counted where it failed, the frame itself
+    # carried on (the other slot completed), and only the completed slot's output is counted as accepted
+    totals = {}
+    for line in server.make_request("GET", "/metrics").body.splitlines():
+        if line.startswith("llamacpp:") and "{" not in line:
+            name, value = line.split(" ", 1)
+            totals[name] = float(value)
+    assert totals["llamacpp:frame_slot_failures_total"] == 1
+    assert totals["llamacpp:frames_failed_total"] == 0
+    assert totals["llamacpp:frame_tokens_accepted_total"] == good.body["timings"]["predicted_n"]
 
     # the failed slot's memory holds none of the prompt, so nothing of it may be reused
     retry = complete(failed[0])

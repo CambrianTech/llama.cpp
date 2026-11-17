@@ -605,6 +605,7 @@ struct common_params {
     float val_split = 0.05f; // fraction of the data used for the validation set
     // llama-server /train: the ONLY directory it may write adapters into; empty disables the route
     std::string train_dir;
+    bool        frame_costs = false; // record each serving-loop frame's work and host time (off unless asked)
 
     // embedding
     bool embedding         = false; // get only sentence embedding

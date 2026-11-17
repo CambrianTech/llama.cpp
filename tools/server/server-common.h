@@ -503,6 +503,7 @@ struct server_metrics {
     // lives in the server context because this struct is copied into every metrics result. Host time, not device time.
     uint64_t n_frames             = 0;
     uint64_t n_frames_failed      = 0;
+    uint64_t n_frame_slot_failures = 0;
     uint64_t n_frame_gen_accepted = 0;
     uint64_t t_frame_loop_us      = 0;
     uint64_t t_frame_batch_us     = 0;
@@ -512,6 +513,7 @@ struct server_metrics {
     template <typename Frame> void add_frame(const Frame & f, int64_t record_us) {
         ++n_frames;
         n_frames_failed      += f.outcome == decltype(f.outcome)::failed;
+        n_frame_slot_failures += (uint64_t) f.slot_failures;
         n_frame_gen_accepted += (uint64_t) f.gen_accepted;
         t_frame_loop_us      += (uint64_t) f.host_loop_us;
         t_frame_batch_us     += (uint64_t) f.host_batch_us;

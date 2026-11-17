@@ -1609,8 +1609,12 @@ std::string server_task_result_metrics::to_metrics() {
             (double) metrics.n_frames
         }, {
             "frames_failed_total",
-            "Frames whose decode or post-decode failed",
+            "Frames whose pre-decode, decode or post-decode failed",
             (double) metrics.n_frames_failed
+        }, {
+            "frame_slot_failures_total",
+            "Slots whose own work threw and was released inside a frame",
+            (double) metrics.n_frame_slot_failures
         }, {
             "frame_tokens_accepted_total",
             "Accepted output tokens, counted per frame",

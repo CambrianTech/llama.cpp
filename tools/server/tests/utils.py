@@ -85,6 +85,7 @@ class ServerProcess:
     server_embeddings: bool | None = False
     server_reranking: bool | None = False
     server_metrics: bool | None = False
+    frame_costs: bool | None = False
     kv_unified: bool | None = False
     swa_full: bool | None = False
     server_slots: bool | None = False
@@ -197,6 +198,8 @@ class ServerProcess:
             server_args.append("--embedding")
         if self.server_reranking:
             server_args.append("--reranking")
+        if self.frame_costs:
+            server_args.append("--frame-costs")
         if self.server_metrics:
             server_args.append("--metrics")
         if self.kv_unified:

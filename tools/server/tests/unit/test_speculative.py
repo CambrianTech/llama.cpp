@@ -138,6 +138,7 @@ def test_frames_count_accepted_tokens_not_drafts():
     # draft model, rejected drafts must not appear in the accepted total, which equals what the requests received
     global server
     server.server_metrics = True
+    server.frame_costs = True
     server.start()
     n_predicted = 0
     for seed in [1, 2, 3]:

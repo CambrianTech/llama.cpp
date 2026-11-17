@@ -232,6 +232,7 @@ def test_frames_count_only_completed_work():
     # accepted output, or missing the frame in which a slot completes and is released (n_predict=1 ends in its first
     # generated frame); its accepted total must equal the completion owner's own count
     global server
+    server.frame_costs = True
     server.start()
 
     n_predicted = 0
@@ -245,3 +246,15 @@ def test_frames_count_only_completed_work():
     assert metrics["llamacpp:frames_total"][1] > 0
     assert metrics["llamacpp:frames_failed_total"][1] == 0
     assert metrics["llamacpp:frame_loop_seconds_total"][1] >= metrics["llamacpp:frame_batch_seconds_total"][1]
+
+
+def test_frames_are_off_unless_asked():
+    # what this catches: the recorder running (and costing) in a server that did not ask for it, which would leave
+    # no clean run to measure its own cost against
+    global server
+    server.start()
+    res = server.make_request("POST", "/completion", data={"prompt": "I believe", "n_predict": 4})
+    assert res.status_code == 200
+    metrics = parse_metrics(fetch_metrics(server))
+    assert metrics["llamacpp:frames_total"][1] == 0
+    assert metrics["llamacpp:frame_tokens_accepted_total"][1] == 0
