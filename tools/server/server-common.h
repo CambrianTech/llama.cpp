@@ -61,6 +61,7 @@ enum error_type {
     ERROR_TYPE_UNAVAILABLE, // custom error
     ERROR_TYPE_NOT_SUPPORTED, // custom error
     ERROR_TYPE_EXCEED_CONTEXT_SIZE, // custom error
+    ERROR_TYPE_CONTINUATION_REFUSED, // Continuum fork: a request's continuation does not hold (server-continuation.h)
 };
 
 // thin wrapper around common_grammar_trigger with (de)serialization functions

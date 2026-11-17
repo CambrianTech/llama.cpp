@@ -48,6 +48,10 @@ json format_error_response(const std::string & message, const enum error_type ty
             type_str = "unavailable_error";
             code = 503;
             break;
+        case ERROR_TYPE_CONTINUATION_REFUSED:
+            type_str = "continuation_refused";
+            code = 409;
+            break;
         case ERROR_TYPE_EXCEED_CONTEXT_SIZE:
             type_str = "exceed_context_size_error";
             code = 400;

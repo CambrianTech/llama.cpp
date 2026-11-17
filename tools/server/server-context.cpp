@@ -1932,17 +1932,25 @@ private:
 
     // A request that continues her last response is served from the tokens her slot holds: her
     // generated tokens stay, and only what follows her response is new (server-continuation.h).
-    // Runs after the adapter check, so a slot cleared for an adapter change never continues.
-    void continue_her_response(server_slot & slot, server_task & task) {
+    // Runs after the adapter check, so a slot cleared for an adapter change never continues. A
+    // continuation that does not hold is REFUSED, typed, and her held tokens and lineage are kept:
+    // serving it as sent would recompute what she already holds. A cold start is the caller's own
+    // decision (a request that names no continuation). Returns false when it refused.
+    bool continue_her_response(server_slot & slot, server_task & task) {
         if (task.params.continues.empty()) {
             slot.responses.clear(); // a new lineage: what this task does to her tokens is not a continuation
-            return;
+            return true;
         }
+        const auto refuse = [&](continuation_miss miss) {
+            SLT_WRN(slot, "continuation of %s refused (%s): her held tokens are kept\n", task.params.continues.c_str(),
+                    continuation_miss_name(miss));
+            send_error(task, string_format("continuation of %s refused (%s): her slot keeps her held tokens; a cold start is a request that names no continuation",
+                                           task.params.continues.c_str(), continuation_miss_name(miss)),
+                       ERROR_TYPE_CONTINUATION_REFUSED);
+            return false;
+        };
         if (task.tokens.has_mtmd || slot.prompt.tokens.has_mtmd) {
-            slot.responses.clear();
-            SLT_WRN(slot, "continuation of %s missed (%s): served as sent\n", task.params.continues.c_str(),
-                    continuation_miss_name(continuation_miss::has_media));
-            return;
+            return refuse(continuation_miss::has_media);
         }
         const llama_tokens & held = slot.prompt.tokens.get_tokens();
         const llama_tokens & sent = task.tokens.get_tokens();
@@ -1951,10 +1959,7 @@ private:
             continuation_request{ task.params.continues, sent, task.params.message_spans },
             [this](llama_token tok) { return llama_vocab_is_eog(vocab, tok); });
         if (c.miss != continuation_miss::none) {
-            slot.responses.clear();
-            SLT_WRN(slot, "continuation of %s missed (%s): served as sent, her held tokens past the shared prefix are recomputed\n",
-                    task.params.continues.c_str(), continuation_miss_name(c.miss));
-            return;
+            return refuse(c.miss);
         }
         for (auto & span : task.params.message_spans.spans) {
             if (span.pos >= c.from) {
@@ -1968,6 +1973,7 @@ private:
                 task.params.continues.c_str(), c.kept, c.generated,
                 sent.size() - c.from, c.from - c.response);
         task.tokens = server_tokens(c.tokens, false);
+        return true;
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
@@ -1991,7 +1997,9 @@ private:
             }
         }
 
-        continue_her_response(slot, task);
+        if (!continue_her_response(slot, task)) {
+            return false;
+        }
 
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
