@@ -14,6 +14,12 @@ add_library(${TARGET} STATIC
     server-common.cpp
     server-common.h
     server-context.cpp
+    server-routes-status.cpp
+    server-routes-generation.cpp
+    server-routes-tokens.cpp
+    server-routes-lora.cpp
+    server-routes-learn.cpp
+    server-routes-control.cpp
     server-mapped-file.cpp
     server-mapped-file.h
     server-mind.h
