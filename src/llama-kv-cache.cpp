@@ -1305,7 +1305,7 @@ void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_bloc
         }
     }
     out.seq = seq_id;
-    std::swap(out.kv.cells, cells); // hers out; the stream takes the prepared empty object
+    out.kv.cells.swap(cells); // hers out; the stream takes the prepared empty object
     v_heads[s] = 0;
 }
 
@@ -1360,7 +1360,7 @@ void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot
             ggml_backend_tensor_set(layer.v_stream[s], in.kv.v[i].data(), 0, in.kv.v[i].size());
         }
     }
-    std::swap(in.kv.cells, v_cells[s]); // hers in; her blocks keep the stream's empty object for her next save
+    in.kv.cells.swap(v_cells[s]); // hers in; her blocks keep the stream's empty object for her next save
     v_heads[s] = 0;
     // bind her own sequence id to stream s; the sequence that held s takes her old stream (both empty of others)
     const uint32_t old = seq_to_stream[seq_id];

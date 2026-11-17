@@ -31,6 +31,22 @@ struct llama_kv_cell_ext {
 // TODO: add unit tests
 class llama_kv_cells {
 public:
+    // Continuum fork (CONTINUUM-ENGINE 4.14): exchange two cells objects in place, member by member, with each
+    // container's own swap: never allocates on any standard library (a std::swap of the whole object moves through a
+    // temporary, and MSVC's node containers allocate a sentinel when move-constructed). A persona's metadata moves
+    // between her blocks and a stream with this.
+    void swap(llama_kv_cells & other) noexcept {
+        std::swap(has_shift, other.has_shift);
+        used.swap(other.used);
+        pos.swap(other.pos);
+        ext.swap(other.ext);
+        shift.swap(other.shift);
+        seq.swap(other.seq);
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            seq_pos[s].swap(other.seq_pos[s]);
+        }
+    }
+
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
