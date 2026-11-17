@@ -185,7 +185,7 @@
         std::memcpy(w, h, sizeof(h));
         w += sizeof(h);
         ckpt_write(cold->prompt.checkpoints, w + n_tgt + n_dft);
-        if (pool->save(seq, LLAMA_STATE_SEQ_FLAGS_NONE, w, w + n_tgt) != save_outcome::saved) {
+        if (pool->save(seq, LLAMA_STATE_SEQ_FLAGS_NONE, { w, n_tgt }, { w + n_tgt, n_dft }) != save_outcome::saved) {
             SRV_ERR("mind %016llx: her state could not be copied out of the pool; she stays where she is\n", (unsigned long long) cold->page.hi);
             return false;
         }
@@ -276,7 +276,7 @@
         bool ok = false;
         while (true) {
             GGML_ASSERT(pool->remove(seq, -1, -1, kv_contexts::both) == edit_outcome::done);
-            ok = pool->load(seq, LLAMA_STATE_SEQ_FLAGS_NONE, r, h[0], r + h[0], h[1]) == load_outcome::loaded;
+            ok = pool->load(seq, LLAMA_STATE_SEQ_FLAGS_NONE, { r, h[0] }, { r + h[0], h[1] }) == load_outcome::loaded;
             if (ok || !flash_coldest()) {
                 break;
             }

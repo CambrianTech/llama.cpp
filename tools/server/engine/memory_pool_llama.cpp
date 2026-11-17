@@ -75,26 +75,38 @@ seq_state_size memory_pool_llama::state_size(llama_seq_id seq, llama_state_seq_f
     return n;
 }
 
-save_outcome memory_pool_llama::save(llama_seq_id seq, llama_state_seq_flags flags, uint8_t * tgt, uint8_t * dft) const {
-    const seq_state_size n = state_size(seq, flags);
-    if (llama_state_seq_get_data_ext(tgt_, tgt, n.tgt, seq, flags) != n.tgt) {
+save_outcome memory_pool_llama::save(llama_seq_id seq, llama_state_seq_flags flags, bytes_out tgt, bytes_out dft) const {
+    if (!save_pair_valid(state_size(seq, flags), tgt.size, dft.size)) {
+        return save_outcome::invalid;
+    }
+    if (llama_state_seq_get_data_ext(tgt_, tgt.data, tgt.size, seq, flags) != tgt.size) {
         return save_outcome::failed;
     }
-    if (dft_ != nullptr && llama_state_seq_get_data_ext(dft_, dft, n.dft, seq, flags) != n.dft) {
+    if (dft_ != nullptr && llama_state_seq_get_data_ext(dft_, dft.data, dft.size, seq, flags) != dft.size) {
         return save_outcome::failed;
     }
     return save_outcome::saved;
 }
 
-load_outcome memory_pool_llama::load(llama_seq_id seq, llama_state_seq_flags flags, const uint8_t * tgt, size_t n_tgt,
-                                     const uint8_t * dft, size_t n_dft) {
-    if (llama_state_seq_set_data_ext(tgt_, tgt, n_tgt, seq, flags) != n_tgt) {
+load_outcome memory_pool_llama::load(llama_seq_id seq, llama_state_seq_flags flags, bytes_in tgt, bytes_in dft) {
+    if (!load_pair_valid(dft_ != nullptr, tgt.size, dft.size)) {
+        return load_outcome::invalid;
+    }
+    const bool dst_empty = llama_memory_seq_pos_max(llama_get_memory(tgt_), seq) < 0 &&
+                           (dft_ == nullptr || llama_memory_seq_pos_max(llama_get_memory(dft_), seq) < 0);
+    if (!dst_empty) {
+        return load_outcome::invalid;
+    }
+    if (llama_state_seq_set_data_ext(tgt_, tgt.data, tgt.size, seq, flags) != tgt.size) {
+        // llama may leave a partial target state: clear it so refused means nothing is loaded
+        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(tgt_), seq, -1, -1));
         return load_outcome::refused;
     }
-    if (dft_ != nullptr && n_dft > 0 && llama_state_seq_set_data_ext(dft_, dft, n_dft, seq, flags) != n_dft) {
+    if (dft_ != nullptr && llama_state_seq_set_data_ext(dft_, dft.data, dft.size, seq, flags) != dft.size) {
         // the target took its half and the draft refused: the target's half goes, so the sequence is not left half
         // loaded (both contexts hold it, or neither does); a whole-sequence removal is never refused
         GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(tgt_), seq, -1, -1));
+        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(dft_), seq, -1, -1));
         return load_outcome::refused;
     }
     return load_outcome::loaded;

@@ -19,10 +19,10 @@ public:
     edit_outcome move(llama_seq_id src, llama_seq_id dst) override;
     seq_range    range(llama_seq_id seq) const override;
 
+    bool           has_draft() const override { return dft_ != nullptr; }
     seq_state_size state_size(llama_seq_id seq, llama_state_seq_flags flags) const override;
-    save_outcome   save(llama_seq_id seq, llama_state_seq_flags flags, uint8_t * tgt, uint8_t * dft) const override;
-    load_outcome   load(llama_seq_id seq, llama_state_seq_flags flags, const uint8_t * tgt, size_t n_tgt,
-                        const uint8_t * dft, size_t n_dft) override;
+    save_outcome   save(llama_seq_id seq, llama_state_seq_flags flags, bytes_out tgt, bytes_out dft) const override;
+    load_outcome   load(llama_seq_id seq, llama_state_seq_flags flags, bytes_in tgt, bytes_in dft) override;
 
 private:
     // the contexts `in` names, target first; the draft only when the pool has one
