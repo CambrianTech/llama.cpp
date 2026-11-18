@@ -701,12 +701,17 @@ int main(int argc, char ** argv) {
         const auto want_f32 = step_delta(params, model, init, tokens, reply, WINDOW, true);
         g_cache_type = GGML_TYPE_F16;
         const auto want_f16 = step_delta(params, model, init, tokens, reply, WINDOW, true);
+        g_cache_type = GGML_TYPE_Q4_0;
+        const auto want_q4_0 = step_delta(params, model, init, tokens, reply, WINDOW, true);
         g_cache_type = GGML_TYPE_F32;
 
-      for (const bool streams : { false, true }) {
+      for (const ggml_type live_cache : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0 }) {
+        // what the q4_0 run catches: a live step that reads her quantized cache differently from
+        // the walk at the same cache (the 35B serves q4_0; the f16 run cannot see it)
+        const bool streams = live_cache != GGML_TYPE_F32;
         // unified F32 cache with explicit attention, then a stream per slot with an f16 cache and
         // flash attention: how a serving lane runs (each slot attends over its own stream)
-        printf("  live sequence, %s:\n", streams ? "a stream per slot, f16 cache, flash attention" : "one unified F32 cache, explicit attention");
+        printf("  live sequence, %s:\n", streams ? (live_cache == GGML_TYPE_F16 ? "a stream per slot, f16 cache, flash attention" : "a stream per slot, q4_0 cache, flash attention") : "one unified F32 cache, explicit attention");
         size_t graph_segments = 0;
         auto two_seq_ctx = [&]() {
             auto cp = common_context_params_to_llama(params);
@@ -715,7 +720,7 @@ int main(int argc, char ** argv) {
             if (getenv("WALK_LIVE_GRAPH_SMALL_UBATCH")) { cp.n_ubatch = WINDOW / 8; }
             if (getenv("WALK_LIVE_SMALL_RESTORE_BATCH")) { cp.n_batch = cp.n_ubatch = WINDOW / 8; }
             cp.flash_attn_type = streams ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
-            cp.type_k = streams ? GGML_TYPE_F16 : GGML_TYPE_F32; cp.type_v = cp.type_k;
+            cp.type_k = live_cache; cp.type_v = cp.type_k;
             // Graph segmentation preserves the full token graph and its gradient.
             // This tests existing scheduler views only, NOT resumable serving yields.
             if (getenv("WALK_LIVE_GRAPH_SEGMENTS")) {
@@ -1198,7 +1203,7 @@ int main(int argc, char ** argv) {
             got[i] = after[i] - before[i];
         }
         printf("  live sequence: learned=%d \"%s\"\n", (int) learned, learned ? "" : "see the log");
-        if (!learned || !same_step(compare("live sequence: her reply learned in place vs the walk's exact step", got, streams ? want_f16 : want_f32))) {
+        if (!learned || !same_step(compare("live sequence: her reply learned in place vs the walk's exact step", got, live_cache == GGML_TYPE_Q4_0 ? want_q4_0 : live_cache == GGML_TYPE_F16 ? want_f16 : want_f32))) {
             fprintf(stderr, "FAILED: learning on a live sequence is not the walk's step\n");
             ++failures;
         }
