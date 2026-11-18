@@ -204,7 +204,6 @@ int main(int argc, char ** argv) {
     require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a out");
     require(f.pos_max(0) < 0, "nothing of a is left in the memory");
     require(a.seq == 0, "her blocks carry her sequence");
-    require_move(ctx.persona_load(1, 1, a, A), llama_persona_move::wrong_persona, "a refused as sequence 1 (never retagged)");
     // what this catches: the native load trusting its caller. a's blocks under b's identity are refused before
     // anything is written, on the native path itself, not only the public seam.
     require_move(ctx.persona_load(0, 1, a, B), llama_persona_move::wrong_owner, "a's blocks refused under b's identity");
@@ -212,6 +211,16 @@ int main(int argc, char ** argv) {
     require_move(ctx.persona_load(0, 1, a, A), llama_persona_move::done, "a into stream 1");
     require(f.pos_max(0) == f.n_prompt - 1, "a's sequence holds her prompt");
     f.require_continues("a moved to stream 1", 0, ref_a0);
+
+    // 1b. what this catches: a mind bound only back as the sequence she was saved from, so two streams cannot serve
+    // any number of minds. Saved as sequence 0, she binds as sequence 1: her cells answer to 1, nothing is left on 0,
+    // and she continues byte-identically.
+    llama_memory_clear(llama_get_memory(f.ctx), true);
+    f.prompt(0, 1);
+    require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a out (to rebind as another sequence)");
+    require_move(ctx.persona_load(1, 1, a, A), llama_persona_move::done, "a bound as sequence 1");
+    require(f.pos_max(1) == f.n_prompt - 1 && f.pos_max(0) < 0, "her cells answer to sequence 1 only");
+    f.require_continues("a continues as sequence 1", 1, ref_a0);
 
     // 2. the mirror: b's sequence 1 out of its stream and into the other
     llama_memory_clear(llama_get_memory(f.ctx), true);

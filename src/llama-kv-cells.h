@@ -354,6 +354,24 @@ public:
         return seq[i].test(seq_id);
     }
 
+    // Relabel every cell of sequence `from` as `to`, with its position index: a persona's cells bound back as the
+    // sequence she is bound as now. `to` holds no cell here (a stream holds one persona), so nothing merges.
+    void seq_rename(llama_seq_id from, llama_seq_id to) {
+        if (from == to) {
+            return;
+        }
+        for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
+            if (seq[i].test(from)) {
+                seq[i].reset(from);
+                seq[i].set(to);
+            }
+        }
+        seq_pos[to].swap(seq_pos[from]);
+        const bool was_stale = stale.test(from);
+        stale.set(from, stale.test(to));
+        stale.set(to, was_stale);
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());

@@ -1359,9 +1359,6 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
     if (in.kv_layout != persona_layout()) {
         return llama_persona_move::layout_mismatch;
     }
-    if (in.kv.n_rows > 0 && in.seq != seq_id) {
-        return llama_persona_move::wrong_persona;
-    }
     const auto & kv = in.kv;
     if (kv.cells.size() != get_size() || kv.n_rows > get_size() || kv.cells.used_max_p1() > kv.n_rows ||
         kv.k.size() != layers.size() || kv.v.size() != layers.size()) {
@@ -1391,6 +1388,7 @@ void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot
         }
     }
     in.kv.cells.swap(v_cells[s]); // hers in; her blocks keep the stream's empty object for her next save
+    v_cells[s].seq_rename(in.seq, seq_id); // her cells answer to the sequence she is bound as now
     v_heads[s] = 0;
     // bind her own sequence id to stream s; the sequence that held s takes her old stream (both empty of others)
     const uint32_t old = seq_to_stream[seq_id];

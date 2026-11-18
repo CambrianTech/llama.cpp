@@ -493,9 +493,6 @@ llama_persona_move llama_memory_recurrent::persona_check_load(llama_seq_id seq_i
     if (!rs.has_state) {
         return llama_persona_move::done;
     }
-    if (in.seq != seq_id) {
-        return llama_persona_move::wrong_persona;
-    }
     if (rs.rs_idx > n_rs_seq) {
         return llama_persona_move::invalid_rollback;
     }
