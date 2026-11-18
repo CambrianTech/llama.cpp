@@ -57,3 +57,25 @@ bool llama_memory_status_is_fail(llama_memory_status status) {
 
     return false;
 }
+
+const char * llama_persona_move_name(llama_persona_move m) {
+    switch (m) {
+        case llama_persona_move::done:               return "done";
+        case llama_persona_move::unsupported:        return "unsupported";
+        case llama_persona_move::no_such_stream:     return "no_such_stream";
+        case llama_persona_move::transposed_v:       return "transposed_v";
+        case llama_persona_move::stream_not_empty:   return "stream_not_empty";
+        case llama_persona_move::cells_not_prepared: return "cells_not_prepared";
+        case llama_persona_move::layout_mismatch:    return "layout_mismatch";
+        case llama_persona_move::invalid_seq:        return "invalid_seq";
+        case llama_persona_move::seq_holds_state:    return "seq_holds_state";
+        case llama_persona_move::shared_cell:        return "shared_cell";
+        case llama_persona_move::no_free_cell:       return "no_free_cell";
+        case llama_persona_move::wrong_persona:      return "wrong_persona";
+        case llama_persona_move::invalid_rollback:   return "invalid_rollback";
+        case llama_persona_move::wrong_owner:        return "wrong_owner";
+        case llama_persona_move::out_of_memory:      return "out_of_memory";
+        case llama_persona_move::no_empty_stream:    return "no_empty_stream";
+    }
+    return "unknown";
+}

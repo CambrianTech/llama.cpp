@@ -403,6 +403,36 @@ def test_completion_unified(n_ctx, n_slots, n_predict_vals, expected_success):
                 assert res.body["timings"]["predicted_n"] == n_predict
 
 
+# Continuum fork (#147): the capacity contract test_completion_unified's all-pass case rests on, made deterministic.
+# Four requests share 256 unified cells (3-token prompts). A 40-token request starting d decode steps behind three
+# 90-token ones needs, at g tokens in, 3 * (3 + g + d) + (3 + g) = 12 + 4g + 3d cells: past 256 before it reaches 40
+# once d > 28. So that case passes only when the four arrive together; in its two Windows failures on #147 the fourth
+# was posted 15 and 25 ms late (d = 41 at the overflow, 32 + 73 + 73 + 77 = 255 cells). Here the late request is sent
+# only after /slots shows every early request at least 40 tokens in, so the overflow is certain on any machine. Its
+# /slots polling also exercises the reads a decode answers beside it (yield_decoding).
+def test_completion_unified_late_arrival_overflows():
+    global server
+    from concurrent.futures import ThreadPoolExecutor
+    server.n_slots = 4
+    server.kv_unified = True
+    server.n_ctx = 256
+    server.server_slots = True
+    server.start()
+    request = lambda n_predict: server.make_request("POST", "/completion", {"prompt": "A", "n_predict": n_predict})
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        early = [pool.submit(request, 90) for _ in range(3)]
+        while True:
+            busy = [s for s in server.make_request("GET", "/slots").body if s["is_processing"]]
+            if len(busy) == 3 and min(s["next_token"][0]["n_decoded"] for s in busy) >= 40:
+                break
+            assert not any(f.done() for f in early), "an early request ended before the late one was sent"
+        late = request(40)
+        early_results = [f.result() for f in early]
+    assert late.status_code == 500, "the late request cannot fit beside three requests 40+ tokens ahead"
+    assert "Context size has been exceeded" in str(late.body)
+    assert all(res.status_code == 500 for res in early_results), "an exceeded context ends every request in the batch"
+
+
 @pytest.mark.parametrize(
     "prompt,n_predict,response_fields",
     [

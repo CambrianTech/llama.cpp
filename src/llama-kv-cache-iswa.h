@@ -91,6 +91,8 @@ public:
     //
 
     llama_kv_cache * get_base() const;
+
+    uint32_t seq_stream(llama_seq_id seq_id) const override { return kv_base->seq_stream(seq_id); }
     llama_kv_cache * get_swa () const;
 
 private:

@@ -1,5 +1,8 @@
 #include "llama-context.h"
 
+#include <new>
+#include "llama-persona-tokens.h"
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -2567,12 +2570,60 @@ llm_graph_type llama_context::graph_type() const {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+llama_persona_move llama_context::persona_prepare(llama_persona_blocks & blocks) const {
+    return memory ? memory->persona_prepare(blocks) : llama_persona_move::unsupported;
+}
+
+llama_persona_move llama_context::persona_save(llama_seq_id seq_id, llama_persona_blocks & out, const llama_persona_identity & who) {
+    if (!memory) {
+        return llama_persona_move::unsupported;
+    }
+    synchronize(); // a decode returns before its writes land; the raw copies read the same device memory
+    const llama_persona_move checked = memory->persona_check_save(seq_id, out);
+    if (checked != llama_persona_move::done) {
+        return checked;
+    }
+    memory->persona_commit_save(seq_id, out);
+    out.owned       = true; // a completed save stamps her blocks with her owner
+    out.owner       = who.persona;
+    out.owner_epoch = who.epoch;
+    return llama_persona_move::done;
+}
+
+llama_persona_move llama_context::persona_load(llama_seq_id seq_id, uint32_t stream, llama_persona_blocks & in, const llama_persona_identity & who) {
+    if (!memory) {
+        return llama_persona_move::unsupported;
+    }
+    if (!in.belongs_to(who)) {
+        return llama_persona_move::wrong_owner; // refused before anything is written
+    }
+    synchronize();
+    llama_persona_slot slot;
+    const llama_persona_move checked = memory->persona_check_load(seq_id, stream, in, slot);
+    if (checked != llama_persona_move::done) {
+        return checked;
+    }
+    memory->persona_commit_load(seq_id, slot, in);
+    return llama_persona_move::done;
+}
+
+llama_persona_move llama_context::persona_bind(llama_seq_id seq_id, llama_persona_blocks & in, const llama_persona_identity & who) {
+    if (!memory) {
+        return llama_persona_move::unsupported;
+    }
+    const int32_t stream = memory->persona_empty_stream();
+    if (stream < 0) {
+        return llama_persona_move::no_empty_stream;
+    }
+    return persona_load(seq_id, (uint32_t) stream, in, who);
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -2591,6 +2642,13 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+    if (memory) {
+        params.streams.reserve(ubatch.n_seqs_unq);
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            params.streams.push_back(memory->seq_stream(ubatch.seq_id_unq[s]));
+        }
+    }
+    return params;
 }
 
 ggml_status llama_context::graph_compute(
@@ -4198,4 +4256,100 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+// Continuum fork (CONTINUUM-ENGINE 4.14): the public seam of a persona's move (llama-persona-blocks.h).
+
+struct llama_persona {
+    llama_persona_blocks                  blocks;
+    std::unique_ptr<llama_persona_tokens> tokens; // her token history, beside her blocks (llama-persona-tokens.h)
+};
+
+// Her owner grows her history ahead of need, between acts: an append on the hot path only writes into it.
+int32_t llama_persona_grow_tokens(llama_persona * persona, size_t more_tokens, size_t more_receipts) {
+    return (int32_t) (persona->tokens->grow(more_tokens, more_receipts) ? llama_persona_move::done : llama_persona_move::out_of_memory);
+}
+
+// As she cools her owner gives back the room she does not hold; nothing she holds is dropped.
+int32_t llama_persona_shrink_tokens(llama_persona * persona) {
+    return (int32_t) (persona->tokens->shrink() ? llama_persona_move::done : llama_persona_move::out_of_memory);
+}
+
+llama_persona_append_receipt llama_persona_append(llama_persona * persona, const llama_persona_append_header * header,
+                                                  const llama_token * delta, size_t n) {
+    llama_persona_append_receipt out = { (int32_t) llama_persona_append_status::invalid, 0, 0, 0 };
+    if (header == nullptr) {
+        return out;
+    }
+    llama_persona_append_request h;
+    h.persona    = header->persona;
+    h.epoch      = header->epoch;
+    h.seq        = header->seq;
+    h.frontier   = header->frontier;
+    h.request.hi = header->request_hi;
+    h.request.lo = header->request_lo;
+    const llama_persona_receipt r = persona->tokens->append(h, delta, n);
+    out.status = (int32_t) r.status;
+    out.seq    = r.seq;
+    out.from   = r.from;
+    out.to     = r.to;
+    return out;
+}
+
+const llama_token * llama_persona_token_ids(const llama_persona * persona, uint64_t * n) {
+    *n = persona->tokens->frontier();
+    return persona->tokens->data();
+}
+
+const char * llama_persona_append_status_name(int32_t status) {
+    return llama_persona_append_status_name((llama_persona_append_status) status);
+}
+
+llama_persona * llama_persona_init(llama_context * ctx, uint64_t persona_id, uint64_t epoch) {
+    auto * persona = new (std::nothrow) llama_persona();
+    if (persona == nullptr) {
+        return nullptr;
+    }
+    persona->tokens.reset(new (std::nothrow) llama_persona_tokens(persona_id, epoch));
+    if (persona->tokens == nullptr || ctx->persona_prepare(persona->blocks) != llama_persona_move::done) {
+        delete persona;
+        return nullptr;
+    }
+    return persona;
+}
+
+void llama_persona_free(llama_persona * persona) {
+    delete persona;
+}
+
+// Her blocks move only under her owner (the persona and epoch of her token history): the native save stamps them,
+// the native load and bind refuse blocks stamped by anyone else, so no path skips the check.
+static llama_persona_identity identity_of(const llama_persona * persona) {
+    return { persona->tokens->persona(), persona->tokens->epoch() };
+}
+
+int32_t llama_persona_save(llama_context * ctx, llama_seq_id seq_id, llama_persona * persona) {
+    return (int32_t) ctx->persona_save(seq_id, persona->blocks, identity_of(persona));
+}
+
+int32_t llama_persona_load(llama_context * ctx, llama_seq_id seq_id, uint32_t stream, llama_persona * persona) {
+    return (int32_t) ctx->persona_load(seq_id, stream, persona->blocks, identity_of(persona));
+}
+
+int32_t llama_persona_bind(llama_context * ctx, llama_seq_id seq_id, llama_persona * persona) {
+    return (int32_t) ctx->persona_bind(seq_id, persona->blocks, identity_of(persona));
+}
+
+// Whose blocks these are, as stamped by the last completed save (false before any).
+bool llama_persona_owner(const llama_persona * persona, uint64_t * persona_id, uint64_t * epoch) {
+    if (!persona->blocks.owned) {
+        return false;
+    }
+    *persona_id = persona->blocks.owner;
+    *epoch      = persona->blocks.owner_epoch;
+    return true;
+}
+
+const char * llama_persona_status_name(int32_t status) {
+    return llama_persona_move_name((llama_persona_move) status);
 }

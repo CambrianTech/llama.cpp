@@ -125,6 +125,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
     }
+
+    persona_layout_id = compute_persona_layout(); // the allocation layout is immutable from here
 }
 
 void llama_memory_recurrent::clear(bool data) {
@@ -390,6 +392,163 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+static uint64_t rs_layout_mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001b3ull; }
+
+uint64_t llama_memory_recurrent::compute_persona_layout() const {
+    uint64_t h = rs_layout_mix(0xcbf29ce484222325ull, r_l.size());
+    h = rs_layout_mix(h, size);
+    h = rs_layout_mix(h, n_rs_seq);
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        for (const ggml_tensor * t : { r_l[il], s_l[il] }) {
+            h = rs_layout_mix(h, t ? (uint64_t) t->type : 0xffu);
+            h = rs_layout_mix(h, t ? (uint64_t) t->ne[0] : 0);
+        }
+    }
+    return h;
+}
+
+llama_persona_move llama_memory_recurrent::persona_prepare(llama_persona_blocks & blocks) const {
+    blocks.rs_layout = persona_layout();
+    blocks.rs.r.resize(r_l.size());
+    blocks.rs.s.resize(s_l.size());
+    return llama_persona_move::done;
+}
+
+llama_persona_move llama_memory_recurrent::persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
+        return llama_persona_move::invalid_seq;
+    }
+    if (out.rs_layout != persona_layout()) {
+        return llama_persona_move::layout_mismatch;
+    }
+    if (out.rs.r.size() != r_l.size() || out.rs.s.size() != s_l.size()) {
+        return llama_persona_move::cells_not_prepared;
+    }
+    const int32_t tail = cells[seq_id].tail;
+    if (tail >= 0 && cells[tail].seq_id.size() != 1) {
+        return llama_persona_move::shared_cell;
+    }
+    // reserve: every byte the commit copies, so the commit never allocates
+    const uint32_t n_groups = 1 + n_rs_seq;
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        out.rs.r[il].resize((tail >= 0 && r_l[il]) ? ggml_row_size(r_l[il]->type, r_l[il]->ne[0]) * n_groups : 0);
+        out.rs.s[il].resize((tail >= 0 && s_l[il]) ? ggml_row_size(s_l[il]->type, s_l[il]->ne[0]) * n_groups : 0);
+    }
+    return llama_persona_move::done;
+}
+
+void llama_memory_recurrent::persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) {
+    auto & rs = out.rs;
+    const int32_t tail = cells[seq_id].tail;
+    rs.has_state = tail >= 0;
+    out.seq = seq_id;
+    if (!rs.has_state) {
+        return;
+    }
+    const uint32_t n_groups = 1 + n_rs_seq;
+    // her row of one state tensor, in every snapshot group, into her reserved bytes
+    const auto rows_out = [&](const ggml_tensor * src, std::vector<uint8_t> & dst) {
+        if (src == nullptr || dst.empty()) {
+            return;
+        }
+        const size_t row = ggml_row_size(src->type, src->ne[0]);
+        for (uint32_t g = 0; g < n_groups; ++g) {
+            ggml_backend_tensor_get(src, dst.data() + g * row, (size_t) (g * size + tail) * src->nb[1], row);
+        }
+    };
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        rows_out(r_l[il], rs.r[il]);
+        rows_out(s_l[il], rs.s[il]);
+    }
+    auto & cell = cells[tail];
+    rs.pos    = cell.pos;
+    rs.rs_idx = rs_idx[seq_id];
+    // her cell leaves with her
+    cell.seq_id.clear();
+    cell.pos  = -1;
+    cell.src  = -1;
+    cell.src0 = -1;
+    cells[seq_id].tail = -1;
+    rs_idx[seq_id] = 0;
+    used -= 1;
+    head = std::min<uint32_t>(head, (uint32_t) tail);
+}
+
+llama_persona_move llama_memory_recurrent::persona_check_load(llama_seq_id seq_id, uint32_t stream,
+                                                             const llama_persona_blocks & in, llama_persona_slot & slot) const {
+    (void) stream; // recurrent state is found through her sequence's tail, in any cell
+    if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
+        return llama_persona_move::invalid_seq;
+    }
+    if (cells[seq_id].tail >= 0) {
+        return llama_persona_move::seq_holds_state;
+    }
+    const auto & rs = in.rs;
+    slot.cell = -1;
+    if (in.rs_layout != persona_layout()) {
+        return llama_persona_move::layout_mismatch;
+    }
+    if (!rs.has_state) {
+        return llama_persona_move::done;
+    }
+    if (rs.rs_idx > n_rs_seq) {
+        return llama_persona_move::invalid_rollback;
+    }
+    if (rs.r.size() != r_l.size() || rs.s.size() != s_l.size()) {
+        return llama_persona_move::layout_mismatch;
+    }
+    const uint32_t n_groups = 1 + n_rs_seq;
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        const size_t r_bytes = r_l[il] ? ggml_row_size(r_l[il]->type, r_l[il]->ne[0]) * n_groups : 0;
+        const size_t s_bytes = s_l[il] ? ggml_row_size(s_l[il]->type, s_l[il]->ne[0]) * n_groups : 0;
+        if (rs.r[il].size() != r_bytes || rs.s[il].size() != s_bytes) {
+            return llama_persona_move::layout_mismatch;
+        }
+    }
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].is_empty() && cells[i].pos < 0) {
+            slot.cell = (int32_t) i;
+            // reserve her cell's sequence-set node now, so the commit inserts it without allocating
+            std::set<llama_seq_id> node_source { seq_id };
+            slot.node = node_source.extract(node_source.begin());
+            return llama_persona_move::done;
+        }
+    }
+    return llama_persona_move::no_free_cell;
+}
+
+void llama_memory_recurrent::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot,
+                                                 llama_persona_blocks & in) {
+    const auto & rs = in.rs;
+    if (!rs.has_state) {
+        return;
+    }
+    const int32_t cell_id = slot.cell;
+    const uint32_t n_groups = 1 + n_rs_seq;
+    // her row of one state tensor, in every snapshot group, from her bytes into the reserved cell
+    const auto rows_in = [&](ggml_tensor * dst, const std::vector<uint8_t> & src) {
+        if (dst == nullptr) {
+            return;
+        }
+        const size_t row = ggml_row_size(dst->type, dst->ne[0]);
+        for (uint32_t g = 0; g < n_groups; ++g) {
+            ggml_backend_tensor_set(dst, src.data() + g * row, (size_t) (g * size + cell_id) * dst->nb[1], row);
+        }
+    };
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        rows_in(r_l[il], rs.r[il]);
+        rows_in(s_l[il], rs.s[il]);
+    }
+    auto & cell = cells[cell_id];
+    cell.pos  = rs.pos;
+    cell.src  = cell_id;
+    cell.src0 = cell_id;
+    cell.seq_id.insert(std::move(slot.node)); // the node reserved by check: no allocation
+    cells[seq_id].tail = cell_id;
+    rs_idx[seq_id] = rs.rs_idx;
+    used += 1;
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {

@@ -85,6 +85,17 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // Continuum fork (CONTINUUM-ENGINE 4.14): her row in every snapshot group copied raw, her cell's record carried;
+    // a load takes the free cell reserved by check_load (a search over this memory's cells, one per sequence slot:
+    // bounded by the slot count, not by context length). Her sequence id is kept.
+    llama_persona_move persona_prepare(llama_persona_blocks & blocks) const override;
+    uint64_t persona_layout() const { return persona_layout_id; }
+    llama_persona_move persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const override;
+    llama_persona_move persona_check_load(llama_seq_id seq_id, uint32_t stream, const llama_persona_blocks & in,
+                                          llama_persona_slot & slot) const override;
+    void persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) override;
+    void persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) override;
+
     // an undo of a draft is pending on this sequence: its next read takes a snapshot group, not the
     // live state (group 0) a training graph reads and writes (llm_graph_context::rs_keep)
     bool rollback_pending(llama_seq_id seq_id) const {
@@ -127,6 +138,10 @@ public:
 
 private:
     uint32_t protected_first = 0, protected_count = 0;
+
+    // this memory's persona layout fingerprint, computed once at construction (the allocation layout is immutable)
+    uint64_t persona_layout_id = 0;
+    uint64_t compute_persona_layout() const;
     //const llama_model & model;
     const llama_hparams & hparams;
 

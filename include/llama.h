@@ -927,6 +927,74 @@ extern "C" {
             struct llama_memory_cells_report * out,
             int32_t n_max);
 
+    // A persona's execution state as native blocks in host memory (Continuum fork, CONTINUUM-ENGINE 4.14). A switch
+    // between personas is raw row copies and a swap of her cell records: nothing tokenized, serialized, walked or
+    // recomputed. Her blocks stay tagged with the sequence they were saved from and load back under it, into any empty
+    // stream; the memory must hold one stream per sequence (not unified) with V not transposed (flash attention on).
+    struct llama_persona;
+
+    // One persona: her blocks prepared for this context's memory and her token history, owned by persona_id at epoch
+    // from the start (nothing is reserved or sized here; her history grows and shrinks with her). NULL when the memory
+    // has no persona move.
+    LLAMA_API struct llama_persona * llama_persona_init(struct llama_context * ctx, uint64_t persona_id, uint64_t epoch);
+    LLAMA_API void llama_persona_free(struct llama_persona * persona);
+
+    // Move sequence seq_id's state out of the memory into persona's blocks; her stream is left empty. Two-phase: a
+    // refusal leaves both sides as they were. 0 when done, else a status for llama_persona_status_name.
+    LLAMA_API int32_t llama_persona_save(struct llama_context * ctx, llama_seq_id seq_id, struct llama_persona * persona);
+
+    // Bind persona's blocks into the empty stream as sequence seq_id (the sequence they were saved from). 0 when done.
+    LLAMA_API int32_t llama_persona_load(struct llama_context * ctx, llama_seq_id seq_id, uint32_t stream, struct llama_persona * persona);
+
+    // Bind her blocks as sequence seq_id into an empty stream the memory chooses: the caller never numbers streams.
+    // no_empty_stream when none is empty; otherwise exactly llama_persona_load's checks and statuses.
+    LLAMA_API int32_t llama_persona_bind(struct llama_context * ctx, llama_seq_id seq_id, struct llama_persona * persona);
+
+    LLAMA_API const char * llama_persona_status_name(int32_t status);
+
+    // Her blocks move only under her owner (the persona and epoch she was made for): a completed save stamps them; a
+    // load of blocks stamped by another persona or another epoch of her returns wrong_owner before anything is
+    // written. llama_persona_owner reads the stamp (false before a completed save).
+    LLAMA_API bool llama_persona_owner(const struct llama_persona * persona, uint64_t * persona_id, uint64_t * epoch);
+
+    // Her token history, held in the persona beside her blocks (so it moves with them by reference, never copied):
+    // one buffer of her token ids and one of her append receipts, grown by her owner. A request appends only its new ids, in
+    // one validated transaction (see llama_persona_append). Owned once by her admitted owner; 0 when done.
+    // Her history grows and shrinks with her, never inside an act: grow adds room for more_tokens ids and more_receipts
+    // appends ahead of need; shrink gives back the room she does not hold as she cools. Neither drops anything she
+    // holds; out_of_memory on allocation failure, with her history unchanged.
+    LLAMA_API int32_t llama_persona_grow_tokens(struct llama_persona * persona, size_t more_tokens, size_t more_receipts);
+    LLAMA_API int32_t llama_persona_shrink_tokens(struct llama_persona * persona);
+
+    // What an append asserts about her history: her persona, her epoch, her request sequence (1, 2, 3, ...), the
+    // frontier it expects her history to end at, and the request's own 128-bit identity.
+    struct llama_persona_append_header {
+        uint64_t persona;
+        uint64_t epoch;
+        uint64_t seq;
+        uint64_t frontier;
+        uint64_t request_hi;
+        uint64_t request_lo;
+    };
+
+    struct llama_persona_append_receipt {
+        int32_t  status; // llama_persona_append_status_name; 0 = appended, 1 = replayed (its original receipt)
+        uint64_t seq;
+        uint64_t from;   // where the delta starts in her history
+        uint64_t to;     // her frontier after it
+    };
+
+    // Append `delta` (n ids, read in place; null only when n is 0) to her history after validating `header`. A retry
+    // of a committed sequence returns its original receipt and writes nothing; nothing allocates.
+    LLAMA_API struct llama_persona_append_receipt llama_persona_append(struct llama_persona * persona,
+                                                                       const struct llama_persona_append_header * header,
+                                                                       const llama_token * delta, size_t n);
+
+    // Her history as held: the ids and their count (her frontier). Empty until her first append.
+    LLAMA_API const llama_token * llama_persona_token_ids(const struct llama_persona * persona, uint64_t * n);
+
+    LLAMA_API const char * llama_persona_append_status_name(int32_t status);
+
     //
     // State / sessions
     //

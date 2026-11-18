@@ -86,6 +86,17 @@ public:
     //
 
     llama_kv_cache * get_mem_attn() const;
+
+    // her whole state: both halves are checked (and the destination reserved) before either commits
+    llama_persona_move persona_prepare(llama_persona_blocks & blocks) const override;
+    llama_persona_move persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const override;
+    int32_t persona_empty_stream() const override { return mem_attn->persona_empty_stream(); }
+    llama_persona_move persona_check_load(llama_seq_id seq_id, uint32_t stream, const llama_persona_blocks & in,
+                                          llama_persona_slot & slot) const override;
+    void persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) override;
+    void persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) override;
+
+    uint32_t seq_stream(llama_seq_id seq_id) const override { return mem_attn->seq_stream(seq_id); }
     llama_memory_recurrent * get_mem_recr() const;
 
 private:

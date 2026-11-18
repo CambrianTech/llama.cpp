@@ -2,12 +2,11 @@
 
 #include "llama.h"
 #include "llama-cparams.h"
+#include "llama-kv-cell-index.h"
 
 #include <bitset>
 #include <cassert>
 #include <cstring>
-#include <map>
-#include <set>
 #include <vector>
 
 struct llama_kv_cell_ext {
@@ -31,6 +30,23 @@ struct llama_kv_cell_ext {
 // TODO: add unit tests
 class llama_kv_cells {
 public:
+    // Continuum fork (CONTINUUM-ENGINE 4.14): exchange two cells objects in place, member by member, with each
+    // container's own swap: never allocates on any standard library (a std::swap of the whole object moves through a
+    // temporary, and MSVC's node containers allocate a sentinel when move-constructed). A persona's metadata moves
+    // between her blocks and a stream with this.
+    void swap(llama_kv_cells & other) noexcept {
+        std::swap(has_shift, other.has_shift);
+        used.swap(other.used);
+        pos.swap(other.pos);
+        ext.swap(other.ext);
+        shift.swap(other.shift);
+        seq.swap(other.seq);
+        for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            seq_pos[s].swap(other.seq_pos[s]);
+        }
+        std::swap(stale, other.stale);
+    }
+
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
@@ -46,6 +62,7 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
+        stale.reset();
     }
 
     void reset_shift() {
@@ -65,6 +82,7 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+        used.resize(n);
 
         reset();
     }
@@ -76,6 +94,37 @@ public:
         return pos[i] == -1;
     }
 
+    // Continuum fork (CONTINUUM-ENGINE 4.14): recompute every stale sequence index now, on the thread that changed the
+    // cells. llama_kv_cache calls this as each of its operations returns, so a query never writes an index: queries
+    // arrive from other threads while a decode runs, and a persona's blocks leave a stream with valid indices.
+    void settle_all() {
+        if (stale.none()) {
+            return;
+        }
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (stale.test(s)) {
+                settle(s);
+            }
+        }
+        stale.reset();
+    }
+
+    // any sequence index a change left stale and nothing has settled yet
+    bool has_stale() const {
+        return stale.any();
+    }
+
+    // how many index recomputations this object has made
+    uint64_t settles() const {
+        return n_settles;
+    }
+
+    // how many queries were answered from the cells because an index was stale: a missed settle, 0 when every change
+    // was settled by its operation
+    uint64_t stale_queries() const {
+        return n_stale_queries.load();
+    }
+
     uint32_t get_used() const {
         return used.size();
     }
@@ -83,13 +132,13 @@ public:
     // the index of the first cell that is used
     // return 0 if no cells are used
     uint32_t used_min() const {
-        return used.empty() ? 0 : *used.begin();
+        return used.min();
     }
 
     // the index of the last cell that is used + 1
     // return 0 if no cells are used
     uint32_t used_max_p1() const {
-        return used.empty() ? 0 : *used.rbegin() + 1;
+        return used.max_p1();
     }
 
     bool get_has_shift() const {
@@ -305,6 +354,24 @@ public:
         return seq[i].test(seq_id);
     }
 
+    // Relabel every cell of sequence `from` as `to`, with its position index: a persona's cells bound back as the
+    // sequence she is bound as now. `to` holds no cell here (a stream holds one persona), so nothing merges.
+    void seq_rename(llama_seq_id from, llama_seq_id to) {
+        if (from == to) {
+            return;
+        }
+        for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
+            if (seq[i].test(from)) {
+                seq[i].reset(from);
+                seq[i].set(to);
+            }
+        }
+        seq_pos[to].swap(seq_pos[from]);
+        const bool was_stale = stale.test(from);
+        stale.set(from, stale.test(to));
+        stale.set(to, was_stale);
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
@@ -335,13 +402,11 @@ public:
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
 
-        if (seq_pos[seq_id].empty()) {
-            return -1;
+        const llama_kv_seq_pos & index = seq_pos[seq_id];
+        if (index.is_stale()) {
+            return unsettled_extremum(seq_id, false);
         }
-
-        assert(seq_pos[seq_id].begin()->second > 0);
-
-        return seq_pos[seq_id].begin()->first;
+        return index.empty() ? -1 : index.min();
     }
 
     // the maximum position of sequence seq_id currently present in any of the cells
@@ -350,13 +415,11 @@ public:
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
 
-        if (seq_pos[seq_id].empty()) {
-            return -1;
+        const llama_kv_seq_pos & index = seq_pos[seq_id];
+        if (index.is_stale()) {
+            return unsettled_extremum(seq_id, true);
         }
-
-        assert(seq_pos[seq_id].rbegin()->second > 0);
-
-        return seq_pos[seq_id].rbegin()->first;
+        return index.empty() ? -1 : index.max();
     }
 
     // note: call only if the cell is not empty
@@ -458,8 +521,8 @@ public:
 private:
     bool has_shift = false;
 
-    // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
-    std::set<uint32_t> used;
+    // the occupied cells (i.e. pos[i] != -1, allowed to not have any seq_id): a bitmap with its count and extrema
+    llama_kv_used used;
 
     std::vector<llama_pos> pos;
 
@@ -488,29 +551,65 @@ private:
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
 
-    // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
-    // if the position p is not present, seq_pos[s][p] is not set
-    // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache
+    // seq_pos[s] holds each position p currently present for sequence s with how many cells hold it, sorted, so its
+    // first and last entries are the min/max positions currently in the cache
     //
-    // note that we cannot a use an std::set because in some cases a position can occur more than once for the same seq:
+    // note that a position needs a count, not just presence, because in some cases a position can occur more than once for the same seq:
     //  - during performing a cache reuse via (rm + add)
     //  - some vision models have input embeddings with repeating positions
     //
-    std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
+    // Continuum fork: each sequence's positions as a native sorted array with counts (llama-kv-cell-index.h), exact on
+    // its O(1) paths; any other change marks it stale (`stale`), and the operation that made the change settles it.
+    llama_kv_seq_pos seq_pos[LLAMA_MAX_SEQ];
+
+    // the sequences whose index a change left stale, so settling visits only those
+    std::bitset<LLAMA_MAX_SEQ> stale;
+
+    // how many times an index was recomputed from the cells (the freeze and restore fixtures count them)
+    uint64_t n_settles = 0;
+
+    // queries answered from the cells because an index was stale (the only thing a query writes)
+    llama_kv_query_count n_stale_queries;
+
+    // recompute sequence seq_id's index from the cells
+    void settle(llama_seq_id seq_id) {
+        ++n_settles;
+        std::vector<llama_pos> positions;
+        for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
+            if (seq[i].test(seq_id)) {
+                positions.push_back(pos[i]);
+            }
+        }
+        seq_pos[seq_id].settle(positions);
+    }
+
+    // a stale sequence's min or max read from the cells without writing its index, counted: correct, and a defect
+    // (the operation that changed the cells did not settle them)
+    llama_pos unsettled_extremum(llama_seq_id seq_id, bool want_max) const {
+        n_stale_queries.add();
+        llama_pos found = -1;
+        for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
+            if (seq[i].test(seq_id) && (found == -1 || (want_max ? pos[i] > found : pos[i] < found))) {
+                found = pos[i];
+            }
+        }
+        return found;
+    }
 
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, llama_pos p) {
-        auto it = seq_pos[s].find(p);
-        assert(it != seq_pos[s].end());
-
-        if (--it->second == 0) {
-            seq_pos[s].erase(it);
+        seq_pos[s].dec(p);
+        if (seq_pos[s].is_stale()) {
+            stale.set(s);
         }
     }
 
     void seq_pos_inc(llama_seq_id s, llama_pos p) {
-        seq_pos[s][p]++;
+        seq_pos[s].inc(p);
+        if (seq_pos[s].is_stale()) {
+            stale.set(s);
+        }
     }
 
     // remove cell i

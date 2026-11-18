@@ -194,6 +194,11 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build_and_test(test-server-view-end.cpp)
 
+# llama_kv_cells' derived indices held natively answer exactly as the node containers they replace (CONTINUUM-ENGINE 4.14)
+llama_build_and_test(test-kv-cell-index.cpp)
+# a persona's token history appends only a request's new ids, in one validated transaction (CONTINUUM-ENGINE 4.14)
+llama_build_and_test(test-persona-tokens.cpp)
+
 # GGML_TENSOR_FLAG_GRAD: a leaf whose gradient the backward computes, never optimized (the walk reads the cached prefix K/V gradient)
 llama_build_and_test(test-grad-leaf.cpp)
 
@@ -267,6 +272,25 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-generate-models PROPERTIES
         FIXTURES_SETUP generate-models
     )
+
+    # a persona's state moved raw between the memory and host memory is byte-identical, and a refused move changes
+    # nothing (CONTINUUM-ENGINE 4.14): on a plain KV model, on the generated hybrid (qwen35moe: attention + recurrent),
+    # and on the hybrid with the rollback groups serving's draft-mtp configuration creates
+    llama_build(test-persona-blocks.cpp)
+    llama_test(
+        test-persona-blocks
+        NAME test-persona-blocks-hybrid
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35moe-moe.gguf"
+    )
+    set_tests_properties(test-persona-blocks-hybrid PROPERTIES FIXTURES_REQUIRED generate-models)
+    llama_test(
+        test-persona-blocks
+        NAME test-persona-blocks-rollback
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35moe-moe.gguf" --test-rs-seq 4
+    )
+    set_tests_properties(test-persona-blocks-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
 
     llama_test(
         test-recurrent-state-rollback
@@ -362,6 +386,12 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-dup-quantized.cpp)
 llama_build_and_test(test-state-restore-streams.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-streams PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    # test-persona-blocks (built above with the internal-API tests) on the downloaded plain KV model
+    llama_test(test-persona-blocks LABEL "model" ARGS -m "${MODEL_DEST}")
+    set_tests_properties(test-persona-blocks PROPERTIES FIXTURES_REQUIRED test-download-model)
+endif()
 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")

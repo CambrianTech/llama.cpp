@@ -13,6 +13,17 @@
 #include <map>
 #include <stdexcept>
 
+// Continuum fork (CONTINUUM-ENGINE 4.14): settles every index a change left stale as the operation that made it returns,
+// on the thread that made it, so a query (from any thread) never writes an index.
+struct llama_kv_settle_on_return {
+    llama_kv_cells_vec & v_cells;
+    ~llama_kv_settle_on_return() {
+        for (auto & cells : v_cells) {
+            cells.settle_all();
+        }
+    }
+};
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -363,6 +374,8 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    persona_layout_id = compute_persona_layout(); // the allocation layout is immutable from here
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -379,6 +392,7 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -448,6 +462,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -540,6 +555,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -567,6 +583,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -617,6 +634,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -752,6 +770,7 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 }
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    const llama_kv_settle_on_return settle{ v_cells };
     llama_kv_cache::slot_info_vec_t res;
 
     struct state_t {
@@ -1098,6 +1117,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1229,6 +1249,156 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     return layers[ikv].k;
+}
+
+// an empty, stream-sized cells object: O(1) (used is a set; has_shift a flag); freed cells hold no sequence position
+static bool cells_prepared(const llama_kv_cells & cells, uint32_t size) {
+    return cells.size() == size && cells.get_used() == 0 && !cells.get_has_shift();
+}
+
+// this memory's attention layout: what her rows' sizes and meaning depend on
+static uint64_t kv_layout_mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001b3ull; }
+
+uint64_t llama_kv_cache::compute_persona_layout() const {
+    uint64_t h = kv_layout_mix(0xcbf29ce484222325ull, layers.size());
+    h = kv_layout_mix(h, get_size());
+    for (const auto & layer : layers) {
+        h = kv_layout_mix(h, layer.il);
+        h = kv_layout_mix(h, layer.k ? (uint64_t) layer.k->type : 0xffu);
+        h = kv_layout_mix(h, layer.k ? (uint64_t) layer.k->ne[0] : 0);
+        h = kv_layout_mix(h, layer.v ? (uint64_t) layer.v->type : 0xffu);
+        h = kv_layout_mix(h, layer.v ? (uint64_t) layer.v->ne[0] : 0);
+    }
+    return h;
+}
+
+llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks) const {
+    if (n_stream == 1) {
+        return llama_persona_move::no_such_stream;
+    }
+    blocks.kv_layout = persona_layout();
+    blocks.kv.cells.resize(get_size()); // once per persona, at her creation
+    blocks.kv.k.resize(layers.size());
+    blocks.kv.v.resize(layers.size());
+    return llama_persona_move::done;
+}
+
+llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const {
+    if (n_stream == 1) {
+        return llama_persona_move::no_such_stream;
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return llama_persona_move::invalid_seq;
+    }
+    if (v_trans) {
+        return llama_persona_move::transposed_v;
+    }
+    if (out.kv_layout != persona_layout()) {
+        return llama_persona_move::layout_mismatch;
+    }
+    if (!cells_prepared(out.kv.cells, get_size()) || out.kv.k.size() != layers.size() || out.kv.v.size() != layers.size()) {
+        return llama_persona_move::cells_not_prepared;
+    }
+    // reserve: every byte the commit copies, so the commit never allocates
+    const uint32_t n_rows = v_cells[seq_to_stream[seq_id]].used_max_p1();
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        out.kv.k[i].resize(ggml_row_size(layer.k->type, layer.k->ne[0]) * n_rows);
+        out.kv.v[i].resize(layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) * n_rows : 0);
+    }
+    out.kv.n_rows = n_rows;
+    return llama_persona_move::done;
+}
+
+void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) {
+    const uint32_t s = seq_to_stream[seq_id];
+    auto & cells = v_cells[s];
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        if (!out.kv.k[i].empty()) {
+            ggml_backend_tensor_get(layer.k_stream[s], out.kv.k[i].data(), 0, out.kv.k[i].size());
+        }
+        if (!out.kv.v[i].empty()) {
+            ggml_backend_tensor_get(layer.v_stream[s], out.kv.v[i].data(), 0, out.kv.v[i].size());
+        }
+    }
+    out.seq = seq_id;
+    out.kv.cells.swap(cells); // hers out; the stream takes the prepared empty object
+    v_heads[s] = 0;
+}
+
+int32_t llama_kv_cache::persona_empty_stream() const {
+    if (n_stream == 1) {
+        return -1; // unified: one stream holds every sequence, so there is nothing empty to bind into
+    }
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (v_cells[s].get_used() == 0) {
+            return (int32_t) s;
+        }
+    }
+    return -1;
+}
+
+llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint32_t stream,
+                                                     const llama_persona_blocks & in, llama_persona_slot & slot) const {
+    if (n_stream == 1 || stream >= n_stream) {
+        return llama_persona_move::no_such_stream;
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return llama_persona_move::invalid_seq;
+    }
+    if (v_trans) {
+        return llama_persona_move::transposed_v;
+    }
+    if (v_cells[stream].get_used() != 0) {
+        return llama_persona_move::stream_not_empty;
+    }
+    if (v_cells[seq_to_stream[seq_id]].seq_pos_max(seq_id) >= 0) {
+        return llama_persona_move::seq_holds_state;
+    }
+    if (in.kv_layout != persona_layout()) {
+        return llama_persona_move::layout_mismatch;
+    }
+    const auto & kv = in.kv;
+    if (kv.cells.size() != get_size() || kv.n_rows > get_size() || kv.cells.used_max_p1() > kv.n_rows ||
+        kv.k.size() != layers.size() || kv.v.size() != layers.size()) {
+        return llama_persona_move::layout_mismatch;
+    }
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        const size_t k_bytes = ggml_row_size(layer.k->type, layer.k->ne[0]) * kv.n_rows;
+        const size_t v_bytes = layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) * kv.n_rows : 0;
+        if (kv.k[i].size() != k_bytes || kv.v[i].size() != v_bytes) {
+            return llama_persona_move::layout_mismatch;
+        }
+    }
+    slot.stream = stream;
+    return llama_persona_move::done;
+}
+
+void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) {
+    const uint32_t s = slot.stream;
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        if (!in.kv.k[i].empty()) {
+            ggml_backend_tensor_set(layer.k_stream[s], in.kv.k[i].data(), 0, in.kv.k[i].size());
+        }
+        if (!in.kv.v[i].empty()) {
+            ggml_backend_tensor_set(layer.v_stream[s], in.kv.v[i].data(), 0, in.kv.v[i].size());
+        }
+    }
+    in.kv.cells.swap(v_cells[s]); // hers in; her blocks keep the stream's empty object for her next save
+    v_cells[s].seq_rename(in.seq, seq_id); // her cells answer to the sequence she is bound as now
+    v_heads[s] = 0;
+    // bind her own sequence id to stream s; the sequence that held s takes her old stream (both empty of others)
+    const uint32_t old = seq_to_stream[seq_id];
+    for (auto & st : seq_to_stream) {
+        if (st == s) {
+            st = old;
+            break;
+        }
+    }
+    seq_to_stream[seq_id] = s;
 }
 
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
@@ -2061,6 +2231,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;

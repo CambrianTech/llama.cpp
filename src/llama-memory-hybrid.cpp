@@ -211,6 +211,33 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
+llama_persona_move llama_memory_hybrid::persona_prepare(llama_persona_blocks & blocks) const {
+    const llama_persona_move attn = mem_attn->persona_prepare(blocks);
+    return attn != llama_persona_move::done ? attn : mem_recr->persona_prepare(blocks);
+}
+
+llama_persona_move llama_memory_hybrid::persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const {
+    const llama_persona_move attn = mem_attn->persona_check_save(seq_id, out);
+    return attn != llama_persona_move::done ? attn : mem_recr->persona_check_save(seq_id, out);
+}
+
+llama_persona_move llama_memory_hybrid::persona_check_load(llama_seq_id seq_id, uint32_t stream,
+                                                          const llama_persona_blocks & in, llama_persona_slot & slot) const {
+    const llama_persona_move attn = mem_attn->persona_check_load(seq_id, stream, in, slot);
+    return attn != llama_persona_move::done ? attn : mem_recr->persona_check_load(seq_id, stream, in, slot);
+}
+
+void llama_memory_hybrid::persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) {
+    mem_attn->persona_commit_save(seq_id, out);
+    mem_recr->persona_commit_save(seq_id, out);
+}
+
+void llama_memory_hybrid::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot,
+                                              llama_persona_blocks & in) {
+    mem_attn->persona_commit_load(seq_id, slot, in);
+    mem_recr->persona_commit_load(seq_id, slot, in);
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }

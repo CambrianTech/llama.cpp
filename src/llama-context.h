@@ -57,6 +57,15 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+
+    // Continuum fork (CONTINUUM-ENGINE 4.14): move a persona's state between the memory and host memory. Fences the
+    // queued device work, checks every condition (reserving the destination), then commits raw copies; a refusal
+    // changes nothing.
+    llama_persona_move persona_prepare(llama_persona_blocks & blocks) const;
+    llama_persona_move persona_save(llama_seq_id seq_id, llama_persona_blocks & out, const llama_persona_identity & who);
+    llama_persona_move persona_load(llama_seq_id seq_id, uint32_t stream, llama_persona_blocks & in, const llama_persona_identity & who);
+    // load her into an empty stream the memory chooses (no_empty_stream when none is)
+    llama_persona_move persona_bind(llama_seq_id seq_id, llama_persona_blocks & in, const llama_persona_identity & who);
     bool opt_state_write_initial(FILE * optimizer, const char * binding);
     bool opt_state_write(FILE * optimizer, const char * binding);
     bool opt_shadow_state_write(const llama_adapter_lora * shadow, FILE * optimizer, const char * binding);

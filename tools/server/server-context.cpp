@@ -725,6 +725,19 @@ struct server_slot {
         common_speculative_print_stats(spec);
     }
 
+    // The engine's positions for this slot's sequence as the main loop last read them (Continuum fork). /slots is
+    // answered on the queue's worker while a decode changes the cache (yield_to_queue), so it reports these, read on
+    // the main thread before every yield, never the cache itself. -1 when the sequence is empty.
+    llama_pos kv_pos_min_read = -1;
+    llama_pos kv_pos_max_read = -1;
+
+    // main thread only: read this slot's positions from the cache
+    void read_kv_positions() {
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        kv_pos_min_read = llama_memory_seq_pos_min(mem, id);
+        kv_pos_max_read = llama_memory_seq_pos_max(mem, id);
+    }
+
     json to_json(bool only_metrics = false) const {
         json res;
 
@@ -737,13 +750,9 @@ struct server_slot {
             {"learn_graph_steps", learn_graph_steps},
         };
 
-        // The engine's own positions for this slot's sequence (Continuum fork): what its cache holds
-        // now, in flight or idle. -1 when the sequence is empty.
-        {
-            llama_memory_t mem = llama_get_memory(ctx_tgt);
-            res["kv_pos_min"] = llama_memory_seq_pos_min(mem, id);
-            res["kv_pos_max"] = llama_memory_seq_pos_max(mem, id);
-        }
+        // The engine's own positions for this slot's sequence as last read by the main loop (Continuum fork).
+        res["kv_pos_min"] = kv_pos_min_read;
+        res["kv_pos_max"] = kv_pos_max_read;
 
         // The slot's context checkpoints as they sit in host memory now (Continuum fork): their count
         // and their bytes, so the core prices the checkpoint store from what it holds, not a guess.
@@ -914,6 +923,34 @@ public:
     // the report never names a size the slots refuse (it said 524288 while each slot capped at
     // 262144, the M5 2026-11-11).
     int n_ctx_slot = 0;
+
+    // Every cell holder's occupancy as the main loop last read it (Continuum fork, GET /cells), beside each slot's
+    // positions (server_slot::kv_pos_*_read). A decode runs on the main thread while the queue's worker answers
+    // /slots (yield_to_queue), so the main thread reads the cache here before it yields, the yield's mutex orders the
+    // read before the worker's, and the worker never touches the cache a decode is changing.
+    std::vector<llama_memory_cells_report> cells_read;
+
+    // main thread only
+    void read_kv_state() {
+        for (auto & slot : slots) {
+            slot.read_kv_positions();
+        }
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        cells_read.resize(std::max<size_t>(cells_read.capacity(), 8));
+        int32_t n = llama_memory_cell_usage(mem, cells_read.data(), (int32_t) cells_read.size());
+        if (n > (int32_t) cells_read.size()) {
+            cells_read.resize(n);
+            n = llama_memory_cell_usage(mem, cells_read.data(), n);
+        }
+        cells_read.resize(n);
+    }
+
+    // every decode or draft that lets the queue run beside it: the state /slots reports is read first
+    void yield_decoding(std::function<void()> && work) {
+        read_kv_state();
+        queue_tasks.yield_to_queue(std::move(work));
+    }
+
     void publish_busy_slots() {
         int n = 0;
         for (const auto & slot : slots) {
@@ -2817,6 +2854,12 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_GET:
                 {
+                    // On the main thread the cache is read now; on the worker during a decode, the main thread
+                    // read it just before it yielded (yield_decoding), and the worker reads only those.
+                    if (!is_yielding) {
+                        read_kv_state();
+                    }
+
                     json slots_data = json::array();
 
                     int n_idle_slots = 0;
@@ -2834,19 +2877,12 @@ private:
                     res->id           = task.id;
                     res->slots_data   = std::move(slots_data);
                     res->n_idle_slots = n_idle_slots;
-                    // Every cell holder's occupancy, read in the same main-loop pass as the slots so
-                    // the two agree (Continuum fork, GET /cells).
+                    // Every cell holder's occupancy, read in the same main-thread read as the slots' positions
+                    // so the two agree (Continuum fork, GET /cells).
                     {
-                        llama_memory_t mem = llama_get_memory(ctx_tgt);
-                        std::vector<llama_memory_cells_report> holders(8);
-                        int32_t n = llama_memory_cell_usage(mem, holders.data(), (int32_t) holders.size());
-                        if (n > (int32_t) holders.size()) {
-                            holders.resize(n);
-                            n = llama_memory_cell_usage(mem, holders.data(), n);
-                        }
                         json cells = json::array();
-                        for (int32_t i = 0; i < n; ++i) {
-                            cells.push_back({ {"holder", holders[i].holder}, {"used", holders[i].used}, {"size", holders[i].size} });
+                        for (const auto & holder : cells_read) {
+                            cells.push_back({ {"holder", holder.holder}, {"used", holder.used}, {"size", holder.size} });
                         }
                         res->cells = std::move(cells);
                     }
@@ -3559,7 +3595,7 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
-            queue_tasks.yield_to_queue([&]() {
+            yield_decoding([&]() {
                 common_speculative_draft(spec.get());
             });
         }
@@ -4049,7 +4085,7 @@ private:
                         // encode on the worker thread, so we can still handle metrics tasks
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
-                        queue_tasks.yield_to_queue([&]() {
+                        yield_decoding([&]() {
                             res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                         });
 
@@ -4281,7 +4317,7 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        queue_tasks.yield_to_queue([&]() {
+        yield_decoding([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -4346,7 +4382,7 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
+            yield_decoding([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
 
