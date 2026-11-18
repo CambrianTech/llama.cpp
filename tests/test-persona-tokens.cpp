@@ -112,7 +112,7 @@ int main() {
         CHECK(her.append(header(7, 2, 1, 0, id(1)), nullptr, 1).status == status::invalid);
         CHECK(her.frontier() == 0 && her.committed() == 0);
     }
-    // what this catches: an append past her reserved capacity growing it in place (an allocation and a copy
+    // what this catches: an append past the room her owner grew growing it in place (an allocation and a copy
     // of what she holds on the hot path): refused, her owner grows first; a length that would overflow too.
     {
         llama_persona_tokens her(7, 1);
@@ -137,7 +137,7 @@ int main() {
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 2).status == status::replayed);
     }
     // what this catches: an accepted append allocating its receipt on the hot path, or a refused one leaving
-    // a half-written append. Receipts are reserved; when they are used up the append is refused before any
+    // a half-written append. Receipts are grown ahead by her owner; when they are used up the append is refused before any
     // write, an empty append included, and her tokens, frontier and commits are unchanged.
     {
         llama_persona_tokens her(7, 1);
@@ -152,7 +152,7 @@ int main() {
     }
     // what this catches (Codex on #147 at f3eb): any allocation on the append path. At her
     // real size, after her owner grew her history ahead, accepted, refused (no room, wrong epoch, stale frontier) and replayed
-    // appends together allocate nothing: her capacity and receipts are fixed at reserve and the hot path only writes.
+    // appends together allocate nothing: her owner grew her room ahead; the hot path only writes.
     {
         llama_persona_tokens her(7, 1);
         CHECK(her.grow(1 << 17, 64));
