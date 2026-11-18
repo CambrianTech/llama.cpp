@@ -4259,32 +4259,20 @@ struct llama_persona {
     std::unique_ptr<llama_persona_tokens> tokens; // her token history, beside her blocks (llama-persona-tokens.h)
 };
 
-// Her token history is reserved once and owns her blocks from then on: a second reserve would drop her history, so
-// it is refused; an allocation failure is a status, never an exception across the C boundary, and changes nothing.
-int32_t llama_persona_reserve_tokens(llama_persona * persona, uint64_t persona_id, uint64_t epoch) {
-    if (persona->tokens != nullptr) {
-        return (int32_t) llama_persona_move::already_reserved;
-    }
-    try {
-        persona->tokens = std::make_unique<llama_persona_tokens>(persona_id, epoch);
-    } catch (const std::bad_alloc &) {
-        return (int32_t) llama_persona_move::out_of_memory;
-    }
-    return (int32_t) llama_persona_move::done;
-}
-
 // Her owner grows her history ahead of need, between acts: an append on the hot path only writes into it.
 int32_t llama_persona_grow_tokens(llama_persona * persona, size_t more_tokens, size_t more_receipts) {
-    if (persona->tokens == nullptr) {
-        return (int32_t) llama_persona_move::no_owner;
-    }
     return (int32_t) (persona->tokens->grow(more_tokens, more_receipts) ? llama_persona_move::done : llama_persona_move::out_of_memory);
+}
+
+// As she cools her owner gives back the room she does not hold; nothing she holds is dropped.
+int32_t llama_persona_shrink_tokens(llama_persona * persona) {
+    return (int32_t) (persona->tokens->shrink() ? llama_persona_move::done : llama_persona_move::out_of_memory);
 }
 
 llama_persona_append_receipt llama_persona_append(llama_persona * persona, const llama_persona_append_header * header,
                                                   const llama_token * delta, size_t n) {
     llama_persona_append_receipt out = { (int32_t) llama_persona_append_status::invalid, 0, 0, 0 };
-    if (persona->tokens == nullptr || header == nullptr) {
+    if (header == nullptr) {
         return out;
     }
     llama_persona_append_request h;
@@ -4303,10 +4291,6 @@ llama_persona_append_receipt llama_persona_append(llama_persona * persona, const
 }
 
 const llama_token * llama_persona_token_ids(const llama_persona * persona, uint64_t * n) {
-    if (persona->tokens == nullptr) {
-        *n = 0;
-        return nullptr;
-    }
     *n = persona->tokens->frontier();
     return persona->tokens->data();
 }
@@ -4315,9 +4299,13 @@ const char * llama_persona_append_status_name(int32_t status) {
     return llama_persona_append_status_name((llama_persona_append_status) status);
 }
 
-llama_persona * llama_persona_init(llama_context * ctx) {
-    auto * persona = new llama_persona();
-    if (ctx->persona_prepare(persona->blocks) != llama_persona_move::done) {
+llama_persona * llama_persona_init(llama_context * ctx, uint64_t persona_id, uint64_t epoch) {
+    auto * persona = new (std::nothrow) llama_persona();
+    if (persona == nullptr) {
+        return nullptr;
+    }
+    persona->tokens.reset(new (std::nothrow) llama_persona_tokens(persona_id, epoch));
+    if (persona->tokens == nullptr || ctx->persona_prepare(persona->blocks) != llama_persona_move::done) {
         delete persona;
         return nullptr;
     }
@@ -4331,9 +4319,6 @@ void llama_persona_free(llama_persona * persona) {
 // Her blocks move only under an owner: the persona and epoch of her token history. A completed save stamps them
 // with it; a load refuses blocks stamped by another persona or another epoch of her before anything is written.
 int32_t llama_persona_save(llama_context * ctx, llama_seq_id seq_id, llama_persona * persona) {
-    if (persona->tokens == nullptr) {
-        return (int32_t) llama_persona_move::no_owner;
-    }
     const llama_persona_move m = ctx->persona_save(seq_id, persona->blocks);
     if (m == llama_persona_move::done) {
         persona->blocks.owned       = true;
@@ -4344,9 +4329,6 @@ int32_t llama_persona_save(llama_context * ctx, llama_seq_id seq_id, llama_perso
 }
 
 static llama_persona_move persona_owner_check(const llama_persona * persona) {
-    if (persona->tokens == nullptr) {
-        return llama_persona_move::no_owner;
-    }
     const llama_persona_blocks & b = persona->blocks;
     if (b.owned && (b.owner != persona->tokens->persona() || b.owner_epoch != persona->tokens->epoch())) {
         return llama_persona_move::wrong_owner;

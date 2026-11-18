@@ -69,10 +69,8 @@ enum class llama_persona_move {
     no_free_cell,       // no free recurrent cell to load into
     wrong_persona,      // her blocks belong to another sequence (her metadata is tagged with it; never retagged)
     invalid_rollback,   // her rollback index exceeds this memory's snapshot groups
-    no_owner,           // her token history is not reserved: blocks cannot be saved or loaded without an owner
     wrong_owner,        // her blocks were saved by another persona or another epoch of her
-    already_reserved,   // her token history is already reserved: a second reserve would drop it
-    out_of_memory,      // reserving her token history failed to allocate; nothing changed
+    out_of_memory,      // growing or shrinking her token history failed to allocate; nothing changed
     no_empty_stream,    // a bind found no empty stream to place her in
 };
 

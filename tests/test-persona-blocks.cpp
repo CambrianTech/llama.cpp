@@ -338,24 +338,20 @@ int main(int argc, char ** argv) {
         auto st = [](int32_t s) { return (llama_persona_move) s; };
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);
-        llama_persona * p = llama_persona_init(f.ctx);
-        require(p != nullptr, "a persona for this memory");
+        llama_persona * p = llama_persona_init(f.ctx, 0xA11CE, 7);
+        require(p != nullptr, "a persona for this memory, owned from the start");
         uint64_t who = 0, when = 0;
-        require(!llama_persona_owner(p, &who, &when), "no owner before a completed save");
-        require_move(st(llama_persona_save(f.ctx, 0, p)), llama_persona_move::no_owner, "save before her history is reserved");
-        require_move(st(llama_persona_reserve_tokens(p, 0xA11CE, 7)), llama_persona_move::done, "reserve her history");
-        require_move(st(llama_persona_grow_tokens(p, 64, 8)), llama_persona_move::done, "her owner grows her history ahead");
-        require_move(st(llama_persona_reserve_tokens(p, 0xB0B, 7)), llama_persona_move::already_reserved,
-                     "a second reserve would drop her history");
+        require(!llama_persona_owner(p, &who, &when), "no stamp before a completed save");
+        require_move(st(llama_persona_grow_tokens(p, f.n_prompt, 1)), llama_persona_move::done, "her history grows with her");
+        require_move(st(llama_persona_shrink_tokens(p)), llama_persona_move::done, "and shrinks as she cools, dropping nothing");
         require_move(st(llama_persona_save(f.ctx, 0, p)), llama_persona_move::done, "save under her owner");
         require(llama_persona_owner(p, &who, &when) && who == 0xA11CE && when == 7, "her blocks are stamped with her owner");
         require_move(st(llama_persona_bind(f.ctx, 0, p)), llama_persona_move::done, "bound into a stream the memory chose");
         f.require_continues("continues after an owned move through the public seam", 0, ref_a0);
 
         // every stream occupied: a bind places nobody and changes nothing
-        llama_persona * q = llama_persona_init(f.ctx);
+        llama_persona * q = llama_persona_init(f.ctx, 0xB0B, 1);
         require(q != nullptr, "a second persona");
-        require_move(st(llama_persona_reserve_tokens(q, 0xB0B, 1)), llama_persona_move::done, "reserve q");
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);
         f.prompt(1, 2);

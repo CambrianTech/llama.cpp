@@ -933,8 +933,10 @@ extern "C" {
     // stream; the memory must hold one stream per sequence (not unified) with V not transposed (flash attention on).
     struct llama_persona;
 
-    // Blocks prepared once for this context's memory (sized to a stream), empty. NULL when the memory has no persona move.
-    LLAMA_API struct llama_persona * llama_persona_init(struct llama_context * ctx);
+    // One persona: her blocks prepared for this context's memory and her token history, owned by persona_id at epoch
+    // from the start (nothing is reserved or sized here; her history grows and shrinks with her). NULL when the memory
+    // has no persona move.
+    LLAMA_API struct llama_persona * llama_persona_init(struct llama_context * ctx, uint64_t persona_id, uint64_t epoch);
     LLAMA_API void llama_persona_free(struct llama_persona * persona);
 
     // Move sequence seq_id's state out of the memory into persona's blocks; her stream is left empty. Two-phase: a
@@ -950,22 +952,19 @@ extern "C" {
 
     LLAMA_API const char * llama_persona_status_name(int32_t status);
 
-    // Her blocks move only under an owner: the persona and epoch her token history was reserved for. A save or load
-    // before llama_persona_reserve_tokens returns no_owner; a completed save stamps her blocks with the owner; a load
-    // of blocks stamped by another persona or another epoch of her returns wrong_owner before anything is written.
-    // Reserving twice returns already_reserved (it would drop her history); an allocation failure returns
-    // out_of_memory and changes nothing. llama_persona_owner reads the stamp (false before a completed save).
+    // Her blocks move only under her owner (the persona and epoch she was made for): a completed save stamps them; a
+    // load of blocks stamped by another persona or another epoch of her returns wrong_owner before anything is
+    // written. llama_persona_owner reads the stamp (false before a completed save).
     LLAMA_API bool llama_persona_owner(const struct llama_persona * persona, uint64_t * persona_id, uint64_t * epoch);
 
     // Her token history, held in the persona beside her blocks (so it moves with them by reference, never copied):
     // one buffer of her token ids and one of her append receipts, grown by her owner. A request appends only its new ids, in
     // one validated transaction (see llama_persona_append). Owned once by her admitted owner; 0 when done.
-    LLAMA_API int32_t llama_persona_reserve_tokens(struct llama_persona * persona, uint64_t persona_id, uint64_t epoch);
-
-    // Grow her history by more_tokens ids and more_receipts appends, keeping what she holds. Her owner calls it ahead
-    // of need, between acts, never inside one: sized by nothing at creation. no_owner before a reserve; out_of_memory
-    // on allocation failure, with her history unchanged.
+    // Her history grows and shrinks with her, never inside an act: grow adds room for more_tokens ids and more_receipts
+    // appends ahead of need; shrink gives back the room she does not hold as she cools. Neither drops anything she
+    // holds; out_of_memory on allocation failure, with her history unchanged.
     LLAMA_API int32_t llama_persona_grow_tokens(struct llama_persona * persona, size_t more_tokens, size_t more_receipts);
+    LLAMA_API int32_t llama_persona_shrink_tokens(struct llama_persona * persona);
 
     // What an append asserts about her history: her persona, her epoch, her request sequence (1, 2, 3, ...), the
     // frontier it expects her history to end at, and the request's own 128-bit identity.
@@ -991,7 +990,7 @@ extern "C" {
                                                                        const struct llama_persona_append_header * header,
                                                                        const llama_token * delta, size_t n);
 
-    // Her history as held: the ids and their count (her frontier). NULL before llama_persona_reserve_tokens.
+    // Her history as held: the ids and their count (her frontier). Empty until her first append.
     LLAMA_API const llama_token * llama_persona_token_ids(const struct llama_persona * persona, uint64_t * n);
 
     LLAMA_API const char * llama_persona_append_status_name(int32_t status);

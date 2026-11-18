@@ -8,14 +8,14 @@
 #include <new>
 #include <memory>
 
-// A persona's token history: one contiguous, reserved buffer of her token ids, owned with her blocks
+// A persona's token history: one contiguous buffer of her token ids, grown and shrunk by her owner, owned with her blocks
 // (CONTINUUM-ENGINE 4.14, "the persona is one contiguous structure; a request appends token ids").
 //
 // Her tokens are what her blocks hold, in order: what she was served and what she generated, exactly.
 // A request never re-sends them; it appends only its new ids, in one validated transaction:
 //   - its header names her persona, her epoch, her request sequence (1, 2, 3, ... minted by her one
 //     caller), the frontier it expects her history to end at, and the request's own 128-bit identity;
-//   - the owner validates all of it, then writes the delta into capacity already reserved: never an
+//   - the owner validates all of it, then writes the delta into room her owner already grew: never an
 //     allocation or a copy of what she holds (growth is the admitted owner's, measured separately);
 //   - every committed append keeps its receipt, indexed by its sequence: a retry of ANY committed
 //     sequence, however delayed or reordered, gets its original receipt and writes nothing; the same
@@ -48,7 +48,7 @@ enum class llama_persona_append_status {
     out_of_order,  // not her next sequence: a gap, or a sequence she never committed
     moved,         // her next sequence, but her history does not end where the request expects
     changed,       // a committed sequence with another identity or delta: refused, never overwritten
-    no_room,       // her reserved tokens or receipts cannot hold this append: her owner grows them first
+    no_room,       // her grown tokens or receipts cannot hold this append: her owner grows them first
     invalid,       // no identity, no sequence, or a null delta with a length
 };
 
@@ -79,6 +79,28 @@ public:
     // Her history is owned from the start and sized by nothing: it begins empty and her owner grows it ahead of
     // need, off the hot path (grow). An accepted append only writes into what has been grown; it never allocates.
     llama_persona_tokens(uint64_t persona, uint64_t epoch) : persona_(persona), epoch_(epoch) {}
+
+    // Give back the room she does not hold (capacity down to her frontier, receipts down to her commits); nothing
+    // she holds is dropped. Her owner calls it as she cools; false on allocation failure, with her history unchanged.
+    bool shrink() {
+        const size_t keep_ids = (size_t) n_, keep_receipts = (size_t) n_committed_;
+        std::unique_ptr<llama_token[]> ids(keep_ids ? new (std::nothrow) llama_token[keep_ids] : nullptr);
+        std::unique_ptr<commit_record[]> committed(keep_receipts ? new (std::nothrow) commit_record[keep_receipts] : nullptr);
+        if ((keep_ids && !ids) || (keep_receipts && !committed)) {
+            return false;
+        }
+        if (keep_ids) {
+            std::memcpy(ids.get(), ids_.get(), keep_ids * sizeof(llama_token));
+        }
+        for (size_t i = 0; i < keep_receipts; ++i) {
+            committed[i] = committed_[i];
+        }
+        ids_.swap(ids);
+        committed_.swap(committed);
+        capacity_ = keep_ids;
+        receipt_capacity_ = keep_receipts;
+        return true;
+    }
 
     // Add room for `more_tokens` ids and `more_receipts` appends, keeping everything she holds. Called by her owner
     // between acts, never inside one. False on allocation failure, with her history unchanged.
@@ -111,7 +133,7 @@ public:
     size_t capacity() const { return capacity_; }
     const llama_token * data() const { return ids_.get(); }
 
-    // Her generated tokens join her history as she samples them: the same reserved tail, one id at a time.
+    // Her generated tokens join her history as she samples them: the same grown tail, one id at a time.
     bool generated(llama_token id) {
         if (n_ >= capacity_) {
             return false;
@@ -121,7 +143,7 @@ public:
     }
 
     // One validated transaction: check her identity, epoch, sequence and frontier, then write the delta
-    // into the reserved tail. `delta` is read in place (the caller's buffer, valid for the call).
+    // into the grown tail. `delta` is read in place (the caller's buffer, valid for the call).
     llama_persona_receipt append(const llama_persona_append_request & h, const llama_token * delta, size_t n_delta) {
         llama_persona_receipt r;
         r.seq = h.seq;
