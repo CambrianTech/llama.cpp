@@ -68,6 +68,10 @@ static void require_identical(const char * what, const std::vector<float> & want
     require(identical, what);
 }
 
+// the owners in this test: each persona's blocks are saved and loaded under her identity
+static const llama_persona_identity A { 0xA, 1 };
+static const llama_persona_identity B { 0xB, 1 };
+
 struct fixture {
     llama_context * ctx     = nullptr;
     int             n_vocab = 0;
@@ -164,7 +168,7 @@ int main(int argc, char ** argv) {
         const int64_t t_prefill = ggml_time_us() - t0;
 
         const int64_t t1 = ggml_time_us();
-        require_move(ctx.persona_save(0, a), llama_persona_move::done, "her state out");
+        require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "her state out");
         const int64_t t_save = ggml_time_us() - t1;
         size_t bytes = 0;
         for (const auto & v : a.kv.k) { bytes += v.size(); }
@@ -173,7 +177,7 @@ int main(int argc, char ** argv) {
         for (const auto & v : a.rs.s) { bytes += v.size(); }
         const uint32_t other = 1 - llama_get_memory(f.ctx)->seq_stream(0);
         const int64_t t2 = ggml_time_us();
-        require_move(ctx.persona_load(0, other, a), llama_persona_move::done, "her state into the other stream");
+        require_move(ctx.persona_load(0, other, a, A), llama_persona_move::done, "her state into the other stream");
         const int64_t t_load = ggml_time_us() - t2;
         std::vector<std::vector<float>> moved;
         moved.push_back(f.decode_one(0, 3 % f.n_vocab, f.n_prompt));
@@ -197,12 +201,15 @@ int main(int argc, char ** argv) {
     // 1. out of stream 0, into stream 1 bound to her own sequence 0
     llama_memory_clear(llama_get_memory(f.ctx), true);
     f.prompt(0, 1);
-    require_move(ctx.persona_save(0, a), llama_persona_move::done, "a out");
+    require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a out");
     require(f.pos_max(0) < 0, "nothing of a is left in the memory");
     require(a.seq == 0, "her blocks carry her sequence");
-    require_move(ctx.persona_load(1, 1, a), llama_persona_move::wrong_persona, "a refused as sequence 1 (never retagged)");
+    require_move(ctx.persona_load(1, 1, a, A), llama_persona_move::wrong_persona, "a refused as sequence 1 (never retagged)");
+    // what this catches: the native load trusting its caller. a's blocks under b's identity are refused before
+    // anything is written, on the native path itself, not only the public seam.
+    require_move(ctx.persona_load(0, 1, a, B), llama_persona_move::wrong_owner, "a's blocks refused under b's identity");
     require(f.pos_max(1) < 0, "the refused load wrote nothing");
-    require_move(ctx.persona_load(0, 1, a), llama_persona_move::done, "a into stream 1");
+    require_move(ctx.persona_load(0, 1, a, A), llama_persona_move::done, "a into stream 1");
     require(f.pos_max(0) == f.n_prompt - 1, "a's sequence holds her prompt");
     f.require_continues("a moved to stream 1", 0, ref_a0);
 
@@ -210,16 +217,16 @@ int main(int argc, char ** argv) {
     llama_memory_clear(llama_get_memory(f.ctx), true);
     f.prompt(1, 2);
     const uint32_t b_stream = llama_get_memory(f.ctx)->seq_stream(1);
-    require_move(ctx.persona_save(1, b), llama_persona_move::done, "b out");
-    require_move(ctx.persona_load(1, 1 - b_stream, b), llama_persona_move::done, "b into the other stream");
+    require_move(ctx.persona_save(1, b, B), llama_persona_move::done, "b out");
+    require_move(ctx.persona_load(1, 1 - b_stream, b, B), llama_persona_move::done, "b into the other stream");
     f.require_continues("b moved to the other stream", 1, ref_b1);
 
     // 3. same-stream round trip
     llama_memory_clear(llama_get_memory(f.ctx), true);
     f.prompt(0, 1);
     const uint32_t a_stream = llama_get_memory(f.ctx)->seq_stream(0);
-    require_move(ctx.persona_save(0, a), llama_persona_move::done, "a out (round trip)");
-    require_move(ctx.persona_load(0, a_stream, a), llama_persona_move::done, "a back into her own stream");
+    require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a out (round trip)");
+    require_move(ctx.persona_load(0, a_stream, a, A), llama_persona_move::done, "a back into her own stream");
     f.require_continues("a same-stream round trip", 0, ref_a0);
 
     // 4. refusals are typed and change nothing
@@ -228,26 +235,26 @@ int main(int argc, char ** argv) {
         f.prompt(0, 1);
         f.prompt(1, 2);
         llama_persona_blocks unprepared;
-        require(ctx.persona_save(0, unprepared) != llama_persona_move::done, "an unprepared save is refused");
+        require(ctx.persona_save(0, unprepared, A) != llama_persona_move::done, "an unprepared save is refused");
         require(f.pos_max(0) == f.n_prompt - 1, "a refused save leaves her in place");
 
-        require_move(ctx.persona_save(0, a), llama_persona_move::done, "a out (refusal setup)");
+        require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a out (refusal setup)");
         const uint32_t occupied = llama_get_memory(f.ctx)->seq_stream(1);
-        require_move(ctx.persona_load(0, occupied, a), llama_persona_move::stream_not_empty, "load over b's stream");
+        require_move(ctx.persona_load(0, occupied, a, A), llama_persona_move::stream_not_empty, "load over b's stream");
         require(f.pos_max(1) == f.n_prompt - 1, "b untouched by the refused load");
 
         llama_persona_blocks bad = a; // the same persona with one layer's rows missing
         bad.kv.k.pop_back();
-        require_move(ctx.persona_load(0, 1 - occupied, bad), llama_persona_move::layout_mismatch, "a layout mismatch");
+        require_move(ctx.persona_load(0, 1 - occupied, bad, A), llama_persona_move::layout_mismatch, "a layout mismatch");
         require(f.pos_max(0) < 0, "a refused load writes nothing");
         if (a.rs.has_state) { // hybrid: a rollback index past the snapshot groups is refused before any write
             llama_persona_blocks far = a;
             far.rs.rs_idx = 1u << 20;
-            require_move(ctx.persona_load(0, 1 - occupied, far), llama_persona_move::invalid_rollback, "a rollback out of bounds");
+            require_move(ctx.persona_load(0, 1 - occupied, far, A), llama_persona_move::invalid_rollback, "a rollback out of bounds");
             require(f.pos_max(0) < 0, "a refused hybrid load writes neither half");
         }
 
-        require_move(ctx.persona_load(0, 1 - occupied, a), llama_persona_move::done, "a back after the refusals");
+        require_move(ctx.persona_load(0, 1 - occupied, a, A), llama_persona_move::done, "a back after the refusals");
         f.require_continues("a after the refusals", 0, ref_a0);
         f.require_continues("b untouched by a's refusals", 1, ref_b1);
     }
@@ -260,10 +267,10 @@ int main(int argc, char ** argv) {
         const uint32_t sa = llama_get_memory(f.ctx)->seq_stream(0);
         const uint32_t sb = llama_get_memory(f.ctx)->seq_stream(1);
         require(sa != sb, "two personas, two streams");
-        require_move(ctx.persona_save(0, a), llama_persona_move::done, "a out (exchange)");
-        require_move(ctx.persona_save(1, b), llama_persona_move::done, "b out (exchange)");
-        require_move(ctx.persona_load(0, sb, a), llama_persona_move::done, "a into b's stream");
-        require_move(ctx.persona_load(1, sa, b), llama_persona_move::done, "b into a's stream");
+        require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a out (exchange)");
+        require_move(ctx.persona_save(1, b, B), llama_persona_move::done, "b out (exchange)");
+        require_move(ctx.persona_load(0, sb, a, A), llama_persona_move::done, "a into b's stream");
+        require_move(ctx.persona_load(1, sa, b, B), llama_persona_move::done, "b into a's stream");
         require(llama_get_memory(f.ctx)->seq_stream(0) == sb && llama_get_memory(f.ctx)->seq_stream(1) == sa,
                 "the streams are exchanged");
         f.require_continues("a after the exchange", 0, ref_a0);
@@ -325,9 +332,9 @@ int main(int argc, char ** argv) {
         drafted_then_rolled_back();
         llama_persona_blocks r;
         require_move(ctx.persona_prepare(r), llama_persona_move::done, "prepare persona r");
-        require_move(ctx.persona_save(0, r), llama_persona_move::done, "r out with a rollback pending");
+        require_move(ctx.persona_save(0, r, A), llama_persona_move::done, "r out with a rollback pending");
         require(!r.rs.has_state || r.rs.rs_idx > 0, "her pending rollback travels with her");
-        require_move(ctx.persona_load(0, 1 - llama_get_memory(f.ctx)->seq_stream(0), r), llama_persona_move::done, "r in");
+        require_move(ctx.persona_load(0, 1 - llama_get_memory(f.ctx)->seq_stream(0), r, A), llama_persona_move::done, "r in");
         require_identical("continues after a move with a rollback pending", in_place,
                           f.decode_one(0, 7 % f.n_vocab, f.n_prompt + 1));
         fprintf(stderr, "rollback groups exercised: n_rs_seq=%u, her rs_idx=%u\n", llama_n_rs_seq(f.ctx), r.rs.rs_idx);

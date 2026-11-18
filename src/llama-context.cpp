@@ -2574,7 +2574,7 @@ llama_persona_move llama_context::persona_prepare(llama_persona_blocks & blocks)
     return memory ? memory->persona_prepare(blocks) : llama_persona_move::unsupported;
 }
 
-llama_persona_move llama_context::persona_save(llama_seq_id seq_id, llama_persona_blocks & out) {
+llama_persona_move llama_context::persona_save(llama_seq_id seq_id, llama_persona_blocks & out, const llama_persona_identity & who) {
     if (!memory) {
         return llama_persona_move::unsupported;
     }
@@ -2584,12 +2584,18 @@ llama_persona_move llama_context::persona_save(llama_seq_id seq_id, llama_person
         return checked;
     }
     memory->persona_commit_save(seq_id, out);
+    out.owned       = true; // a completed save stamps her blocks with her owner
+    out.owner       = who.persona;
+    out.owner_epoch = who.epoch;
     return llama_persona_move::done;
 }
 
-llama_persona_move llama_context::persona_load(llama_seq_id seq_id, uint32_t stream, llama_persona_blocks & in) {
+llama_persona_move llama_context::persona_load(llama_seq_id seq_id, uint32_t stream, llama_persona_blocks & in, const llama_persona_identity & who) {
     if (!memory) {
         return llama_persona_move::unsupported;
+    }
+    if (!in.belongs_to(who)) {
+        return llama_persona_move::wrong_owner; // refused before anything is written
     }
     synchronize();
     llama_persona_slot slot;
@@ -2601,7 +2607,7 @@ llama_persona_move llama_context::persona_load(llama_seq_id seq_id, uint32_t str
     return llama_persona_move::done;
 }
 
-llama_persona_move llama_context::persona_bind(llama_seq_id seq_id, llama_persona_blocks & in) {
+llama_persona_move llama_context::persona_bind(llama_seq_id seq_id, llama_persona_blocks & in, const llama_persona_identity & who) {
     if (!memory) {
         return llama_persona_move::unsupported;
     }
@@ -2609,7 +2615,7 @@ llama_persona_move llama_context::persona_bind(llama_seq_id seq_id, llama_person
     if (stream < 0) {
         return llama_persona_move::no_empty_stream;
     }
-    return persona_load(seq_id, (uint32_t) stream, in);
+    return persona_load(seq_id, (uint32_t) stream, in, who);
 }
 
 llm_graph_params llama_context::graph_params(
@@ -4316,40 +4322,22 @@ void llama_persona_free(llama_persona * persona) {
     delete persona;
 }
 
-// Her blocks move only under an owner: the persona and epoch of her token history. A completed save stamps them
-// with it; a load refuses blocks stamped by another persona or another epoch of her before anything is written.
-int32_t llama_persona_save(llama_context * ctx, llama_seq_id seq_id, llama_persona * persona) {
-    const llama_persona_move m = ctx->persona_save(seq_id, persona->blocks);
-    if (m == llama_persona_move::done) {
-        persona->blocks.owned       = true;
-        persona->blocks.owner       = persona->tokens->persona();
-        persona->blocks.owner_epoch = persona->tokens->epoch();
-    }
-    return (int32_t) m;
+// Her blocks move only under her owner (the persona and epoch of her token history): the native save stamps them,
+// the native load and bind refuse blocks stamped by anyone else, so no path skips the check.
+static llama_persona_identity identity_of(const llama_persona * persona) {
+    return { persona->tokens->persona(), persona->tokens->epoch() };
 }
 
-static llama_persona_move persona_owner_check(const llama_persona * persona) {
-    const llama_persona_blocks & b = persona->blocks;
-    if (b.owned && (b.owner != persona->tokens->persona() || b.owner_epoch != persona->tokens->epoch())) {
-        return llama_persona_move::wrong_owner;
-    }
-    return llama_persona_move::done;
+int32_t llama_persona_save(llama_context * ctx, llama_seq_id seq_id, llama_persona * persona) {
+    return (int32_t) ctx->persona_save(seq_id, persona->blocks, identity_of(persona));
 }
 
 int32_t llama_persona_load(llama_context * ctx, llama_seq_id seq_id, uint32_t stream, llama_persona * persona) {
-    const llama_persona_move owner = persona_owner_check(persona);
-    if (owner != llama_persona_move::done) {
-        return (int32_t) owner;
-    }
-    return (int32_t) ctx->persona_load(seq_id, stream, persona->blocks);
+    return (int32_t) ctx->persona_load(seq_id, stream, persona->blocks, identity_of(persona));
 }
 
 int32_t llama_persona_bind(llama_context * ctx, llama_seq_id seq_id, llama_persona * persona) {
-    const llama_persona_move owner = persona_owner_check(persona);
-    if (owner != llama_persona_move::done) {
-        return (int32_t) owner;
-    }
-    return (int32_t) ctx->persona_bind(seq_id, persona->blocks);
+    return (int32_t) ctx->persona_bind(seq_id, persona->blocks, identity_of(persona));
 }
 
 // Whose blocks these are, as stamped by the last completed save (false before any).

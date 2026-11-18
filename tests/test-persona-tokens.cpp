@@ -57,7 +57,9 @@ int main() {
             const llama_token delta[] = { 9, 1, (llama_token) (70 + a), 9, 2, 7 };
             const auto r = her.append(header(7, 1, a + 2, her.frontier(), id(a + 2)), delta, 6);
             CHECK(r.status == status::appended && r.from + 6 == r.to && r.to == her.frontier());
-            expect.insert(expect.end(), delta, delta + 6);
+            for (const llama_token t : delta) {
+                expect.push_back(t); // one at a time: GCC 14 -Werror=stringop-overflow refuses the bulk range insert
+            }
         }
         CHECK(her.frontier() == expect.size() && her.committed() == 4);
         CHECK(std::equal(expect.begin(), expect.end(), her.data()));

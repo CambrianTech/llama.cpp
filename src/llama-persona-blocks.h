@@ -34,13 +34,23 @@ struct llama_rs_seq_blocks {
 
 // her identity travels with her blocks: the sequence her metadata is tagged with, and the layout of the memory they
 // were prepared for (a fingerprint of layer count, stream size, row types and sizes, snapshot groups)
+// Who a move is for: the persona and epoch whose token history the blocks belong to.
+struct llama_persona_identity {
+    uint64_t persona = 0;
+    uint64_t epoch   = 0;
+};
+
 struct llama_persona_blocks {
     llama_seq_id           seq       = -1;
-    // whose blocks these are: the owner of her token history when they were saved (persona + epoch), stamped by
-    // the public seam on a completed save and checked before any load; never retagged
+    // whose blocks these are: the owner of her token history when they were saved (persona + epoch), stamped by a
+    // completed save and checked by every load, native or public, before anything is written; never retagged
     bool                   owned       = false;
     uint64_t               owner       = 0;
     uint64_t               owner_epoch = 0;
+
+    bool belongs_to(const llama_persona_identity & who) const {
+        return !owned || (owner == who.persona && owner_epoch == who.epoch);
+    }
     uint64_t               kv_layout = 0;
     uint64_t               rs_layout = 0;
     llama_kv_stream_blocks kv;
