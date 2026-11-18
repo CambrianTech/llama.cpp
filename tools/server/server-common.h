@@ -215,6 +215,14 @@ public:
 
     llama_tokens get_text_tokens() const;
 
+    // the token ids from `from` to the end, read in place (no copy); nullptr when a media chunk lies in
+    // that range, whose positions hold no ids (get_tokens() aborts the whole engine on any media-capable
+    // server, media or not)
+    const llama_token * text_from(size_t from) const;
+
+    // whether a media chunk occupies any position at or after `from`
+    bool has_media_from(size_t from) const;
+
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
 
