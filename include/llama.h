@@ -944,6 +944,10 @@ extern "C" {
     // Bind persona's blocks into the empty stream as sequence seq_id (the sequence they were saved from). 0 when done.
     LLAMA_API int32_t llama_persona_load(struct llama_context * ctx, llama_seq_id seq_id, uint32_t stream, struct llama_persona * persona);
 
+    // Bind her blocks as sequence seq_id into an empty stream the memory chooses: the caller never numbers streams.
+    // no_empty_stream when none is empty; otherwise exactly llama_persona_load's checks and statuses.
+    LLAMA_API int32_t llama_persona_bind(struct llama_context * ctx, llama_seq_id seq_id, struct llama_persona * persona);
+
     LLAMA_API const char * llama_persona_status_name(int32_t status);
 
     // Her blocks move only under an owner: the persona and epoch her token history was reserved for. A save or load

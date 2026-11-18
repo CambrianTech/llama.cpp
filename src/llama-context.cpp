@@ -2601,6 +2601,17 @@ llama_persona_move llama_context::persona_load(llama_seq_id seq_id, uint32_t str
     return llama_persona_move::done;
 }
 
+llama_persona_move llama_context::persona_bind(llama_seq_id seq_id, llama_persona_blocks & in) {
+    if (!memory) {
+        return llama_persona_move::unsupported;
+    }
+    const int32_t stream = memory->persona_empty_stream();
+    if (stream < 0) {
+        return llama_persona_move::no_empty_stream;
+    }
+    return persona_load(seq_id, (uint32_t) stream, in);
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -4324,15 +4335,31 @@ int32_t llama_persona_save(llama_context * ctx, llama_seq_id seq_id, llama_perso
     return (int32_t) m;
 }
 
-int32_t llama_persona_load(llama_context * ctx, llama_seq_id seq_id, uint32_t stream, llama_persona * persona) {
+static llama_persona_move persona_owner_check(const llama_persona * persona) {
     if (persona->tokens == nullptr) {
-        return (int32_t) llama_persona_move::no_owner;
+        return llama_persona_move::no_owner;
     }
     const llama_persona_blocks & b = persona->blocks;
     if (b.owned && (b.owner != persona->tokens->persona() || b.owner_epoch != persona->tokens->epoch())) {
-        return (int32_t) llama_persona_move::wrong_owner;
+        return llama_persona_move::wrong_owner;
+    }
+    return llama_persona_move::done;
+}
+
+int32_t llama_persona_load(llama_context * ctx, llama_seq_id seq_id, uint32_t stream, llama_persona * persona) {
+    const llama_persona_move owner = persona_owner_check(persona);
+    if (owner != llama_persona_move::done) {
+        return (int32_t) owner;
     }
     return (int32_t) ctx->persona_load(seq_id, stream, persona->blocks);
+}
+
+int32_t llama_persona_bind(llama_context * ctx, llama_seq_id seq_id, llama_persona * persona) {
+    const llama_persona_move owner = persona_owner_check(persona);
+    if (owner != llama_persona_move::done) {
+        return (int32_t) owner;
+    }
+    return (int32_t) ctx->persona_bind(seq_id, persona->blocks);
 }
 
 // Whose blocks these are, as stamped by the last completed save (false before any).

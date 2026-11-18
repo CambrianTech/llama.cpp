@@ -180,6 +180,7 @@ public:
     // (seq_to_stream stays a permutation; her cells are never retagged). Requires unified KV off and flash attention.
     llama_persona_move persona_prepare(llama_persona_blocks & blocks) const override;
     uint64_t persona_layout() const { return persona_layout_id; }
+    int32_t persona_empty_stream() const override;
     llama_persona_move persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const override;
     llama_persona_move persona_check_load(llama_seq_id seq_id, uint32_t stream, const llama_persona_blocks & in,
                                           llama_persona_slot & slot) const override;

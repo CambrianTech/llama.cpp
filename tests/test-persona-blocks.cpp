@@ -348,9 +348,19 @@ int main(int argc, char ** argv) {
                      "a second reserve would drop her history");
         require_move(st(llama_persona_save(f.ctx, 0, p)), llama_persona_move::done, "save under her owner");
         require(llama_persona_owner(p, &who, &when) && who == 0xA11CE && when == 7, "her blocks are stamped with her owner");
-        const uint32_t other = 1 - llama_get_memory(f.ctx)->seq_stream(0);
-        require_move(st(llama_persona_load(f.ctx, 0, other, p)), llama_persona_move::done, "load under the same owner");
+        require_move(st(llama_persona_bind(f.ctx, 0, p)), llama_persona_move::done, "bound into a stream the memory chose");
         f.require_continues("continues after an owned move through the public seam", 0, ref_a0);
+
+        // every stream occupied: a bind places nobody and changes nothing
+        llama_persona * q = llama_persona_init(f.ctx);
+        require(q != nullptr, "a second persona");
+        require_move(st(llama_persona_reserve_tokens(q, 0xB0B, 1, 64, 8)), llama_persona_move::done, "reserve q");
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 1);
+        f.prompt(1, 2);
+        require_move(st(llama_persona_bind(f.ctx, 1, q)), llama_persona_move::no_empty_stream, "no empty stream to bind into");
+        f.require_continues("both residents untouched by the refused bind", 0, ref_a0);
+        llama_persona_free(q);
         llama_persona_free(p);
     }
 

@@ -170,6 +170,9 @@ struct llama_memory_i {
         (void) seq_id; (void) stream; (void) in; (void) slot;
         return llama_persona_move::unsupported;
     }
+    // An empty stream for a load to place her in, chosen by the memory that owns the streams (the caller never numbers
+    // them); -1 when none is empty or the memory has no streams to move into.
+    virtual int32_t persona_empty_stream() const { return -1; }
     virtual void persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) { (void) seq_id; (void) out; }
     virtual void persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) {
         (void) seq_id; (void) slot; (void) in;

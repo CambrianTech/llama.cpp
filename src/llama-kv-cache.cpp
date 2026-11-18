@@ -1327,6 +1327,18 @@ void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_bloc
     v_heads[s] = 0;
 }
 
+int32_t llama_kv_cache::persona_empty_stream() const {
+    if (n_stream == 1) {
+        return -1; // unified: one stream holds every sequence, so there is nothing empty to bind into
+    }
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        if (v_cells[s].get_used() == 0) {
+            return (int32_t) s;
+        }
+    }
+    return -1;
+}
+
 llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint32_t stream,
                                                      const llama_persona_blocks & in, llama_persona_slot & slot) const {
     if (n_stream == 1 || stream >= n_stream) {

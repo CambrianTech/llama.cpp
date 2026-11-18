@@ -73,6 +73,7 @@ enum class llama_persona_move {
     wrong_owner,        // her blocks were saved by another persona or another epoch of her
     already_reserved,   // her token history is already reserved: a second reserve would drop it
     out_of_memory,      // reserving her token history failed to allocate; nothing changed
+    no_empty_stream,    // a bind found no empty stream to place her in
 };
 
 const char * llama_persona_move_name(llama_persona_move m);

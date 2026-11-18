@@ -77,6 +77,7 @@ const char * llama_persona_move_name(llama_persona_move m) {
         case llama_persona_move::wrong_owner:        return "wrong_owner";
         case llama_persona_move::already_reserved:   return "already_reserved";
         case llama_persona_move::out_of_memory:      return "out_of_memory";
+        case llama_persona_move::no_empty_stream:    return "no_empty_stream";
     }
     return "unknown";
 }
