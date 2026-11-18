@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-cparams.h"
 #include "llama-graph.h"
+#include "llama-learn-step-plan.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
@@ -237,8 +238,9 @@ struct llama_context {
     size_t opt_graph_bytes() const;
     void opt_visit_memory(llama_opt_memory_callback callback, void * user_data) const;
     enum class opt_measure_phase { accumulation_and_commit, whole_reply_commit };
-    bool opt_measure_memory(llama_opt_memory_callback callback, void * user_data, opt_measure_phase phase, ggml_backend_sched_t held = nullptr, uint32_t reply_rows = 0);
-    bool opt_measure_shadow(llama_opt_params params, llama_opt_memory_callback callback, void * user_data, opt_measure_phase phase, uint32_t reply_rows = 0);
+    // step: a live learning step's shaped plan (its graph attends to her rows); null for a general caller
+    bool opt_measure_memory(llama_opt_memory_callback callback, void * user_data, opt_measure_phase phase, ggml_backend_sched_t held = nullptr, const llama_learn_step_plan * step = nullptr);
+    bool opt_measure_shadow(llama_opt_params params, llama_opt_memory_callback callback, void * user_data, opt_measure_phase phase, const llama_learn_step_plan * step = nullptr);
     ggml_opt_params opt_params_for(llama_opt_params params);
     int64_t opt_shadow_steps(const llama_adapter_lora * shadow) const;
 

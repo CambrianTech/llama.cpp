@@ -118,7 +118,7 @@ ggml_opt_params llama_context::opt_params_for(llama_opt_params lopt_params) {
     return opt_params;
 }
 
-bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory_callback callback, void * user_data, opt_measure_phase phase, uint32_t reply_rows) {
+bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory_callback callback, void * user_data, opt_measure_phase phase, const llama_learn_step_plan * step) {
     if (!callback || !params.adapter || opt_reply) {
         opt_failure = "shadow preflight requires an idle learning boundary";
         return false;
@@ -174,7 +174,7 @@ bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory
                 max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     opt_params_base = opt_params_for(params);
-    return opt_measure_memory(callback, user_data, phase, held_scheduler, reply_rows);
+    return opt_measure_memory(callback, user_data, phase, held_scheduler, step);
 }
 
 bool llama_opt_measure_shadow(llama_context * ctx, llama_opt_params params,
@@ -182,10 +182,11 @@ bool llama_opt_measure_shadow(llama_context * ctx, llama_opt_params params,
     return ctx && ctx->opt_measure_shadow(params, callback, user_data, llama_context::opt_measure_phase::accumulation_and_commit);
 }
 
-bool llama_opt_measure_shadow_graph(llama_context * ctx, llama_opt_params params, uint32_t reply_rows,
+bool llama_opt_measure_shadow_graph(llama_context * ctx, llama_opt_params params, llama_learn_step_geometry step,
         llama_opt_memory_callback callback, void * user_data) {
-    return ctx && reply_rows > 0 && ctx->opt_measure_shadow(params, callback, user_data,
-            llama_context::opt_measure_phase::whole_reply_commit, reply_rows);
+    const auto plan = llama_learn_step_plan::shaped(step);
+    return ctx && step.reply_rows > 0 && ctx->opt_measure_shadow(params, callback, user_data,
+            llama_context::opt_measure_phase::whole_reply_commit, &plan);
 }
 
 static void opt_bind_admission(ggml_opt_context_t optimizer, const llama_opt_params & params) {

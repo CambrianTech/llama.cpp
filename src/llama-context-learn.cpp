@@ -216,15 +216,19 @@ llama_opt_learn_status llama_context::opt_learn_step() {
     opt_learn_labels_done = s.labels_done;
     // Build one graph for the entire reply. Serving retains its configured batches;
     // the served context window and label denominator never change.
+    // A training chunk is one ubatch under its bound plan: attention reads her positions
+    // [0, prefix + cursor + m) and nothing else of the shared cache (llama_learn_step_plan).
+    const auto plan = llama_learn_step_plan::for_sequence(s.seq, (uint32_t) (s.prefix + s.cursor), (uint32_t) m);
     const bool ok = [&] {
         struct restore_batches {
             llama_cparams & params;
             uint32_t batch, ubatch;
-            ~restore_batches() { params.n_batch = batch; params.n_ubatch = ubatch; }
+            ~restore_batches() { params.n_batch = batch; params.n_ubatch = ubatch; params.learn_step = nullptr; }
         } restore{cparams, cparams.n_batch, cparams.n_ubatch};
-        if (!s.restoring && s.graph_nodes > 0) {
+        if (!s.restoring) {
             cparams.n_batch = std::max<uint32_t>(cparams.n_batch, m);
             cparams.n_ubatch = std::max<uint32_t>(cparams.n_ubatch, m);
+            cparams.learn_step = &plan;
         }
         return decode(batch) == 0;
     }();

@@ -95,9 +95,11 @@
         if (const auto why = train_repack_refusal(model_tgt, params_base); !why.empty()) {
             return refuse("unsupported", why);
         }
+        // the step attends to her served prefix and her reply (llama_learn_step_geometry): both are measured
+        const int64_t prefix_rows = body.value("prefix_rows", int64_t(-1));
         const int64_t reply_rows = body.value("reply_rows", int64_t(0));
-        if (reply_rows <= 0 || reply_rows > llama_n_ctx_seq(ctx_tgt)) {
-            return refuse("invalid", "reply_rows must describe a nonempty example within the served window");
+        if (prefix_rows < 0 || reply_rows <= 0 || prefix_rows + reply_rows > llama_n_ctx_seq(ctx_tgt)) {
+            return refuse("invalid", "prefix_rows and reply_rows must describe a nonempty example within the served window");
         }
         // The loop serializes this with decoding and adapter unload. Restore the active
         // default composition on exit; update_slots installs each batched slot before decode.
@@ -110,13 +112,14 @@
         auto set = construct_lora_list({});
         set[id].scale = 1.0f;
         common_set_adapter_lora(ctx_tgt, set);
-        const bool ok = llama_opt_measure_shadow_graph(ctx_tgt, learning_shadow_params((int32_t) id), (uint32_t) reply_rows, [](const llama_adapter_lora *, const char * device,
+        const bool ok = llama_opt_measure_shadow_graph(ctx_tgt, learning_shadow_params((int32_t) id), llama_learn_step_geometry{(uint32_t) prefix_rows, (uint32_t) reply_rows}, [](const llama_adapter_lora *, const char * device,
                 const char * buft, const char * kind, size_t bytes, bool host, void * data) {
             static_cast<json *>(data)->push_back({{"device", device}, {"buffer_type", buft},
                 {"kind", kind}, {"bytes", bytes}, {"host", host}});
         }, &out["requirements"]);
         if (!ok) { return refuse("unsupported", llama_opt_failure(ctx_tgt)); }
         out["lora_id"] = id;
+        out["prefix_rows"] = prefix_rows;
         out["reply_rows"] = reply_rows;
         out["served_window"] = llama_n_ctx_seq(ctx_tgt);
         return out;

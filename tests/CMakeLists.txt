@@ -210,6 +210,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
+    llama_build_and_test(test-learn-step-plan.cpp)
     llama_build_and_test(test-walk-plan.cpp)
     # the exact walk trains on the window's whole gradient whatever the chunking: run on a pure-attention AND a
     # hybrid model (-m), on a GPU backend as well as the CPU (a hybrid passed on the CPU while Metal tore its state)

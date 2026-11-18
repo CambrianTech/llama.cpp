@@ -6345,16 +6345,27 @@ void server_routes::init_routes() {
             if (!body.is_object() || body.contains("reply_rows")) {
                 throw std::invalid_argument("preflight requires the example, not caller-computed reply_rows");
             }
-            size_t rows;
+            if (body.contains("prefix_rows")) {
+                throw std::invalid_argument("preflight requires the example, not caller-computed prefix_rows");
+            }
+            // the step attends to her prefix and her reply: the prefix is the served prompt but its
+            // last token, which the step decodes again with the reply (llama_opt_learn_begin)
+            size_t rows, prefix;
             if (body.contains("messages")) {
-                rows = render_learn_example(body).reply.size();
+                const auto example = render_learn_example(body);
+                rows = example.reply.size();
+                prefix = example.n_prefix > 0 ? (size_t) example.n_prefix - 1 : 0;
             } else if (body.contains("learn")) {
                 // Completion-attached corrections share the completion schema, including EOT.
                 rows = server_schema::eval_llama_cmpl_schema(ctx_server.vocab, params, meta->logit_bias_eog,
                     json{{"learn", body.at("learn")}}).learn->reply.size();
+                // its prompt is the completion's, not rendered here: price the longest one the slot
+                // serves; the admission's revalidation measures the actual prompt before mutation
+                prefix = rows < (size_t) meta->slot_n_ctx ? (size_t) meta->slot_n_ctx - rows : 0;
             } else {
                 throw std::invalid_argument("preflight requires messages or a completion learn example");
             }
+            body["prefix_rows"] = prefix;
             body["reply_rows"] = rows;
             server_http_req measured = req;
             measured.body = body.dump();

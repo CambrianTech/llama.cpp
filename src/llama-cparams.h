@@ -34,6 +34,9 @@ struct llama_cparams {
     uint32_t walk_acc_base  = 0;
     // a later chunk's gradient sits on the recurrent state this chunk leaves
     bool     walk_state_surrogate = false;
+    // a live learning step's plan (llama-learn-step-plan.h): attention reads her rows only.
+    // Set for the step's own graph (preflight or decode), never for a neighbour's
+    const struct llama_learn_step_plan * learn_step = nullptr;
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;

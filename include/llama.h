@@ -1892,12 +1892,19 @@ extern "C" {
     // Select only in disposable metadata: preserve serving scheduler buffers and optimizer state.
     LLAMA_API bool llama_opt_measure_shadow(struct llama_context * ctx, struct llama_opt_params params,
             llama_opt_memory_callback callback, void * user_data);
+    // One learning step's geometry: her positions [0, prefix_rows + reply_rows), the last
+    // reply_rows of them labelled. The step attends to her rows only, so this, not the cache's
+    // size or what other sequences hold in it, shapes the step's graph.
+    struct llama_learn_step_geometry {
+        uint32_t prefix_rows;
+        uint32_t reply_rows;
+    };
     // One whole-reply optimizer graph, yielded by graph nodes, never token batches.
     // Measures the commit graph only: accumulation-only callers use the general
-    // preflight above. Rows describe the actual example, not a context/window limit.
+    // preflight above. The geometry is the actual example, not a context/window limit.
     // Execution remeasures its geometry and re-admits growth before mutation.
     LLAMA_API bool llama_opt_measure_shadow_graph(struct llama_context * ctx, struct llama_opt_params params,
-            uint32_t reply_rows, llama_opt_memory_callback callback, void * user_data);
+            struct llama_learn_step_geometry step, llama_opt_memory_callback callback, void * user_data);
     LLAMA_API bool llama_opt_measure_memory(struct llama_context * ctx,
             llama_opt_memory_callback callback, void * user_data);
 
