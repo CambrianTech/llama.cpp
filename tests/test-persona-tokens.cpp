@@ -9,6 +9,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <atomic>
+#include <new>
+
+// Every allocation in this test binary is counted, so "an accepted append never allocates" is measured, not stated.
+static std::atomic<uint64_t> g_allocations { 0 };
+void * operator new(std::size_t n) {
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+    if (void * p = std::malloc(n ? n : 1)) {
+        return p;
+    }
+    throw std::bad_alloc();
+}
+void operator delete(void * p) noexcept { std::free(p); }
+void operator delete(void * p, std::size_t) noexcept { std::free(p); }
 
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
 
@@ -113,6 +127,27 @@ int main() {
         CHECK(her.append(header(7, 1, 3, 2, id(3)), nullptr, 0).status == status::no_room);
         CHECK(her.frontier() == 2 && her.committed() == 2 && her.data()[0] == 1 && her.data()[1] == 2);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 2).status == status::replayed);
+    }
+    // what this catches (Codex on #147 at f3eb: fixed-capacity evidence): any allocation on the append path. At her
+    // real size, after the one reserve, accepted, refused (no room, wrong epoch, stale frontier) and replayed
+    // appends together allocate nothing: her capacity and receipts are fixed at reserve and the hot path only writes.
+    {
+        llama_persona_tokens her(7, 1, 1 << 17, 64);
+        std::vector<llama_token> prompt(100000, 5);
+        std::vector<llama_token> delta(2048, 6);
+        std::vector<llama_token> too_much(1 << 17, 7);
+        const uint64_t before = g_allocations.load();
+        CHECK(her.append(header(7, 1, 1, 0, id(1)), prompt.data(), prompt.size()).status == status::appended);
+        for (uint64_t i = 0; i < 8; i++) {
+            CHECK(her.append(header(7, 1, i + 2, her.frontier(), id(i + 2)), delta.data(), delta.size()).status == status::appended);
+        }
+        CHECK(her.append(header(7, 1, 10, her.frontier(), id(10)), too_much.data(), too_much.size()).status == status::no_room);
+        CHECK(her.append(header(7, 2, 10, her.frontier(), id(10)), delta.data(), delta.size()).status == status::wrong_epoch);
+        CHECK(her.append(header(7, 1, 10, 0, id(10)), delta.data(), delta.size()).status != status::appended);
+        CHECK(her.append(header(7, 1, 1, 0, id(1)), prompt.data(), prompt.size()).status == status::replayed);
+        CHECK(g_allocations.load() == before);
+        fprintf(stderr, "fixed capacity: %llu appends and refusals at a %llu-token history, 0 allocations\n",
+                (unsigned long long) 13, (unsigned long long) her.frontier());
     }
     // The cost of an act's append at her real size: a 100k-token history, a 2k-token delta. Printed, not
     // asserted; the writes are read back so the optimizer cannot remove them.
