@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-learn-step-plan.h"
 
 #include <cstdlib>
 #include <cstdint>
@@ -330,6 +331,24 @@ public:
 
     const llama_hparams hparams;
     const llama_cparams cparams;
+};
+
+// The cells holding one learning step's positions, in position order, and her causal mask over
+// them (llama_learn_step_plan): the step attends to her rows only, never the shared cache's others.
+class llm_graph_input_learn_rows : public llm_graph_input_i {
+public:
+    llm_graph_input_learn_rows(const llama_learn_step_plan & plan, const llama_kv_cache_context * mctx) : plan(plan), mctx(mctx) {}
+    virtual ~llm_graph_input_learn_rows() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params &) override { return false; }
+
+    ggml_tensor * cells = nullptr; // I32 [rows]
+    ggml_tensor * mask  = nullptr; // F16 [rows, n_tokens, 1, 1]
+
+    const llama_learn_step_plan plan;
+    const llama_kv_cache_context * mctx;
 };
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {
@@ -1091,6 +1110,7 @@ struct llm_graph_context {
     llm_graph_result * res;
 
     mutable ggml_tensor * inp_train_rows = nullptr; // build_inp_train_rows, once per graph
+    mutable llm_graph_input_learn_rows * inp_learn_rows = nullptr; // build_inp_learn_rows, once per graph
     mutable llm_graph_input_training_rows * inp_training_rows = nullptr;
 
     ggml_context * ctx0 = nullptr;
@@ -1214,6 +1234,11 @@ struct llm_graph_context {
     // A training chunk's cache rows: I32 [n_tokens], its positions (in the walk a position
     // is its cell). One per graph, shared by every attention layer.
     ggml_tensor * build_inp_train_rows() const;
+
+    // A live learning step's rows (cparams.learn_step), shared by every attention layer.
+    llm_graph_input_learn_rows * build_inp_learn_rows(const llama_kv_cache_context * mctx_cur) const;
+    // one layer's K or V at her rows, in position order, as F16 [D, Hkv, rows]
+    ggml_tensor * build_learn_rows(ggml_tensor * all, const llm_graph_input_learn_rows * rows, ggml_tensor * cur) const;
 
     // whether an attached adapter's term is in this graph: every one but the shadow always, the
     // shadow only when the ubatch has labelled rows
