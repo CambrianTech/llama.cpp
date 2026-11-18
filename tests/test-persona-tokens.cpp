@@ -44,7 +44,8 @@ int main() {
     // what this catches: her history rebuilt per act. Three acts: each request appends only its new ids
     // after what she generated; her history is exactly served + generated + new, in order.
     {
-        llama_persona_tokens her(7, 1, 64, 16);
+        llama_persona_tokens her(7, 1);
+        CHECK(her.grow(64, 16));
         const llama_token prompt[] = { 1, 40, 9, 2, 7 };
         CHECK(her.append(header(7, 1, 1, 0, id(1)), prompt, 5).status == status::appended);
         std::vector<llama_token> expect(prompt, prompt + 5);
@@ -65,7 +66,8 @@ int main() {
     // A then B commit; a delayed retry of A (after B) gets A's original receipt and writes nothing; so does a
     // duplicate of B; A's sequence with another request or delta is refused.
     {
-        llama_persona_tokens her(7, 1, 16, 16);
+        llama_persona_tokens her(7, 1);
+        CHECK(her.grow(16, 16));
         const llama_token a[] = { 1, 2, 3 }, b[] = { 4, 5 }, other[] = { 1, 2, 4 };
         const auto ra = her.append(header(7, 1, 1, 0, id(1)), a, 3);
         const auto rb = her.append(header(7, 1, 2, 3, id(2)), b, 2);
@@ -80,7 +82,8 @@ int main() {
     // what this catches: empty appends at the same frontier letting a retried request be accepted twice.
     // Each empty append commits its own sequence; a retry of the first is its receipt, never a new append.
     {
-        llama_persona_tokens her(7, 1, 16, 16);
+        llama_persona_tokens her(7, 1);
+        CHECK(her.grow(16, 16));
         CHECK(her.append(header(7, 1, 1, 0, id(1)), nullptr, 0).status == status::appended);
         CHECK(her.append(header(7, 1, 2, 0, id(2)), nullptr, 0).status == status::appended);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), nullptr, 0).status == status::replayed);
@@ -88,7 +91,8 @@ int main() {
     }
     // what this catches: a reordered request (a later sequence arriving first) appended out of order.
     {
-        llama_persona_tokens her(7, 1, 16, 16);
+        llama_persona_tokens her(7, 1);
+        CHECK(her.grow(16, 16));
         const llama_token d[] = { 1 };
         CHECK(her.append(header(7, 1, 2, 0, id(2)), d, 1).status == status::out_of_order);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 1).status == status::appended);
@@ -97,7 +101,8 @@ int main() {
     }
     // what this catches: a stale, foreign or malformed request appended to her history.
     {
-        llama_persona_tokens her(7, 2, 16, 16);
+        llama_persona_tokens her(7, 2);
+        CHECK(her.grow(16, 16));
         const llama_token d[] = { 1 };
         CHECK(her.append(header(8, 2, 1, 0, id(1)), d, 1).status == status::wrong_persona);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 1).status == status::wrong_epoch);
@@ -110,16 +115,33 @@ int main() {
     // what this catches: an append past her reserved capacity growing it in place (an allocation and a copy
     // of what she holds on the hot path): refused, her owner grows first; a length that would overflow too.
     {
-        llama_persona_tokens her(7, 1, 4, 16);
+        llama_persona_tokens her(7, 1);
+        CHECK(her.grow(4, 16));
         const llama_token d[] = { 1, 2, 3, 4, 5 };
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 5).status == status::no_room && her.frontier() == 0);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, SIZE_MAX).status == status::no_room);
+    }
+    // what this catches (Joel: nothing sized at creation): a history that cannot grow. Out of room, the append is
+    // refused and writes nothing; her owner grows her (between acts) and the same request lands, with everything
+    // she held kept and her earlier commit still replayable.
+    {
+        llama_persona_tokens her(7, 1);
+        const llama_token d[] = { 1, 2, 3, 4, 5 };
+        CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 2).status == status::no_room && her.frontier() == 0);
+        CHECK(her.grow(2, 1));
+        CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 2).status == status::appended);
+        CHECK(her.append(header(7, 1, 2, 2, id(2)), d + 2, 3).status == status::no_room && her.frontier() == 2);
+        CHECK(her.grow(3, 1));
+        CHECK(her.append(header(7, 1, 2, 2, id(2)), d + 2, 3).status == status::appended && her.frontier() == 5);
+        CHECK(her.data()[0] == 1 && her.data()[4] == 5);
+        CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 2).status == status::replayed);
     }
     // what this catches: an accepted append allocating its receipt on the hot path, or a refused one leaving
     // a half-written append. Receipts are reserved; when they are used up the append is refused before any
     // write, an empty append included, and her tokens, frontier and commits are unchanged.
     {
-        llama_persona_tokens her(7, 1, 16, 2);
+        llama_persona_tokens her(7, 1);
+        CHECK(her.grow(16, 2));
         const llama_token d[] = { 1, 2 };
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 2).status == status::appended);
         CHECK(her.append(header(7, 1, 2, 2, id(2)), nullptr, 0).status == status::appended);
@@ -128,11 +150,12 @@ int main() {
         CHECK(her.frontier() == 2 && her.committed() == 2 && her.data()[0] == 1 && her.data()[1] == 2);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), d, 2).status == status::replayed);
     }
-    // what this catches (Codex on #147 at f3eb: fixed-capacity evidence): any allocation on the append path. At her
-    // real size, after the one reserve, accepted, refused (no room, wrong epoch, stale frontier) and replayed
+    // what this catches (Codex on #147 at f3eb): any allocation on the append path. At her
+    // real size, after her owner grew her history ahead, accepted, refused (no room, wrong epoch, stale frontier) and replayed
     // appends together allocate nothing: her capacity and receipts are fixed at reserve and the hot path only writes.
     {
-        llama_persona_tokens her(7, 1, 1 << 17, 64);
+        llama_persona_tokens her(7, 1);
+        CHECK(her.grow(1 << 17, 64));
         std::vector<llama_token> prompt(100000, 5);
         std::vector<llama_token> delta(2048, 6);
         std::vector<llama_token> too_much(1 << 17, 7);
@@ -146,13 +169,14 @@ int main() {
         CHECK(her.append(header(7, 1, 10, 0, id(10)), delta.data(), delta.size()).status != status::appended);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), prompt.data(), prompt.size()).status == status::replayed);
         CHECK(g_allocations.load() == before);
-        fprintf(stderr, "fixed capacity: %llu appends and refusals at a %llu-token history, 0 allocations\n",
+        fprintf(stderr, "grown ahead: %llu appends and refusals at a %llu-token history, 0 allocations\n",
                 (unsigned long long) 13, (unsigned long long) her.frontier());
     }
     // The cost of an act's append at her real size: a 100k-token history, a 2k-token delta. Printed, not
     // asserted; the writes are read back so the optimizer cannot remove them.
     {
-        llama_persona_tokens her(7, 1, 1 << 20, 128);
+        llama_persona_tokens her(7, 1);
+        CHECK(her.grow(1 << 20, 128));
         std::vector<llama_token> prompt(100000, 5);
         CHECK(her.append(header(7, 1, 1, 0, id(1)), prompt.data(), prompt.size()).status == status::appended);
         std::vector<llama_token> delta(2048, 6);

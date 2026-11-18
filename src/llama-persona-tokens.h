@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <memory>
 
 // A persona's token history: one contiguous, reserved buffer of her token ids, owned with her blocks
@@ -75,11 +76,33 @@ struct llama_persona_receipt {
 
 class llama_persona_tokens {
 public:
-    // Both arrays are reserved here, by her admitted owner: an accepted append writes into them and never
-    // allocates (`capacity` token ids, `receipts` committed appends, one per request sequence).
-    llama_persona_tokens(uint64_t persona, uint64_t epoch, size_t capacity, size_t receipts)
-        : persona_(persona), epoch_(epoch), capacity_(capacity), ids_(new llama_token[capacity]),
-          receipt_capacity_(receipts), committed_(new commit_record[receipts]) {}
+    // Her history is owned from the start and sized by nothing: it begins empty and her owner grows it ahead of
+    // need, off the hot path (grow). An accepted append only writes into what has been grown; it never allocates.
+    llama_persona_tokens(uint64_t persona, uint64_t epoch) : persona_(persona), epoch_(epoch) {}
+
+    // Add room for `more_tokens` ids and `more_receipts` appends, keeping everything she holds. Called by her owner
+    // between acts, never inside one. False on allocation failure, with her history unchanged.
+    bool grow(size_t more_tokens, size_t more_receipts) {
+        if (more_tokens > SIZE_MAX - capacity_ || more_receipts > SIZE_MAX - receipt_capacity_) {
+            return false;
+        }
+        std::unique_ptr<llama_token[]> ids(new (std::nothrow) llama_token[capacity_ + more_tokens]);
+        std::unique_ptr<commit_record[]> committed(new (std::nothrow) commit_record[receipt_capacity_ + more_receipts]);
+        if (!ids || !committed) {
+            return false;
+        }
+        if (n_ > 0) {
+            std::memcpy(ids.get(), ids_.get(), n_ * sizeof(llama_token));
+        }
+        for (uint64_t i = 0; i < n_committed_; ++i) {
+            committed[i] = committed_[i];
+        }
+        ids_.swap(ids);
+        committed_.swap(committed);
+        capacity_ += more_tokens;
+        receipt_capacity_ += more_receipts;
+        return true;
+    }
 
     uint64_t persona() const { return persona_; }
     uint64_t epoch() const { return epoch_; }
@@ -160,10 +183,10 @@ private:
 
     uint64_t                       persona_;
     uint64_t                       epoch_;
-    size_t                         capacity_;
+    size_t                         capacity_ = 0;
     std::unique_ptr<llama_token[]> ids_;
     uint64_t                       n_ = 0;
-    size_t                           receipt_capacity_;
+    size_t                           receipt_capacity_ = 0;
     std::unique_ptr<commit_record[]> committed_;
     uint64_t                         n_committed_ = 0;
 };

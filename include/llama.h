@@ -958,10 +958,14 @@ extern "C" {
     LLAMA_API bool llama_persona_owner(const struct llama_persona * persona, uint64_t * persona_id, uint64_t * epoch);
 
     // Her token history, held in the persona beside her blocks (so it moves with them by reference, never copied):
-    // one reserved buffer of her token ids and one of her append receipts. A request appends only its new ids, in
-    // one validated transaction (see llama_persona_append). Reserved once by her admitted owner; 0 when done.
-    LLAMA_API int32_t llama_persona_reserve_tokens(struct llama_persona * persona, uint64_t persona_id, uint64_t epoch,
-                                                   size_t n_tokens, size_t n_receipts);
+    // one buffer of her token ids and one of her append receipts, grown by her owner. A request appends only its new ids, in
+    // one validated transaction (see llama_persona_append). Owned once by her admitted owner; 0 when done.
+    LLAMA_API int32_t llama_persona_reserve_tokens(struct llama_persona * persona, uint64_t persona_id, uint64_t epoch);
+
+    // Grow her history by more_tokens ids and more_receipts appends, keeping what she holds. Her owner calls it ahead
+    // of need, between acts, never inside one: sized by nothing at creation. no_owner before a reserve; out_of_memory
+    // on allocation failure, with her history unchanged.
+    LLAMA_API int32_t llama_persona_grow_tokens(struct llama_persona * persona, size_t more_tokens, size_t more_receipts);
 
     // What an append asserts about her history: her persona, her epoch, her request sequence (1, 2, 3, ...), the
     // frontier it expects her history to end at, and the request's own 128-bit identity.

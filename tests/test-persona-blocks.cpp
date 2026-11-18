@@ -343,8 +343,9 @@ int main(int argc, char ** argv) {
         uint64_t who = 0, when = 0;
         require(!llama_persona_owner(p, &who, &when), "no owner before a completed save");
         require_move(st(llama_persona_save(f.ctx, 0, p)), llama_persona_move::no_owner, "save before her history is reserved");
-        require_move(st(llama_persona_reserve_tokens(p, 0xA11CE, 7, 64, 8)), llama_persona_move::done, "reserve her history");
-        require_move(st(llama_persona_reserve_tokens(p, 0xB0B, 7, 64, 8)), llama_persona_move::already_reserved,
+        require_move(st(llama_persona_reserve_tokens(p, 0xA11CE, 7)), llama_persona_move::done, "reserve her history");
+        require_move(st(llama_persona_grow_tokens(p, 64, 8)), llama_persona_move::done, "her owner grows her history ahead");
+        require_move(st(llama_persona_reserve_tokens(p, 0xB0B, 7)), llama_persona_move::already_reserved,
                      "a second reserve would drop her history");
         require_move(st(llama_persona_save(f.ctx, 0, p)), llama_persona_move::done, "save under her owner");
         require(llama_persona_owner(p, &who, &when) && who == 0xA11CE && when == 7, "her blocks are stamped with her owner");
@@ -354,7 +355,7 @@ int main(int argc, char ** argv) {
         // every stream occupied: a bind places nobody and changes nothing
         llama_persona * q = llama_persona_init(f.ctx);
         require(q != nullptr, "a second persona");
-        require_move(st(llama_persona_reserve_tokens(q, 0xB0B, 1, 64, 8)), llama_persona_move::done, "reserve q");
+        require_move(st(llama_persona_reserve_tokens(q, 0xB0B, 1)), llama_persona_move::done, "reserve q");
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);
         f.prompt(1, 2);

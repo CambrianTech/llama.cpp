@@ -4261,16 +4261,24 @@ struct llama_persona {
 
 // Her token history is reserved once and owns her blocks from then on: a second reserve would drop her history, so
 // it is refused; an allocation failure is a status, never an exception across the C boundary, and changes nothing.
-int32_t llama_persona_reserve_tokens(llama_persona * persona, uint64_t persona_id, uint64_t epoch, size_t n_tokens, size_t n_receipts) {
+int32_t llama_persona_reserve_tokens(llama_persona * persona, uint64_t persona_id, uint64_t epoch) {
     if (persona->tokens != nullptr) {
         return (int32_t) llama_persona_move::already_reserved;
     }
     try {
-        persona->tokens = std::make_unique<llama_persona_tokens>(persona_id, epoch, n_tokens, n_receipts);
+        persona->tokens = std::make_unique<llama_persona_tokens>(persona_id, epoch);
     } catch (const std::bad_alloc &) {
         return (int32_t) llama_persona_move::out_of_memory;
     }
     return (int32_t) llama_persona_move::done;
+}
+
+// Her owner grows her history ahead of need, between acts: an append on the hot path only writes into it.
+int32_t llama_persona_grow_tokens(llama_persona * persona, size_t more_tokens, size_t more_receipts) {
+    if (persona->tokens == nullptr) {
+        return (int32_t) llama_persona_move::no_owner;
+    }
+    return (int32_t) (persona->tokens->grow(more_tokens, more_receipts) ? llama_persona_move::done : llama_persona_move::out_of_memory);
 }
 
 llama_persona_append_receipt llama_persona_append(llama_persona * persona, const llama_persona_append_header * header,
