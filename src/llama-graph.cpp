@@ -504,6 +504,14 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_learn_rows::set_input(const llama_ubatch * ubatch) {
+    // the plan was bound to this ubatch's sequence and geometry when its decode began (opt_learn_step)
+    GGML_ASSERT(plan.bound() && ubatch->n_tokens == plan.reply_rows && ubatch->pos[0] == (llama_pos) plan.prefix_rows);
+    mctx->set_input_learn_cells(cells, plan);
+    GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
+    plan.fill_mask(ubatch->pos, ubatch->n_tokens, (ggml_fp16_t *) mask->data);
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the store indices are left unallocated when the graph attends without storing K/V
     // (a training graph reads this ubatch's K/V directly, see build_attn)
@@ -1137,13 +1145,17 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
     }
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // the mask is left unallocated when the graph attends under its own mask (a live learning
+    // step attends to her rows under llm_graph_input_learn_rows): the attn_kv guard, here too
+    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
-    if (inp_attn->self_k_rot) {
+    if (inp_attn->self_k_rot && inp_attn->self_k_rot->buffer) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
     }
 
-    if (inp_attn->self_v_rot) {
+    if (inp_attn->self_v_rot && inp_attn->self_v_rot->buffer) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
@@ -2442,6 +2454,44 @@ ggml_tensor * llm_graph_context::build_inp_train_rows() const {
     return inp_train_rows;
 }
 
+ggml_tensor * llm_graph_context::build_learn_rows(ggml_tensor * all, const llm_graph_input_learn_rows * rows, ggml_tensor * cur) const {
+    // all: one layer's K or V cache over the stream's cells, [D, Hkv, n_kv, 1], the cache tensor itself
+    // (no edge to this ubatch's write). cur: this ubatch's own K/V (F32), whose shape her rows take.
+    // Her rows (prefix and reply) are gathered from the cache AFTER this ubatch wrote her reply into it:
+    // the caller expands the write into the graph first, and the graph runs in that order. So she
+    // attends exactly the values decode reads (her reply rounded through the cache's type and, for a
+    // quantized cache, its rotation), and the gather is a constant of the step: no gradient path into
+    // the cache, so a quantized cache needs no differentiable GET_ROWS. The grad sinks give dK/dV of
+    // her last rows (the reply) to cur.
+    // Measured (test-walk-exact, 0.5B, M5): joining cur after a prefix gather instead, even rounded
+    // through the cache's type, is not what the cache holds at q4_0 (cosine 0.6754 vs the walk's step);
+    // this gather matches it (cosine 1.0000, norm ratio 1.0000) at F32, f16 and q4_0.
+    GGML_ASSERT(all->ne[3] == 1 && "a learning step reads one stream");
+    GGML_ASSERT(all->nb[1] <= all->nb[2] && "a flash-attention cache holds V untransposed");
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    const int64_t n_embd = cur->ne[0]*cur->ne[1];
+    GGML_ASSERT(ggml_row_size(all->type, n_embd) == all->nb[2]);
+    ggml_tensor * flat = ggml_view_2d(ctx0, all, n_embd, all->ne[2], all->nb[2], 0);
+    ggml_tensor * hers = ggml_get_rows(ctx0, flat, rows->cells); // F32 [n_embd, rows], position order
+    return ggml_cast(ctx0, ggml_reshape_3d(ctx0, hers, cur->ne[0], cur->ne[1], hers->ne[1]), GGML_TYPE_F16);
+}
+
+llm_graph_input_learn_rows * llm_graph_context::build_inp_learn_rows(const llama_kv_cache_context * mctx_cur) const {
+    if (inp_learn_rows == nullptr) {
+        const auto & plan = *cparams.learn_step;
+        GGML_ASSERT(plan.reply_rows == (uint32_t) n_tokens && "a learning step's graph is its reply's ubatch");
+        auto inp = std::make_unique<llm_graph_input_learn_rows>(plan, mctx_cur);
+        inp->cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, plan.rows());
+        ggml_set_input(inp->cells);
+        ggml_set_name(inp->cells, "learn_cells");
+        inp->mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, plan.rows(), n_tokens, 1, 1);
+        ggml_set_input(inp->mask);
+        ggml_set_name(inp->mask, "learn_kq_mask");
+        inp_learn_rows = (llm_graph_input_learn_rows *) res->add_input(std::move(inp));
+    }
+    return inp_learn_rows;
+}
+
 bool llm_graph_context::lora_on(const llama_adapter_lora * adapter) const {
     return adapter != shadow || n_shadow_rows > 0;
 }
@@ -3133,6 +3183,26 @@ ggml_tensor * llm_graph_context::build_attn(
             kq_mask = ggml_cont(ctx0, ggml_view_4d(ctx0, kq_mask, n_past + n_tokens, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
                     kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], 0));
         }
+    } else if (cparams.training && cparams.learn_step != nullptr && uses_flash_attn(kq_b, sinks, v_mla)) {
+        // THE LIVE LEARNING STEP (llama_opt_learn on a serving slot, llama_learn_step_plan). Her
+        // reply's K/V go into the cache exactly as serving writes them; attention reads HER rows:
+        // the cells holding her positions [0, rows), gathered in position order, under her causal
+        // mask. Another sequence's cells in a shared cache are neither attended nor sized, and the
+        // preflight's shaped plan builds this same graph, so what it measures is what runs.
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
+        ggml_tensor * written_k = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        ggml_tensor * written_v = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        ggml_build_forward_expand(gf, written_k);
+        ggml_build_forward_expand(gf, written_v);
+        llm_graph_input_learn_rows * rows = build_inp_learn_rows(mctx_cur);
+        // her rows are read from the cache after the write above (the graph runs in expansion order)
+        k = build_learn_rows(mctx_cur->get_k(ctx0, il), rows, k_cur);
+        v = build_learn_rows(mctx_cur->get_v(ctx0, il), rows, v_cur);
+        // her reply is the last rows of K/V: their gradient goes to this ubatch's own K/V, and the
+        // frozen prefix (a gather of the cache) receives none, so no pool-sized gradient exists
+        walk_grad_sinks = { nullptr, k_cur, nullptr, v_cur };
+        kq_mask = rows->mask;
     } else {
         // store to KV cache
         const auto & k_idxs = inp->get_k_idxs();

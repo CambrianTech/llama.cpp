@@ -2722,6 +2722,17 @@ void ggml_backend_sched_graph_discard(ggml_backend_sched_t sched) {
     ggml_backend_sched_reset(sched);
 }
 
+// The reason a graph cannot be computed across yields, or nullptr when it can.
+static const char * sched_yield_hazard(const struct ggml_cgraph * graph) {
+    bool expert_op = false;
+    for (int i = 0; i < graph->n_nodes && !expert_op; ++i) { expert_op = graph->nodes[i]->op == GGML_OP_MUL_MAT_ID; }
+    if (!expert_op) { return nullptr; }
+    if (ggml_moe::moe_config().container_dir) { return "its experts page from a container whose custody is per call"; }
+    if (ggml_moe::moe_config().gather)        { return "its experts are gathered through tables recycled per call"; }
+    if (moe_expert_cache().enabled())         { return "its experts page through a residency cache whose clock advances per call"; }
+    return nullptr;
+}
+
 enum ggml_status ggml_backend_sched_graph_step(ggml_backend_sched_t sched,
         struct ggml_cgraph * graph, int max_nodes, bool * complete) {
     GGML_ASSERT(sched && graph && complete);
@@ -2732,9 +2743,13 @@ enum ggml_status ggml_backend_sched_graph_step(ggml_backend_sched_t sched,
         return GGML_STATUS_FAILED;
     }
     if (!sched->continuation_graph) {
-        // Expert paging has a separate generation lifetime; it cannot yield yet.
-        for (int i = 0; i < graph->n_nodes; ++i) {
-            if (graph->nodes[i]->op == GGML_OP_MUL_MAT_ID) { return GGML_STATUS_FAILED; }
+        // A yield lets the serving context run between steps. Expert paging keeps per-call state
+        // (the residency clock, gather tables, container custody) that a serving call in between
+        // would advance under this graph, so a paged expert graph cannot yield yet. Resident experts
+        // (every weight in device memory, as on unified-memory machines) carry no such state.
+        if (const char * hazard = sched_yield_hazard(graph)) {
+            GGML_LOG_ERROR("%s: refusing to yield this graph: %s\n", __func__, hazard);
+            return GGML_STATUS_FAILED;
         }
         if (!sched->is_alloc && !ggml_backend_sched_alloc_graph(sched, graph)) {
             return GGML_STATUS_ALLOC_FAILED;

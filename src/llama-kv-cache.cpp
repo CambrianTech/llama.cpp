@@ -1748,6 +1748,14 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+void llama_kv_cache::set_input_learn_cells(ggml_tensor * dst, const slot_info & sinfo, const llama_learn_step_plan & plan) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer) && dst->type == GGML_TYPE_I32 && ggml_nelements(dst) == plan.rows());
+    GGML_ASSERT(sinfo.n_stream() == 1 && "a learning step reads one stream");
+    // llama_opt_learn_begin refused a sequence missing any of its served prefix, and this ubatch
+    // was placed before its inputs are set, so a miss here is a broken invariant, not a refusal
+    GGML_ASSERT(plan.collect_cells(v_cells[sinfo.strm[0]], (int32_t *) dst->data) && "a learning step's position has no cell");
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -2678,6 +2686,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_learn_cells(ggml_tensor * dst, const llama_learn_step_plan & plan) const {
+    kv->set_input_learn_cells(dst, sinfos[i_cur], plan);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
