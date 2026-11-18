@@ -36,6 +36,11 @@ struct llama_rs_seq_blocks {
 // were prepared for (a fingerprint of layer count, stream size, row types and sizes, snapshot groups)
 struct llama_persona_blocks {
     llama_seq_id           seq       = -1;
+    // whose blocks these are: the owner of her token history when they were saved (persona + epoch), stamped by
+    // the public seam on a completed save and checked before any load; never retagged
+    bool                   owned       = false;
+    uint64_t               owner       = 0;
+    uint64_t               owner_epoch = 0;
     uint64_t               kv_layout = 0;
     uint64_t               rs_layout = 0;
     llama_kv_stream_blocks kv;
@@ -64,6 +69,10 @@ enum class llama_persona_move {
     no_free_cell,       // no free recurrent cell to load into
     wrong_persona,      // her blocks belong to another sequence (her metadata is tagged with it; never retagged)
     invalid_rollback,   // her rollback index exceeds this memory's snapshot groups
+    no_owner,           // her token history is not reserved: blocks cannot be saved or loaded without an owner
+    wrong_owner,        // her blocks were saved by another persona or another epoch of her
+    already_reserved,   // her token history is already reserved: a second reserve would drop it
+    out_of_memory,      // reserving her token history failed to allocate; nothing changed
 };
 
 const char * llama_persona_move_name(llama_persona_move m);

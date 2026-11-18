@@ -946,6 +946,13 @@ extern "C" {
 
     LLAMA_API const char * llama_persona_status_name(int32_t status);
 
+    // Her blocks move only under an owner: the persona and epoch her token history was reserved for. A save or load
+    // before llama_persona_reserve_tokens returns no_owner; a completed save stamps her blocks with the owner; a load
+    // of blocks stamped by another persona or another epoch of her returns wrong_owner before anything is written.
+    // Reserving twice returns already_reserved (it would drop her history); an allocation failure returns
+    // out_of_memory and changes nothing. llama_persona_owner reads the stamp (false before a completed save).
+    LLAMA_API bool llama_persona_owner(const struct llama_persona * persona, uint64_t * persona_id, uint64_t * epoch);
+
     // Her token history, held in the persona beside her blocks (so it moves with them by reference, never copied):
     // one reserved buffer of her token ids and one of her append receipts. A request appends only its new ids, in
     // one validated transaction (see llama_persona_append). Reserved once by her admitted owner; 0 when done.

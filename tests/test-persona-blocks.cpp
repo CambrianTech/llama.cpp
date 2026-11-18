@@ -333,6 +333,27 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "rollback groups exercised: n_rs_seq=%u, her rs_idx=%u\n", llama_n_rs_seq(f.ctx), r.rs.rs_idx);
     }
 
+    // the public seam's owner (Codex on #147 at e046): her blocks move only under the owner of her token history.
+    {
+        auto st = [](int32_t s) { return (llama_persona_move) s; };
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 1);
+        llama_persona * p = llama_persona_init(f.ctx);
+        require(p != nullptr, "a persona for this memory");
+        uint64_t who = 0, when = 0;
+        require(!llama_persona_owner(p, &who, &when), "no owner before a completed save");
+        require_move(st(llama_persona_save(f.ctx, 0, p)), llama_persona_move::no_owner, "save before her history is reserved");
+        require_move(st(llama_persona_reserve_tokens(p, 0xA11CE, 7, 64, 8)), llama_persona_move::done, "reserve her history");
+        require_move(st(llama_persona_reserve_tokens(p, 0xB0B, 7, 64, 8)), llama_persona_move::already_reserved,
+                     "a second reserve would drop her history");
+        require_move(st(llama_persona_save(f.ctx, 0, p)), llama_persona_move::done, "save under her owner");
+        require(llama_persona_owner(p, &who, &when) && who == 0xA11CE && when == 7, "her blocks are stamped with her owner");
+        const uint32_t other = 1 - llama_get_memory(f.ctx)->seq_stream(0);
+        require_move(st(llama_persona_load(f.ctx, 0, other, p)), llama_persona_move::done, "load under the same owner");
+        f.require_continues("continues after an owned move through the public seam", 0, ref_a0);
+        llama_persona_free(p);
+    }
+
     fprintf(stderr, "test-persona-blocks: ok (%zu attention layers, %zu recurrent layers)\n", a.kv.k.size(), a.rs.r.size());
     return 0;
 }
