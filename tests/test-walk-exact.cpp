@@ -1205,6 +1205,7 @@ int main(int argc, char ** argv) {
         printf("  live sequence: learned=%d \"%s\"\n", (int) learned, learned ? "" : "see the log");
         if (!learned || !same_step(compare("live sequence: her reply learned in place vs the walk's exact step", got, live_cache == GGML_TYPE_Q4_0 ? want_q4_0 : live_cache == GGML_TYPE_F16 ? want_f16 : want_f32))) {
             fprintf(stderr, "FAILED: learning on a live sequence is not the walk's step\n");
+            worst_tensors(got, live_cache == GGML_TYPE_Q4_0 ? want_q4_0 : live_cache == GGML_TYPE_F16 ? want_f16 : want_f32, 8);
             ++failures;
         }
         const bool her_ok = her_after == want_her;
