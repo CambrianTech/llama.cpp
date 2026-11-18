@@ -2451,15 +2451,24 @@ ggml_tensor * llm_graph_context::build_inp_train_rows() const {
 }
 
 ggml_tensor * llm_graph_context::build_learn_rows(ggml_tensor * all, const llm_graph_input_learn_rows * rows, ggml_tensor * cur) const {
-    // all: one layer's K or V over the stream's attended cells, [D, Hkv, n_kv, 1]
+    // all: one layer's K or V over the stream's attended cells, [D, Hkv, n_kv, 1], read BEFORE this
+    // ubatch's write: her prefix is a constant of the step (no gradient path into the cache, so a
+    // quantized cache needs no differentiable gather). cur: this ubatch's own K/V (F32, the reply).
     GGML_ASSERT(all->ne[3] == 1 && "a learning step reads one stream");
     GGML_ASSERT(all->nb[1] <= all->nb[2] && "a flash-attention cache holds V untransposed");
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
     const int64_t n_embd = cur->ne[0]*cur->ne[1];
     GGML_ASSERT(ggml_row_size(all->type, n_embd) == all->nb[2]);
-    ggml_tensor * flat = ggml_view_2d(ctx0, all, n_embd, all->ne[2], all->nb[2], 0);
-    ggml_tensor * hers = ggml_get_rows(ctx0, flat, rows->cells); // F32 [n_embd, rows]
-    // a quantized cache trains on the values serving reads (straight-through, as the walk does)
-    return ggml_cast(ctx0, ggml_reshape_3d(ctx0, hers, cur->ne[0], cur->ne[1], hers->ne[1]), GGML_TYPE_F16);
+    const int64_t n_prefix = rows->plan.prefix_rows;
+    ggml_tensor * kv = cur;
+    if (n_prefix > 0) {
+        ggml_tensor * flat   = ggml_view_2d(ctx0, all, n_embd, all->ne[2], all->nb[2], 0);
+        ggml_tensor * cells  = ggml_view_1d(ctx0, rows->cells, n_prefix, 0); // her prefix, position order
+        ggml_tensor * prefix = ggml_get_rows(ctx0, flat, cells);             // F32 [n_embd, prefix]
+        // the reply is the last rows: the grad sinks route dK/dV to cur, nothing to the prefix
+        kv = ggml_concat(ctx0, ggml_reshape_3d(ctx0, prefix, cur->ne[0], cur->ne[1], n_prefix), cur, 2);
+    }
+    return ggml_cast(ctx0, kv, GGML_TYPE_F16);
 }
 
 llm_graph_input_learn_rows * llm_graph_context::build_inp_learn_rows(const llama_kv_cache_context * mctx_cur) const {
@@ -3182,8 +3191,10 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, written_k);
         ggml_build_forward_expand(gf, written_v);
         llm_graph_input_learn_rows * rows = build_inp_learn_rows(mctx_cur);
-        k = build_learn_rows(mctx_cur->get_k(ctx0, il, written_k), rows, k_cur);
-        v = build_learn_rows(mctx_cur->get_v(ctx0, il, written_v), rows, v_cur);
+        // her prefix is read from the cache as it stood before this ubatch (its cells are not the
+        // ones written here); the reply joins as this ubatch's own K/V
+        k = build_learn_rows(mctx_cur->get_k(ctx0, il), rows, k_cur);
+        v = build_learn_rows(mctx_cur->get_v(ctx0, il), rows, v_cur);
         // her reply is the last rows of K/V: their gradient goes to this ubatch's own K/V, and the
         // frozen prefix (a gather of the cache) receives none, so no pool-sized gradient exists
         walk_grad_sinks = { nullptr, k_cur, nullptr, v_cur };
