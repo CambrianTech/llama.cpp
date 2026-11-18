@@ -25,21 +25,26 @@ int main() {
         require(text.text_from(5) == nullptr, "past the end is refused");
         require(text.size() == 4 && text[0] == 10 && text[3] == 13, "reading changes nothing");
     }
-    // 5 text ids (0..4), a 16-position image (5..20), then 3 more ids (21..23).
+    // The fixture's text ids, then its image, then 3 more ids; every offset from the chunks' own counts.
     {
         mtmd::input_chunks chunks(mtmd_test_create_input_chunks());
+        require(chunks.size() == 2, "fixture: a text chunk and an image chunk");
+        const size_t n_text  = mtmd_input_chunk_get_n_tokens(chunks[0]);
+        const size_t n_image = mtmd_input_chunk_get_n_tokens(chunks[1]);
+        require(n_text > 0 && n_image > 0, "fixture: real text and a real image");
+        const size_t image_end = n_text + n_image; // one past the image's last position
         server_tokens history(chunks, /* has_mtmd */ true);
         history.push_back(7);
         history.push_back(8);
         history.push_back(9);
-        require(history.size() == 24, "fixture: 5 + 16 + 3 positions");
+        require(history.size() == image_end + 3, "the history is the text, the image and 3 ids");
         require(history.text_from(0) == nullptr, "a range holding the image is refused");
-        require(history.text_from(5) == nullptr, "a range starting at the image is refused");
-        require(history.text_from(20) == nullptr, "a range starting on the image's last position is refused");
-        const llama_token * after = history.text_from(21);
+        require(history.text_from(n_text) == nullptr, "a range starting at the image is refused");
+        require(history.text_from(image_end - 1) == nullptr, "a range starting on the image's last position is refused");
+        const llama_token * after = history.text_from(image_end);
         require(after != nullptr && after[0] == 7 && after[2] == 9, "media before the range is allowed: ids after it are read");
-        require(history.text_from(24) != nullptr && history.text_from(25) == nullptr, "bounds");
-        require(history.size() == 24, "reading changes nothing");
+        require(history.text_from(image_end + 3) != nullptr && history.text_from(image_end + 4) == nullptr, "bounds");
+        require(history.size() == image_end + 3, "reading changes nothing");
     }
     std::cout << "server_tokens range: ok\n";
     return 0;
