@@ -243,8 +243,10 @@ int main(int argc, char ** argv) {
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);
         f.prompt(1, 2);
+        const auto completed_before_refusal = llama_perf_context(f.ctx).n_p_eval;
         llama_persona_blocks unprepared;
         require(ctx.persona_save(0, unprepared, A) != llama_persona_move::done, "an unprepared save is refused");
+        require(llama_perf_context(f.ctx).n_p_eval == completed_before_refusal, "refusal leaves the pending decode with its owner");
         require(f.pos_max(0) == f.n_prompt - 1, "a refused save leaves her in place");
 
         require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a out (refusal setup)");

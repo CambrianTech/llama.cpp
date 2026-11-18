@@ -2578,11 +2578,11 @@ llama_persona_move llama_context::persona_save(llama_seq_id seq_id, llama_person
     if (!memory) {
         return llama_persona_move::unsupported;
     }
-    synchronize(); // a decode returns before its writes land; the raw copies read the same device memory
     const llama_persona_move checked = memory->persona_check_save(seq_id, out);
     if (checked != llama_persona_move::done) {
         return checked;
     }
+    synchronize(); // The validated move reads rows that an earlier decode may still be writing.
     memory->persona_commit_save(seq_id, out);
     out.owned       = true; // a completed save stamps her blocks with her owner
     out.owner       = who.persona;
@@ -2597,12 +2597,12 @@ llama_persona_move llama_context::persona_load(llama_seq_id seq_id, uint32_t str
     if (!in.belongs_to(who)) {
         return llama_persona_move::wrong_owner; // refused before anything is written
     }
-    synchronize();
     llama_persona_slot slot;
     const llama_persona_move checked = memory->persona_check_load(seq_id, stream, in, slot);
     if (checked != llama_persona_move::done) {
         return checked;
     }
+    synchronize(); // Finish pending device work before writing into the admitted destination.
     memory->persona_commit_load(seq_id, slot, in);
     return llama_persona_move::done;
 }
