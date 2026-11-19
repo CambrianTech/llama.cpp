@@ -3063,6 +3063,18 @@ size_t llama_model_n_weight_backends(const llama_model * model) {
     return llama_model_weight_backends(model).size();
 }
 
+llama_weight_allocation llama_model_weight_allocation(const llama_model * model) {
+    llama_weight_allocation allocation = {};
+    for (const auto & [buft, bytes] : model->memory_breakdown()) {
+        if (ggml_backend_buft_is_host(buft)) {
+            allocation.host += bytes;
+        } else {
+            allocation.device += bytes;
+        }
+    }
+    return allocation;
+}
+
 const char * llama_model_weight_backend_name(const llama_model * model, size_t i) {
     const auto v = llama_model_weight_backends(model);
     return i < v.size() ? v[i].first : nullptr;
