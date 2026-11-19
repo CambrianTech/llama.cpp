@@ -165,7 +165,7 @@ jobs:
           dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
 
   windows:
-    runs-on: windows-2025
+    runs-on: windows-2022
 
     steps:
       - name: Clone
@@ -178,7 +178,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: server-windows-2025-x64
+          key: server-windows-2022-x64
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
 
@@ -227,7 +227,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          key: server-windows-2025-x64
+          key: server-windows-2022-x64
           older: 5m
           min: 1
           dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}

@@ -569,6 +569,16 @@ extern "C" {
     // NOTE: After creating a llama_context, it is recommended to query the actual values using these functions
     //       In some cases the requested values via llama_context_params may differ from the actual values used by the context
     //       ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+    // Native buffer footprint of this context, excluding shared model weights.
+    // On a no_alloc model, compute and KV are the backend's planned sizes.
+    // Includes the context's output buffer in the pool where it resides.
+    struct llama_context_buffer_bytes {
+        uint64_t host;
+        uint64_t device;
+    };
+    LLAMA_API bool llama_context_get_buffer_bytes(
+            const struct llama_context * ctx, struct llama_context_buffer_bytes * out);
+
     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);

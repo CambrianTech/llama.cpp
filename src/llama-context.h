@@ -213,6 +213,7 @@ struct llama_context {
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
 
+    llama_context_buffer_bytes buffer_bytes() const;
     llama_memory_breakdown memory_breakdown() const;
 
     //

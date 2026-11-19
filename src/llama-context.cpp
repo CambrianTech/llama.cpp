@@ -3528,6 +3528,21 @@ void llama_context::perf_reset() {
     n_reused    = 0;
 }
 
+llama_context_buffer_bytes llama_context::buffer_bytes() const {
+    llama_context_buffer_bytes result = {};
+    const auto add = [&](ggml_backend_buffer_type_t buft, uint64_t bytes) {
+        auto & pool = ggml_backend_buft_is_host(buft) ? result.host : result.device;
+        pool += bytes;
+    };
+    for (const auto & [buft, bytes] : memory_breakdown()) {
+        add(buft, bytes.context + bytes.compute);
+    }
+    if (buf_output) {
+        add(ggml_backend_buffer_get_type(buf_output.get()), ggml_backend_buffer_get_size(buf_output.get()));
+    }
+    return result;
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -4289,6 +4304,19 @@ void llama_perf_context_reset(llama_context * ctx) {
 //
 // ext
 //
+
+bool llama_context_get_buffer_bytes(const llama_context * ctx, llama_context_buffer_bytes * out) {
+    if (!ctx || !out) {
+        return false;
+    }
+    try {
+        *out = ctx->buffer_bytes();
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return false;
+    }
+}
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
