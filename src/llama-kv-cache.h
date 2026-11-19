@@ -310,7 +310,8 @@ private:
 
     // this memory's persona layout fingerprint, computed once at construction (the allocation layout is immutable)
     uint64_t persona_layout_id = 0;
-    uint64_t compute_persona_layout() const;
+    uint64_t persona_rows_id   = 0; // the layout without the stream size: what a persona file restores against
+    uint64_t compute_persona_layout(bool with_size) const;
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;

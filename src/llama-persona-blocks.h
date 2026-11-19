@@ -52,6 +52,9 @@ struct llama_persona_blocks {
         return !owned || (owner == who.persona && owner_epoch == who.epoch);
     }
     uint64_t               kv_layout = 0;
+    // the attention layout without the stream size (layers, row types and widths): a file restores her into any stream of
+    // this memory that holds her rows, whatever window a restart's planner chose (CONTINUUM-ENGINE 4.16)
+    uint64_t               kv_rows   = 0;
     uint64_t               rs_layout = 0;
     llama_kv_stream_blocks kv;
     llama_rs_seq_blocks    rs;

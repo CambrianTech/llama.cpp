@@ -90,7 +90,7 @@ int32_t llama_persona_write_file(const llama_persona * persona, const char * pat
     w.put<uint64_t>(b.owner);
     w.put<uint64_t>(b.owner_epoch);
     w.put<int32_t>(b.seq);
-    w.put<uint64_t>(b.kv_layout);
+    w.put<uint64_t>(b.kv_rows); // not the stream size: a restart's window may differ
     w.put<uint64_t>(b.rs_layout);
     // attention: her rows, then her occupied cells (position, 2D extension, whether her sequence holds it)
     w.put<uint32_t>(b.kv.n_rows);
@@ -151,18 +151,23 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path) {
     if (owner != persona->tokens->persona() || epoch != persona->tokens->epoch()) {
         return mismatch;
     }
-    // this memory's only: the layouts her prepared blocks carry for this context
-    if (r.get<uint64_t>() != b.kv_layout || r.get<uint64_t>() != b.rs_layout || !r.ok) {
+    // this memory's rows only: the row format (layers, types, widths) and the recurrent layout her prepared blocks carry;
+    // the stream size may differ, and she fits when her rows and every cell she occupies are inside this stream
+    if (r.get<uint64_t>() != b.kv_rows || r.get<uint64_t>() != b.rs_layout || !r.ok) {
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
+    const uint32_t stream_cells = b.kv.cells.size();
     const uint32_t n_rows = r.get<uint32_t>();
+    if (r.ok && n_rows > stream_cells) {
+        return mismatch; // she holds more than this stream: it never fits her
+    }
     std::vector<std::vector<uint8_t>> k, v, rs_r, rs_s;
     if (!r.rows(k, b.kv.k.size()) || !r.rows(v, b.kv.v.size())) {
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
     const uint32_t n_cells = r.get<uint32_t>();
     const uint32_t occupied = r.get<uint32_t>();
-    if (!r.ok || n_cells != b.kv.cells.size() || occupied > n_cells) {
+    if (!r.ok || occupied > n_cells || occupied > stream_cells) {
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
     struct cell { uint32_t i; llama_pos pos; llama_kv_cell_ext ext; bool hers; };
@@ -173,7 +178,7 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path) {
         c.ext.x = r.get<llama_pos>();
         c.ext.y = r.get<llama_pos>();
         c.hers = r.get<uint8_t>() != 0;
-        if (r.ok && c.i >= n_cells) {
+        if (r.ok && c.i >= stream_cells) {
             return mismatch;
         }
     }
@@ -185,7 +190,7 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path) {
     }
     // every check passed: commit. Her cells start from the empty, stream-sized object her preparation made.
     llama_kv_cells restored;
-    restored.resize(n_cells);
+    restored.resize(stream_cells);
     for (const auto & c : cells) {
         restored.pos_set(c.i, c.pos);
         restored.ext_set(c.i, c.ext);
