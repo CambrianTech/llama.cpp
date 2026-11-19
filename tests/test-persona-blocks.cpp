@@ -433,6 +433,26 @@ int main(int argc, char ** argv) {
         require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "her checkpoint follows her");
         require_identical("a different continuation after her move and rewind", in_place, f.decode_one(0, other, f.n_prompt));
 
+        // what this catches (Codex on #153 at 12a98779b): a newer take erasing the cut receipt an older checkpoint
+        // needed. Take A, cut below it and refill a different suffix to the same length, take B: A is stale (by its
+        // serial), B still rewinds.
+        {
+            llama_persona_checkpoint * newer = llama_persona_checkpoint_init();
+            require(newer != nullptr, "a second checkpoint");
+            llama_memory_clear(llama_get_memory(f.ctx), true);
+            f.prompt(0, 1);
+            require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "checkpoint A");
+            const llama_pos half = f.n_prompt / 2;
+            require(llama_memory_seq_rm(llama_get_memory(f.ctx), 0, half, -1), "cut below A");
+            for (llama_pos p = half; p < f.n_prompt; ++p) {
+                f.decode_one(0, 11 % f.n_vocab, p); // a different suffix, to the same length
+            }
+            require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, newer)), llama_persona_move::done, "checkpoint B");
+            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::checkpoint_stale, "A no longer matches what she holds");
+            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, newer)), llama_persona_move::done, "B, the newest, still rewinds");
+            llama_persona_checkpoint_free(newer);
+        }
+
         // ahead: she holds less than the checkpoint does
         llama_memory_clear(llama_get_memory(f.ctx), true);
         const int full = f.n_prompt;

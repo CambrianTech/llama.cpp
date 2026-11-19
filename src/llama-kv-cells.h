@@ -50,6 +50,7 @@ public:
         std::swap(stale, other.stale);
         std::swap(lineage_id, other.lineage_id);
         std::swap(lowest_cut, other.lowest_cut);
+        std::swap(checkpoint_serial, other.checkpoint_serial);
     }
 
     // Continuum fork (CONTINUUM-ENGINE 4.15): whose history these cells hold, and the lowest position cut from it since
@@ -58,7 +59,10 @@ public:
     uint64_t lineage() const { return lineage_id; }
     llama_pos cut_low() const { return lowest_cut; }
     void note_cut(llama_pos p0) { lowest_cut = std::min(lowest_cut, p0); }
-    void mark_checkpoint() { lowest_cut = std::numeric_limits<llama_pos>::max(); }
+    // Only the newest checkpoint on a lineage rewinds: each take bumps the serial and starts counting cuts afresh, so
+    // an older one (whose cut receipt that reset erased) is refused by serial (Codex on #153).
+    uint64_t checkpoint() const { return checkpoint_serial; }
+    uint64_t mark_checkpoint() { lowest_cut = std::numeric_limits<llama_pos>::max(); return ++checkpoint_serial; }
 
     void reset() {
         lineage_id = next_lineage();
@@ -540,6 +544,7 @@ private:
     }
     uint64_t  lineage_id = next_lineage();
     llama_pos lowest_cut = std::numeric_limits<llama_pos>::max();
+    uint64_t  checkpoint_serial = 0;
 
     bool has_shift = false;
 

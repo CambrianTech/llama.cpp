@@ -100,6 +100,7 @@ struct llama_persona_checkpoint_blocks {
     // reused by another mind, a restart, an eviction), so her rows are never spliced onto someone else's KV
     llama_persona_identity owner;
     uint64_t            lineage   = 0;
+    uint64_t            serial    = 0; // which checkpoint of that lineage: only the newest rewinds
     uint64_t            rs_layout = 0;
     llama_rs_seq_blocks rs;
 };

@@ -1344,7 +1344,7 @@ llama_persona_move llama_kv_cache::persona_check_checkpoint(llama_seq_id seq_id,
 
 void llama_kv_cache::persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
     out.seq = seq_id;
-    v_cells[seq_to_stream[seq_id]].mark_checkpoint(); // cuts are counted from here on
+    out.serial = v_cells[seq_to_stream[seq_id]].mark_checkpoint(); // cuts are counted from here on, for this checkpoint only
 }
 
 llama_persona_move llama_kv_cache::persona_check_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const {
@@ -1360,7 +1360,7 @@ llama_persona_move llama_kv_cache::persona_check_rewind(llama_seq_id seq_id, con
     // the cells must be the ones it was taken from, uncut at or below its position since (Codex on #153: a slot
     // reused by another mind must never receive these rows)
     const auto & cells = v_cells[seq_to_stream[seq_id]];
-    if (cells.lineage() != in.lineage || cells.cut_low() <= in.pos) {
+    if (cells.lineage() != in.lineage || cells.checkpoint() != in.serial || cells.cut_low() <= in.pos) {
         return llama_persona_move::checkpoint_stale;
     }
     return llama_persona_move::done;
