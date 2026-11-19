@@ -438,7 +438,7 @@ int main(int argc, char ** argv) {
 
         // what this catches (Codex on #153 at 12a98779b): a newer take erasing the cut receipt an older checkpoint
         // needed. Take A, cut below it and refill a different suffix to the same length, take B: A is stale (by its
-        // serial), B still rewinds.
+        // cut receipt), B still rewinds.
         // A hybrid memory cuts its recurrent half only by a checkpoint rewind (a plain seq_rm mid-sequence is refused),
         // so the cut below A is a rewind to an earlier checkpoint taken at half her prompt.
         {
@@ -456,12 +456,8 @@ int main(int argc, char ** argv) {
                 f.decode_one(0, 7 % f.n_vocab, p);
             }
             require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "checkpoint A");
-            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, early)), llama_persona_move::checkpoint_stale, "the earlier checkpoint is older than A on her lineage");
+            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, early)), llama_persona_move::done, "the head survives a later checkpoint on the unchanged prefix");
             llama_persona_checkpoint_free(early);
-            f.n_prompt = half;
-            llama_memory_clear(llama_get_memory(f.ctx), true);
-            f.prompt(0, 1);
-            f.n_prompt = full;
             for (llama_pos p = half; p < full; ++p) {
                 f.decode_one(0, 11 % f.n_vocab, p); // a different suffix, to the same length
             }
