@@ -573,7 +573,7 @@ llama_persona_move llama_memory_recurrent::persona_check_checkpoint(llama_seq_id
     return llama_persona_move::done;
 }
 
-void llama_memory_recurrent::persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
+void llama_memory_recurrent::persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
     auto & rs = out.rs;
     const int32_t tail = cells[seq_id].tail;
     rs.has_state = tail >= 0;

@@ -245,7 +245,7 @@ llama_persona_move llama_memory_hybrid::persona_check_checkpoint(llama_seq_id se
     return attn != llama_persona_move::done ? attn : mem_recr->persona_check_checkpoint(seq_id, out);
 }
 
-void llama_memory_hybrid::persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
+void llama_memory_hybrid::persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
     mem_attn->persona_commit_checkpoint(seq_id, out);
     mem_recr->persona_commit_checkpoint(seq_id, out);
 }

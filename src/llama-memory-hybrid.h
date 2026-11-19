@@ -96,7 +96,7 @@ public:
     void persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) override;
     void persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) override;
     llama_persona_move persona_check_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const override;
-    void persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const override;
+    void persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) override;
     llama_persona_move persona_check_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const override;
     void persona_commit_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) override;
 

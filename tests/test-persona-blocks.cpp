@@ -394,27 +394,51 @@ int main(int argc, char ** argv) {
         require(cp != nullptr, "a checkpoint");
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);
-        require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, cp)), llama_persona_move::no_checkpoint, "a rewind of nothing taken");
+        require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::no_checkpoint, "a rewind of nothing taken");
         require(f.pos_max(0) == f.n_prompt - 1, "a refused rewind leaves her as she was");
-        require_move(st(llama_persona_checkpoint_take(f.ctx, 0, cp)), llama_persona_move::done, "checkpoint at her prompt's end");
+        require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "checkpoint at her prompt's end");
         require(llama_persona_checkpoint_pos(cp) == f.n_prompt - 1, "it holds through her last prompt position");
         require(f.pos_max(0) == f.n_prompt - 1, "taking a checkpoint leaves her bound and whole");
         for (int round = 0; round < 2; ++round) {
             f.decode_one(0, 3 % f.n_vocab, f.n_prompt);     // she goes on past the boundary...
             f.decode_one(0, 5 % f.n_vocab, f.n_prompt + 1);
-            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, cp)), llama_persona_move::done, "rewind to the boundary");
+            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "rewind to the boundary");
             require(f.pos_max(0) == f.n_prompt - 1, "what she held past the boundary is cut");
             char label[96];
             snprintf(label, sizeof(label), "a different continuation after rewind %d", round + 1);
             require_identical(label, in_place, f.decode_one(0, other, f.n_prompt)); // ...and continues as if she never had
-            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, cp)), llama_persona_move::done, "rewind again before the next round");
+            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "rewind again before the next round");
         }
+        // what this catches (Codex on #153): A's rows spliced onto B's KV when B reuses A's slot at the same layout and
+        // position. B in the slot A was checkpointed in: refused as stale under A's owner, as wrong owner under B's,
+        // and B continues exactly as in place.
+        const auto ref_b = f.reference(0, 2);
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 1);
+        require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "A's checkpoint");
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 2); // B, same slot, same length
+        require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::checkpoint_stale, "A's rows never reach B's cells");
+        require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xB, 1, cp)), llama_persona_move::wrong_owner, "nor under B's owner");
+        f.require_continues("B untouched by the refused rewinds", 0, ref_b);
+
+        // what this catches: a checkpoint lost when she moves between streams (four minds rotate through two). Taken
+        // on her stream, she is saved and bound into the other one, and the rewind there continues byte-identically.
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 1);
+        require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "A's checkpoint before her move");
+        f.decode_one(0, 3 % f.n_vocab, f.n_prompt);
+        require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "A out");
+        require_move(ctx.persona_load(0, 1 - llama_get_memory(f.ctx)->seq_stream(0), a, A), llama_persona_move::done, "A into the other stream");
+        require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "her checkpoint follows her");
+        require_identical("a different continuation after her move and rewind", in_place, f.decode_one(0, other, f.n_prompt));
+
         // ahead: she holds less than the checkpoint does
         llama_memory_clear(llama_get_memory(f.ctx), true);
         const int full = f.n_prompt;
         f.n_prompt = full / 2;
         f.prompt(0, 1);
-        require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, cp)), llama_persona_move::checkpoint_ahead, "a rewind never moves forward");
+        require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::checkpoint_ahead, "a rewind never moves forward");
         require(f.pos_max(0) == f.n_prompt - 1, "a refused forward rewind leaves her as she was");
         f.n_prompt = full;
         fprintf(stderr, "checkpoint: %zu bytes of recurrent rows (attention KV stays in place)\n", llama_persona_checkpoint_bytes(cp));

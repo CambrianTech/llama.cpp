@@ -2562,26 +2562,31 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
-llama_persona_move llama_context::persona_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
+llama_persona_move llama_context::persona_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out, const llama_persona_identity & who) {
+    // Her buffers are reused take after take (no copy of the previous checkpoint). Any refused take, an unsupported
+    // memory included, leaves no checkpoint at all, so a later rewind refuses (no_checkpoint) instead of restoring a
+    // stale one (Codex on #153).
+    out.taken = false;
     if (!memory) {
         return llama_persona_move::unsupported;
     }
     synchronize(); // the raw copies read device memory a queued decode may still be writing
-    // Her buffers are reused take after take (no copy of the previous checkpoint). A refused take leaves no checkpoint
-    // at all, so a later rewind refuses (no_checkpoint) instead of restoring a stale one.
-    out.taken = false;
     const llama_persona_move checked = memory->persona_check_checkpoint(seq_id, out);
     if (checked != llama_persona_move::done) {
         return checked;
     }
     memory->persona_commit_checkpoint(seq_id, out);
+    out.owner = who;
     out.taken = true;
     return llama_persona_move::done;
 }
 
-llama_persona_move llama_context::persona_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) {
+llama_persona_move llama_context::persona_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in, const llama_persona_identity & who) {
     if (!memory) {
         return llama_persona_move::unsupported;
+    }
+    if (in.taken && (in.owner.persona != who.persona || in.owner.epoch != who.epoch)) {
+        return llama_persona_move::wrong_owner; // refused before anything is written
     }
     synchronize();
     const llama_persona_move checked = memory->persona_check_rewind(seq_id, in);
@@ -4392,12 +4397,12 @@ void llama_persona_checkpoint_free(llama_persona_checkpoint * checkpoint) {
     delete checkpoint;
 }
 
-int32_t llama_persona_checkpoint_take(llama_context * ctx, llama_seq_id seq_id, llama_persona_checkpoint * out) {
-    return (int32_t) ctx->persona_checkpoint(seq_id, out->blocks);
+int32_t llama_persona_checkpoint_take(llama_context * ctx, llama_seq_id seq_id, uint64_t persona_id, uint64_t epoch, llama_persona_checkpoint * out) {
+    return (int32_t) ctx->persona_checkpoint(seq_id, out->blocks, llama_persona_identity { persona_id, epoch });
 }
 
-int32_t llama_persona_checkpoint_rewind(llama_context * ctx, llama_seq_id seq_id, const llama_persona_checkpoint * in) {
-    return (int32_t) ctx->persona_rewind(seq_id, in->blocks);
+int32_t llama_persona_checkpoint_rewind(llama_context * ctx, llama_seq_id seq_id, uint64_t persona_id, uint64_t epoch, const llama_persona_checkpoint * in) {
+    return (int32_t) ctx->persona_rewind(seq_id, in->blocks, llama_persona_identity { persona_id, epoch });
 }
 
 llama_pos llama_persona_checkpoint_pos(const llama_persona_checkpoint * checkpoint) {
@@ -4405,12 +4410,13 @@ llama_pos llama_persona_checkpoint_pos(const llama_persona_checkpoint * checkpoi
 }
 
 size_t llama_persona_checkpoint_bytes(const llama_persona_checkpoint * checkpoint) {
+    // what its buffers hold allocated (capacity, not the last take's size): what the governor must count
     size_t bytes = 0;
     for (const auto & row : checkpoint->blocks.rs.r) {
-        bytes += row.size();
+        bytes += row.capacity();
     }
     for (const auto & row : checkpoint->blocks.rs.s) {
-        bytes += row.size();
+        bytes += row.capacity();
     }
     return bytes;
 }

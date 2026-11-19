@@ -4,7 +4,10 @@
 #include "llama-cparams.h"
 #include "llama-kv-cell-index.h"
 
+#include <algorithm>
+#include <atomic>
 #include <bitset>
+#include <limits>
 #include <cassert>
 #include <cstring>
 #include <vector>
@@ -45,9 +48,21 @@ public:
             seq_pos[s].swap(other.seq_pos[s]);
         }
         std::swap(stale, other.stale);
+        std::swap(lineage_id, other.lineage_id);
+        std::swap(lowest_cut, other.lowest_cut);
     }
 
+    // Continuum fork (CONTINUUM-ENGINE 4.15): whose history these cells hold, and the lowest position cut from it since
+    // her last checkpoint. A lineage is minted fresh whenever the cells are reset (or made), and travels with them on a
+    // swap, so a checkpoint follows her between streams and is refused for anyone else's cells in the same slot.
+    uint64_t lineage() const { return lineage_id; }
+    llama_pos cut_low() const { return lowest_cut; }
+    void note_cut(llama_pos p0) { lowest_cut = std::min(lowest_cut, p0); }
+    void mark_checkpoint() { lowest_cut = std::numeric_limits<llama_pos>::max(); }
+
     void reset() {
+        lineage_id = next_lineage();
+        lowest_cut = std::numeric_limits<llama_pos>::max();
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
@@ -519,6 +534,13 @@ public:
     }
 
 private:
+    static uint64_t next_lineage() {
+        static std::atomic<uint64_t> next { 1 };
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint64_t  lineage_id = next_lineage();
+    llama_pos lowest_cut = std::numeric_limits<llama_pos>::max();
+
     bool has_shift = false;
 
     // the occupied cells (i.e. pos[i] != -1, allowed to not have any seq_id): a bitmap with its count and extrema

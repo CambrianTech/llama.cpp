@@ -183,7 +183,7 @@ struct llama_memory_i {
         (void) seq_id; (void) out;
         return llama_persona_move::unsupported;
     }
-    virtual void persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
+    virtual void persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
         (void) seq_id; (void) out;
     }
     virtual llama_persona_move persona_check_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const {

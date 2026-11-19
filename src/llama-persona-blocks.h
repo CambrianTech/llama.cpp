@@ -84,6 +84,7 @@ enum class llama_persona_move {
     no_empty_stream,    // a bind found no empty stream to place her in
     no_checkpoint,      // a rewind was asked of a checkpoint never taken
     checkpoint_ahead,   // a rewind was asked to a position past what she holds: a rewind never moves forward
+    checkpoint_stale,   // her cells are not the lineage the checkpoint was taken from, or were cut at or below it since
 };
 
 // A copy of a bound persona at one of her positions, taken WITHOUT moving her: her recurrent rows (every snapshot
@@ -94,6 +95,11 @@ struct llama_persona_checkpoint_blocks {
     bool                taken     = false;
     llama_seq_id        seq       = -1;
     llama_pos           pos       = -1; // her last position held when taken (attention and recurrent agree)
+    // whose it is (the persona and epoch it was taken for) and the lineage of the cells it was taken from: a rewind is
+    // refused for another owner, or for cells that are not that lineage or were cut at or below `pos` since (a slot
+    // reused by another mind, a restart, an eviction), so her rows are never spliced onto someone else's KV
+    llama_persona_identity owner;
+    uint64_t            lineage   = 0;
     uint64_t            rs_layout = 0;
     llama_rs_seq_blocks rs;
 };
