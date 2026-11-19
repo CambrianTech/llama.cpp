@@ -95,10 +95,14 @@ public:
                                           llama_persona_slot & slot) const override;
     void persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) override;
     void persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) override;
-    llama_persona_move persona_check_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const override;
-    void persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) override;
-    llama_persona_move persona_check_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const override;
-    void persona_commit_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) override;
+    // Her recurrent rows for a checkpoint and a rewind, used only by the hybrid memory, whose attention half checks the
+    // lineage, the newest-take serial and the lowest cut before these run. Standalone recurrent memory has no lineage to
+    // check, so it does not override the checkpoint verbs: a checkpoint of it is refused as unsupported, never rewound
+    // onto a reused slot (Codex on CambrianTech/llama.cpp#153).
+    llama_persona_move persona_check_checkpoint_rows(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const;
+    void persona_commit_checkpoint_rows(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out);
+    llama_persona_move persona_check_rewind_rows(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const;
+    void persona_commit_rewind_rows(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in);
 
     // an undo of a draft is pending on this sequence: its next read takes a snapshot group, not the
     // live state (group 0) a training graph reads and writes (llm_graph_context::rs_keep)
