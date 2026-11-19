@@ -179,10 +179,14 @@ jobs:
           $lib =  $(join-path $msvc 'bin\Hostx64\x64\lib.exe')
           & $lib /machine:x64 "/def:${env:RUNNER_TEMP}/openblas/lib/libopenblas.def" "/out:${env:RUNNER_TEMP}/openblas/lib/openblas.lib" /name:openblas.dll
 
-      - name: Install Ninja
-        id: install_ninja
+      - name: Install Windows build tools
         run: |
           choco install ninja
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # The VS 2026 STL requires Clang 22 or newer.
+          if ((clang --version | Out-String) -notmatch 'clang version (\d+)' -or [int]$Matches[1] -lt 22) {
+            choco upgrade llvm -y
+          }
 
       - name: Build
         id: cmake_build
