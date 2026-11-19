@@ -177,6 +177,22 @@ struct llama_memory_i {
     virtual void persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) {
         (void) seq_id; (void) slot; (void) in;
     }
+    // A checkpoint of a BOUND sequence, the same two phases: check reserves every byte (sizes `out`), commit copies her
+    // rows out and leaves her in place. A rewind writes them back and cuts what she holds past the checkpoint.
+    virtual llama_persona_move persona_check_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
+        (void) seq_id; (void) out;
+        return llama_persona_move::unsupported;
+    }
+    virtual void persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
+        (void) seq_id; (void) out;
+    }
+    virtual llama_persona_move persona_check_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const {
+        (void) seq_id; (void) in;
+        return llama_persona_move::unsupported;
+    }
+    virtual void persona_commit_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) {
+        (void) seq_id; (void) in;
+    }
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 

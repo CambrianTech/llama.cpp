@@ -1327,6 +1327,38 @@ void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_bloc
     v_heads[s] = 0;
 }
 
+// Attention KV is never copied by a checkpoint: it stays in place, and only her position is recorded, so a rewind can
+// cut what she holds past it.
+llama_persona_move llama_kv_cache::persona_check_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return llama_persona_move::invalid_seq;
+    }
+    out.pos = v_cells[seq_to_stream[seq_id]].seq_pos_max(seq_id);
+    return llama_persona_move::done;
+}
+
+void llama_kv_cache::persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
+    out.seq = seq_id;
+}
+
+llama_persona_move llama_kv_cache::persona_check_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return llama_persona_move::invalid_seq;
+    }
+    if (!in.taken) {
+        return llama_persona_move::no_checkpoint;
+    }
+    if (in.pos > v_cells[seq_to_stream[seq_id]].seq_pos_max(seq_id)) {
+        return llama_persona_move::checkpoint_ahead;
+    }
+    return llama_persona_move::done;
+}
+
+void llama_kv_cache::persona_commit_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) {
+    // what she holds past the checkpoint is cut; what she held up to it is untouched in place
+    seq_rm(seq_id, in.pos + 1, -1);
+}
+
 int32_t llama_kv_cache::persona_empty_stream() const {
     if (n_stream == 1) {
         return -1; // unified: one stream holds every sequence, so there is nothing empty to bind into

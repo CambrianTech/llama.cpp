@@ -2562,6 +2562,36 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+llama_persona_move llama_context::persona_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
+    if (!memory) {
+        return llama_persona_move::unsupported;
+    }
+    synchronize(); // the raw copies read device memory a queued decode may still be writing
+    // Her buffers are reused take after take (no copy of the previous checkpoint). A refused take leaves no checkpoint
+    // at all, so a later rewind refuses (no_checkpoint) instead of restoring a stale one.
+    out.taken = false;
+    const llama_persona_move checked = memory->persona_check_checkpoint(seq_id, out);
+    if (checked != llama_persona_move::done) {
+        return checked;
+    }
+    memory->persona_commit_checkpoint(seq_id, out);
+    out.taken = true;
+    return llama_persona_move::done;
+}
+
+llama_persona_move llama_context::persona_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) {
+    if (!memory) {
+        return llama_persona_move::unsupported;
+    }
+    synchronize();
+    const llama_persona_move checked = memory->persona_check_rewind(seq_id, in);
+    if (checked != llama_persona_move::done) {
+        return checked; // refused before anything is written: she stays exactly as she was
+    }
+    memory->persona_commit_rewind(seq_id, in);
+    return llama_persona_move::done;
+}
+
 llm_graph_type llama_context::graph_type() const {
     switch (cparams.ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -4348,6 +4378,41 @@ bool llama_persona_owner(const llama_persona * persona, uint64_t * persona_id, u
     *persona_id = persona->blocks.owner;
     *epoch      = persona->blocks.owner_epoch;
     return true;
+}
+
+struct llama_persona_checkpoint {
+    llama_persona_checkpoint_blocks blocks;
+};
+
+llama_persona_checkpoint * llama_persona_checkpoint_init(void) {
+    return new (std::nothrow) llama_persona_checkpoint();
+}
+
+void llama_persona_checkpoint_free(llama_persona_checkpoint * checkpoint) {
+    delete checkpoint;
+}
+
+int32_t llama_persona_checkpoint_take(llama_context * ctx, llama_seq_id seq_id, llama_persona_checkpoint * out) {
+    return (int32_t) ctx->persona_checkpoint(seq_id, out->blocks);
+}
+
+int32_t llama_persona_checkpoint_rewind(llama_context * ctx, llama_seq_id seq_id, const llama_persona_checkpoint * in) {
+    return (int32_t) ctx->persona_rewind(seq_id, in->blocks);
+}
+
+llama_pos llama_persona_checkpoint_pos(const llama_persona_checkpoint * checkpoint) {
+    return checkpoint->blocks.taken ? checkpoint->blocks.pos : -1;
+}
+
+size_t llama_persona_checkpoint_bytes(const llama_persona_checkpoint * checkpoint) {
+    size_t bytes = 0;
+    for (const auto & row : checkpoint->blocks.rs.r) {
+        bytes += row.size();
+    }
+    for (const auto & row : checkpoint->blocks.rs.s) {
+        bytes += row.size();
+    }
+    return bytes;
 }
 
 const char * llama_persona_status_name(int32_t status) {
