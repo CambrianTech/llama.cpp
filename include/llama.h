@@ -725,6 +725,13 @@ extern "C" {
     LLAMA_API const char * llama_model_weight_backend_name (const struct llama_model * model, size_t i);
     LLAMA_API size_t       llama_model_weight_backend_bytes(const struct llama_model * model, size_t i);
 
+    // Account for the allocator's actual memory pool, including pinned host buffers.
+    struct llama_weight_allocation {
+        size_t host;
+        size_t device;
+    };
+    LLAMA_API struct llama_weight_allocation llama_model_weight_allocation(const struct llama_model * model);
+
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
