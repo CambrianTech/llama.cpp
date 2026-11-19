@@ -85,6 +85,8 @@ enum class llama_persona_move {
     no_checkpoint,      // a rewind was asked of a checkpoint never taken
     checkpoint_ahead,   // a rewind was asked to a position past what she holds: a rewind never moves forward
     checkpoint_stale,   // her cells are not the lineage the checkpoint was taken from, or were cut at or below it since
+    io_error,           // her blocks' file could not be written or read whole
+    file_mismatch,      // her blocks' file is not hers or not this memory's (owner, epoch, layout, sizes): nothing was read
 };
 
 // A copy of a bound persona at one of her positions, taken WITHOUT moving her: her recurrent rows (every snapshot

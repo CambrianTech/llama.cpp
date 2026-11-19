@@ -1,7 +1,7 @@
 #include "llama-context.h"
 
 #include <new>
-#include "llama-persona-tokens.h"
+#include "llama-persona.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -4293,12 +4293,8 @@ llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
 
-// Continuum fork (CONTINUUM-ENGINE 4.14): the public seam of a persona's move (llama-persona-blocks.h).
-
-struct llama_persona {
-    llama_persona_blocks                  blocks;
-    std::unique_ptr<llama_persona_tokens> tokens; // her token history, beside her blocks (llama-persona-tokens.h)
-};
+// Continuum fork (CONTINUUM-ENGINE 4.14): the public seam of a persona's move (llama-persona-blocks.h); the persona
+// object itself is in llama-persona.h.
 
 // Her owner grows her history ahead of need, between acts: an append on the hot path only writes into it.
 int32_t llama_persona_grow_tokens(llama_persona * persona, size_t more_tokens, size_t more_receipts) {

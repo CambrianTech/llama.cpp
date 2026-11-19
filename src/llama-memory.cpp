@@ -79,6 +79,8 @@ const char * llama_persona_move_name(llama_persona_move m) {
         case llama_persona_move::no_checkpoint:      return "no_checkpoint";
         case llama_persona_move::checkpoint_ahead:   return "checkpoint_ahead";
         case llama_persona_move::checkpoint_stale:   return "checkpoint_stale";
+        case llama_persona_move::io_error:           return "io_error";
+        case llama_persona_move::file_mismatch:      return "file_mismatch";
     }
     return "unknown";
 }
