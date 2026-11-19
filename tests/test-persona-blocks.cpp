@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -494,6 +495,8 @@ int main(int argc, char ** argv) {
         f.prompt(0, 1);
         require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "a saved");
         require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written to her file");
+        // a second save to her fixed path replaces the first (Windows CRT rename refuses an existing destination)
+        require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written again over her file");
         llama_persona_free(saved);
 
         llama_persona * other = llama_persona_init(f.ctx, 0xB, 1);
@@ -503,6 +506,23 @@ int main(int argc, char ** argv) {
         require_move(st(llama_persona_read_file(other, path.c_str())), llama_persona_move::file_mismatch, "another owner's file is refused");
         require_move(st(llama_persona_read_file(stale, path.c_str())), llama_persona_move::file_mismatch, "another epoch of her is refused");
         require_move(st(llama_persona_read_file(back, path.c_str())), llama_persona_move::done, "a read back from her file");
+        // a truncated file is refused before anything is sized from it, and leaves the blocks she holds as they were
+        const std::string cut = path + ".cut";
+        std::filesystem::copy_file(path, cut, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::resize_file(cut, std::filesystem::file_size(cut) / 2);
+        const auto refused = st(llama_persona_read_file(back, cut.c_str()));
+        require(refused == llama_persona_move::io_error || refused == llama_persona_move::file_mismatch, "a truncated file is refused");
+        // a length the file claims beyond this memory's geometry (here, its first K layer's, at byte 52: magic, version,
+        // owner, epoch, seq, row id, recurrent layout, row and layer counts) is refused before any buffer is sized from it
+        std::filesystem::copy_file(path, cut, std::filesystem::copy_options::overwrite_existing);
+        {
+            std::fstream patch(cut, std::ios::in | std::ios::out | std::ios::binary);
+            const uint64_t huge = UINT64_C(1) << 62;
+            patch.seekp(52);
+            patch.write(reinterpret_cast<const char *>(&huge), sizeof(huge));
+        }
+        require_move(st(llama_persona_read_file(back, cut.c_str())), llama_persona_move::file_mismatch, "a length past the geometry is refused");
+        std::remove(cut.c_str());
         llama_memory_clear(llama_get_memory(f.ctx), true);
         require_move(st(llama_persona_bind(f.ctx, 0, back)), llama_persona_move::done, "a bound from her file");
         f.require_continues("a continues after a restart from her file", 0, ref_a0);

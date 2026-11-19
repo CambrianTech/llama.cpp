@@ -1287,6 +1287,14 @@ llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks
     blocks.kv.cells.resize(get_size()); // once per persona, at her creation
     blocks.kv.k.resize(layers.size());
     blocks.kv.v.resize(layers.size());
+    // the row sizes a save copies (persona_check_save), recorded for a file read to check before it allocates
+    blocks.geometry.k_row.resize(layers.size());
+    blocks.geometry.v_row.resize(layers.size());
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        blocks.geometry.k_row[i] = ggml_row_size(layer.k->type, layer.k->ne[0]);
+        blocks.geometry.v_row[i] = layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) : 0;
+    }
     return llama_persona_move::done;
 }
 

@@ -413,6 +413,17 @@ llama_persona_move llama_memory_recurrent::persona_prepare(llama_persona_blocks 
     blocks.rs_layout = persona_layout();
     blocks.rs.r.resize(r_l.size());
     blocks.rs.s.resize(s_l.size());
+    // the bytes a save copies for a sequence that holds state (persona_check_save), recorded for a file read to check
+    // before it allocates
+    const uint32_t n_groups = 1 + n_rs_seq;
+    blocks.geometry.r_bytes.resize(r_l.size());
+    blocks.geometry.s_bytes.resize(s_l.size());
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        blocks.geometry.r_bytes[il] = r_l[il] ? ggml_row_size(r_l[il]->type, r_l[il]->ne[0]) * n_groups : 0;
+    }
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        blocks.geometry.s_bytes[il] = s_l[il] ? ggml_row_size(s_l[il]->type, s_l[il]->ne[0]) * n_groups : 0;
+    }
     return llama_persona_move::done;
 }
 

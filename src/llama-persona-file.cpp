@@ -4,13 +4,24 @@
 // recomputed: rows are written and read as bytes.
 //
 // A write goes to `<path>.tmp` and is renamed into place, so a crash mid-write never leaves a torn file that reads as
-// hers. A read fills temporaries and commits them to her blocks only when every check passed (owner, epoch, both layout
+// hers; the rename replaces an existing file on every platform (POSIX rename, Windows MoveFileEx). A read checks every
+// layer length against the geometry her preparation recorded before it allocates, fills temporaries, and commits them to
+// her blocks only when every check passed (owner, epoch, both layout
 // fingerprints, layer and cell counts, a complete read), so a refused read leaves her as she was.
 
 #include "llama.h"
 #include "llama-persona.h"
 
 #include <cstdio>
+#ifdef _WIN32
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
 #include <string>
 #include <vector>
 
@@ -43,29 +54,42 @@ struct reader {
         ok = ok && std::fread(&v, sizeof(T), 1, f) == 1;
         return v;
     }
-    std::vector<uint8_t> bytes() {
+    // one layer's bytes, refused unless the file says exactly `expect` (from this memory's geometry): no buffer is ever
+    // sized from a length the file claims, so a truncated or foreign file allocates nothing (Codex on #155)
+    bool bytes(std::vector<uint8_t> & out, size_t expect) {
         const uint64_t n = get<uint64_t>();
-        std::vector<uint8_t> b;
-        if (!ok) {
-            return b;
-        }
-        b.resize(n);
-        ok = n == 0 || std::fread(b.data(), 1, n, f) == n;
-        return b;
-    }
-    // `expect` layers: the memory's count; a file with another count is not this memory's
-    bool rows(std::vector<std::vector<uint8_t>> & out, size_t expect) {
-        const uint32_t n = get<uint32_t>();
         if (!ok || n != expect) {
             return false;
         }
         out.resize(n);
-        for (auto & layer : out) {
-            layer = bytes();
+        ok = n == 0 || std::fread(out.data(), 1, n, f) == n;
+        return ok;
+    }
+    // every layer, each the length `expect` names; a file with another layer count is not this memory's
+    bool rows(std::vector<std::vector<uint8_t>> & out, const std::vector<size_t> & expect) {
+        const uint32_t n = get<uint32_t>();
+        if (!ok || n != expect.size()) {
+            return false;
+        }
+        out.resize(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (!bytes(out[i], expect[i])) {
+                return false;
+            }
         }
         return ok;
     }
 };
+
+// Replace `path` with the finished `tmp` in one step. POSIX rename replaces an existing destination; the Windows CRT's
+// refuses one (Codex on #155, UCRT on BigMama: -1 with the old body intact), so a second save to her fixed path failed.
+bool replace_file(const std::string & tmp, const char * path) {
+#ifdef _WIN32
+    return MoveFileExA(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return std::rename(tmp.c_str(), path) == 0;
+#endif
+}
 
 struct closes {
     std::FILE * f;
@@ -122,7 +146,7 @@ int32_t llama_persona_write_file(const llama_persona * persona, const char * pat
     w.rows(b.rs.s);
     const bool flushed = w.ok && std::fflush(f) == 0;
     const bool closed = std::fclose(f) == 0;
-    if (!flushed || !closed || std::rename(tmp.c_str(), path) != 0) {
+    if (!flushed || !closed || !replace_file(tmp, path)) {
         std::remove(tmp.c_str());
         return (int32_t) llama_persona_move::io_error;
     }
@@ -161,8 +185,17 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path) {
     if (r.ok && n_rows > stream_cells) {
         return mismatch; // she holds more than this stream: it never fits her
     }
+    // every length the file may hold, from this memory's geometry (persona_prepare), before anything is read into memory
+    const auto & g = b.geometry;
+    std::vector<size_t> k_bytes(g.k_row.size()), v_bytes(g.v_row.size());
+    for (size_t i = 0; i < g.k_row.size(); ++i) {
+        k_bytes[i] = g.k_row[i] * n_rows;
+    }
+    for (size_t i = 0; i < g.v_row.size(); ++i) {
+        v_bytes[i] = g.v_row[i] * n_rows;
+    }
     std::vector<std::vector<uint8_t>> k, v, rs_r, rs_s;
-    if (!r.rows(k, b.kv.k.size()) || !r.rows(v, b.kv.v.size())) {
+    if (!r.ok || !r.rows(k, k_bytes) || !r.rows(v, v_bytes)) {
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
     const uint32_t n_cells = r.get<uint32_t>();
@@ -185,7 +218,10 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path) {
     const bool has_state = r.get<uint8_t>() != 0;
     const llama_pos rs_pos = r.get<llama_pos>();
     const uint32_t rs_idx = r.get<uint32_t>();
-    if (!r.ok || !r.rows(rs_r, b.rs.r.size()) || !r.rows(rs_s, b.rs.s.size())) {
+    // her recurrent rows are whole when she held state and absent when she did not (persona_check_save)
+    const std::vector<size_t> r_bytes = has_state ? g.r_bytes : std::vector<size_t>(g.r_bytes.size(), 0);
+    const std::vector<size_t> s_bytes = has_state ? g.s_bytes : std::vector<size_t>(g.s_bytes.size(), 0);
+    if (!r.ok || !r.rows(rs_r, r_bytes) || !r.rows(rs_s, s_bytes)) {
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
     // every check passed: commit. Her cells start from the empty, stream-sized object her preparation made.
