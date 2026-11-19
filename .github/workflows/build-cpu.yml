@@ -134,7 +134,7 @@ jobs:
 
   windows:
     name: windows / ${{ matrix.build }}
-    runs-on: windows-2025
+    runs-on: windows-2022
 
     env:
       OPENBLAS_VERSION: 0.3.23
@@ -161,7 +161,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: cpu-windows-2025-${{ matrix.build }}
+          key: cpu-windows-2022-${{ matrix.build }}
           variant: ccache
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
@@ -183,9 +183,9 @@ jobs:
         run: |
           choco install ninja
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          # The VS 2026 STL requires Clang 22 or newer.
-          if ((clang --version | Out-String) -notmatch 'clang version (\d+)' -or [int]$Matches[1] -lt 22) {
-            choco upgrade llvm -y
+          # Match the compiler to the pinned LLVM OpenMP runtime in ggml.
+          if ((clang --version | Out-String) -notmatch 'clang version 20\.') {
+            choco install llvm --version=20.1.8 --allow-downgrade -y
           }
 
       - name: Build
@@ -228,7 +228,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          key: cpu-windows-2025-${{ matrix.build }}
+          key: cpu-windows-2022-${{ matrix.build }}
           older: 5m
           min: 1
           dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
