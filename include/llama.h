@@ -399,6 +399,7 @@ extern "C" {
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
+        bool embeddings_only; // pooled embeddings without vocabulary logits or sampling
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
@@ -725,6 +726,13 @@ extern "C" {
     LLAMA_API const char * llama_model_weight_backend_name (const struct llama_model * model, size_t i);
     LLAMA_API size_t       llama_model_weight_backend_bytes(const struct llama_model * model, size_t i);
 
+    // Account for the allocator's actual memory pool, including pinned host buffers.
+    struct llama_weight_allocation {
+        size_t host;
+        size_t device;
+    };
+    LLAMA_API struct llama_weight_allocation llama_model_weight_allocation(const struct llama_model * model);
+
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
@@ -949,6 +957,14 @@ extern "C" {
     // Bind her blocks as sequence seq_id into an empty stream the memory chooses: the caller never numbers streams.
     // no_empty_stream when none is empty; otherwise exactly llama_persona_load's checks and statuses.
     LLAMA_API int32_t llama_persona_bind(struct llama_context * ctx, llama_seq_id seq_id, struct llama_persona * persona);
+
+    // Continuum fork (CONTINUUM-ENGINE 4.16): her saved blocks on disk and back, so a restart demotes her instead of
+    // dropping her. write_file writes blocks a completed save holds (file_mismatch when none) to `path` through
+    // `<path>.tmp` and a rename. read_file fills a persona made by llama_persona_init on a context of the same memory
+    // layout, for the owner and epoch her file names; file_mismatch (another owner, epoch, layout or size) and io_error
+    // leave her as she was. Bind her afterwards as after a save.
+    LLAMA_API int32_t llama_persona_write_file(const struct llama_persona * persona, const char * path);
+    LLAMA_API int32_t llama_persona_read_file(struct llama_persona * persona, const char * path);
 
     LLAMA_API const char * llama_persona_status_name(int32_t status);
 

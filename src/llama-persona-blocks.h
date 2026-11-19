@@ -32,6 +32,16 @@ struct llama_rs_seq_blocks {
     std::vector<std::vector<uint8_t>> s; // per layer: (1 + n_rs_seq) rows of s, group-major
 };
 
+// the byte geometry of this memory's rows, recorded once by persona_prepare from the memory's own tensors: a read of her
+// file checks every length against it BEFORE allocating, so a truncated or foreign file is refused without sizing any
+// buffer from what the file claims (Codex on CambrianTech/llama.cpp#155)
+struct llama_persona_geometry {
+    std::vector<size_t> k_row;   // per KV layer: bytes of one K row
+    std::vector<size_t> v_row;   // per KV layer: bytes of one V row (0 for a layer without V)
+    std::vector<size_t> r_bytes; // per recurrent layer: bytes of her r rows in every snapshot group (0 without r)
+    std::vector<size_t> s_bytes; // per recurrent layer: bytes of her s rows in every snapshot group (0 without s)
+};
+
 // her identity travels with her blocks: the sequence her metadata is tagged with, and the layout of the memory they
 // were prepared for (a fingerprint of layer count, stream size, row types and sizes, snapshot groups)
 // Who a move is for: the persona and epoch whose token history the blocks belong to.
@@ -52,7 +62,11 @@ struct llama_persona_blocks {
         return !owned || (owner == who.persona && owner_epoch == who.epoch);
     }
     uint64_t               kv_layout = 0;
+    // the attention layout without the stream size (layers, row types and widths): a file restores her into any stream of
+    // this memory that holds her rows, whatever window a restart's planner chose (CONTINUUM-ENGINE 4.16)
+    uint64_t               kv_rows   = 0;
     uint64_t               rs_layout = 0;
+    llama_persona_geometry geometry;
     llama_kv_stream_blocks kv;
     llama_rs_seq_blocks    rs;
 };
@@ -85,6 +99,8 @@ enum class llama_persona_move {
     no_checkpoint,      // a rewind was asked of a checkpoint never taken
     checkpoint_ahead,   // a rewind was asked to a position past what she holds: a rewind never moves forward
     checkpoint_stale,   // her cells are not the lineage the checkpoint was taken from, or were cut at or below it since
+    io_error,           // her blocks' file could not be written or read whole
+    file_mismatch,      // her blocks' file is not hers or not this memory's (owner, epoch, layout, sizes): nothing was read
 };
 
 // A copy of a bound persona at one of her positions, taken WITHOUT moving her: her recurrent rows (every snapshot

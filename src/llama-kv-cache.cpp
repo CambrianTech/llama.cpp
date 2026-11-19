@@ -375,7 +375,8 @@ llama_kv_cache::llama_kv_cache(
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 
-    persona_layout_id = compute_persona_layout(); // the allocation layout is immutable from here
+    persona_layout_id = compute_persona_layout(true); // the allocation layout is immutable from here
+    persona_rows_id   = compute_persona_layout(false);
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1263,9 +1264,10 @@ static bool cells_prepared(const llama_kv_cells & cells, uint32_t size) {
 // this memory's attention layout: what her rows' sizes and meaning depend on
 static uint64_t kv_layout_mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001b3ull; }
 
-uint64_t llama_kv_cache::compute_persona_layout() const {
+uint64_t llama_kv_cache::compute_persona_layout(bool with_size) const {
     uint64_t h = kv_layout_mix(0xcbf29ce484222325ull, layers.size());
-    h = kv_layout_mix(h, get_size());
+    // the stream size is part of a live move's layout; a file restores into any stream her rows fit
+    h = with_size ? kv_layout_mix(h, get_size()) : h;
     for (const auto & layer : layers) {
         h = kv_layout_mix(h, layer.il);
         h = kv_layout_mix(h, layer.k ? (uint64_t) layer.k->type : 0xffu);
@@ -1281,9 +1283,18 @@ llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks
         return llama_persona_move::no_such_stream;
     }
     blocks.kv_layout = persona_layout();
+    blocks.kv_rows   = persona_rows_id;
     blocks.kv.cells.resize(get_size()); // once per persona, at her creation
     blocks.kv.k.resize(layers.size());
     blocks.kv.v.resize(layers.size());
+    // the row sizes a save copies (persona_check_save), recorded for a file read to check before it allocates
+    blocks.geometry.k_row.resize(layers.size());
+    blocks.geometry.v_row.resize(layers.size());
+    for (size_t i = 0; i < layers.size(); ++i) {
+        const auto & layer = layers[i];
+        blocks.geometry.k_row[i] = ggml_row_size(layer.k->type, layer.k->ne[0]);
+        blocks.geometry.v_row[i] = layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) : 0;
+    }
     return llama_persona_move::done;
 }
 

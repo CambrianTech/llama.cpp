@@ -23,6 +23,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <vector>
 
 // allocation fault injection: while armed, every allocation in this process throws std::bad_alloc
@@ -436,15 +439,30 @@ int main(int argc, char ** argv) {
         // what this catches (Codex on #153 at 12a98779b): a newer take erasing the cut receipt an older checkpoint
         // needed. Take A, cut below it and refill a different suffix to the same length, take B: A is stale (by its
         // serial), B still rewinds.
+        // A hybrid memory cuts its recurrent half only by a checkpoint rewind (a plain seq_rm mid-sequence is refused),
+        // so the cut below A is a rewind to an earlier checkpoint taken at half her prompt.
         {
             llama_persona_checkpoint * newer = llama_persona_checkpoint_init();
-            require(newer != nullptr, "a second checkpoint");
+            llama_persona_checkpoint * early = llama_persona_checkpoint_init();
+            require(newer != nullptr && early != nullptr, "two more checkpoints");
+            llama_memory_clear(llama_get_memory(f.ctx), true);
+            const int full = f.n_prompt;
+            const llama_pos half = full / 2;
+            f.n_prompt = half;
+            f.prompt(0, 1);
+            f.n_prompt = full;
+            require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, early)), llama_persona_move::done, "checkpoint at half");
+            for (llama_pos p = half; p < full; ++p) {
+                f.decode_one(0, 7 % f.n_vocab, p);
+            }
+            require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "checkpoint A");
+            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, early)), llama_persona_move::checkpoint_stale, "the earlier checkpoint is older than A on her lineage");
+            llama_persona_checkpoint_free(early);
+            f.n_prompt = half;
             llama_memory_clear(llama_get_memory(f.ctx), true);
             f.prompt(0, 1);
-            require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "checkpoint A");
-            const llama_pos half = f.n_prompt / 2;
-            require(llama_memory_seq_rm(llama_get_memory(f.ctx), 0, half, -1), "cut below A");
-            for (llama_pos p = half; p < f.n_prompt; ++p) {
+            f.n_prompt = full;
+            for (llama_pos p = half; p < full; ++p) {
                 f.decode_one(0, 11 % f.n_vocab, p); // a different suffix, to the same length
             }
             require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, newer)), llama_persona_move::done, "checkpoint B");
@@ -463,6 +481,55 @@ int main(int argc, char ** argv) {
         f.n_prompt = full;
         fprintf(stderr, "checkpoint: %zu bytes of recurrent rows (attention KV stays in place)\n", llama_persona_checkpoint_bytes(cp));
         llama_persona_checkpoint_free(cp);
+    }
+
+    // 9. what this catches (CONTINUUM-ENGINE 4.16, restore is the norm): a restart that drops a mind. Her saved blocks
+    // written to a file and read into a fresh persona bind and continue byte-identically; a file read under another
+    // owner or another epoch of her is refused and leaves that persona as it was (it still binds nothing).
+    {
+        auto st = [](int32_t s) { return (llama_persona_move) s; };
+        const std::string path = (std::filesystem::temp_directory_path() / "test-persona-blocks-a.cpb").string();
+        llama_persona * saved = llama_persona_init(f.ctx, 0xA, 1);
+        require(saved != nullptr, "a persona to save");
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 1);
+        require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "a saved");
+        require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written to her file");
+        // a second save to her fixed path replaces the first (Windows CRT rename refuses an existing destination)
+        require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written again over her file");
+        llama_persona_free(saved);
+
+        llama_persona * other = llama_persona_init(f.ctx, 0xB, 1);
+        llama_persona * stale = llama_persona_init(f.ctx, 0xA, 2);
+        llama_persona * back  = llama_persona_init(f.ctx, 0xA, 1);
+        require(other != nullptr && stale != nullptr && back != nullptr, "fresh personas to read into");
+        require_move(st(llama_persona_read_file(other, path.c_str())), llama_persona_move::file_mismatch, "another owner's file is refused");
+        require_move(st(llama_persona_read_file(stale, path.c_str())), llama_persona_move::file_mismatch, "another epoch of her is refused");
+        require_move(st(llama_persona_read_file(back, path.c_str())), llama_persona_move::done, "a read back from her file");
+        // a truncated file is refused before anything is sized from it, and leaves the blocks she holds as they were
+        const std::string cut = path + ".cut";
+        std::filesystem::copy_file(path, cut, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::resize_file(cut, std::filesystem::file_size(cut) / 2);
+        const auto refused = st(llama_persona_read_file(back, cut.c_str()));
+        require(refused == llama_persona_move::io_error || refused == llama_persona_move::file_mismatch, "a truncated file is refused");
+        // a length the file claims beyond this memory's geometry (here, its first K layer's, at byte 52: magic, version,
+        // owner, epoch, seq, row id, recurrent layout, row and layer counts) is refused before any buffer is sized from it
+        std::filesystem::copy_file(path, cut, std::filesystem::copy_options::overwrite_existing);
+        {
+            std::fstream patch(cut, std::ios::in | std::ios::out | std::ios::binary);
+            const uint64_t huge = UINT64_C(1) << 62;
+            patch.seekp(52);
+            patch.write(reinterpret_cast<const char *>(&huge), sizeof(huge));
+        }
+        require_move(st(llama_persona_read_file(back, cut.c_str())), llama_persona_move::file_mismatch, "a length past the geometry is refused");
+        std::remove(cut.c_str());
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        require_move(st(llama_persona_bind(f.ctx, 0, back)), llama_persona_move::done, "a bound from her file");
+        f.require_continues("a continues after a restart from her file", 0, ref_a0);
+        llama_persona_free(other);
+        llama_persona_free(stale);
+        llama_persona_free(back);
+        std::remove(path.c_str());
     }
 
     fprintf(stderr, "test-persona-blocks: ok (%zu attention layers, %zu recurrent layers)\n", a.kv.k.size(), a.rs.r.size());
