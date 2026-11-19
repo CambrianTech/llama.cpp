@@ -399,6 +399,7 @@ extern "C" {
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
+        bool embeddings_only; // pooled embeddings without vocabulary logits or sampling
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU
         bool no_perf;     // measure performance timings
         bool op_offload;  // offload host tensor operations to device
@@ -724,6 +725,13 @@ extern "C" {
     LLAMA_API size_t       llama_model_n_weight_backends   (const struct llama_model * model);
     LLAMA_API const char * llama_model_weight_backend_name (const struct llama_model * model, size_t i);
     LLAMA_API size_t       llama_model_weight_backend_bytes(const struct llama_model * model, size_t i);
+
+    // Account for the allocator's actual memory pool, including pinned host buffers.
+    struct llama_weight_allocation {
+        size_t host;
+        size_t device;
+    };
+    LLAMA_API struct llama_weight_allocation llama_model_weight_allocation(const struct llama_model * model);
 
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
