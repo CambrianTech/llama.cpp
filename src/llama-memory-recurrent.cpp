@@ -551,6 +551,120 @@ void llama_memory_recurrent::persona_commit_load(llama_seq_id seq_id, llama_pers
     used += 1;
 }
 
+// A checkpoint copies her recurrent rows (every snapshot group) out of her tail cell and leaves her bound: unlike a
+// save, her cell, position and rollback index stay as they are.
+llama_persona_move llama_memory_recurrent::persona_check_checkpoint_rows(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
+        return llama_persona_move::invalid_seq;
+    }
+    const int32_t tail = cells[seq_id].tail;
+    if (tail >= 0 && cells[tail].seq_id.size() != 1) {
+        return llama_persona_move::shared_cell;
+    }
+    // reserve: every byte the commit copies, so the commit never allocates
+    const uint32_t n_groups = 1 + n_rs_seq;
+    out.rs_layout = persona_layout();
+    out.rs.r.resize(r_l.size());
+    out.rs.s.resize(s_l.size());
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        out.rs.r[il].resize((tail >= 0 && r_l[il]) ? ggml_row_size(r_l[il]->type, r_l[il]->ne[0]) * n_groups : 0);
+        out.rs.s[il].resize((tail >= 0 && s_l[il]) ? ggml_row_size(s_l[il]->type, s_l[il]->ne[0]) * n_groups : 0);
+    }
+    return llama_persona_move::done;
+}
+
+void llama_memory_recurrent::persona_commit_checkpoint_rows(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
+    auto & rs = out.rs;
+    const int32_t tail = cells[seq_id].tail;
+    rs.has_state = tail >= 0;
+    out.seq = seq_id;
+    if (!rs.has_state) {
+        return;
+    }
+    const uint32_t n_groups = 1 + n_rs_seq;
+    const auto rows_out = [&](const ggml_tensor * src, std::vector<uint8_t> & dst) {
+        if (src == nullptr || dst.empty()) {
+            return;
+        }
+        const size_t row = ggml_row_size(src->type, src->ne[0]);
+        for (uint32_t g = 0; g < n_groups; ++g) {
+            ggml_backend_tensor_get(src, dst.data() + g * row, (size_t) (g * size + tail) * src->nb[1], row);
+        }
+    };
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        rows_out(r_l[il], rs.r[il]);
+        rows_out(s_l[il], rs.s[il]);
+    }
+    rs.pos    = cells[tail].pos;
+    rs.rs_idx = rs_idx[seq_id];
+}
+
+llama_persona_move llama_memory_recurrent::persona_check_rewind_rows(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
+        return llama_persona_move::invalid_seq;
+    }
+    if (!in.taken) {
+        return llama_persona_move::no_checkpoint;
+    }
+    if (in.rs_layout != persona_layout()) {
+        return llama_persona_move::layout_mismatch;
+    }
+    const auto & rs = in.rs;
+    const int32_t tail = cells[seq_id].tail;
+    if (!rs.has_state) {
+        // a checkpoint of a sequence with no recurrent state rewinds only if she still has none
+        return tail < 0 ? llama_persona_move::done : llama_persona_move::layout_mismatch;
+    }
+    if (tail < 0) {
+        return llama_persona_move::no_checkpoint;
+    }
+    if (cells[tail].seq_id.size() != 1) {
+        return llama_persona_move::shared_cell;
+    }
+    if (rs.pos > cells[tail].pos) {
+        return llama_persona_move::checkpoint_ahead;
+    }
+    if (rs.rs_idx > n_rs_seq) {
+        return llama_persona_move::invalid_rollback;
+    }
+    if (rs.r.size() != r_l.size() || rs.s.size() != s_l.size()) {
+        return llama_persona_move::layout_mismatch;
+    }
+    const uint32_t n_groups = 1 + n_rs_seq;
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        const size_t r_bytes = r_l[il] ? ggml_row_size(r_l[il]->type, r_l[il]->ne[0]) * n_groups : 0;
+        const size_t s_bytes = s_l[il] ? ggml_row_size(s_l[il]->type, s_l[il]->ne[0]) * n_groups : 0;
+        if (rs.r[il].size() != r_bytes || rs.s[il].size() != s_bytes) {
+            return llama_persona_move::layout_mismatch;
+        }
+    }
+    return llama_persona_move::done;
+}
+
+void llama_memory_recurrent::persona_commit_rewind_rows(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) {
+    const auto & rs = in.rs;
+    if (!rs.has_state) {
+        return;
+    }
+    const int32_t tail = cells[seq_id].tail;
+    const uint32_t n_groups = 1 + n_rs_seq;
+    const auto rows_in = [&](ggml_tensor * dst, const std::vector<uint8_t> & src) {
+        if (dst == nullptr || src.empty()) {
+            return;
+        }
+        const size_t row = ggml_row_size(dst->type, dst->ne[0]);
+        for (uint32_t g = 0; g < n_groups; ++g) {
+            ggml_backend_tensor_set(dst, src.data() + g * row, (size_t) (g * size + tail) * dst->nb[1], row);
+        }
+    };
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        rows_in(r_l[il], rs.r[il]);
+        rows_in(s_l[il], rs.s[il]);
+    }
+    cells[tail].pos = rs.pos;
+    rs_idx[seq_id]  = rs.rs_idx;
+}
+
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     if (seq_id < 0) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);

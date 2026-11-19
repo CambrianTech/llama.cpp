@@ -970,6 +970,24 @@ extern "C" {
 
     LLAMA_API const char * llama_persona_status_name(int32_t status);
 
+    // A checkpoint of a BOUND sequence at its current position, taken without moving her: her recurrent rows (every
+    // snapshot group) are copied out, her attention KV stays where it is. A rewind writes the rows back and cuts what she
+    // holds past the checkpoint's position, so the next decode continues from there. Both are two-phase: a refused
+    // rewind leaves her exactly as she was; a refused take leaves no checkpoint (a later rewind refuses no_checkpoint).
+    // A rewind never moves forward (checkpoint_ahead). The caller owns WHEN to take one (a stable prompt boundary).
+    // A checkpoint is stamped with the persona and epoch it was taken for, and with the lineage of the cells it was
+    // taken from, which travels with her between streams: a rewind for another owner is wrong_owner, and onto cells
+    // that are not that lineage, or were cut at or below its position since (a slot reused by another mind, a restart,
+    // an eviction), is checkpoint_stale. Her rows never reach anyone else's KV.
+    struct llama_persona_checkpoint;
+    LLAMA_API struct llama_persona_checkpoint * llama_persona_checkpoint_init(void);
+    LLAMA_API void    llama_persona_checkpoint_free(struct llama_persona_checkpoint * checkpoint);
+    LLAMA_API int32_t llama_persona_checkpoint_take(struct llama_context * ctx, llama_seq_id seq_id, uint64_t persona_id, uint64_t epoch, struct llama_persona_checkpoint * out);
+    LLAMA_API int32_t llama_persona_checkpoint_rewind(struct llama_context * ctx, llama_seq_id seq_id, uint64_t persona_id, uint64_t epoch, const struct llama_persona_checkpoint * in);
+    // The position a taken checkpoint holds through (-1 when none is taken), and the bytes its buffers hold allocated.
+    LLAMA_API llama_pos llama_persona_checkpoint_pos(const struct llama_persona_checkpoint * checkpoint);
+    LLAMA_API size_t    llama_persona_checkpoint_bytes(const struct llama_persona_checkpoint * checkpoint);
+
     // Her blocks move only under her owner (the persona and epoch she was made for): a completed save stamps them; a
     // load of blocks stamped by another persona or another epoch of her returns wrong_owner before anything is
     // written. llama_persona_owner reads the stamp (false before a completed save).

@@ -412,6 +412,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (seq_id >= 0) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
+        cells.note_cut(p0); // a checkpoint at or past p0 no longer holds what it counted on
 
         uint32_t new_head = cells.size();
 
@@ -438,6 +439,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             auto & head  = v_heads[s];
 
             uint32_t new_head = cells.size();
+            cells.note_cut(p0); // every sequence in this stream loses what a checkpoint past p0 counted on
 
             for (uint32_t i = 0; i < cells.size(); ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
@@ -598,6 +600,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (shift == 0) {
         return;
     }
+    cells.note_cut(std::max<llama_pos>(p0, 0)); // a shift moves what a checkpoint past p0 counted on
 
     uint32_t new_head = cells.size();
 
@@ -648,6 +651,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     if (d == 1) {
         return;
     }
+    cells.note_cut(std::max<llama_pos>(p0, 0)); // a division moves what a checkpoint past p0 counted on
 
     if (p0 < 0) {
         p0 = 0;
@@ -1325,6 +1329,46 @@ void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_bloc
     out.seq = seq_id;
     out.kv.cells.swap(cells); // hers out; the stream takes the prepared empty object
     v_heads[s] = 0;
+}
+
+// Attention KV is never copied by a checkpoint: it stays in place, and only her position is recorded, so a rewind can
+// cut what she holds past it.
+llama_persona_move llama_kv_cache::persona_check_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return llama_persona_move::invalid_seq;
+    }
+    out.pos = v_cells[seq_to_stream[seq_id]].seq_pos_max(seq_id);
+    out.lineage = v_cells[seq_to_stream[seq_id]].lineage();
+    return llama_persona_move::done;
+}
+
+void llama_kv_cache::persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
+    out.seq = seq_id;
+    out.serial = v_cells[seq_to_stream[seq_id]].mark_checkpoint(); // cuts are counted from here on, for this checkpoint only
+}
+
+llama_persona_move llama_kv_cache::persona_check_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return llama_persona_move::invalid_seq;
+    }
+    if (!in.taken) {
+        return llama_persona_move::no_checkpoint;
+    }
+    if (in.pos > v_cells[seq_to_stream[seq_id]].seq_pos_max(seq_id)) {
+        return llama_persona_move::checkpoint_ahead;
+    }
+    // the cells must be the ones it was taken from, uncut at or below its position since (Codex on #153: a slot
+    // reused by another mind must never receive these rows)
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    if (cells.lineage() != in.lineage || cells.checkpoint() != in.serial || cells.cut_low() <= in.pos) {
+        return llama_persona_move::checkpoint_stale;
+    }
+    return llama_persona_move::done;
+}
+
+void llama_kv_cache::persona_commit_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) {
+    // what she holds past the checkpoint is cut; what she held up to it is untouched in place
+    seq_rm(seq_id, in.pos + 1, -1);
 }
 
 int32_t llama_kv_cache::persona_empty_stream() const {

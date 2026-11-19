@@ -82,6 +82,27 @@ enum class llama_persona_move {
     wrong_owner,        // her blocks were saved by another persona or another epoch of her
     out_of_memory,      // growing or shrinking her token history failed to allocate; nothing changed
     no_empty_stream,    // a bind found no empty stream to place her in
+    no_checkpoint,      // a rewind was asked of a checkpoint never taken
+    checkpoint_ahead,   // a rewind was asked to a position past what she holds: a rewind never moves forward
+    checkpoint_stale,   // her cells are not the lineage the checkpoint was taken from, or were cut at or below it since
+};
+
+// A copy of a bound persona at one of her positions, taken WITHOUT moving her: her recurrent rows (every snapshot
+// group), her recurrent position and rollback index. Her attention KV is not copied: it stays in place, and a rewind
+// cuts it back past the checkpoint's position. So a checkpoint costs her recurrent rows, never her KV (CONTINUUM-ENGINE
+// 4.15: a request whose prefix matches her up to a stable boundary prefills only what follows it).
+struct llama_persona_checkpoint_blocks {
+    bool                taken     = false;
+    llama_seq_id        seq       = -1;
+    llama_pos           pos       = -1; // her last position held when taken (attention and recurrent agree)
+    // whose it is (the persona and epoch it was taken for) and the lineage of the cells it was taken from: a rewind is
+    // refused for another owner, or for cells that are not that lineage or were cut at or below `pos` since (a slot
+    // reused by another mind, a restart, an eviction), so her rows are never spliced onto someone else's KV
+    llama_persona_identity owner;
+    uint64_t            lineage   = 0;
+    uint64_t            serial    = 0; // which checkpoint of that lineage: only the newest rewinds
+    uint64_t            rs_layout = 0;
+    llama_rs_seq_blocks rs;
 };
 
 const char * llama_persona_move_name(llama_persona_move m);

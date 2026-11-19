@@ -66,6 +66,8 @@ struct llama_context {
     llama_persona_move persona_load(llama_seq_id seq_id, uint32_t stream, llama_persona_blocks & in, const llama_persona_identity & who);
     // load her into an empty stream the memory chooses (no_empty_stream when none is)
     llama_persona_move persona_bind(llama_seq_id seq_id, llama_persona_blocks & in, const llama_persona_identity & who);
+    llama_persona_move persona_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out, const llama_persona_identity & who);
+    llama_persona_move persona_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in, const llama_persona_identity & who);
     bool opt_state_write_initial(FILE * optimizer, const char * binding);
     bool opt_state_write(FILE * optimizer, const char * binding);
     bool opt_shadow_state_write(const llama_adapter_lora * shadow, FILE * optimizer, const char * binding);
