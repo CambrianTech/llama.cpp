@@ -242,12 +242,12 @@ void llama_memory_hybrid::persona_commit_load(llama_seq_id seq_id, llama_persona
 // the same token.
 llama_persona_move llama_memory_hybrid::persona_check_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
     const llama_persona_move attn = mem_attn->persona_check_checkpoint(seq_id, out);
-    return attn != llama_persona_move::done ? attn : mem_recr->persona_check_checkpoint(seq_id, out);
+    return attn != llama_persona_move::done ? attn : mem_recr->persona_check_checkpoint_rows(seq_id, out);
 }
 
 void llama_memory_hybrid::persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
     mem_attn->persona_commit_checkpoint(seq_id, out);
-    mem_recr->persona_commit_checkpoint(seq_id, out);
+    mem_recr->persona_commit_checkpoint_rows(seq_id, out);
 }
 
 llama_persona_move llama_memory_hybrid::persona_check_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const {
@@ -255,12 +255,12 @@ llama_persona_move llama_memory_hybrid::persona_check_rewind(llama_seq_id seq_id
         return llama_persona_move::layout_mismatch; // the halves were not at one token when it was taken
     }
     const llama_persona_move attn = mem_attn->persona_check_rewind(seq_id, in);
-    return attn != llama_persona_move::done ? attn : mem_recr->persona_check_rewind(seq_id, in);
+    return attn != llama_persona_move::done ? attn : mem_recr->persona_check_rewind_rows(seq_id, in);
 }
 
 void llama_memory_hybrid::persona_commit_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) {
     mem_attn->persona_commit_rewind(seq_id, in);
-    mem_recr->persona_commit_rewind(seq_id, in);
+    mem_recr->persona_commit_rewind_rows(seq_id, in);
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

@@ -553,7 +553,7 @@ void llama_memory_recurrent::persona_commit_load(llama_seq_id seq_id, llama_pers
 
 // A checkpoint copies her recurrent rows (every snapshot group) out of her tail cell and leaves her bound: unlike a
 // save, her cell, position and rollback index stay as they are.
-llama_persona_move llama_memory_recurrent::persona_check_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
+llama_persona_move llama_memory_recurrent::persona_check_checkpoint_rows(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) const {
     if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
         return llama_persona_move::invalid_seq;
     }
@@ -573,7 +573,7 @@ llama_persona_move llama_memory_recurrent::persona_check_checkpoint(llama_seq_id
     return llama_persona_move::done;
 }
 
-void llama_memory_recurrent::persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
+void llama_memory_recurrent::persona_commit_checkpoint_rows(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
     auto & rs = out.rs;
     const int32_t tail = cells[seq_id].tail;
     rs.has_state = tail >= 0;
@@ -599,7 +599,7 @@ void llama_memory_recurrent::persona_commit_checkpoint(llama_seq_id seq_id, llam
     rs.rs_idx = rs_idx[seq_id];
 }
 
-llama_persona_move llama_memory_recurrent::persona_check_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const {
+llama_persona_move llama_memory_recurrent::persona_check_rewind_rows(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const {
     if (seq_id < 0 || (uint32_t) seq_id >= size || (uint32_t) seq_id >= n_seq_max) {
         return llama_persona_move::invalid_seq;
     }
@@ -641,7 +641,7 @@ llama_persona_move llama_memory_recurrent::persona_check_rewind(llama_seq_id seq
     return llama_persona_move::done;
 }
 
-void llama_memory_recurrent::persona_commit_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) {
+void llama_memory_recurrent::persona_commit_rewind_rows(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) {
     const auto & rs = in.rs;
     if (!rs.has_state) {
         return;
