@@ -1276,12 +1276,13 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
                     (is_required ? required_args : optional_args).push_back(arg_rule);
                 });
 
-                // Accept required arguments in any order, as Qwen does not always adhere to the
-                // order provided.
-                auto args = p.permute("tool-" + name + "-args", required_args);
-                if (!optional_args.empty()) {
-                    args = args + p.zero_or_more(p.choice(optional_args));
+                // Optional arguments may precede, separate, or follow required arguments.
+                // Keep the required permutation intact, including its bound on grammar growth.
+                auto optional = optional_args.empty() ? p.eps() : p.zero_or_more(p.choice(optional_args));
+                for (auto & required : required_args) {
+                    required = required + optional;
                 }
+                auto args = optional + p.permute("tool-" + name + "-args", required_args);
 
                 auto func = p.tool(p.tool_open("<function=" + p.tool_name(p.literal(name)) + ">\n") +
                                    p.tool_args(args) +
