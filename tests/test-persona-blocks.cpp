@@ -15,6 +15,9 @@
 #include "llama.h"
 
 #include "../src/llama-context.h"
+#include "../src/llama-batch.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-model.h"
 
 #include <algorithm>
 #include <atomic>
@@ -125,6 +128,44 @@ struct fixture {
     llama_pos pos_max(llama_seq_id seq) const { return llama_memory_seq_pos_max(llama_get_memory(ctx), seq); }
 };
 
+// Exercise placement and receipt ownership directly. Four metadata cells suffice to wrap
+// the sliding window, independent of the architecture and weights of the fixture model.
+static void test_checkpoint_after_swa_overwrite(const llama_model & model) {
+    llama_kv_cache cache(model, model.hparams, GGML_TYPE_F16, GGML_TYPE_F16, false, false, true,
+                         4, 1, 1, 2, LLAMA_SWA_TYPE_STANDARD, nullptr, [](int) { return false; }, nullptr, nullptr);
+    llama_seq_id seq = 0;
+    llama_seq_id * ids = &seq;
+    llama_pos pos = 0;
+    int32_t count = 1;
+    llama_ubatch batch{};
+    batch.n_seq_tokens = batch.n_seqs = batch.n_tokens = batch.n_seqs_unq = batch.n_pos = batch.b_equal_seqs = 1;
+    batch.pos = &pos;
+    batch.n_seq_id = &count;
+    batch.seq_id = &ids;
+    batch.seq_id_unq = &seq;
+    auto plan = [&] {
+        auto slots = cache.prepare({batch});
+        require(slots.size() == 1, "one SWA slot planned");
+        return slots.front();
+    };
+    auto take = [&](llama_persona_checkpoint_blocks & mark) {
+        require_move(cache.persona_check_checkpoint(seq, mark), llama_persona_move::done, "prepare SWA checkpoint");
+        cache.persona_commit_checkpoint(seq, mark);
+        mark.taken = true;
+    };
+    for (; pos < 4; ++pos) {
+        cache.apply_ubatch(plan(), batch);
+    }
+    llama_persona_checkpoint_blocks before{}, after{};
+    take(before);
+    const auto slot = plan();
+    require_move(cache.persona_check_rewind(seq, before), llama_persona_move::done, "planning preserves old KV");
+    cache.apply_ubatch(slot, batch);
+    take(after);
+    require_move(cache.persona_check_rewind(seq, before), llama_persona_move::checkpoint_stale, "overwritten KV revoked");
+    require_move(cache.persona_check_rewind(seq, after), llama_persona_move::done, "new sliding window retained");
+}
+
 int main(int argc, char ** argv) {
     common_params params;
     params.kv_unified      = false; // one attention stream per sequence
@@ -197,6 +238,8 @@ int main(int argc, char ** argv) {
                 t_save / 1e3, gb / (t_save / 1e6), t_load / 1e3, gb / (t_load / 1e6), (double) t_prefill / t_load);
         return 0;
     }
+
+    test_checkpoint_after_swa_overwrite(*llama_get_model(f.ctx));
 
     const auto ref_a0 = f.reference(0, 1); // persona a on sequence 0
     const auto ref_b1 = f.reference(1, 2); // persona b on sequence 1

@@ -247,6 +247,10 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    enum class placement { planned, committed };
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, placement mode);
+    bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1, placement mode);
+
     const llama_model & model;
     const llama_hparams & hparams;
 

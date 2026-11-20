@@ -393,6 +393,10 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return seq_rm(seq_id, p0, p1, placement::committed);
+}
+
+bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1, placement mode) {
     const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -413,7 +417,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (seq_id >= 0) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
-        cells.note_cut(p0); // a checkpoint at or past p0 no longer holds what it counted on
+        if (mode == placement::committed) {
+            cells.note_cut(p0);
+        }
 
         uint32_t new_head = cells.size();
 
@@ -440,7 +446,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             auto & head  = v_heads[s];
 
             uint32_t new_head = cells.size();
-            cells.note_cut(p0); // every sequence in this stream loses what a checkpoint past p0 counted on
+            if (mode == placement::committed) {
+                cells.note_cut(p0);
+            }
 
             for (uint32_t i = 0; i < cells.size(); ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
@@ -816,7 +824,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        apply_ubatch(sinfo_new, ubatch, placement::planned);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -1122,6 +1130,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+    apply_ubatch(sinfo, ubatch, placement::committed);
+}
+
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, placement mode) {
     const llama_kv_settle_on_return settle{ v_cells };
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -1138,6 +1150,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        llama_pos first_overwritten = std::numeric_limits<llama_pos>::max();
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
             const uint32_t i = s*sinfo.size() + ii;
 
@@ -1153,6 +1166,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
                 seq_pos_max_rm[seq_id] = std::max(seq_pos_max_rm[seq_id], pos);
 
+                first_overwritten = std::min(first_overwritten, pos);
                 cells.rm(idx);
             }
 
@@ -1169,6 +1183,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
+        }
+        if (mode == placement::committed && first_overwritten != std::numeric_limits<llama_pos>::max()) {
+            v_cells[sinfo.strm[s]].note_cut(first_overwritten);
         }
     }
 
@@ -1188,7 +1205,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1, mode);
         }
     }
 
