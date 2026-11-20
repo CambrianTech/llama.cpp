@@ -15,6 +15,9 @@
 #include "llama.h"
 
 #include "../src/llama-context.h"
+#include "../src/llama-batch.h"
+#include "../src/llama-kv-cache.h"
+#include "../src/llama-model.h"
 
 #include <algorithm>
 #include <atomic>
@@ -125,6 +128,47 @@ struct fixture {
     llama_pos pos_max(llama_seq_id seq) const { return llama_memory_seq_pos_max(llama_get_memory(ctx), seq); }
 };
 
+// Exercise placement and receipt ownership directly. Four metadata cells suffice to wrap
+// the sliding window, independent of the architecture and weights of the fixture model.
+static void test_checkpoint_after_swa_overwrite(const llama_model & model, bool fragmented) {
+    llama_kv_cache cache(model, model.hparams, GGML_TYPE_F16, GGML_TYPE_F16, false, false, true,
+                         4, 1, 1, 2, LLAMA_SWA_TYPE_STANDARD, nullptr, [](int) { return false; }, nullptr, nullptr);
+    llama_seq_id seq = 0;
+    llama_seq_id * ids = &seq;
+    llama_pos pos = 0;
+    int32_t count = 1;
+    llama_ubatch batch{};
+    batch.n_seq_tokens = batch.n_seqs = batch.n_tokens = batch.n_seqs_unq = batch.n_pos = batch.b_equal_seqs = 1;
+    batch.pos = &pos;
+    batch.n_seq_id = &count;
+    batch.seq_id = &ids;
+    batch.seq_id_unq = &seq;
+    auto plan = [&] {
+        auto slots = cache.prepare({batch});
+        require(slots.size() == 1, "one SWA slot planned");
+        return slots.front();
+    };
+    auto take = [&](llama_persona_checkpoint_blocks & mark) {
+        require_move(cache.persona_check_checkpoint(seq, mark), llama_persona_move::done, "prepare SWA checkpoint");
+        cache.persona_commit_checkpoint(seq, mark);
+        mark.taken = true;
+    };
+    for (llama_pos i = 0; i < 4; ++i) {
+        pos = fragmented && i < 2 ? 1 - i : i;
+        cache.apply_ubatch(plan(), batch);
+    }
+    pos = 4;
+    llama_persona_checkpoint_blocks before{}, after{};
+    take(before);
+    const auto slot = plan();
+    require(cache.seq_pos_min(seq) == 0, "planning restores every purged prefix cell");
+    require_move(cache.persona_check_rewind(seq, before), llama_persona_move::done, "planning preserves old KV");
+    cache.apply_ubatch(slot, batch);
+    take(after);
+    require_move(cache.persona_check_rewind(seq, before), llama_persona_move::checkpoint_stale, "overwritten KV revoked");
+    require_move(cache.persona_check_rewind(seq, after), llama_persona_move::done, "new sliding window retained");
+}
+
 int main(int argc, char ** argv) {
     common_params params;
     params.kv_unified      = false; // one attention stream per sequence
@@ -197,6 +241,9 @@ int main(int argc, char ** argv) {
                 t_save / 1e3, gb / (t_save / 1e6), t_load / 1e3, gb / (t_load / 1e6), (double) t_prefill / t_load);
         return 0;
     }
+
+    test_checkpoint_after_swa_overwrite(*llama_get_model(f.ctx), false);
+    test_checkpoint_after_swa_overwrite(*llama_get_model(f.ctx), true);
 
     const auto ref_a0 = f.reference(0, 1); // persona a on sequence 0
     const auto ref_b1 = f.reference(1, 2); // persona b on sequence 1
@@ -438,7 +485,7 @@ int main(int argc, char ** argv) {
 
         // what this catches (Codex on #153 at 12a98779b): a newer take erasing the cut receipt an older checkpoint
         // needed. Take A, cut below it and refill a different suffix to the same length, take B: A is stale (by its
-        // serial), B still rewinds.
+        // cut receipt), B still rewinds.
         // A hybrid memory cuts its recurrent half only by a checkpoint rewind (a plain seq_rm mid-sequence is refused),
         // so the cut below A is a rewind to an earlier checkpoint taken at half her prompt.
         {
@@ -456,12 +503,8 @@ int main(int argc, char ** argv) {
                 f.decode_one(0, 7 % f.n_vocab, p);
             }
             require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "checkpoint A");
-            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, early)), llama_persona_move::checkpoint_stale, "the earlier checkpoint is older than A on her lineage");
+            require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, early)), llama_persona_move::done, "the head survives a later checkpoint on the unchanged prefix");
             llama_persona_checkpoint_free(early);
-            f.n_prompt = half;
-            llama_memory_clear(llama_get_memory(f.ctx), true);
-            f.prompt(0, 1);
-            f.n_prompt = full;
             for (llama_pos p = half; p < full; ++p) {
                 f.decode_one(0, 11 % f.n_vocab, p); // a different suffix, to the same length
             }

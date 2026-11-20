@@ -134,7 +134,7 @@ jobs:
 
   windows:
     name: windows / ${{ matrix.build }}
-    runs-on: windows-2025
+    runs-on: windows-2022
 
     env:
       OPENBLAS_VERSION: 0.3.23
@@ -161,7 +161,7 @@ jobs:
       - name: ccache
         uses: ggml-org/ccache-action@v1.2.21
         with:
-          key: cpu-windows-2025-${{ matrix.build }}
+          key: cpu-windows-2022-${{ matrix.build }}
           variant: ccache
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
@@ -179,10 +179,14 @@ jobs:
           $lib =  $(join-path $msvc 'bin\Hostx64\x64\lib.exe')
           & $lib /machine:x64 "/def:${env:RUNNER_TEMP}/openblas/lib/libopenblas.def" "/out:${env:RUNNER_TEMP}/openblas/lib/openblas.lib" /name:openblas.dll
 
-      - name: Install Ninja
-        id: install_ninja
+      - name: Install Windows build tools
         run: |
           choco install ninja
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Match the compiler to the pinned LLVM OpenMP runtime in ggml.
+          if ((clang --version | Out-String) -notmatch 'clang version 20\.') {
+            choco install llvm --version=20.1.8 --allow-downgrade -y
+          }
 
       - name: Build
         id: cmake_build
@@ -224,7 +228,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         with:
-          key: cpu-windows-2025-${{ matrix.build }}
+          key: cpu-windows-2022-${{ matrix.build }}
           older: 5m
           min: 1
           dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
