@@ -247,9 +247,16 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
-    enum class placement { planned, committed };
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, placement mode);
-    bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1, placement mode);
+    // Metadata changed by a speculative placement. Entries unwind in reverse order
+    // because a later purge can touch a cell already saved by an earlier placement.
+    struct cell_snapshot {
+        uint32_t stream;
+        std::vector<uint32_t> indices;
+        llama_kv_cells cells;
+    };
+    using placement_journal = std::vector<cell_snapshot>;
+    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, placement_journal * journal);
+    bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1, placement_journal * journal);
 
     const llama_model & model;
     const llama_hparams & hparams;

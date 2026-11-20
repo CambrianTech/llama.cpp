@@ -130,7 +130,7 @@ struct fixture {
 
 // Exercise placement and receipt ownership directly. Four metadata cells suffice to wrap
 // the sliding window, independent of the architecture and weights of the fixture model.
-static void test_checkpoint_after_swa_overwrite(const llama_model & model) {
+static void test_checkpoint_after_swa_overwrite(const llama_model & model, bool fragmented) {
     llama_kv_cache cache(model, model.hparams, GGML_TYPE_F16, GGML_TYPE_F16, false, false, true,
                          4, 1, 1, 2, LLAMA_SWA_TYPE_STANDARD, nullptr, [](int) { return false; }, nullptr, nullptr);
     llama_seq_id seq = 0;
@@ -153,12 +153,15 @@ static void test_checkpoint_after_swa_overwrite(const llama_model & model) {
         cache.persona_commit_checkpoint(seq, mark);
         mark.taken = true;
     };
-    for (; pos < 4; ++pos) {
+    for (llama_pos i = 0; i < 4; ++i) {
+        pos = fragmented && i < 2 ? 1 - i : i;
         cache.apply_ubatch(plan(), batch);
     }
+    pos = 4;
     llama_persona_checkpoint_blocks before{}, after{};
     take(before);
     const auto slot = plan();
+    require(cache.seq_pos_min(seq) == 0, "planning restores every purged prefix cell");
     require_move(cache.persona_check_rewind(seq, before), llama_persona_move::done, "planning preserves old KV");
     cache.apply_ubatch(slot, batch);
     take(after);
@@ -239,7 +242,8 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    test_checkpoint_after_swa_overwrite(*llama_get_model(f.ctx));
+    test_checkpoint_after_swa_overwrite(*llama_get_model(f.ctx), false);
+    test_checkpoint_after_swa_overwrite(*llama_get_model(f.ctx), true);
 
     const auto ref_a0 = f.reference(0, 1); // persona a on sequence 0
     const auto ref_b1 = f.reference(1, 2); // persona b on sequence 1
