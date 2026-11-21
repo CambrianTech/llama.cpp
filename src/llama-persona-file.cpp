@@ -22,6 +22,7 @@
 #    endif
 #    include <windows.h>
 #endif
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -85,7 +86,23 @@ struct reader {
 // refuses one (Codex on #155, UCRT on BigMama: -1 with the old body intact), so a second save to her fixed path failed.
 bool replace_file(const std::string & tmp, const char * path) {
 #ifdef _WIN32
-    return MoveFileExA(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    // A short-lived reader without FILE_SHARE_DELETE can hold the complete temporary
+    // file across fclose. Retry only the atomic rename, never the block write.
+    constexpr ULONGLONG sharing_deadline_ms = 2000;
+    const auto deadline = GetTickCount64() + sharing_deadline_ms;
+    DWORD delay_ms = 10;
+    for (;;) {
+        if (MoveFileExA(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            return true;
+        }
+        const auto error = GetLastError();
+        const auto now = GetTickCount64();
+        if (error != ERROR_SHARING_VIOLATION || now >= deadline) {
+            return false;
+        }
+        Sleep(static_cast<DWORD>(std::min<ULONGLONG>(delay_ms, deadline - now)));
+        delay_ms = std::min<DWORD>(2 * delay_ms, 100);
+    }
 #else
     return std::rename(tmp.c_str(), path) == 0;
 #endif
