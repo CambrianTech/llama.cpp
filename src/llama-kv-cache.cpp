@@ -1278,8 +1278,16 @@ uint64_t llama_kv_cache::compute_persona_layout(bool with_size) const {
     return h;
 }
 
+// Continuum fork: a persona move copies one sequence's own stream, so it needs every stream to belong to
+// exactly one sequence. That holds with a stream per sequence, and with one stream and one sequence (the
+// Core's context: the mind swapped in holds the whole of it). It does not hold for one stream shared by
+// several sequences (unified KV), where her rows are interleaved with others'.
+bool llama_kv_cache::persona_streams_are_own() const {
+    return n_stream > 1 || n_seq_max == 1;
+}
+
 llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks) const {
-    if (n_stream == 1) {
+    if (!persona_streams_are_own()) {
         return llama_persona_move::no_such_stream;
     }
     blocks.kv_layout = persona_layout();
@@ -1299,7 +1307,7 @@ llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks
 }
 
 llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const {
-    if (n_stream == 1) {
+    if (!persona_streams_are_own()) {
         return llama_persona_move::no_such_stream;
     }
     if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
@@ -1390,7 +1398,7 @@ void llama_kv_cache::persona_commit_rewind(llama_seq_id seq_id, const llama_pers
 }
 
 int32_t llama_kv_cache::persona_empty_stream() const {
-    if (n_stream == 1) {
+    if (!persona_streams_are_own()) {
         return -1; // unified: one stream holds every sequence, so there is nothing empty to bind into
     }
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1403,7 +1411,7 @@ int32_t llama_kv_cache::persona_empty_stream() const {
 
 llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint32_t stream,
                                                      const llama_persona_blocks & in, llama_persona_slot & slot) const {
-    if (n_stream == 1 || stream >= n_stream) {
+    if (!persona_streams_are_own() || stream >= n_stream) {
         return llama_persona_move::no_such_stream;
     }
     if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {

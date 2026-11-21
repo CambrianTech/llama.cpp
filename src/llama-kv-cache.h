@@ -177,10 +177,13 @@ public:
 
     // Continuum fork (CONTINUUM-ENGINE 4.14): her used rows of her stream copied raw per layer, her cells exchanged by
     // swap with an already-empty object (never reset or walked), her own sequence id bound to the stream she lands on
-    // (seq_to_stream stays a permutation; her cells are never retagged). Requires unified KV off and flash attention.
+    // (seq_to_stream stays a permutation; her cells are never retagged). Requires each stream to be one sequence's (a
+    // stream per sequence, or one stream and one sequence; never unified KV shared by several) and flash attention.
     llama_persona_move persona_prepare(llama_persona_blocks & blocks) const override;
     uint64_t persona_layout() const { return persona_layout_id; }
     int32_t persona_empty_stream() const override;
+    // every stream belongs to one sequence: a stream per sequence, or one stream and one sequence
+    bool persona_streams_are_own() const;
     llama_persona_move persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const override;
     llama_persona_move persona_check_load(llama_seq_id seq_id, uint32_t stream, const llama_persona_blocks & in,
                                           llama_persona_slot & slot) const override;
