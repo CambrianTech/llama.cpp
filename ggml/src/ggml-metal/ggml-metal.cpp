@@ -1027,6 +1027,8 @@ static bool ggml_backend_metal_moe_gather_entry(const struct ggml_tensor * src0_
     }
     *entry = (int64_t) (va_slot - va_src0);
     return true;
+}
+
 // generic fusion debugging API (ad-hoc proc-address mechanism): the test resolves the device
 // fusion context once and passes that opaque handle to the rest of the functions
 typedef void * ggml_backend_fusion_t;
@@ -1075,6 +1077,7 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_moe_gather_entry") == 0) {
         return (void *)ggml_backend_metal_moe_gather_entry;
+    }
     // generic fusion debugging API (ad-hoc proc-address mechanism, not part of the official
     // ggml backend interface yet; a backend that adopts it exports these exact names)
     if (strcmp(name, "ggml_backend_fusion_get") == 0) {

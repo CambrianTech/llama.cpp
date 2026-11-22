@@ -5559,7 +5559,7 @@ void ggml_flash_attn_ext_set_back_tile(
         struct ggml_tensor * a,
         int32_t              tile) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    ggml_set_op_params_i32(a, 4, tile); // scale, max_bias, softcap, prec come first
+    ggml_set_op_params_i32(a, 5, tile); // scale, max_bias, softcap, prec, n_kv_max (upstream) come first
 }
 
 void ggml_flash_attn_ext_set_grad_sinks(
@@ -5580,6 +5580,8 @@ void ggml_flash_attn_ext_set_grad_sinks(
     a->src[6] = k_cur;
     a->src[7] = v_tap;
     a->src[8] = v_cur;
+}
+
 void ggml_flash_attn_ext_set_n_kv_max(
         struct ggml_tensor * a,
         int32_t              n_kv_max) {
@@ -6919,7 +6921,7 @@ static struct ggml_tensor * ggml_fa_back_f32(struct ggml_context * ctx, struct g
 // round the scores and the gradients ~1e-3 per product (Metal's default mul_mm)
 static struct ggml_tensor * ggml_fa_back_mm(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * b) {
     struct ggml_tensor * r = ggml_mul_mat(ctx, a, b);
-    ggml_mul_mat_set_prec(r, GGML_PREC_F32);
+    ggml_prec_set_acc(r, GGML_PREC_F32);
     return r;
 }
 
@@ -7012,7 +7014,7 @@ static void ggml_flash_attn_ext_backward(
     // the native backward reads a quantized K/V itself: one the forward read through an F16 cast of
     // a quantized cache is read at the cast's source, so the window-sized cast is not kept alive
     // for the backward
-    const bool native = ggml_get_op_params_i32(tensor, 4) == GGML_FA_BACK_NATIVE;
+    const bool native = ggml_get_op_params_i32(tensor, 5) == GGML_FA_BACK_NATIVE;
     if (native && k->op == GGML_OP_CPY && ggml_is_quantized(k->src[0]->type) && ggml_are_same_shape(k, k->src[0])) {
         k = k->src[0];
     }
@@ -7038,7 +7040,7 @@ static void ggml_flash_attn_ext_backward(
         dv_needed = ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[7], &is) || ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[8], &is);
     }
 
-    int32_t tile = ggml_get_op_params_i32(tensor, 4);
+    int32_t tile = ggml_get_op_params_i32(tensor, 5); // slot 4 is upstream's n_kv_max
     if (tile == GGML_FA_BACK_NATIVE) {
         struct ggml_tensor * b = ggml_flash_attn_back(ctx, q, k, v, mask, grad, scale, kv0);
         // views of the packed result: dQ shaped like q, dK/dV like k/v from row kv0

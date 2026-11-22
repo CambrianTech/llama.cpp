@@ -2263,7 +2263,6 @@ static ggml_backend_moe_gather_entry_t moe_gather_entry_fn(ggml_backend_t backen
     return reg ? (ggml_backend_moe_gather_entry_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_gather_entry") : nullptr;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched, int node_budget = 0) {
 static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
     return t->buffer != NULL &&
         ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
@@ -2383,7 +2382,7 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
     }
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched, int node_budget = 0) {
     GGML_ASSERT(sched);
     if (ggml_moe::moe_config().container_dir && !moe_container_fetcher().ok()) {
         GGML_LOG_ERROR("%s: expert container custody unavailable; refusing graph execution\n", __func__);

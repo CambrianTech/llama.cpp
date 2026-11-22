@@ -950,6 +950,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_fp32(ggml
     res.nr1  = 32;
     res.smem = 64*32*sizeof(float) + 32*32*sizeof(float); // sa + sb; the bc_out tile (8192) fits
     res.nsg  = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
+    return res;
+}
+
 // threadgroups needed to fill the GPU
 // TODO: dedup
 static constexpr int64_t GGML_METAL_MIN_THREADGROUPS = 128;

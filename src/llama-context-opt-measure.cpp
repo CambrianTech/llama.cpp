@@ -33,12 +33,13 @@ bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void 
     } guard{cparams, saved_cparams, sched.get(), n_outputs, saved_outputs};
     // Scope cleanup also invalidates reuse of scheduler-rewritten graph metadata.
     ggml_backend_sched_reset(sched.get());
-    gf_res_prev->reset();
+    for (auto & res : gf_res_prev) { res->reset(); } // both result slots
+    gf_res_prev_active = nullptr;
     cparams.training = true;
     cparams.walk_active = false;
     // Shape only: attention still sees the full served memory, without token cuts.
     const uint32_t chunk = reply_rows ? reply_rows : cparams.n_ctx_seq;
-    size_t max_nodes = graph_max_nodes(chunk);
+    size_t max_nodes = graph_max_nodes();
     if (cparams.flash_attn && !cparams.fa_back_native) {
         max_nodes += (size_t) model.hparams.n_layer() * ggml_flash_attn_ext_back_n_nodes(opt_n_ctx_train, 0);
     }

@@ -91,6 +91,8 @@ const char * llama_persona_move_name(llama_persona_move m) {
         case llama_persona_move::file_mismatch:      return "file_mismatch";
     }
     return "unknown";
+}
+
 //
 // llama_memory_bufs
 //

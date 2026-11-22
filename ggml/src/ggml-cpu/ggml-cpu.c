@@ -2412,11 +2412,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
-<<<<<<< HEAD
         case GGML_OP_MUL_MAT_ID_BACK:
-=======
         case GGML_OP_SET_ROWS:
->>>>>>> upstream/master
             {
                 n_tasks = n_threads;
             } break;
@@ -2965,15 +2962,9 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
-<<<<<<< HEAD
-                        if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F16) {
-                            // the blocked kernel's tile and gathered values (ops.h)
-                            cur = ggml_type_size(GGML_TYPE_F32) * ggml_out_prod_cpu_wsize(node->src[0]->ne[0]) * n_tasks;
-=======
                         if (ggml_is_quantized(node->src[0]->type) || node->src[0]->type == GGML_TYPE_F8_E4M3 ||
                             node->src[0]->type == GGML_TYPE_F16) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
->>>>>>> upstream/master
+                            cur = ggml_type_size(GGML_TYPE_F32) * ggml_out_prod_cpu_wsize(node->src[0]->ne[0]) * n_tasks;
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID_BACK:
