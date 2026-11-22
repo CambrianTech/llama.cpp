@@ -1253,3 +1253,148 @@ bool llama_context::opt_state_write_initial(FILE * optimizer, const char * bindi
 bool llama_opt_state_write_initial(llama_context * ctx, FILE * optimizer, const char * binding) {
     return ctx && ctx->opt_state_write_initial(optimizer, binding);
 }
+
+//
+// Continuum: the hooks upstream's llama-context.cpp calls (one line each), the training side of a serving context
+//
+
+// every optimizer this context made: one per trained adapter (opt_minds), else the base's own
+void llama_context::opt_free_all() {
+    for (auto & [adapter, mind] : opt_minds) {
+        ggml_opt_free(mind);
+    }
+    if (opt_minds.empty()) {
+        ggml_opt_free(opt_ctx); // the base's own optimizer, when the base trained
+    }
+}
+
+// an attached adapter whose generation restore is uncertain refuses every decode until a known-good one is restored
+bool llama_context::adapters_restore_uncertain(const char * who) const {
+    for (const auto & entry : *loras) {
+        if (entry.first->restore_quarantined) {
+            LLAMA_LOG_ERROR("%s: adapter generation restore is uncertain\n", who);
+            return true;
+        }
+    }
+    return false;
+}
+
+// a decode the live owner serves beside a retained or pending graph
+bool llama_context::opt_beside_graph() const {
+    return ggml_backend_sched_graph_pending(sched.get()) ||
+        (!opt_serving_continuation && opt_reply && opt_reply->graph_meta);
+}
+
+// a labelled batch needs a token-wise LM head, an optimizer, and a memory that can carry it
+bool llama_context::labels_refused(const char * who) const {
+    if (balloc->get_n_labels() == 0) {
+        return false;
+    }
+    if (!model.output) {
+        LLAMA_LOG_ERROR("%s: labelled training requires a language-model output weight\n", who);
+        return true;
+    }
+    if (cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        LLAMA_LOG_ERROR("%s: labelled training requires a token-wise output head, not pooled outputs\n", who);
+        return true;
+    }
+    if (!opt_ctx) {
+        LLAMA_LOG_ERROR("%s: labelled rows require an initialized optimizer\n", who);
+        return true;
+    }
+    if (const char * why = memory->training_error(balloc->get_batch(), cparams.flash_attn)) {
+        LLAMA_LOG_ERROR("%s: %s\n", who, why);
+        return true;
+    }
+    return false;
+}
+
+// outputs reach the host unless they only feed a training loss
+bool llama_context::opt_host_outputs() const {
+    return !opt_outputs_internal && opt_walk_active == nullptr;
+}
+
+// the live owner retains the prepared graph and publishes no partial outputs; its segmented path admits a single whole
+// ubatch, never token partitions
+bool llama_context::opt_retains_graph(llama_memory_context_ptr & mctx) {
+    if (opt_serving_continuation || !opt_reply || !opt_reply->graph_meta) {
+        return false;
+    }
+    opt_reply->graph_memory = std::move(mctx);
+    if (opt_reply->recurrent) {
+        opt_reply->recurrent_graph_head  = opt_reply->recurrent->head;
+        opt_reply->recurrent_graph_count = opt_reply->recurrent->n;
+    }
+    return true;
+}
+
+// a ubatch with a quarantined shadow refuses labelled evaluation
+bool llama_context::opt_refuses_ubatch(const llama_ubatch & ubatch, ggml_status & ret) {
+    if (opt_shadow && opt_shadow->restore_quarantined && ubatch.n_labels() > 0) {
+        opt_fail("shadow generation restore is uncertain; restore a known-good generation before labelled evaluation");
+        ret = GGML_STATUS_FAILED;
+        return true;
+    }
+    return false;
+}
+
+// a ubatch with labelled rows is a training step on this context's trainable adapter (llama_opt_init): the same graph
+// with the extras on, the shadow's masked term (graph_params) and the loss and backward (opt_ubatch). It is built
+// fresh, and cparams.training is part of the reuse key, so a serving graph never reuses it.
+bool llama_context::opt_mark_training(const llama_ubatch & ubatch) {
+    if (opt_ctx == nullptr) {
+        return false;
+    }
+    const bool train = !opt_forward_only && ubatch.n_labels() > 0;
+    cparams.training    = train;
+    cparams.walk_active = opt_walk_active != nullptr;
+    return train;
+}
+
+// the training step on a freshly built graph
+llm_graph_result * llama_context::opt_train_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch, ggml_status & ret) {
+    if (!opt_ubatch(res, gf, ubatch)) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+    ret = GGML_STATUS_SUCCESS;
+    return res;
+}
+
+// a serving graph's allocation, admitted against the workspace a training continuation holds; a refusal resets the
+// result and the scheduler, since splitting rewrites graph inputs even when allocation is refused and a later
+// admitted retry must rebuild, not reuse those unallocated tensors
+bool llama_context::opt_alloc_graph(llm_graph_result * res, ggml_cgraph * gf) {
+    const bool allocated = opt_serving_continuation
+        ? ggml_backend_sched_alloc_graph_admitted(sched.get(), gf, nullptr, nullptr, opt_admit_serving_workspace, this)
+        : ggml_backend_sched_alloc_graph(sched.get(), gf);
+    if (!allocated) {
+        res->reset();
+        ggml_backend_sched_reset(sched.get());
+    }
+    return allocated;
+}
+
+// the shadow's rows and the attention streams of the ubatch, set after upstream's graph_params initializer; a training
+// ubatch keeps every row's output for the loss
+void llama_context::opt_graph_params(llm_graph_params & params, const llama_ubatch & ubatch) const {
+    params.shadow        = opt_shadow;
+    params.n_shadow_rows = opt_shadow != nullptr ? ubatch.n_labels() : 0;
+    if (cparams.training || (opt_shadow && ubatch.n_labels() > 0)) {
+        params.n_outputs = ubatch.n_tokens;
+    }
+    if (memory) {
+        params.streams.reserve(ubatch.n_seqs_unq);
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            params.streams.push_back(memory->seq_stream(ubatch.seq_id_unq[s]));
+        }
+    }
+}
+
+// the serving scheduler a live owner holds beside this context's own, counted in the breakdown
+void llama_context::opt_breakdown_serving(std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> & ret, ggml_backend_t backend) const {
+    if (opt_reply && opt_reply->serving_sched) {
+        const auto other = opt_reply->serving_sched.get();
+        ret[ggml_backend_sched_get_buffer_type(other, backend)].compute += ggml_backend_sched_get_buffer_size(other, backend);
+    }
+}

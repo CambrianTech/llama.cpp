@@ -7,16 +7,51 @@
 #include <algorithm>
 #include <atomic>
 #include <bitset>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <iterator>
 #include <limits>
 #include <memory>
-#include <cassert>
-#include <cstring>
 #include <vector>
+
+#if defined(__GNUC__)
+#    define LLAMA_ATTRIBUTE_NOINLINE __attribute__((noinline))
+#else
+#    define LLAMA_ATTRIBUTE_NOINLINE
+#endif
+
+#if defined(_MSC_VER)
+#    include <intrin.h>
+#endif
+
+// index of the lowest set bit, x != 0
+static inline int ctz64(uint64_t x) {
+#if defined(_MSC_VER)
+    unsigned long i;
+#if defined(_WIN64)
+    _BitScanForward64(&i, x);
+    return (int) i;
+#else
+    if (_BitScanForward(&i, (unsigned long) x)) {
+        return (int) i;
+    }
+    _BitScanForward(&i, (unsigned long) (x >> 32));
+    return (int) i + 32;
+#endif
+#else
+    return __builtin_ctzll(x);
+#endif
+}
 
 struct llama_kv_cell_ext {
     // 2D spatial positions, typically used for M-RoPE
     llama_pos x = 0;
     llama_pos y = 0;
+
+    // when tok = LLAMA_TOKEN_NULL when the cell is produced by embedding input (i.e. multimodal)
+    // use case: n-gram embeddings hash
+    llama_token tok = LLAMA_TOKEN_NULL;
 
     // return true if the current 2D spatial position is greater than other
     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
@@ -26,14 +61,24 @@ struct llama_kv_cell_ext {
     void reset() {
         static_assert(std::is_trivially_copyable_v<llama_kv_cell_ext>);
 
-        memset(this, 0, sizeof(*this));
+        *this = llama_kv_cell_ext{};
     }
+};
+
+// the data of one slice of a ubatch, used to build the cell rows of the kv_rows attention (see ggml_flash_attn_ext_rows)
+struct llama_kv_rows_slice {
+    std::vector<llama_seq_id> seq_ids; // the sequences whose cells form the list of the slice
+
+    // min position of the cells that are not masked by the SWA (-1 if all cells are kept)
+    llama_pos p_min = -1;
 };
 
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
 public:
+    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
+
     // Continuum fork (CONTINUUM-ENGINE 4.14): exchange two cells objects in place, member by member, with each
     // container's own swap: never allocates on any standard library (a std::swap of the whole object moves through a
     // temporary, and MSVC's node containers allocate a sentinel when move-constructed). A persona's metadata moves
@@ -47,6 +92,7 @@ public:
         seq.swap(other.seq);
         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].swap(other.seq_pos[s]);
+            seq_bits[s].swap(other.seq_bits[s]);
         }
         std::swap(stale, other.stale);
         std::swap(lineage_id, other.lineage_id);
@@ -80,55 +126,6 @@ public:
         });
     }
 
-    void reset() {
-        lineage_id = next_lineage();
-        checkpoints.clear();
-        for (uint32_t i = 0; i < pos.size(); ++i) {
-            pos[i]   = -1;
-            ext[i].reset();
-            shift[i] =  0;
-            seq[i].reset();
-        }
-
-        has_shift = false;
-
-        used.clear();
-
-        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
-            seq_pos[s].clear();
-        }
-        stale.reset();
-    }
-
-    void reset_shift() {
-        has_shift = false;
-
-        for (uint32_t i = 0; i < shift.size(); ++i) {
-            shift[i] = 0;
-        }
-    }
-
-    uint32_t size() const {
-        return pos.size();
-    }
-
-    void resize(uint32_t n) {
-        pos.resize(n);
-        ext.resize(n);
-        shift.resize(n);
-        seq.resize(n);
-        used.resize(n);
-
-        reset();
-    }
-
-    bool is_empty(uint32_t i) const {
-        assert(i < pos.size());
-        assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);
-
-        return pos[i] == -1;
-    }
-
     // Continuum fork (CONTINUUM-ENGINE 4.14): recompute every stale sequence index now, on the thread that changed the
     // cells. llama_kv_cache calls this as each of its operations returns, so a query never writes an index: queries
     // arrive from other threads while a decode runs, and a persona's blocks leave a stream with valid indices.
@@ -158,6 +155,60 @@ public:
     // was settled by its operation
     uint64_t stale_queries() const {
         return n_stale_queries.load();
+    }
+
+    void reset() {
+        lineage_id = next_lineage();
+        checkpoints.clear();
+        stale.reset();
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            pos[i]   = -1;
+            ext[i].reset();
+            shift[i] =  0;
+            seq[i].reset();
+        }
+
+        has_shift = false;
+
+        used.clear();
+
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            seq_pos[s].clear();
+            std::fill(seq_bits[s].begin(), seq_bits[s].end(), 0);
+        }
+    }
+
+    void reset_shift() {
+        has_shift = false;
+
+        for (uint32_t i = 0; i < shift.size(); ++i) {
+            shift[i] = 0;
+        }
+    }
+
+    uint32_t size() const {
+        return pos.size();
+    }
+
+    void resize(uint32_t n) {
+        pos.resize(n);
+        ext.resize(n);
+        shift.resize(n);
+        seq.resize(n);
+        used.resize(n);
+
+        for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            seq_bits[s].clear();
+        }
+
+        reset();
+    }
+
+    bool is_empty(uint32_t i) const {
+        assert(i < pos.size());
+        assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);
+
+        return pos[i] == -1;
     }
 
     uint32_t get_used() const {
@@ -326,7 +377,7 @@ public:
         assert(seq_id >= 0);
 
         seq[i].reset(seq_id);
-        seq_pos_dec(seq_id, pos[i]);
+        seq_pos_dec(seq_id, i);
 
         if (seq[i].none()) {
             pos[i] = -1;
@@ -341,6 +392,35 @@ public:
         return false;
     }
 
+    // remove seq_id from its cells at positions in [p0, p1)
+    // return the lowest index of a cell that becomes empty, or size() if none does
+    uint32_t seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        uint32_t res = size();
+
+        // Continuum: the index is a sorted array, so the cells are collected before any is removed, then removed
+        // newest first: a cut of her newest positions (a rollback, a rejected draft) pops the index's tail and keeps
+        // it exact. A mutator may settle a stale index; only a query may not.
+        if (seq_pos[seq_id].is_stale()) {
+            settle(seq_id);
+            stale.reset(seq_id);
+        }
+        const auto & sp = seq_pos[seq_id];
+        std::vector<uint32_t> cut;
+        for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
+            cut.push_back(it->second);
+        }
+        for (auto it = cut.rbegin(); it != cut.rend(); ++it) {
+            if (seq_rm(*it, seq_id)) {
+                res = std::min(res, *it);
+            }
+        }
+
+        return res;
+    }
+
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
@@ -350,7 +430,7 @@ public:
             seq[i].reset();
 
             seq[i].set(seq_id);
-            seq_pos_inc(seq_id, pos[i]);
+            seq_pos_inc(seq_id, i);
 
             return false;
         }
@@ -381,6 +461,13 @@ public:
         return seq[i].count();
     }
 
+    // the full set of sequences this cell is visible to
+    const seq_set_t & seq_get_all(uint32_t i) const {
+        assert(i < pos.size());
+
+        return seq[i];
+    }
+
     // check if the cell contains seq_id
     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
         assert(i < pos.size());
@@ -389,22 +476,44 @@ public:
         return seq[i].test(seq_id);
     }
 
-    // Relabel every cell of sequence `from` as `to`, with its position index: a persona's cells bound back as the
-    // sequence she is bound as now. `to` holds no cell here (a stream holds one persona), so nothing merges.
-    void seq_rename(llama_seq_id from, llama_seq_id to) {
-        if (from == to) {
-            return;
-        }
-        for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
-            if (seq[i].test(from)) {
-                seq[i].reset(from);
-                seq[i].set(to);
+    // the (pos, cell) pairs of sequence seq_id, ordered by position
+    // Continuum: a stale index here is a missed settle, refused loudly rather than read
+    const llama_kv_seq_pos & seq_pos_get(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+        GGML_ASSERT(!seq_pos[seq_id].is_stale() && "a cache operation left this sequence's index unsettled");
+
+        return seq_pos[seq_id];
+    }
+
+    // the token of the cell of sequence seq_id at the largest position <= p
+    // when several cells share that position, the one with the highest index wins
+    // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p
+    // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
+    llama_token seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+
+        if (sp.is_stale()) {
+            // answered from the cells, counted: correct, and a defect (the operation that changed them did not settle)
+            n_stale_queries.add();
+            int64_t best = -1;
+            for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
+                if (seq[i].test(seq_id) && pos[i] <= p && (best < 0 || pos[i] >= pos[best])) {
+                    best = i;
+                }
             }
+            return best < 0 ? LLAMA_TOKEN_NULL : ext[best].tok;
         }
-        seq_pos[to].swap(seq_pos[from]);
-        const bool was_stale = stale.test(from);
-        stale.set(from, stale.test(to));
-        stale.set(to, was_stale);
+
+        auto it = sp.upper_bound({ p, std::numeric_limits<uint32_t>::max() });
+        if (it == sp.begin()) {
+            return LLAMA_TOKEN_NULL;
+        }
+
+        return ext[(--it)->second].tok;
     }
 
     // note: call only if the cell is not empty and the seq_id is not in the cell
@@ -414,7 +523,7 @@ public:
         assert(!seq[i].test(seq_id));
 
         seq[i].set(seq_id);
-        seq_pos_inc(seq_id, pos[i]);
+        seq_pos_inc(seq_id, i);
     }
 
     // return the sequence id of this cell
@@ -429,6 +538,91 @@ public:
         }
 
         return -1;
+    }
+
+    // Continuum: relabel every cell of sequence `from` as `to`, with its position index: a persona's cells bound back
+    // as the sequence she is bound as now. `to` holds no cell here (a stream holds one persona), so nothing merges.
+    void seq_rename(llama_seq_id from, llama_seq_id to) {
+        if (from == to) {
+            return;
+        }
+        for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
+            if (seq[i].test(from)) {
+                seq[i].reset(from);
+                seq[i].set(to);
+            }
+        }
+        seq_pos[to].swap(seq_pos[from]);
+        seq_bits[to].swap(seq_bits[from]);
+        const bool was_stale = stale.test(from);
+        stale.set(from, stale.test(to));
+        stale.set(to, was_stale);
+    }
+
+    // number of cells that contain seq_id
+    uint32_t seq_n_cells(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_n_cells(seq_id, std::numeric_limits<llama_pos>::min());
+    }
+
+    // number of cells that contain seq_id at a position >= p_min
+    uint32_t seq_n_cells(llama_seq_id seq_id, llama_pos p_min) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+
+        if (sp.is_stale()) {
+            n_stale_queries.add();
+            uint32_t n = 0;
+            for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
+                n += seq[i].test(seq_id) && pos[i] >= p_min;
+            }
+            return n;
+        }
+
+        return std::distance(sp.lower_bound({ p_min, 0 }), sp.end());
+    }
+
+    // get the lists of the cells that contain any of the sequences of each slice, in cell order
+    // one list of max `n_per_seq` for each slice, padded with -1
+    // the cells of slice s at a position below slices[s].p_min are skipped
+    LLAMA_ATTRIBUTE_NOINLINE
+    void get_seq_cells(const std::vector<llama_kv_rows_slice> & slices, int32_t * data, int64_t n_per_seq) const {
+        assert(slices.size() >= 1);
+
+        const int64_t n_slices = (int64_t) slices.size();
+
+        const uint32_t n_words = (used_max_p1() + 63)/64;
+
+        for (int64_t s = 0; s < n_slices; ++s) {
+            const llama_pos pm = slices[s].p_min;
+
+            int32_t * dst = data + s*n_per_seq;
+            int32_t * end = dst + n_per_seq;
+
+            for (uint32_t w = 0; w < n_words; ++w) {
+                uint64_t word = 0;
+                for (const llama_seq_id seq_id : slices[s].seq_ids) {
+                    const auto & bits = seq_bits[seq_id];
+                    if (w < bits.size()) {
+                        word |= bits[w];
+                    }
+                }
+
+                for (uint64_t b = word; b != 0; b &= b - 1) {
+                    const int32_t i = 64*w + ctz64(b);
+                    if (pos[i] >= pm) {
+                        GGML_ASSERT(dst < end);
+                        *dst++ = i;
+                    }
+                }
+            }
+
+            std::fill(dst, end, -1);
+        }
     }
 
     // the minimum position of sequence seq_id currently present in any of the cells
@@ -588,20 +782,20 @@ private:
     //
     std::vector<llama_pos> shift;
 
-    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
-
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
 
-    // seq_pos[s] holds each position p currently present for sequence s with how many cells hold it, sorted, so its
-    // first and last entries are the min/max positions currently in the cache
+    // seq_pos[s] holds one (pos, cell) pair per cell that carries sequence s, ordered by position
+    // this way seq_pos[s].begin() and the last entry give us the min/max positions currently in the cache
+    // and upper_bound() on a position finds the nearest cell of the sequence in logarithmic time
     //
-    // note that a position needs a count, not just presence, because in some cases a position can occur more than once for the same seq:
+    // the cell index is part of the key because a position can occur more than once for the same seq:
     //  - during performing a cache reuse via (rm + add)
     //  - some vision models have input embeddings with repeating positions
     //
-    // Continuum fork: each sequence's positions as a native sorted array with counts (llama-kv-cell-index.h), exact on
-    // its O(1) paths; any other change marks it stale (`stale`), and the operation that made the change settles it.
+    // Continuum fork: a native sorted array (llama-kv-cell-index.h), so a persona's metadata holds no node container
+    // and her flash image binds without rebuilding it. Exact on its O(1) paths (her newest position appended or
+    // removed); any other change marks it stale (`stale`), and the operation that made the change settles it.
     llama_kv_seq_pos seq_pos[LLAMA_MAX_SEQ];
 
     // the sequences whose index a change left stale, so settling visits only those
@@ -616,13 +810,13 @@ private:
     // recompute sequence seq_id's index from the cells
     void settle(llama_seq_id seq_id) {
         ++n_settles;
-        std::vector<llama_pos> positions;
+        std::vector<llama_kv_pos_cell> now;
         for (uint32_t i = used.min(); i < used.max_p1(); ++i) {
             if (seq[i].test(seq_id)) {
-                positions.push_back(pos[i]);
+                now.emplace_back(pos[i], i);
             }
         }
-        seq_pos[seq_id].settle(positions);
+        seq_pos[seq_id].settle(now);
     }
 
     // a stale sequence's min or max read from the cells without writing its index, counted: correct, and a defect
@@ -638,27 +832,39 @@ private:
         return found;
     }
 
-    // helper functions for updating `seq_pos`, once cell at a time:
+    // bit i of seq_bits[s] is set if cell i carries sequence s (the transpose of `seq`), used to build the cell lists
+    // allocated on the first cell of the sequence, so the copies made by cp() never allocate it
+    std::vector<uint64_t> seq_bits[LLAMA_MAX_SEQ];
 
-    void seq_pos_dec(llama_seq_id s, llama_pos p) {
-        seq_pos[s].dec(p);
+    // helper functions for updating `seq_pos` and `seq_bits`, once cell at a time:
+
+    void seq_pos_dec(llama_seq_id s, uint32_t i) {
+        seq_pos[s].dec(pos[i], i);
         if (seq_pos[s].is_stale()) {
             stale.set(s);
         }
+
+        seq_bits[s][i/64] &= ~(1ull << (i%64));
     }
 
-    void seq_pos_inc(llama_seq_id s, llama_pos p) {
-        seq_pos[s].inc(p);
+    void seq_pos_inc(llama_seq_id s, uint32_t i) {
+        seq_pos[s].inc(pos[i], i);
         if (seq_pos[s].is_stale()) {
             stale.set(s);
         }
+
+        if (seq_bits[s].empty()) {
+            seq_bits[s].assign((pos.size() + 63)/64, 0);
+        }
+
+        seq_bits[s][i/64] |= 1ull << (i%64);
     }
 
     // remove cell i
     void seq_pos_rm(uint32_t i) {
         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             if (seq[i].test(s)) {
-                seq_pos_dec(s, pos[i]);
+                seq_pos_dec(s, i);
             }
         }
     }
@@ -667,7 +873,7 @@ private:
     void seq_pos_add(uint32_t i) {
         for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
             if (seq[i].test(s)) {
-                seq_pos_inc(s, pos[i]);
+                seq_pos_inc(s, i);
             }
         }
     }

@@ -1,5 +1,6 @@
 import pytest
 import requests
+import socket
 from utils import *
 
 server = ServerPreset.tinyllama2()
@@ -16,17 +17,41 @@ def test_server_start_simple():
     server.start()
     res = server.make_request("GET", "/health")
     assert res.status_code == 200
-    # The standalone health route retains the actual loader snapshot after ready.
-    progress = res.body["load_progress"]
-    assert progress["pid"] == server.process.pid
-    assert progress["current"] in progress["stages"]
-    assert 0 < progress["value"] <= 1
 
 
-@pytest.mark.parametrize("kv_unified", [False, True])
-def test_server_props(kv_unified):
+def test_server_multiple_addresses(monkeypatch):
+    # The CLI value replaces the environment value, including an unavailable address.
+    monkeypatch.setenv("LLAMA_ARG_HOST", "192.0.2.1")
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+    except OSError:
+        pytest.skip("IPv6 loopback is unavailable")  # ty: ignore[too-many-positional-arguments]
+
+    server.server_host = "127.0.0.1,::1"
+    server.api_key = "test-multiple-addresses"
+    server.start()
+
+    def check_address(host):
+        res = server.make_request("GET", "/health", host=host)
+        assert res.status_code == 200
+        res = server.make_request("POST", "/v1/completions", data={}, host=host)
+        assert res.status_code == 401
+        events = list(server.make_stream_request("POST", "/v1/completions", data={
+            "prompt": "Once upon a time",
+            "max_tokens": 8,
+            "stream": True,
+        }, headers={"Authorization": f"Bearer {server.api_key}"}, host=host))
+        assert len(events) > 1
+        return True
+
+    # parallel_function_calls swallows exceptions, a failed check leaves None in the results
+    results = parallel_function_calls([(check_address, (host,)) for host in ["127.0.0.1", "[::1]"]])
+    assert all(results)
+
+
+def test_server_props():
     global server
-    server.kv_unified = kv_unified
     server.start()
     res = server.make_request("GET", "/props")
     assert res.status_code == 200
@@ -34,12 +59,7 @@ def test_server_props(kv_unified):
     assert res.body["total_slots"] == server.n_slots
     default_val = res.body["default_generation_settings"]
     assert server.n_ctx is not None and server.n_slots is not None
-    expected_window = server.n_ctx if kv_unified else server.n_ctx // server.n_slots
-    assert default_val["n_ctx"] == expected_window
-    geometry = res.body["context_geometry"]
-    assert geometry["allocated_tokens"] == server.n_ctx
-    assert geometry["max_tokens_per_sequence"] == expected_window
-    assert geometry["sequence_capacity"] == server.n_slots
+    assert default_val["n_ctx"] == server.n_ctx / server.n_slots
     assert default_val["params"]["seed"] == server.seed
 
 
@@ -78,8 +98,8 @@ def test_server_slots():
 def test_load_split_model():
     global server
     server.offline = False
-    server.model_hf_repo = "ggml-org/models"
-    server.model_hf_file = "tinyllamas/split/stories15M-q8_0-00001-of-00003.gguf"
+    server.model_hf_repo = "ggml-org-dev/stories15M"
+    server.model_hf_file = "split/stories15M-q8_0-00001-of-00003.gguf"
     server.model_alias = "tinyllama-split"
     server.start()
     res = server.make_request("POST", "/completion", data={

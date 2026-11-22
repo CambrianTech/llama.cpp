@@ -6,7 +6,7 @@
 //
 //  - llama_kv_used: which cells are occupied, a bitmap over the cell rows (bounded by the stream size, never by a
 //    position), with its count and its extrema kept as cells change.
-//  - llama_kv_seq_pos: one sequence's positions, sorted, each with how many cells hold it (duplicates are allowed: cache
+//  - llama_kv_seq_pos: one sequence's (position, cell) pairs, sorted (a position held by several cells appears once per cell: cache
 //    reuse rm+add, repeated M-RoPE positions). Bounded by the cells (each cell adds at most one entry per sequence),
 //    never a histogram by absolute position. Each sequence owns its own array, so a change to one never moves
 //    another's.
@@ -147,94 +147,102 @@ private:
     }
 };
 
-// One position of one sequence, and how many of its cells hold it.
-struct llama_kv_pos_count {
-    llama_pos pos;
-    int32_t   n;
-};
+// One cell of one sequence: its position and its cell row, ordered by position, then row.
+using llama_kv_pos_cell = std::pair<llama_pos, uint32_t>;
 
-// One sequence's positions, sorted, each with its count: exact on its O(1) paths, else stale until recomputed.
+// One sequence's (position, cell) pairs, sorted: exact on its O(1) paths, else stale until recomputed. Each cell adds
+// one entry per sequence it carries, so a position held by several cells appears once per cell.
 class llama_kv_seq_pos {
 public:
-    // a cell of this sequence now holds position p
-    void inc(llama_pos p) {
+    using const_iterator = std::vector<llama_kv_pos_cell>::const_iterator;
+
+    // cell `cell` of this sequence now holds position p
+    void inc(llama_pos p, uint32_t cell) {
         if (stale) {
             return;
         }
-        if (runs.empty() || runs.back().pos < p) {
-            runs.push_back({ p, 1 });
-            return;
-        }
-        if (runs.back().pos == p) {
-            ++runs.back().n;
+        const llama_kv_pos_cell e{ p, cell };
+        if (cells.empty() || cells.back() < e) {
+            cells.push_back(e);
             return;
         }
         stale = true;
     }
 
-    // a cell of this sequence no longer holds position p
-    void dec(llama_pos p) {
+    // cell `cell` of this sequence no longer holds position p
+    void dec(llama_pos p, uint32_t cell) {
         if (stale) {
             return;
         }
-        assert(!runs.empty());
-        if (runs.back().pos == p) {
-            if (--runs.back().n == 0) {
-                runs.pop_back();
-            }
+        assert(!cells.empty());
+        if (cells.back() == llama_kv_pos_cell{ p, cell }) {
+            cells.pop_back();
             return;
         }
         stale = true;
     }
 
     void clear() {
-        runs.clear();
+        cells.clear();
         stale = false;
     }
 
     bool is_stale() const { return stale; }
 
-    // recompute from the positions its cells hold now, in any order: sorted, equal positions merged with their counts
-    void settle(std::vector<llama_pos> & positions) {
-        std::sort(positions.begin(), positions.end());
-        runs.clear();
-        for (const llama_pos p : positions) {
-            if (!runs.empty() && runs.back().pos == p) {
-                ++runs.back().n;
-            } else {
-                runs.push_back({ p, 1 });
-            }
-        }
+    // recompute from the (position, cell) pairs its cells hold now, in any order
+    void settle(std::vector<llama_kv_pos_cell> & now) {
+        std::sort(now.begin(), now.end());
+        cells.swap(now);
         stale = false;
     }
 
     bool empty() const {
         assert(!stale);
-        return runs.empty();
+        return cells.empty();
+    }
+
+    // how many cells carry this sequence
+    uint32_t size() const {
+        assert(!stale);
+        return (uint32_t) cells.size();
     }
 
     llama_pos min() const {
-        assert(!stale && !runs.empty() && runs.front().n > 0);
-        return runs.front().pos;
+        assert(!stale && !cells.empty());
+        return cells.front().first;
     }
 
     llama_pos max() const {
-        assert(!stale && !runs.empty() && runs.back().n > 0);
-        return runs.back().pos;
+        assert(!stale && !cells.empty());
+        return cells.back().first;
     }
 
-    const std::vector<llama_kv_pos_count> & entries() const {
+    // ordered access, the shape of a std::set of (position, cell) pairs
+    const_iterator begin() const { assert(!stale); return cells.begin(); }
+    const_iterator end()   const { assert(!stale); return cells.end(); }
+
+    const_iterator lower_bound(const llama_kv_pos_cell & e) const {
         assert(!stale);
-        return runs;
+        return std::lower_bound(cells.begin(), cells.end(), e);
+    }
+
+    const_iterator upper_bound(const llama_kv_pos_cell & e) const {
+        assert(!stale);
+        return std::upper_bound(cells.begin(), cells.end(), e);
+    }
+
+    const std::vector<llama_kv_pos_cell> & entries() const {
+        assert(!stale);
+        return cells;
     }
 
     void swap(llama_kv_seq_pos & other) noexcept {
-        runs.swap(other.runs);
+        cells.swap(other.cells);
         std::swap(stale, other.stale);
     }
 
 private:
-    std::vector<llama_kv_pos_count> runs;
+    std::vector<llama_kv_pos_cell> cells;
     bool stale = false;
 };
 

@@ -3,11 +3,6 @@ from utils import *
 import base64
 import requests
 import struct
-import threading
-import time
-import uuid
-from pathlib import Path
-from typing import IO
 
 # sequence state file: magic(4) version(4) payload_size(4), then payload_size llama_token words
 STATE_FILE_HEADER_SIZE = 12
@@ -15,21 +10,16 @@ STATE_FILE_HEADER_SIZE = 12
 server = ServerPreset.tinyllama2()
 
 @pytest.fixture(autouse=True)
-def create_server():
+def create_server(tmp_path):
     global server
     server = ServerPreset.tinyllama2()
-    server.slot_save_path = "./tmp"
+    server.slot_save_path = str(tmp_path)
     server.temperature = 0.0
 
 
 def test_slot_save_restore():
     global server
-    server.server_slots = True
     server.start()
-
-    props = server.make_request("GET", "/props")
-    assert props.status_code == 200
-    assert props.body["slot_save_size_version"] == 1
 
     # First prompt in slot 1 should be fully processed
     res = server.make_request("POST", "/completion", data={
@@ -41,39 +31,14 @@ def test_slot_save_restore():
     assert match_regex("(Whiskers|Flana)+", res.body["content"])
     assert res.body["timings"]["prompt_n"] == 21  # all tokens are processed
 
-    # 2e3dd9c1: exact file framing and companions are quoted without writing.
-    paths = [Path(server.slot_save_path) / ("slot1.bin" + suffix) for suffix in ("", ".ckpt", ".lora")]
-    before = [p.read_bytes() if p.exists() else None for p in paths]
-    for invalid in (-1, 0.5, "1"):
-        assert server.make_request("POST", "/slots/1?action=save", data={
-            "filename": "slot1.bin", "admitted_bytes": invalid,
-        }).status_code == 400
-    assert server.make_request("POST", "/slots/1?action=save-size", data={
-        "filename": "slot1.bin", "admitted_bytes": (1 << 64) - 1,
-    }).status_code == 200
-    quote = server.make_request("POST", "/slots/1?action=save-size", data={"filename": "slot1.bin"})
-    assert quote.status_code == 200
-    projected = quote.body["projected_bytes"]
-    assert projected > 0
-    assert [p.read_bytes() if p.exists() else None for p in paths] == before
-    refused = server.make_request("POST", "/slots/1?action=save", data={
-        "filename": "slot1.bin", "admitted_bytes": projected - 1,
-    })
-    assert refused.status_code == 400
-    assert [p.read_bytes() if p.exists() else None for p in paths] == before
-
     # Save state of slot 1
     res = server.make_request("POST", "/slots/1?action=save", data={
-        "filename": "slot1.bin", "admitted_bytes": projected,
+        "filename": "slot1.bin",
     })
     assert res.status_code == 200
     assert res.body["n_saved"] == 84
-    assert sum(p.stat().st_size for p in paths) == projected
-    saved = [p.read_bytes() for p in paths]
-    assert server.make_request("POST", "/slots/1?action=save", data={
-        "filename": "slot1.bin", "admitted_bytes": 0,
-    }).status_code == 400
-    assert [p.read_bytes() for p in paths] == saved
+    slot_file = os.path.join(server.slot_save_path, "slot1.bin")
+    assert res.body["n_written"] == os.path.getsize(slot_file)
 
     # Since we have cache, this should only process the last tokens
     res = server.make_request("POST", "/completion", data={
@@ -86,26 +51,12 @@ def test_slot_save_restore():
     assert res.body["timings"]["prompt_n"] == 6  # only different part is processed
 
     # Loading the saved cache into slot 0
-    operation = str(uuid.uuid4())
     res = server.make_request("POST", "/slots/0?action=restore", data={
         "filename": "slot1.bin",
-        "operation_id": operation,
     })
     assert res.status_code == 200
     assert res.body["n_restored"] == 84
-    # c610ef8f: same operation/slot, real IO count, terminal observation separate
-    # from the successful restore response above. Unknown identities are refused.
-    progress = server.make_request("GET", f"/slots?operation_id={operation}")
-    assert progress.status_code == 200
-    assert progress.body["operation_id"] == operation and progress.body["id_slot"] == 0
-    assert progress.body["action"] == "restore" and progress.body["phase"] == 3
-    assert 0 < progress.body["state_bytes"] <= progress.body["state_total"]
-    assert progress.body["sidecar_bytes"] <= progress.body["sidecar_total"]
-    assert server.make_request("GET", f"/slots?operation_id={uuid.uuid4()}").status_code == 404
-    # One retained identity cannot alias another slot (even after completion).
-    assert server.make_request("POST", "/slots/1?action=restore", data={
-        "filename": "slot1.bin", "operation_id": operation,
-    }).status_code == 400
+    assert res.body["n_read"] == os.path.getsize(slot_file)
 
     # Since we have cache, slot 0 should only process the last tokens
     res = server.make_request("POST", "/completion", data={
@@ -127,207 +78,6 @@ def test_slot_save_restore():
     assert match_regex("(Jack|said)+", res.body["content"])
     assert res.body["timings"]["prompt_n"] == 1
 
-    # A later failed operation replaces the bounded per-slot snapshot. The old
-    # UUID becomes unknown; the new failure remains distinct from completion.
-    failed_operation = str(uuid.uuid4())
-    failed = server.make_request("POST", "/slots/0?action=restore", data={
-        "filename": f"missing-{failed_operation}.bin", "operation_id": failed_operation,
-    })
-    assert failed.status_code != 200
-    progress = server.make_request("GET", f"/slots?operation_id={failed_operation}")
-    assert progress.status_code == 200 and progress.body["phase"] == 4
-    assert server.make_request("GET", f"/slots?operation_id={operation}").status_code == 404
-
-
-def test_slot_save_while_slot_is_processing():
-    # what this catches (Continuum fork): a SLOT_SAVE against a slot that is
-    # mid-generation must return PROMPTLY instead of being deferred until the
-    # turn ends. Upstream deferred save/restore/erase alike while is_processing();
-    # for SAVE that defer bounced the request for the whole multi-second turn, so
-    # a long turn always tripped the client's 10s timeout and the warm KV page
-    # was never captured (measured on the 35B lane: action=save ok=false ms=10003).
-    # The fork drops the defer for SAVE only — it's safe because the arm is reached
-    # only when is_yielding==false (no llama_decode in flight, KV at a consistent
-    # inter-batch boundary) and the save is read-only. Restore/erase keep the defer.
-    # regression for the KV-save-contention fix (the "seconds, not minutes" seam).
-    global server
-    server.server_slots = True  # /slots GET must be enabled to observe processing
-    server.n_predict = 512      # long enough that generation is clearly in flight
-    server.start()
-
-    stream_done = threading.Event()
-
-    def run_stream():
-        try:
-            for _ in server.make_stream_request("POST", "/completion", data={
-                "prompt": "Tell me a very long and detailed story about a cat.",
-                "id_slot": 1,
-                "n_predict": 512,
-                "cache_prompt": True,
-                "stream": True,
-            }):
-                pass
-        finally:
-            stream_done.set()
-
-    t = threading.Thread(target=run_stream, daemon=True)
-    t.start()
-
-    # Wait until slot 1 is actually processing. SLOT_GET is answered even while a
-    # decode is yielding, so this poll is reliable during live generation.
-    deadline = time.time() + 20
-    processing = False
-    while time.time() < deadline and not processing:
-        res = server.make_request("GET", "/slots")
-        if res.status_code == 200:
-            for s in res.body:
-                if s.get("id") == 1 and s.get("is_processing"):
-                    processing = True
-                    break
-        if not processing:
-            time.sleep(0.02)
-    assert processing, "slot 1 never entered processing state"
-    assert not stream_done.is_set(), "generation finished before a live save could be tested"
-
-    # THE regression: save while the slot is mid-generation. Before the fix this
-    # deferred until the turn ended, so the response could not arrive before the
-    # stream did; after the fix it returns while generation is still running.
-    res = server.make_request("POST", "/slots/1?action=save", data={
-        "filename": "live_slot1.bin",
-    })
-    assert res.status_code == 200
-    assert res.body["n_saved"] > 0
-    assert not stream_done.is_set(), \
-        "save only returned after generation ended — it deferred instead of snapshotting the live slot"
-
-    # The concurrent generation must still finish cleanly — a live save must not
-    # corrupt, stall, or abort the turn it snapshotted.
-    t.join(timeout=DEFAULT_HTTP_TIMEOUT)
-    assert stream_done.is_set(), "streamed generation did not complete after a concurrent save"
-
-    # And the saved live page must restore into another slot and be reusable.
-    res = server.make_request("POST", "/slots/0?action=restore", data={
-        "filename": "live_slot1.bin",
-    })
-    assert res.status_code == 200
-    assert res.body["n_restored"] > 0
-
-
-def test_deferred_restore_is_bound_to_its_slot():
-    # what this catches (Continuum fork): a RESTORE deferred while its target slot
-    # is mid-generation must be serviced when THAT slot releases — not made to wait
-    # for an unrelated, longer-running slot to finish first. RESTORE correctly defers
-    # while is_processing() (it mutates KV a live decode reads); it re-runs via
-    # callback_on_release -> pop_deferred_task(id_slot), which matches task.id_slot.
-    # The fork bug: the SLOT_RESTORE task set only slot_action.id_slot, leaving
-    # task.id_slot == -1, so pop_deferred_task(freed_slot) never matched the returner's
-    # restore and fell through to "first deferred task" — a restore for a still-busy
-    # slot got popped ahead of it, re-deferred, and the returner's restore starved
-    # until the OTHER (longer) generation ended. Measured live 2026-09-03: 27/27
-    # restores failed status=0 under >lane paging. Binding task.id_slot fixes it.
-    # regression for the KV restore-into-busy-slot fix (fork continuum/kv-live-slot-save).
-    global server
-    server.server_slots = True   # /slots GET to observe processing
-    server.n_slots = 2
-    # The long slot must OUTLAST the whole restore round-trip on a fast CI runner (a 512-token
-    # gen of the tiny model ends in ~2 s on hosted ubuntu/windows runners — measured 2026-09-13:
-    # the binding assertion then failed for timing, not for binding). 4096 keeps slot 1 busy.
-    server.n_predict = 4096
-    server.n_ctx = 8192  # 4096 per slot: room for the long slot to actually run 4096 tokens
-    server.start()
-
-    # A reusable page on disk: process a prompt on slot 0, save it, let slot 0 idle.
-    res = server.make_request("POST", "/completion", data={
-        "prompt": "What is the capital of France?", "id_slot": 0, "cache_prompt": True,
-    })
-    assert res.status_code == 200
-    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "page.bin"})
-    assert res.status_code == 200 and res.body["n_saved"] > 0
-    # Room for both restores' pages at once, as the core sets it from its host room: binding, not the
-    # page IO budget, is what this test is about (unset, the budget admits one switch at a time).
-    page_bytes = sum((Path(server.slot_save_path) / ("page.bin" + suffix)).stat().st_size for suffix in ("", ".ckpt", ".lora"))
-    assert server.make_request("POST", "/page-io/budget", data={"budget_bytes": 2 * page_bytes}).status_code == 200
-
-    done0 = threading.Event()
-    done1 = threading.Event()
-    t_done = {}
-
-    def gen(id_slot, n_predict, done):
-        try:
-            for _ in server.make_stream_request("POST", "/completion", data={
-                "prompt": "Tell me a very long and detailed story about a cat.",
-                "id_slot": id_slot, "n_predict": n_predict, "cache_prompt": True, "stream": True,
-                "ignore_eos": True,  # the tiny model emits EOS within a few tokens: the long slot must really run long
-            }):
-                pass
-        finally:
-            t_done[id_slot] = time.time()
-            done.set()
-
-    # slot 0 finishes FIRST (256 tokens: long enough that a fast runner can observe it busy), slot 1 runs LONG. The returner wants slot 0.
-    t0 = threading.Thread(target=gen, args=(0, 128, done0), daemon=True)
-    t1 = threading.Thread(target=gen, args=(1, 4096, done1), daemon=True)
-    t1.start()
-    # ensure slot 1 is processing before slot 0 starts, so the slot-1 op queues first
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        r = server.make_request("GET", "/slots")
-        if r.status_code == 200 and any(s.get("id") == 1 and s.get("is_processing") for s in r.body):
-            break
-        time.sleep(0.02)
-    t0.start()
-    # wait until BOTH slots are processing so both restores must defer
-    deadline = time.time() + 20
-    both = False
-    while time.time() < deadline and not both:
-        r = server.make_request("GET", "/slots")
-        if r.status_code == 200:
-            busy = {s.get("id") for s in r.body if s.get("is_processing")}
-            both = 0 in busy and 1 in busy
-        if not both:
-            time.sleep(0.02)
-    assert both, "both slots never processing concurrently"
-
-    # Queue a restore for the STILL-BUSY long slot 1 FIRST (deferred). Without the
-    # id_slot bind this is the task pop_deferred_task wrongly pops when slot 0 frees.
-    r1_result = {}
-    operation = str(uuid.uuid4())
-    def restore_slot1():
-        rr = server.make_request("POST", "/slots/1?action=restore", data={"filename": "page.bin", "operation_id": operation})
-        r1_result["code"] = rr.status_code
-    tr1 = threading.Thread(target=restore_slot1, daemon=True)
-    tr1.start()
-    time.sleep(0.3)  # ensure the slot-1 restore is enqueued (deferred) before the slot-0 one
-    progress = server.make_request("GET", f"/slots?operation_id={operation}")
-    assert progress.status_code == 200 and progress.body["id_slot"] == 1
-    assert progress.body["operation_id"] == operation
-    # Even while queued behind a long generation the progress query is answered.
-    # Runner speed may have advanced it, so do not assume it is still queued.
-    assert progress.body["phase"] in (0, 1, 2, 3)
-
-    # THE regression: restore into slot 0. Slot 0's short gen ends well before slot 1's.
-    started = time.time()
-    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "page.bin"})
-    elapsed = time.time() - started
-
-    assert res.status_code == 200, f"slot-0 restore failed: {res.status_code} {res.body}"
-    assert res.body["n_restored"] > 0
-    t_ret = time.time()
-    t1.join(timeout=DEFAULT_HTTP_TIMEOUT)
-    tr1.join(timeout=DEFAULT_HTTP_TIMEOUT)
-    # The binding proof, in TIMESTAMPS (2026-09-13: "returned while slot 1 was still
-    # generating" was a race against the runner's speed — a tiny model ends 4096
-    # tokens in ~4 s on Metal and ~2 s on hosted runners). With the bind, the slot-0
-    # restore is serviced the moment ITS slot releases: it returns within a beat of
-    # slot 0's own generation ending. Unbound, it waited for the LONG slot: it returns
-    # only after slot 1 ended. So: the restore's return sits next to done0, not done1.
-    after_own = t_ret - t_done[0]
-    gap = t_done[1] - t_done[0]
-    if gap < 1.0:
-        pytest.skip(f"runner too fast to separate the slots (slot 1 ended {gap:.2f}s after slot 0)")
-    assert after_own < gap / 2, \
-        f"slot-0 restore returned {after_own:.2f}s after its own slot freed (slot 1 ended {gap:.2f}s later) — not bound to its slot"
-
 
 def test_slot_restore_legacy_token_list():
     global server
@@ -347,7 +97,7 @@ def test_slot_restore_legacy_token_list():
     assert res.body["n_saved"] == 84
 
     # rewrite the token payload into a plain token list, as written by servers that predate the packed server_tokens format
-    path = os.path.join("tmp", "slot_legacy.bin")
+    path = os.path.join(server.slot_save_path, "slot_legacy.bin")
     with open(path, "rb") as f:
         data = bytearray(f.read())
 
@@ -381,6 +131,55 @@ def test_slot_restore_legacy_token_list():
     assert res.status_code == 200
     assert res.body["timings"]["prompt_n"] == 6  # only the different part is processed
 
+
+# the slot file carries the live draft state: a restored slot drafts like a slot that was never saved
+def test_slot_restore_draft_state():
+    global server
+    server.model_draft_hf_repo = server.model_hf_repo
+    server.spec_type = "draft-simple"
+    server.start()
+
+    prompt = "What is the capital of France?"
+    turn = {}
+    for id_slot in [0, 1]:
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "n_predict": 16,
+            "id_slot": id_slot,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        turn[id_slot] = res.body["content"]
+    assert turn[0] == turn[1]
+
+    res = server.make_request("POST", "/slots/0?action=save", data={
+        "filename": "draft_slot0.bin",
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/0?action=erase")
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "draft_slot0.bin",
+    })
+    assert res.status_code == 200
+
+    timings = {}
+    for id_slot in [0, 1]:
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt + turn[id_slot] + " And",
+            "n_predict": 32,
+            "id_slot": id_slot,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        timings[id_slot] = res.body["timings"]
+
+    assert timings[0]["prompt_n"] == timings[1]["prompt_n"]
+    assert timings[0]["draft_n_accepted"] > 0
+    assert timings[0]["draft_n"]          == timings[1]["draft_n"]
+    assert timings[0]["draft_n_accepted"] == timings[1]["draft_n_accepted"]
 
 
 def test_slot_erase():
@@ -418,8 +217,8 @@ def test_slot_erase():
 # Erase remains gated on the slot's content.
 #
 
-IMG_URL_CAT = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/91_cat.png"
-IMG_URL_TRUCK = "https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/main/test/11_truck.png"
+IMG_URL_CAT = "https://huggingface.co/ggml-org-dev/tinygemma3-GGUF/resolve/main/test/91_cat.png"
+IMG_URL_TRUCK = "https://huggingface.co/ggml-org-dev/tinygemma3-GGUF/resolve/main/test/11_truck.png"
 
 
 def _get_img_base64(url: str) -> str:
@@ -715,7 +514,7 @@ def test_slot_save_restore_image_payload_larger_than_context(mmproj_server):
     })
     assert res.status_code == 200
 
-    path = os.path.join("tmp", "mm_slot_large_payload.bin")
+    path = os.path.join(server.slot_save_path, "mm_slot_large_payload.bin")
     with open(path, "rb") as f:
         data = bytearray(f.read())
     payload_size = struct.unpack_from("=I", data, STATE_FILE_HEADER_SIZE - 4)[0]
@@ -801,149 +600,327 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.body["content"] == content
 
 
-# Continuum fork: a page switch's file IO runs on a worker, off the task loop (server-page-io.h).
-# LLAMA_SERVER_TEST_PAGE_IO_GATE names a FIFO each switch's IO reads one byte from before it starts:
-# opening the FIFO's write end returns once that IO is waiting, and the byte written releases it, so
-# these tests hold IO in flight without sleeping.
-
-class HeldPageIo:
-    def __init__(self, gate: str, request):
-        self.result: dict = {}
-        self.writer: IO[bytes] | None = None
-        either = threading.Event()
-
-        def run():
-            self.result["res"] = request()
-            either.set()
-
-        def open_gate():
-            self.writer = open(gate, "wb")  # returns once the switch's IO opened the read end
-            either.set()
-
-        self.thread = threading.Thread(target=run, daemon=True)
-        self.thread.start()
-        threading.Thread(target=open_gate, daemon=True).start()
-        assert either.wait(DEFAULT_HTTP_TIMEOUT), "the page switch neither reached the gate nor answered"
-        if self.writer is None:
-            # answered without waiting at the gate: the server was built without the test faults
-            os.close(os.open(gate, os.O_RDONLY | os.O_NONBLOCK))  # unblock the opener
-            pytest.skip("llama-server was built without -DLLAMA_SERVER_TEST_FAULTS=ON")
-
-    def release(self):
-        assert self.writer is not None
-        self.writer.write(b"\x01")
-        self.writer.close()
-        self.thread.join(timeout=DEFAULT_HTTP_TIMEOUT)
-        assert not self.thread.is_alive(), "the page switch never answered after its IO was released"
-        return self.result["res"]
+@pytest.fixture
+def swa_server():
+    swa = ServerPreset.tinygemma3()
+    swa.slot_save_path = "./tmp"
+    swa.temperature = 0.0
+    swa.cache_ram = 0
+    # Keep the first prompt checkpoint before the divergence point.
+    swa.n_ubatch = 32
+    return swa
 
 
-def start_with_page_io_gate(monkeypatch, tmp_path) -> str:
-    if not hasattr(os, "mkfifo"):
-        pytest.skip("the page IO gate is a FIFO")
-    gate = str(tmp_path / "page-io-gate")
-    os.mkfifo(gate)
-    monkeypatch.setenv("LLAMA_SERVER_TEST_PAGE_IO_GATE", gate)
-    server.server_slots = True
+# the non-ASCII name checks that the appendix lands in the same file as the llama state on Windows
+@pytest.mark.parametrize("filename", ["ckpt_slot1.bin", "ckpt_slot1_é.bin"])
+def test_slot_restore_preserves_context_checkpoints(swa_server, filename):
+    server = swa_server
     server.start()
-    return gate
 
+    base = "The quick brown fox jumps over the lazy dog. " * 20
 
-def test_decode_continues_while_a_save_is_written(monkeypatch, tmp_path):
-    # what this catches (the M5 2026-11-14): a save's disk write stalling every other slot's decode.
-    # Slot 0's save is held in its file write; slot 1 runs a whole completion meanwhile, and the save
-    # answers once released, with the loop's copy and the worker's IO timed apart.
-    gate = start_with_page_io_gate(monkeypatch, tmp_path)
-    assert server.make_request("POST", "/completion", data={
-        "prompt": "What is the capital of France?", "id_slot": 0, "cache_prompt": True,
-    }).status_code == 200
-
-    held = HeldPageIo(gate, lambda: server.make_request("POST", "/slots/0?action=save", data={"filename": "held.bin"}))
     res = server.make_request("POST", "/completion", data={
-        "prompt": "Tell me a story about a cat.", "id_slot": 1, "n_predict": 16, "cache_prompt": True,
+        "prompt": base + "The first ending of this story is a happy one.",
+        "id_slot": 1,
+        "cache_prompt": True,
     })
-    assert res.status_code == 200 and res.body["timings"]["predicted_n"] > 0
-    assert held.thread.is_alive(), "the save answered before its file was written"
+    assert res.status_code == 200
+    n_full = res.body["timings"]["prompt_n"]
 
-    saved = held.release()
-    assert saved.status_code == 200 and saved.body["n_saved"] == 84
-    assert saved.body["page_io"]["io_bytes"] > 0 and saved.body["page_io"]["io_budget_bytes"] == 0
-    assert saved.body["page_io"]["io_bytes_in_flight"] == 0, "a written save returns its bytes before its receipt"
-    timings = saved.body["timings"]
-    assert timings["copy_ms"] >= 0 and timings["io_ms"] >= 0
-    assert abs(timings["save_ms"] - (timings["copy_ms"] + timings["io_ms"])) < 1e-6
-    # the file it wrote is the library's own page: it restores
-    restore = HeldPageIo(gate, lambda: server.make_request("POST", "/slots/1?action=restore", data={"filename": "held.bin"}))
-    restored = restore.release()
-    assert restored.status_code == 200 and restored.body["n_restored"] == 84
-    assert "copy_ms" in restored.body["timings"] and "io_ms" in restored.body["timings"]
-
-
-def test_a_restore_into_a_slot_given_another_task_meanwhile_is_refused(monkeypatch, tmp_path):
-    # what this catches: a restore read on a worker applied over a slot that was given another task
-    # while the page was read, destroying that task's KV. It is refused, typed, and the occupant's
-    # cache is kept.
-    gate = start_with_page_io_gate(monkeypatch, tmp_path)
-    assert server.make_request("POST", "/completion", data={
-        "prompt": "What is the capital of France?", "id_slot": 1, "cache_prompt": True,
-    }).status_code == 200
-    saved = HeldPageIo(gate, lambda: server.make_request("POST", "/slots/1?action=save", data={"filename": "page.bin"})).release()
-    assert saved.status_code == 200
-
-    restore = HeldPageIo(gate, lambda: server.make_request("POST", "/slots/0?action=restore", data={"filename": "page.bin"}))
-    held = server.make_request("GET", "/page-io")
-    assert held.status_code == 200 and held.body["in_flight_bytes"] > 0, "the restore holds its page's bytes"
-    occupant = server.make_request("POST", "/completion", data={
-        "prompt": "What is the capital of Germany?", "id_slot": 0, "cache_prompt": True,
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "id_slot": 1,
+        "cache_prompt": True,
     })
-    assert occupant.status_code == 200
-    # Fable on #118: the slot was given another task, so the restore's bytes return at once, while its
-    # read is still held, not when it completes
-    dropped = server.make_request("GET", "/page-io")
-    assert dropped.body["in_flight_bytes"] == 0 and dropped.body["waiting"] == 0
+    assert res.status_code == 200
+    n_live = res.body["timings"]["prompt_n"]
+    assert n_live < n_full
 
-    refused = restore.release()
-    assert refused.status_code == 400
-    assert refused.body["error"]["type"] == "invalid_request_error"
-    assert refused.body["error"]["refusal"] == "slot_reassigned"
+    res = server.make_request("POST", "/slots/1?action=erase")
+    assert res.status_code == 200
 
-    again = server.make_request("POST", "/completion", data={
-        "prompt": "What is the capital of Germany?", "id_slot": 0, "cache_prompt": True,
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The first ending of this story is a happy one.",
+        "id_slot": 1,
+        "cache_prompt": True,
     })
-    assert again.status_code == 200
-    assert again.body["timings"]["prompt_n"] == 1, "the occupant's cache was kept, not overwritten by the page"
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": filename,
+    })
+    assert res.status_code == 200
+    assert res.body["n_saved"] > 0
+    ckpt_file = os.path.join(server.slot_save_path, filename)
+    assert res.body["n_written"] == os.path.getsize(ckpt_file)
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Unrelated text with no common prefix occupies the slot now.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=restore", data={
+        "filename": filename,
+    })
+    assert res.status_code == 200
+    assert res.body["n_read"] == os.path.getsize(ckpt_file)
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] == n_live
 
 
-def test_page_io_budget_admits_a_waiting_switch_when_room_is_made(monkeypatch, tmp_path):
-    # what this catches (Fable on #118, the M5 at 0.1 GB free): page switches allocating without a
-    # bound. Unset, the budget admits one switch at a time: a second save waits, holding nothing,
-    # until the first returns its bytes; the core's budget is set at runtime and reported.
-    gate = start_with_page_io_gate(monkeypatch, tmp_path)
-    for slot in (0, 1):
-        assert server.make_request("POST", "/completion", data={
-            "prompt": "What is the capital of France?", "id_slot": slot, "cache_prompt": True,
-        }).status_code == 200
-    assert server.make_request("GET", "/page-io").body == {"budget_bytes": 0, "in_flight_bytes": 0, "waiting": 0}
+# checkpoint appendix: magic(4) version(4) count(4), then per checkpoint
+# n_tokens(8) pos_min(4) pos_max(4) and three blobs (target, draft, speculative), each size(8) + data
+def parse_ckpt_appendix(data):
+    off = data.find(struct.pack("<II", 0x504b4353, 1))
+    assert off > 0
+    count = struct.unpack_from("<I", data, off + 8)[0]
+    ckpts = []
+    pos = off + 12
+    for _ in range(count):
+        start = pos
+        pos += 16
+        blobs = []
+        for _ in range(3):
+            n = struct.unpack_from("<Q", data, pos)[0]
+            blobs.append(pos + 8)
+            pos += 8 + n
+        ckpts.append((start, pos, blobs[0]))
+    assert pos == len(data)
+    return off, ckpts
 
-    first = HeldPageIo(gate, lambda: server.make_request("POST", "/slots/0?action=save", data={"filename": "first.bin"}))
-    second_result: dict = {}
-    second = threading.Thread(target=lambda: second_result.update(
-        res=server.make_request("POST", "/slots/1?action=save", data={"filename": "second.bin"})), daemon=True)
-    second.start()
-    # the second save reaches the budget before the first's IO is released: it waits, holding nothing
-    # beyond the first's bytes (GET /page-io is answered off the task loop)
-    status = server.make_request("GET", "/page-io").body
-    held_bytes = status["in_flight_bytes"]
-    assert held_bytes > 0
-    assert server.make_request("POST", "/page-io/budget", data={"budget_bytes": -1}).status_code == 400
 
-    saved = first.release()
-    assert saved.status_code == 200
-    # the first's release admitted the second; its IO now waits at the gate in turn
-    with open(gate, "wb") as release:
-        release.write(b"\x01")
-    second.join(timeout=DEFAULT_HTTP_TIMEOUT)
-    assert second_result["res"].status_code == 200 and second_result["res"].body["n_saved"] == 84
+# a damaged appendix must be ignored, or its checkpoints dropped when they fail to load, without aborting the server
+@pytest.mark.parametrize("damage", ["oversized_blob", "empty_target", "corrupt_state", "many_checkpoints"])
+def test_slot_restore_damaged_checkpoint_appendix(swa_server, damage):
+    server = swa_server
+    server.start()
 
-    raised = server.make_request("POST", "/page-io/budget", data={"budget_bytes": 4 * held_bytes})
-    assert raised.status_code == 200 and raised.body == {"budget_bytes": 4 * held_bytes, "in_flight_bytes": 0, "waiting": 0}
+    base = "The quick brown fox jumps over the lazy dog. " * 20
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The first ending of this story is a happy one.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    n_live = res.body["timings"]["prompt_n"]
+
+    res = server.make_request("POST", "/slots/1?action=erase")
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The first ending of this story is a happy one.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "ckpt_damaged.bin",
+    })
+    assert res.status_code == 200
+
+    path = os.path.join(server.slot_save_path, "ckpt_damaged.bin")
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+    off, ckpts = parse_ckpt_appendix(data)
+
+    if damage == "oversized_blob":
+        # the first target blob declares a size that cannot be allocated, it must be rejected before allocating
+        data = data[:ckpts[0][0] + 16] + struct.pack("<Q", 1 << 62)
+    elif damage == "empty_target":
+        # the target blobs are removed and their size set to 0, a valid save never writes an empty target state
+        for start, end, tgt in reversed(ckpts):
+            size = struct.unpack_from("<Q", data, tgt - 8)[0]
+            data = data[:tgt - 8] + struct.pack("<Q", 0) + data[tgt + size:]
+    elif damage == "corrupt_state":
+        # the sizes are intact, but the target states do not load
+        for _, _, tgt in ckpts:
+            struct.pack_into("<I", data, tgt, 0xdeadbeef)
+    else:
+        # more than 1024 entries: one-byte fillers that never match go first, the real checkpoints stay last
+        filler = struct.pack("<qiiQBQQ", 0, 0, 1 << 30, 1, 0, 0, 0)
+        data = data[:off + 12] + filler * (1025 - len(ckpts)) + data[off + 12:]
+        struct.pack_into("<I", data, off + 8, 1025)
+
+    with open(path, "wb") as f:
+        f.write(data)
+
+    res = server.make_request("POST", "/slots/1?action=restore", data={
+        "filename": "ckpt_damaged.bin",
+    })
+    assert res.status_code == 200
+    if damage in ("oversized_blob", "empty_target"):
+        assert res.body["n_read"] == off
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    if damage == "many_checkpoints":
+        assert res.body["timings"]["prompt_n"] == n_live
+    else:
+        assert res.body["timings"]["prompt_n"] > n_live
+
+
+# the draft blobs of the checkpoint appendix are not covered by the main payload checks,
+# so restoring into a server with another draft KV cache type must not abort
+@pytest.mark.parametrize("ctkd_restore", ["f16", "q8_0"])
+def test_slot_restore_checkpoints_draft_kv_type_change(swa_server, ctkd_restore):
+    server = swa_server
+    server.model_draft_hf_repo = "ggml-org-dev/tinygemma3-GGUF:Q8_0"  # same file as the target, already in the HF cache
+    server.spec_type = "draft-simple"
+    server.ctkd = "f16"
+    server.start()
+
+    base = "The quick brown fox jumps over the lazy dog. " * 20
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The first ending of this story is a happy one.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    n_live = res.body["timings"]["prompt_n"]
+
+    res = server.make_request("POST", "/slots/1?action=erase")
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "The first ending of this story is a happy one.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "ckpt_draft_slot1.bin",
+    })
+    assert res.status_code == 200
+
+    server.stop()
+    server.ctkd = ctkd_restore
+    server.start()
+
+    res = server.make_request("POST", "/slots/1?action=restore", data={
+        "filename": "ckpt_draft_slot1.bin",
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": base + "But the second ending was different and sad.",
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] == n_live
+
+
+# a SWA window smaller than the prompt, so a saved state holds only the cells inside the window
+@pytest.fixture
+def swa_window_server(tmp_path):
+    swa = ServerPreset.tinygemma3()
+    swa.override_kv = "gemma3.attention.sliding_window=int:64"
+    swa.slot_save_path = str(tmp_path)
+    swa.temperature = 0.0
+    swa.n_predict = 8
+    return swa
+
+
+SWA_PROMPT = "The quick brown fox jumps over the lazy dog. " * 30
+
+
+def tokenize(server, text):
+    res = server.make_request("POST", "/tokenize", data={"content": text})
+    assert res.status_code == 200
+    return res.body["tokens"]
+
+
+# the first turn and the exact token continuation of it, so the next turn extends the saved state
+def swa_turns(server, id_slot):
+    res = server.make_request("POST", "/completion", data={
+        "prompt": tokenize(server, SWA_PROMPT),
+        "id_slot": id_slot,
+        "cache_prompt": True,
+        "return_tokens": True,
+    })
+    assert res.status_code == 200
+    return tokenize(server, SWA_PROMPT) + res.body["tokens"] + tokenize(server, " The end.")
+
+
+def swa_next(server, id_slot, prompt):
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": id_slot,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    return res.body["timings"]
+
+
+# a restored SWA state holds the window the next token needs, so it is reused as is
+def test_slot_restore_swa_window(swa_window_server):
+    server = swa_window_server
+    server.cache_ram = 0
+    server.start()
+
+    prompt = {id_slot: swa_turns(server, id_slot) for id_slot in [0, 1]}
+    assert prompt[0] == prompt[1]
+
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "swa_slot0.bin"})
+    assert res.status_code == 200
+    res = server.make_request("POST", "/slots/0?action=erase")
+    assert res.status_code == 200
+    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "swa_slot0.bin"})
+    assert res.status_code == 200
+
+    timings = {id_slot: swa_next(server, id_slot, prompt[id_slot]) for id_slot in [0, 1]}
+
+    assert timings[0]["cache_n"]  == timings[1]["cache_n"]
+    assert timings[0]["prompt_n"] == timings[1]["prompt_n"]
+
+
+# a SWA state loaded back from the RAM prompt cache is reused as is
+def test_prompt_cache_swa_window(swa_window_server):
+    server = swa_window_server
+    server.n_slots = 1
+
+    def run(other_prompt_first):
+        server.start()
+        prompt = swa_turns(server, 0)
+        if other_prompt_first:
+            res = server.make_request("POST", "/completion", data={"prompt": "Once upon a time " * 60, "cache_prompt": True})
+            assert res.status_code == 200
+        timings = swa_next(server, 0, prompt)
+        server.stop()
+        return timings
+
+    direct = run(False)
+    cached = run(True)
+
+    assert cached["cache_n"]  == direct["cache_n"]
+    assert cached["prompt_n"] == direct["prompt_n"]

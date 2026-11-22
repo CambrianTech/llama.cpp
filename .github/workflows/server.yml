@@ -43,6 +43,10 @@ on:
       'tools/server/**.*'
     ]
 
+cache-mode: none
+permissions:
+  contents: read
+
 env:
   LLAMA_ARG_LOG_COLORS: 1
   LLAMA_ARG_LOG_PREFIX: 1
@@ -55,7 +59,7 @@ concurrency:
 
 jobs:
   ubuntu:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
 
     steps:
       - name: Dependencies
@@ -80,11 +84,19 @@ jobs:
           ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: server-ubuntu-24.04-arm
-          evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          restore: false
+          save: false
+
+      - name: ccache-buckets-restore
+        uses: ./.github/actions/ccache-buckets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
+        with:
+          key: server-ubuntu-26.04-arm
+          folder: llama.cpp
+          hf_bucket: ggml-org/cache
 
       - name: Build
         id: cmake_build
@@ -118,6 +130,18 @@ jobs:
             sleep 1
           done
           python3 tools/server/tests/dream-adapter-routes.py http://127.0.0.1:58199 "$fixture/train"
+
+      - name: ccache-buckets-save
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        uses: ./.github/actions/ccache-buckets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
+        with:
+          key: server-ubuntu-26.04-arm
+          folder: llama.cpp
+          evict-old-files: 1d
+          hf_bucket: ggml-org/cache
+          save: true
 
       - name: Python setup
         id: setup_python
@@ -154,18 +178,13 @@ jobs:
           export LLAMA_ARG_BACKEND_SAMPLING=1
           SLOW_TESTS=1 ./tests.sh
 
-      - name: ccache-clear
-        uses: ./.github/actions/ccache-clear
-        env:
-          GH_TOKEN: ${{ github.token }}
-        with:
-          key: server-ubuntu-24.04-arm
-          older: 5m
-          min: 1
-          dry-run: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
-
   windows:
     runs-on: windows-2022
+
+    cache-mode: write
+    permissions:
+      actions: write
+      contents: read
 
     steps:
       - name: Clone
@@ -176,11 +195,16 @@ jobs:
           ref: ${{ github.event.inputs.sha || github.event.pull_request.head.sha || github.sha || github.head_ref || github.ref_name }}
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ggml-org/ccache-action@v1.2.24
         with:
           key: server-windows-2022-x64
           evict-old-files: 1d
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Install LLVM
+        run: |
+          choco install llvm --version=22.1.8
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
       - name: Build
         id: cmake_build
