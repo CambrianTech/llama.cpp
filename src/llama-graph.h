@@ -878,16 +878,6 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
 
-    // Continuum: THE SHADOW, the attached adapter being trained (llama_opt_init), the layer that switches on
-    // and off. It applies only to the ubatch's labelled rows (n_shadow_rows of them); a ubatch with no label
-    // never applies it, so serving is the stable set's graph
-    const llama_adapter_lora     * shadow;
-    uint32_t                       n_shadow_rows;
-
-    // Continuum: the physical attention stream of each of the ubatch's unique sequences (seq_id_unq order): the
-    // graph's K/V views are built at these streams, so a graph is reused only when they match
-    std::vector<uint32_t> streams = {};
-
     ggml_tensor * layer_inp_dev = nullptr; // own layer input device buffer (write)
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
     ggml_tensor * h_nextn_dev   = nullptr; // own h_nextn device buffer (write)
@@ -915,6 +905,15 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    // Continuum (set after upstream's initializer, in llama_context::graph_params): THE SHADOW, the attached adapter
+    // being trained (llama_opt_init), the layer that switches on and off. It applies only to the ubatch's labelled
+    // rows (n_shadow_rows of them); a ubatch with no label never applies it, so serving is the stable set's graph
+    const llama_adapter_lora * shadow = nullptr;
+    uint32_t                   n_shadow_rows = 0;
+    // the physical attention stream of each of the ubatch's unique sequences (seq_id_unq order): the graph's K/V
+    // views are built at these streams, so a graph is reused only when they match
+    std::vector<uint32_t> streams = {};
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases

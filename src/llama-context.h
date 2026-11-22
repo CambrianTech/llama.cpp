@@ -297,7 +297,8 @@ struct llama_context {
         std::vector<int32_t> graph_targets;
         std::vector<float> graph_weights;
         ggml_backend_sched_ptr serving_sched;
-        llm_graph_result_ptr serving_graph;
+        std::array<llm_graph_result_ptr, 2> serving_graph; // both of the serving context's result slots
+        llm_graph_result * graph_result = nullptr; // the result slot the retained learning graph was built in
         llm_graph_result_ptr serving_reserve;
         bool drain_graph = false;
         bool restoring = false;
@@ -332,7 +333,7 @@ struct llama_context {
             ggml_opt_result_t                result,
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
-            llama_batch_ext                & batch,
+            llama_batch                    & batch,
             ggml_opt_epoch_callback          callback,
             bool                             train,
             int64_t                          idata_in_loop,
@@ -571,7 +572,8 @@ private:
     bool opt_beside_graph() const;
     bool labels_refused(const char * who) const;
     bool opt_host_outputs() const;
-    bool opt_retains_graph(llama_memory_context_ptr & mctx);
+    bool opt_retains_graph(llama_memory_context_ptr & mctx, const llm_graph_result * res);
+    void opt_reset_graph_results(size_t max_nodes);
     bool opt_refuses_ubatch(const llama_ubatch & ubatch, ggml_status & ret);
     bool opt_mark_training(const llama_ubatch & ubatch);
     llm_graph_result * opt_train_ubatch(llm_graph_result * res, ggml_cgraph * gf, const llama_ubatch & ubatch, ggml_status & ret);

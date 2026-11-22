@@ -136,11 +136,12 @@ bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory
         uint32_t window;
         const llama_adapter_lora * shadow;
         ggml_backend_sched_ptr scheduler;
-        llm_graph_result_ptr graph;
+        std::array<llm_graph_result_ptr, 2> graph; // both result slots
         std::unordered_map<ggml_tensor *, int32_t> flags;
         ~restore_measurement() {
             ctx.sched = std::move(scheduler);
             ctx.gf_res_prev = std::move(graph);
+            ctx.gf_res_prev_active = nullptr;
             ctx.cparams = cparams;
             ctx.opt_params_base = opt_params;
             ctx.opt_n_ctx_train = window;
@@ -166,13 +167,13 @@ bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory
     opt_n_ctx_train = n_ctx();
     cparams.training = true;
     cparams.fa_back_native = opt_fa_back_native();
-    size_t max_nodes = graph_max_nodes(n_ubatch());
+    size_t max_nodes = graph_max_nodes();
     if (cparams.flash_attn && !cparams.fa_back_native) {
         max_nodes += (size_t) model.hparams.n_layer() * ggml_flash_attn_ext_back_n_nodes(opt_n_ctx_train, 0);
     }
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                 max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
+    opt_reset_graph_results(max_nodes);
     opt_params_base = opt_params_for(params);
     return opt_measure_memory(callback, user_data, phase, held_scheduler, reply_rows);
 }
@@ -256,11 +257,11 @@ bool llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     // count grows with the window (decided first: it sizes the graph)
     cparams.fa_back_native = opt_fa_back_native();
     {
-        size_t max_nodes = graph_max_nodes(n_ubatch);
+        size_t max_nodes = graph_max_nodes();
         if (cparams.flash_attn && !cparams.fa_back_native) {
             max_nodes += (size_t) model->hparams.n_layer() * ggml_flash_attn_ext_back_n_nodes(opt_n_ctx_train, 0);
         }
-        gf_res_prev.reset(new llm_graph_result(max_nodes));
+        opt_reset_graph_results(max_nodes);
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                     max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     }
@@ -1135,9 +1136,9 @@ bool llama_context::opt_prepare_restore(const llama_batch & retained) {
         return false;
     }
     llama_batch_allocr retained_batches(model.hparams.n_pos_per_embd());
-    const uint32_t max_seq = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
     // Retained positions are historical; do not infer new positions or change current cache custody.
-    if (!retained_batches.init(retained, model.vocab, nullptr, model.hparams.n_embd_inp(), max_seq, false) ||
+    llama_batch_compat retained_ext(this, retained); // upstream's allocator reads llama_batch_ext; labels ride along
+    if (!retained_batches.init(*retained_ext.batch_ext, model.vocab, false) ||
         retained_batches.get_n_labels() == 0) {
         opt_fail("restore preparation refused invalid or unlabelled retained experience");
         return false;
@@ -1167,7 +1168,7 @@ bool llama_context::opt_prepare_restore(const llama_batch & retained) {
     const bool was_training = cparams.training;
     const bool was_walk = cparams.walk_active;
     const auto prior_outputs = n_outputs;
-    auto * res = gf_res_prev.get();
+    auto * res = get_gf_res_prev();
     const auto release_graph = [&]() {
         cparams.training = was_training;
         cparams.walk_active = was_walk;
@@ -1316,11 +1317,12 @@ bool llama_context::opt_host_outputs() const {
 
 // the live owner retains the prepared graph and publishes no partial outputs; its segmented path admits a single whole
 // ubatch, never token partitions
-bool llama_context::opt_retains_graph(llama_memory_context_ptr & mctx) {
+bool llama_context::opt_retains_graph(llama_memory_context_ptr & mctx, const llm_graph_result * res) {
     if (opt_serving_continuation || !opt_reply || !opt_reply->graph_meta) {
         return false;
     }
     opt_reply->graph_memory = std::move(mctx);
+    opt_reply->graph_result = const_cast<llm_graph_result *>(res); // the slot the learning steps feed and reset
     if (opt_reply->recurrent) {
         opt_reply->recurrent_graph_head  = opt_reply->recurrent->head;
         opt_reply->recurrent_graph_count = opt_reply->recurrent->n;
@@ -1397,4 +1399,13 @@ void llama_context::opt_breakdown_serving(std::map<ggml_backend_buffer_type_t, l
         const auto other = opt_reply->serving_sched.get();
         ret[ggml_backend_sched_get_buffer_type(other, backend)].compute += ggml_backend_sched_get_buffer_size(other, backend);
     }
+}
+
+// both graph result slots (upstream keeps one per output shape, gf_res_prev[n_outputs > 0]) sized for max_nodes, with
+// no graph marked reusable
+void llama_context::opt_reset_graph_results(size_t max_nodes) {
+    for (auto & res : gf_res_prev) {
+        res = std::make_unique<llm_graph_result>(max_nodes);
+    }
+    gf_res_prev_active = nullptr;
 }

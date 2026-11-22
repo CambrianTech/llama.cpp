@@ -105,7 +105,7 @@ bool llama_context::opt_learn_drain() {
         opt_reply->graph_preparing = false;
         opt_reply->graph_meta.reset();
         opt_reply->graph_memory.reset();
-        gf_res_prev->reset();
+        opt_reply->graph_result->reset();
         opt_reply->cursor = opt_reply->n_train;
         return true;
     }
@@ -144,11 +144,11 @@ llama_opt_learn_status llama_context::opt_learn_step() {
                 s.graph_preparing = false;
                 s.graph_meta.reset();
                 s.graph_memory.reset();
-                gf_res_prev->reset();
+                s.graph_result->reset();
                 s.cursor = s.n_train;
                 return LLAMA_OPT_LEARN_MORE;
             }
-            gf_res_prev->set_inputs(&s.graph_ubatch);
+            s.graph_result->set_inputs(&s.graph_ubatch);
             auto * labels = ggml_opt_labels(opt_ctx);
             ggml_backend_tensor_set(labels, s.graph_targets.data(), 0, ggml_nbytes(labels));
             if (auto * weights = ggml_opt_label_weights(opt_ctx)) {
@@ -170,7 +170,7 @@ llama_opt_learn_status llama_context::opt_learn_step() {
                 loras->erase(shadow);
             }
             s.graph_meta.reset();
-            gf_res_prev->reset();
+            s.graph_result->reset();
             s.cursor = s.n_train;
             return LLAMA_OPT_LEARN_MORE;
         }
@@ -332,10 +332,12 @@ int llama_context::opt_decode_beside_graph(const llama_batch & batch) {
     if (memory && memory->has_pending_update()) { return -3; }
     auto & state = *opt_reply;
     if (!state.serving_sched) {
-        const auto nodes = graph_max_nodes(n_ubatch());
+        const auto nodes = graph_max_nodes();
         state.serving_sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(),
                 backend_ptrs.size(), nodes, false, cparams.op_offload));
-        state.serving_graph.reset(new llm_graph_result(nodes));
+        for (auto & res : state.serving_graph) {
+            res = std::make_unique<llm_graph_result>(nodes);
+        }
         state.serving_reserve.reset(new llm_graph_result(nodes));
     }
     struct restore_owner {
@@ -348,6 +350,7 @@ int llama_context::opt_decode_beside_graph(const llama_batch & batch) {
             ggml_backend_sched_synchronize(ctx.sched.get());
             ctx.sched.swap(state.serving_sched);
             ctx.gf_res_prev.swap(state.serving_graph);
+            ctx.gf_res_prev_active = nullptr;
             ctx.gf_res_reserve.swap(state.serving_reserve);
             ctx.cparams = params;
             ctx.sched_need_reserve = reserve;
@@ -356,6 +359,7 @@ int llama_context::opt_decode_beside_graph(const llama_batch & batch) {
     } guard{*this, state, cparams, sched_need_reserve};
     sched.swap(state.serving_sched);
     gf_res_prev.swap(state.serving_graph);
+    gf_res_prev_active = nullptr;
     gf_res_reserve.swap(state.serving_reserve);
     sched_need_reserve = false;
     opt_serving_continuation = true;

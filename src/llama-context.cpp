@@ -2437,7 +2437,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
-        if (opt_retains_graph(mctx)) { // Continuum: the live owner keeps the prepared graph
+        if (opt_retains_graph(mctx, res)) { // Continuum: the live owner keeps the prepared graph
             return 0;
         }
 
