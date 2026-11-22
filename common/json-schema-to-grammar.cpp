@@ -895,69 +895,11 @@ public:
                 add_component(*child, true, 0);
             }
         }
-<<<<<<< HEAD
-        // A singleton union wrapper adds no constraint unless a sibling does.
-        if (schema.contains("allOf") && schema["allOf"].is_array() && schema["allOf"].size() == 1) {
-            bool transparent = true;
-            for (const auto & item : schema.items()) {
-                const auto & key = item.key();
-                if (key != "allOf" && key != "description" && key != "title" && key != "$comment" &&
-                    key != "default" && key != "examples" && key != "definitions" && key != "$defs") {
-                    transparent = false;
-                }
-            }
-            const json * component = &schema["allOf"][0];
-            if (component->is_object() && component->contains("$ref")) {
-                auto ref = _refs.find((*component)["$ref"]);
-                if (ref != _refs.end() && component->size() == 1) {
-                    component = &ref->second;
-                }
-            }
-            if (transparent && (component->contains("oneOf") || component->contains("anyOf"))) {
-                return visit(*component, name);
-            }
-        }
-        if ((schema_type.is_null() || schema_type == "object" || schema_type == "string") && schema.contains("allOf")) {
-            std::unordered_set<std::string> required;
-            std::vector<std::pair<std::string, json>> properties;
-            std::map<std::string, size_t> enum_values;
-            const std::string& hybrid_name = name;
-            std::function<void(const json &, bool)> add_component = [&](const json & comp_schema, bool is_required) {
-                if (comp_schema.contains("$ref")) {
-                    add_component(_refs[comp_schema["$ref"]], is_required);
-                } else if (comp_schema.contains("properties")) {
-                    for (const auto & prop : comp_schema["properties"].items()) {
-                        properties.emplace_back(prop.key(), prop.value());
-                        if (is_required) {
-                            required.insert(prop.key());
-                        }
-                    }
-                } else if (comp_schema.contains("enum")) {
-                    for (const auto & v : comp_schema["enum"]) {
-                        const auto rule = _generate_constant_rule(v);
-                        if (enum_values.find(rule) == enum_values.end()) {
-                            enum_values[rule] = 0;
-                        }
-                        enum_values[rule] += 1;
-                    }
-                } else {
-                  // todo warning
-                }
-            };
-            for (const auto & t : schema["allOf"]) {
-                if (t.contains("anyOf")) {
-                    for (const auto & tt : t["anyOf"]) {
-                        add_component(tt, false);
-                    }
-                } else {
-                    add_component(t, true);
-=======
         if (!enum_values.empty()) {
             std::vector<std::string> enum_intersection;
             for (const auto & p : enum_values) {
                 if (p.second == schema.children.size()) {
                     enum_intersection.push_back(p.first);
->>>>>>> upstream/master
                 }
             }
             if (!enum_intersection.empty()) {

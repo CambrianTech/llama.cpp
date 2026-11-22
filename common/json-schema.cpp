@@ -255,6 +255,22 @@ class common_chat_schema_builder {
             return build_alternatives<common_chat_schema_any_of>(schema.at(key), path + "/" + key);
         }
 
+        // A one-child intersection with only annotations has exactly its child's constraints.
+        if (schema.contains("allOf") && schema.at("allOf").is_array() && schema.at("allOf").size() == 1) {
+            bool transparent = true;
+            for (const auto & item : schema.items()) {
+                const auto & key = item.key();
+                if (key != "allOf" && key != "description" && key != "title" && key != "$comment" &&
+                    key != "default" && key != "examples" && key != "definitions" && key != "$defs") {
+                    transparent = false;
+                    break;
+                }
+            }
+            if (transparent) {
+                return build_node(schema.at("allOf").at(0), path + "/allOf/0");
+            }
+        }
+
         common_json type;
         if (schema.contains("type")) {
             type = schema.at("type");
