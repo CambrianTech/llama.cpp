@@ -7,6 +7,7 @@
 #import "ggml-metal-common.h"
 #import "ggml-metal-ops.h"
 #import "ggml-metal-fusion.h"
+#import "ggml-metal-timing.h" // Continuum fork: GGML_METAL_TIMING=1 measures each step's encode, GPU work and idle gap
 
 #import <Foundation/Foundation.h>
 
@@ -282,6 +283,11 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
                 return;
             }
         }
+        id<MTLCommandBuffer> timed[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+        for (int cb_idx = 0; cb_idx <= n_cb; ++cb_idx) {
+            timed[cb_idx] = ctx->cmd_bufs[cb_idx].obj;
+        }
+        ggml_metal_timing_completed(timed, n_cb + 1);
     }
 
     // release any completed extra command buffers
@@ -487,6 +493,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     if (gf->n_nodes == 0) {
         return GGML_STATUS_SUCCESS;
     }
+    ggml_metal_timing_encode_begin(gf->n_nodes);
 
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
@@ -612,6 +619,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        ggml_metal_timing_encode_end();
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];

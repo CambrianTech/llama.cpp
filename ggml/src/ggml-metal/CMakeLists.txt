@@ -13,6 +13,7 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-fusion.cpp
                          ggml-metal-ops.cpp
                          ggml-metal-tuning.cpp
+                         ggml-metal-timing.m
                         )
 
 target_link_libraries(ggml-metal PRIVATE
