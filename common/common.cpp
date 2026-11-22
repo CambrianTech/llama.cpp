@@ -4,13 +4,10 @@
 
 #include "build-info.h"
 #include "common.h"
-<<<<<<< HEAD
 #include <random>
-=======
 
 #include "../src/llama-ext.h"
 
->>>>>>> upstream/master
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -1272,6 +1269,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
         params.tensor_split,
         params.tensor_buft_overrides.data(),
         params.fit_params_target.data(),
+        params.fit_params_budget.empty() ? nullptr : params.fit_params_budget.data(),
         params.fit_params_min_ctx,
         has_draft || spec_mtp ? &extra : nullptr,
         params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
@@ -1284,42 +1282,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     common_fit_apply(params, mparams, cparams);
 
-<<<<<<< HEAD
-        // the draft context is created from the same base params and follows the main context, fit both together
-        const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
-
-        common_params params_dft = common_base_params_to_speculative(params);
-
-        auto mparams_dft = common_model_params_to_llama(params_dft);
-        auto cparams_dft = common_context_params_to_llama(params_dft);
-        if (spec_mtp) {
-            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-        }
-        cparams_dft.n_rs_seq = 0;
-
-        const common_fit_extra_model extra = {
-            /*.path_model   =*/ params_dft.model.path.c_str(),
-            /*.mparams      =*/ &mparams_dft,
-            /*.cparams      =*/ &cparams_dft,
-            /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
-        };
-
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_budget.empty() ? nullptr : params.fit_params_budget.data(),
-            params.fit_params_min_ctx,
-            has_draft || spec_mtp ? &extra : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-    }
-
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
-=======
     llama_model * model = common_model_load(params.model.get_paths(), mparams);
->>>>>>> upstream/master
     if (model == NULL) {
         return;
     }

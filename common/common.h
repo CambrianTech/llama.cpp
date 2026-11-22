@@ -8,12 +8,9 @@
 #include "ggml.h"
 #include "llama.h"
 
-<<<<<<< HEAD
 #include <cstdio>
-=======
 #include <array>
 #include <list>
->>>>>>> upstream/master
 #include <set>
 #include <sstream>
 #include <string>

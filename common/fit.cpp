@@ -1004,11 +1004,7 @@ enum common_params_fit_status common_fit_params(
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-<<<<<<< HEAD
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, budgets, n_ctx_min, extra, log_level);
-=======
-        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
->>>>>>> upstream/master
+        common_params_fit_impl(paths_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, budgets, n_ctx_min, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

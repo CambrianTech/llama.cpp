@@ -81,27 +81,25 @@ struct fixture {
     int             n_prompt = 24;
 
     std::vector<float> decode_one(llama_seq_id seq, llama_token token, llama_pos pos) {
-        llama_batch b = llama_batch_init(1, 0, 1);
-        common_batch_add(b, token, pos, { seq }, true);
-        require(llama_decode(ctx, b) == 0, "decode a token");
+        common_batch b(ctx);
+        b.add(token, pos, seq, true);
+        require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0, "decode a token");
         const float * l = llama_get_logits_ith(ctx, 0);
         std::vector<float> out(l, l + n_vocab);
-        llama_batch_free(b);
         return out;
     }
 
     // her prompt (salt makes two personas' prompts differ), decoded in batches of n_batch
     int n_batch = 2048;
     void prompt(llama_seq_id seq, int salt) {
-        llama_batch b = llama_batch_init(n_batch, 0, 1);
+        common_batch b(ctx);
         for (int i0 = 0; i0 < n_prompt; i0 += n_batch) {
-            common_batch_clear(b);
+            b.clear();
             for (int i = i0; i < std::min(n_prompt, i0 + n_batch); ++i) {
-                common_batch_add(b, 1 + (i * 7 + salt * 13) % (n_vocab - 1), i, { seq }, false);
+                b.add(1 + (i * 7 + salt * 13) % (n_vocab - 1), i, seq, false);
             }
-            require(llama_decode(ctx, b) == 0, "decode a prompt");
+            require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0, "decode a prompt");
         }
-        llama_batch_free(b);
     }
 
     // her next two tokens decoded in place from a clear memory: the reference
