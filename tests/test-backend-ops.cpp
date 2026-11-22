@@ -2610,44 +2610,8 @@ struct test_get_rows : public test_case {
     }
 };
 
-<<<<<<< HEAD
-// GET_ROWS's gradient on batched rows (a MoE gathers its router weights per token: [1, n_expert,
-// n_tokens] by [n_used, n_tokens]), checked by finite differences. Every row of every batch is
-// gathered (r >= m) and the output is weighted by a fixed random tensor: the suite's metric,
-// (a-b)/(a+b) averaged, is NaN on any element whose gradient is 0 on both sides, and a NaN mean
-// never exceeds the threshold, so a row nothing gathers would pass the case whatever the kernel did.
-struct test_get_rows_grad : public test_case {
-    const int n; // cols
-    const int m; // rows
-    const int r; // rows to get, >= m
-    const int be1; // batches
+#include "backend-get-rows-grad.inc"
 
-    std::string vars() override {
-        return VARS_TO_STR4(n, m, r, be1);
-    }
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "GET_ROWS";
-    }
-
-    test_get_rows_grad(int n = 1, int m = 6, int r = 9, int be1 = 7) : n(n), m(m), r(r), be1(be1) {
-        GGML_ASSERT(r >= m);
-    }
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, m, be1);
-        ggml_set_name(in, "in");
-        ggml_set_param(in);
-
-        ggml_tensor * rows = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, r, be1);
-        ggml_set_name(rows, "rows");
-
-        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, r, be1);
-        ggml_set_name(w, "w");
-
-        ggml_tensor * out = ggml_mul(ctx, ggml_get_rows(ctx, in, rows), w);
-=======
 // GGML_OP_GET_ROWS on a weight also used by GGML_OP_MUL_MAT (tied embeddings)
 // that the preceding mul_mat may have put in the SYCL reorder layout. The
 // mul_mat runs first, so a backend that changes the weight layout in place
@@ -2687,27 +2651,12 @@ struct test_get_rows_after_mul_mat : public test_case {
 
         // repeat(mm) is the first source, so mul_mat is computed before get_rows
         ggml_tensor * out = ggml_add(ctx, ggml_repeat(ctx, mm, gr), gr);
->>>>>>> upstream/master
         ggml_set_name(out, "out");
 
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-<<<<<<< HEAD
-        std::random_device rd;
-        std::default_random_engine rng(rd());
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->type == GGML_TYPE_I32) {
-                for (int b = 0; b < be1; b++) {
-                    std::vector<int32_t> data(r);
-                    for (int k = 0; k < r; k++) {
-                        data[k] = k % m; // every row at least once
-                    }
-                    std::shuffle(data.begin(), data.end(), rng);
-                    ggml_backend_tensor_set(t, data.data(), b*t->nb[1], r*sizeof(int32_t));
-                }
-=======
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 std::vector<int> data(ggml_nelements(t));
@@ -2715,7 +2664,6 @@ struct test_get_rows_after_mul_mat : public test_case {
                     data[i] = rand() % m;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
->>>>>>> upstream/master
             } else {
                 init_tensor_uniform(t);
             }
@@ -2723,8 +2671,6 @@ struct test_get_rows_after_mul_mat : public test_case {
     }
 };
 
-<<<<<<< HEAD
-=======
 // The persistent SYCL weight reorder installs on the first small-batch mul_mat; a
 // later >8-column mul_mat on the same weight goes through the fused-dequant GEMM /
 // conversion routes, which must decode the reordered layout (regression test for the
@@ -2767,7 +2713,6 @@ struct test_mul_mat_reorder_then_big_batch : public test_case {
     }
 };
 
->>>>>>> upstream/master
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -6924,11 +6869,6 @@ struct test_clamp : public test_case {
         : type(type), ne(ne), min(min), max(max), v(v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-<<<<<<< HEAD
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_param(a);
-        ggml_set_name(a, "a");
-=======
         ggml_tensor * a;
         if (v & 1) {
             auto ne_a = ne;
@@ -6937,15 +6877,16 @@ struct test_clamp : public test_case {
             ne_a[2] *= 5;
             ne_a[3] *= 4;
             a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_param(a);
             ggml_set_name(a, "a");
 
             a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
             ggml_set_name(a, "view_of_a");
         } else {
             a = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_param(a);
             ggml_set_name(a, "a");
         }
->>>>>>> upstream/master
 
         ggml_tensor * out = ggml_clamp(ctx, a, min, max);
         ggml_set_name(out, "out");
@@ -9772,110 +9713,8 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
-<<<<<<< HEAD
-// FLASH_ATTN_EXT's gradients through either backward (the native ggml_flash_attn_back or the
-// composed tiles), against finite differences: GQA, a causal mask, q, k and v all trained
-struct test_flash_attn_ext_grad : public test_case {
-    const int64_t hs, nh, nhkv, kv, nb;
-    const bool    native;
+#include "backend-flash-attn-grad.inc"
 
-    std::string vars() override {
-        return VARS_TO_STR6(hs, nh, nhkv, kv, nb, native);
-    }
-
-    test_flash_attn_ext_grad(int64_t hs = 16, int64_t nh = 4, int64_t nhkv = 2, int64_t kv = 24, int64_t nb = 8, bool native = true)
-        : hs(hs), nh(nh), nhkv(nhkv), kv(kv), nb(nb), native(native) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nb, nh);
-        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, kv, nhkv);
-        ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, kv, nhkv);
-        ggml_set_param(q); ggml_set_name(q, "q");
-        ggml_set_param(k); ggml_set_name(k, "k");
-        ggml_set_param(v); ggml_set_name(v, "v");
-        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, nb);
-        ggml_set_name(m, "m");
-        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        ggml_flash_attn_ext_set_back_tile(out, native ? GGML_FA_BACK_NATIVE : 0);
-        // weighted by a fixed random tensor: a plain sum of attention outputs nearly cancels the
-        // query gradient (each row's weights sum to one), and the finite difference drowns in it
-        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, out->ne[0], out->ne[1], out->ne[2]);
-        ggml_set_name(w, "w");
-        out = ggml_mul(ctx, out, w);
-        ggml_set_name(out, "out");
-        return out;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "m") == 0) {
-                // causal: query row i sees KV positions j <= kv - nb + i
-                std::vector<ggml_fp16_t> m(ggml_nelements(t));
-                for (int64_t i = 0; i < t->ne[1]; ++i) {
-                    for (int64_t j = 0; j < t->ne[0]; ++j) {
-                        m[i*t->ne[0] + j] = ggml_fp32_to_fp16(j <= kv - nb + i ? 0.0f : -INFINITY);
-                    }
-                }
-                ggml_backend_tensor_set(t, m.data(), 0, ggml_nbytes(t));
-            } else {
-                init_tensor_uniform(t);
-            }
-        }
-    }
-
-    bool grad_precise() override {
-        return true;
-    }
-};
-
-// GGML_OP_FLASH_ATTN_BACK itself: each backend's kernel against the CPU reference, at the cache
-// types training reads (F16, F32, q8_0) and a GQA group
-struct test_flash_attn_back : public test_case {
-    const int64_t   hs, nh, nhkv, kv, nb;
-    const ggml_type type_kv;
-    const int64_t   kv0; // the first key row with a dK/dV (a frozen prefix before it)
-
-    std::string vars() override {
-        return VARS_TO_STR7(hs, nh, nhkv, kv, nb, type_kv, kv0);
-    }
-
-    test_flash_attn_back(int64_t hs = 128, int64_t nh = 8, int64_t nhkv = 2, int64_t kv = 512, int64_t nb = 64, ggml_type type_kv = GGML_TYPE_F16,
-            int64_t kv0 = 0)
-        : hs(hs), nh(nh), nhkv(nhkv), kv(kv), nb(nb), type_kv(type_kv), kv0(kv0) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nb, nh);
-        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_kv, hs, kv, nhkv);
-        ggml_tensor * v = ggml_new_tensor_3d(ctx, type_kv, hs, kv, nhkv);
-        ggml_tensor * m = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv, nb);
-        ggml_tensor * d = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nh, nb);
-        ggml_set_name(q, "q"); ggml_set_name(k, "k"); ggml_set_name(v, "v"); ggml_set_name(m, "m"); ggml_set_name(d, "d");
-        ggml_tensor * out = ggml_flash_attn_back(ctx, q, k, v, m, d, 1.0f/sqrtf((float) hs), kv0);
-        ggml_set_name(out, "out");
-        return out;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
-            } else {
-                init_tensor_uniform(t);
-            }
-        }
-    }
-
-    double max_nmse_err() override {
-        return 1e-5; // the kernel and the reference sum in different orders over the window
-    }
-
-    // the five products of the ideal backward (S, dP, dV, dQ, dK), so perf reports TFLOPS against
-    // the forward's two
-    uint64_t op_flops(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return 2ull*nb*nh*(3*kv*hs + 2*(kv - kv0)*hs); // pass 1 over every key, pass 2 from kv0
-=======
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -10009,7 +9848,6 @@ struct test_flash_attn_ext_kv_rows : public test_case {
                 init_tensor_uniform(t);
             }
         }
->>>>>>> upstream/master
     }
 };
 
@@ -14262,7 +14100,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
 
-<<<<<<< HEAD
     test_cases.emplace_back(new test_flash_attn_ext_grad(16, 4, 2, 24, 8, true));
     test_cases.emplace_back(new test_flash_attn_ext_grad(16, 4, 2, 24, 8, false));
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_Q8_0 }) {
@@ -14280,7 +14117,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cross_entropy_loss_index({30000, 2, 1, 1}, true));
     test_cases.emplace_back(new test_cross_entropy_loss_index({10, 5, 4, 3}, true, true));
     test_cases.emplace_back(new test_cross_entropy_loss_index({151936, 6, 1, 1}, true, true));
-=======
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 1024, 320, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(96, 96, 8, {4, 1}, 512, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {8, 1}, 512, 259, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
@@ -14327,7 +14163,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
 
->>>>>>> upstream/master
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -14705,7 +14540,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-<<<<<<< HEAD
     // the attention backward beside its forward at one training shape (head 256, 16 heads over 4 KV
     // heads, 256 rows over a 2048 window, f16 cache): small enough to time on every kernel edit; a
     // backward costs about 2.5 forwards of matmul work
@@ -14724,7 +14558,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_F32,  GGML_TYPE_F32, 5120, 1024, 17408, {1, 1}, {1, 1}, true));
     test_cases.emplace_back(new test_out_prod(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, 1024, 17408, {1, 1}, {1, 1}, true));
 
-=======
     test_cases.emplace_back(new test_timestep_embedding());
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {32769, 1, 1, 1}, 4096, 10000));
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 1, 10000));
@@ -14766,7 +14599,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen3.8-Flash-Next pooled indexer prefill.
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 1088, 1024, 1, 1, GGML_TYPE_Q4_0));
->>>>>>> upstream/master
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
