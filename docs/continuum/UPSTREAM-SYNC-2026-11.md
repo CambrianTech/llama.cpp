@@ -65,3 +65,20 @@ The sync merges only when every row below passes on the synced build. A worse nu
 | training step time | test-walk-exact timing, M5 | new <= old |
 
 Known, accepted: saved KV state files from before the sync are refused (both sides changed the format; upstream's #28498 saves the exact rotation, a correctness fix), so each mind re-prefills once after the upgrade. Identity, memory, genome and work are in continuum and untouched.
+
+## Upstreaming inventory (Joel, 2026-11-22: keep it organized and ready for their integration, then PR what we know is good)
+
+The fork shows extreme speed with many personas switching on one engine: per-sequence KV moves, cache reuse, paging, optimized kernels. Each addition now lives in its own file, so each row lifts out as one PR. Upstream has already adopted three of ours (the per_layer_token_embd type override, the qk_k <= 32 fallback, loras_mutex).
+
+| Addition | Files | Upstream value | PR when |
+|---|---|---|---|
+| Metal NVFP4 (mul_mv, mul_mm, get_rows) | ggml-metal kernels, device.m | high: CUDA has it, Metal did not | after test-backend-ops passes on the synced build |
+| Metal flash-attention backward | kernels/fa_back.metal | high: training on Apple GPUs | with a test-backend-ops grad case |
+| Sequence KV moves (save, load, bind, checkpoint, rewind in memory) | llama-kv-cache-persona.cpp, llama-context-persona.cpp, llama-persona-*.cpp | high: multi-agent serving, fast context switch | after the speed gate, with a multi-sequence switch bench |
+| Sequence state across stream layouts | state_read_sinfo any-layout hook | medium: a relaunch with a new -np keeps warm sequences | small PR, test-state-restore-streams |
+| Native cell index (no node containers) | llama-kv-cell-index.h, kv-cells.h | medium: fewer allocations on the hot path | with a before/after micro-bench |
+| memory_breakdown counts a shared buffer type once | llama-context.cpp hook | bug fix | now |
+| Same-type quant copy needs no imatrix | llama-quant-device-fit.cpp | bug fix | now |
+| Sequence state file body (page-out without a file) | llama-context-state.inc | medium: servers that page state | with test-server-page-io |
+| Training through the serving cache (walk, shadow adapter, labels on llama_batch_ext) | llama-graph-train.cpp, llama-context-opt/-learn.cpp, llama-batch-label.cpp | large, needs design discussion upstream | after the learning acceptance test |
+| Continuum-only (not for upstream) | llama-model-api.cpp (governor facts), --resident-only device fit, learn ticketing in tools/server | - | - |
