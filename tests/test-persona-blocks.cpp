@@ -89,6 +89,17 @@ struct fixture {
         return out;
     }
 
+    // drafted tokens verified in ONE ubatch, as serving verifies a draft: the recurrent memory snapshots
+    // the state after each of them, so a rejected tail rolls back to a snapshot this ubatch wrote
+    void decode_drafts(llama_seq_id seq, const std::vector<llama_token> & tokens, llama_pos pos) {
+        common_batch b(ctx);
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            b.add(tokens[i], pos + (llama_pos) i, seq, true);
+        }
+        require(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0, "decode the drafts");
+    }
+
+
     // her prompt (salt makes two personas' prompts differ), decoded in batches of n_batch
     int n_batch = 2048;
     void prompt(llama_seq_id seq, int salt) {
@@ -332,8 +343,7 @@ int main(int argc, char ** argv) {
         auto drafted_then_rolled_back = [&]() {
             llama_memory_clear(llama_get_memory(f.ctx), true);
             f.prompt(0, 1);
-            f.decode_one(0, 3 % f.n_vocab, f.n_prompt);
-            f.decode_one(0, 5 % f.n_vocab, f.n_prompt + 1);
+            f.decode_drafts(0, { 3 % f.n_vocab, 5 % f.n_vocab }, f.n_prompt);
             require(llama_memory_seq_rm(llama_get_memory(f.ctx), 0, f.n_prompt + 1, -1), "take the second draft back");
         };
         drafted_then_rolled_back();
