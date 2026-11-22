@@ -35,3 +35,33 @@ Take upstream's file whole; re-home our additions into files of our own (llama-k
 - PORTED llama-context-opt.cpp / -learn.cpp to upstream internals: gf_res_prev is std::array<...,2> (pair saved/restored as a unit, opt_reset_graph_results sizes both, gf_res_prev_active cleared on every swap/reset), the retained learning graph's slot recorded in opt_live_reply::graph_result (set by opt_retains_graph from decode's res), graph_max_nodes() without args, retained replay through llama_batch_compat into the ext allocator, opt_epoch_iter keeps llama_batch (upstream's version is gone). All touched src files pass c++ -fsyntax-only -Wall -Wextra except deprecation warnings.
 - FOLLOW-UP (owner Fable, before the sync merges): move our batch building to llama_batch_ext with a public label setter (fork: llama-context-opt.cpp opt_epoch, opt_live_reply batch holder; continuum: 3 Rust llama_batch_init sites); upstream deprecated llama_batch_init/free. Not fatal (LLAMA/GGML_FATAL_WARNINGS default OFF, our build sets neither).
 - Cormac (2026-11-22 06:20Z) for Codex's tools/server half: keep per-subscriber ticket_queues in server-queue.{h,cpp} (fork #113, c2255853d), GET /learn/events ticket_stream with set_req, off-loop ledger publication (#109), 'ticket': true on grant/unload/release; run tools/server/tests/learn-tickets.py (two-stream case) on the synced build.
+
+## Merge gate: nothing we need is lost, nothing gets slower (Joel, 2026-11-22: "can't lose speed or stuff we need")
+
+The sync merges only when every row below passes on the synced build. A worse number blocks the merge until fixed.
+
+### Features (each has its own test; tests/CMakeLists.txt must still register every one)
+| What we need | Proof |
+|---|---|
+| A mind's KV moves: save, load, bind, checkpoint, rewind | test-persona-blocks, test-persona-tokens, test-llama-context, tests/llama-context/ |
+| Cell index (flash tier image), now (pos, cell) pairs | test-kv-cell-index (model check against the std::map reference) |
+| Labels through llama_batch_ext (learning on) | test-batch-alloc: a labelled llama_decode yields n_labels() == labelled rows (ADD this case) |
+| The walk, exact and planned | test-walk-exact (cosine vs one graph, q8_0 and f16), test-walk-plan |
+| Optimizer, per-adapter shadow, dynamic accumulation | test-opt, test-opt-dynamic-accum |
+| State across stream layouts | test-state-restore-streams |
+| MoE expert paging and residency | test-moe-gather, test-moe-residency |
+| Server page-out, adapters, learn ledger | test-server-page-io, test-server-page-adapters, test-server-learn-ledger |
+| Learn ticketing and custody (Cormac) | tools/server/tests/learn-*.py, learn-tickets.py two-stream case |
+| Metal kernels incl. NVFP4, PAD on views, FA backward | test-backend-ops -b Metal (MUL_MAT, MUL_MAT_ID, GET_ROWS, PAD, FLASH_ATTN_EXT(+back)) |
+| Metal graph optimize / fusion on Qwen3.5 GDN | test-metal-graph-optimize |
+| Device-fit quant (--resident-only, manifest) | quantize --resident-only on a small MoE: no *_exps.* tensors, .resident.json written |
+| embeddings_only context | validate_embedding_model (continuum) |
+
+### Speed (same model, same residents, serving down for the raw runs; old = c4c93981e build, new = sync build)
+| Number | Where | Rule |
+|---|---|---|
+| prefill and decode tok/s, 1 and 4 sequences | llama-bench / batched-bench, M5 resident model, then the 5090 | new >= old within run noise (3 runs each) |
+| act p50, prefix reuse, graphs reused | 15-min live read, M5 (baseline 998f1b745d: act p50 50 s, reuse 0.93) then 5090 | new <= old act p50, reuse not lower |
+| training step time | test-walk-exact timing, M5 | new <= old |
+
+Known, accepted: saved KV state files from before the sync are refused (both sides changed the format; upstream's #28498 saves the exact rotation, a correctness fix), so each mind re-prefills once after the upgrade. Identity, memory, genome and work are in continuum and untouched.
