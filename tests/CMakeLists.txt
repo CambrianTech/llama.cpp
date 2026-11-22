@@ -2,54 +2,8 @@ find_package(Threads REQUIRED)
 
 llama_add_compile_flags()
 
-<<<<<<< HEAD
-# Model-free scheduling validator: compile the same traversal used by server-context.
-# Model-free: placed checkpoints keep her head through a full store (CONTINUUM-ENGINE 4.7.3, llama.cpp#121).
-add_executable(test-server-checkpoint-policy test-server-checkpoint-policy.cpp)
-target_compile_features(test-server-checkpoint-policy PRIVATE cxx_std_17)
-add_test(NAME test-server-checkpoint-policy COMMAND test-server-checkpoint-policy)
-set_tests_properties(test-server-checkpoint-policy PROPERTIES LABELS "main")
-
-add_executable(test-server-media-range test-server-media-range.cpp)
-target_compile_features(test-server-media-range PRIVATE cxx_std_17)
-add_test(NAME test-server-media-range COMMAND test-server-media-range)
-set_tests_properties(test-server-media-range PROPERTIES LABELS "main")
-
-add_executable(test-server-prefill test-server-prefill.cpp)
-target_compile_features(test-server-prefill PRIVATE cxx_std_17)
-add_test(NAME test-server-prefill COMMAND test-server-prefill)
-set_tests_properties(test-server-prefill PROPERTIES LABELS "main")
-
-# Model-free scheduling validator: which slot's adapter set holds the next batch.
-add_executable(test-server-adapter-turn test-server-adapter-turn.cpp)
-target_compile_features(test-server-adapter-turn PRIVATE cxx_std_17)
-add_test(NAME test-server-adapter-turn COMMAND test-server-adapter-turn)
-set_tests_properties(test-server-adapter-turn PROPERTIES LABELS "main")
-
-# Model-free validator: whether a saved page's KV belongs to the loaded adapters.
-add_executable(test-server-page-adapters test-server-page-adapters.cpp)
-target_compile_features(test-server-page-adapters PRIVATE cxx_std_17)
-add_test(NAME test-server-page-adapters COMMAND test-server-page-adapters)
-set_tests_properties(test-server-page-adapters PROPERTIES LABELS "main")
-
-# Model-free validator: KV page file IO off the task loop (a worker pool, one switch per file at a time).
-add_executable(test-server-page-io test-server-page-io.cpp)
-target_compile_features(test-server-page-io PRIVATE cxx_std_17)
-find_package(Threads REQUIRED)
-target_link_libraries(test-server-page-io PRIVATE Threads::Threads)
-add_test(NAME test-server-page-io COMMAND test-server-page-io)
-set_tests_properties(test-server-page-io PROPERTIES LABELS "main")
-
-# Model-free learning-budget validator: the ledger every learning step debits.
-add_executable(test-server-learn-ledger test-server-learn-ledger.cpp)
-target_compile_features(test-server-learn-ledger PRIVATE cxx_std_17)
-add_test(NAME test-server-learn-ledger COMMAND test-server-learn-ledger)
-set_tests_properties(test-server-learn-ledger PROPERTIES LABELS "main")
-
-=======
 # Optional args:
 # - LINK: libraries to link against (defaults to llama-common, which also brings llama)
->>>>>>> upstream/master
 function(llama_build source)
     set(options)
     set(oneValueArgs)
@@ -215,47 +169,6 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp  LABEL "main behavior"  ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-<<<<<<< HEAD
-llama_build(test-recurrent-state-rollback.cpp)
-llama_build_and_test(test-server-view-end.cpp)
-
-# llama_kv_cells' derived indices held natively answer exactly as the node containers they replace (CONTINUUM-ENGINE 4.14)
-llama_build_and_test(test-kv-cell-index.cpp)
-# a persona's token history appends only a request's new ids, in one validated transaction (CONTINUUM-ENGINE 4.14)
-llama_build_and_test(test-persona-tokens.cpp)
-
-# GGML_TENSOR_FLAG_GRAD: a leaf whose gradient the backward computes, never optimized (the walk reads the cached prefix K/V gradient)
-llama_build_and_test(test-grad-leaf.cpp)
-
-# ggml-opt with per-step graphs (the llama training path) starts each optimizer period from zero accumulators
-llama_build_and_test(test-opt-dynamic-accum.cpp)
-llama_build_and_test(test-sched-measure.cpp)
-
-if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
-    # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
-    llama_build_and_test(test-unicode.cpp)
-    llama_build_and_test(test-sampling.cpp)
-    llama_build_and_test(test-reasoning-budget.cpp)
-    llama_build_and_test(test-grammar-parser.cpp)
-    llama_build_and_test(test-grammar-integration.cpp)
-    llama_build_and_test(test-llama-grammar.cpp)
-    llama_build_and_test(test-batch-alloc.cpp)
-    llama_build_and_test(test-walk-plan.cpp)
-    # the exact walk trains on the window's whole gradient whatever the chunking: run on a pure-attention AND a
-    # hybrid model (-m), on a GPU backend as well as the CPU (a hybrid passed on the CPU while Metal tore its state)
-    llama_build(test-walk-exact.cpp)
-    llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    target_link_libraries(test-chat PRIVATE server-context)
-    llama_build_and_test(test-server-tokens-range.cpp)
-    target_include_directories(test-server-tokens-range PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
-    target_link_libraries(test-server-tokens-range PRIVATE server-context)
-    # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
-    if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
-        llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-        target_include_directories(test-json-schema-to-grammar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    endif()
-=======
 # llama_context state tests: KV and recurrent state save, load, copy, rollback
 set(LLAMA_CONTEXT_TEST_SRC
     test-llama-context.cpp
@@ -286,7 +199,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-component PRIVATE server-context)
     llama_build_and_test(test-json-schema-to-grammar.cpp  LABEL behavior)
->>>>>>> upstream/master
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
@@ -315,70 +227,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
-<<<<<<< HEAD
-    llama_build_and_test(test-llama-archs.cpp)
-
-    set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
-    file(MAKE_DIRECTORY "${MODEL_DIR}")
-
-    llama_test(
-        test-llama-archs
-        NAME test-generate-models
-        LABEL main
-        ARGS -o "${MODEL_DIR}"
-    )
-    set_tests_properties(test-generate-models PROPERTIES
-        FIXTURES_SETUP generate-models
-    )
-
-    # a persona's state moved raw between the memory and host memory is byte-identical, and a refused move changes
-    # nothing (CONTINUUM-ENGINE 4.14): on a plain KV model, on the generated hybrid (qwen35moe: attention + recurrent),
-    # and on the hybrid with the rollback groups serving's draft-mtp configuration creates
-    llama_build(test-persona-blocks.cpp)
-    llama_test(
-        test-persona-blocks
-        NAME test-persona-blocks-hybrid
-        LABEL main
-        ARGS -m "${MODEL_DIR}/qwen35moe-moe.gguf"
-    )
-    set_tests_properties(test-persona-blocks-hybrid PROPERTIES FIXTURES_REQUIRED generate-models)
-    llama_test(
-        test-persona-blocks
-        NAME test-persona-blocks-rollback
-        LABEL main
-        ARGS -m "${MODEL_DIR}/qwen35moe-moe.gguf" --test-rs-seq 4
-    )
-    set_tests_properties(test-persona-blocks-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
-
-    llama_test(
-        test-recurrent-state-rollback
-        LABEL main
-        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
-
-    llama_test(
-        test-recurrent-state-rollback
-        NAME test-recurrent-state-rollback-nemotron-h
-        LABEL main
-        ARGS -m "${MODEL_DIR}/nemotron_h-dense.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback-nemotron-h PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
-    llama_test(
-        test-recurrent-state-rollback
-        NAME test-recurrent-state-rollback-dsv4
-        LABEL main
-        ARGS -m "${MODEL_DIR}/deepseek4-moe.gguf"
-    )
-    set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
-        FIXTURES_REQUIRED generate-models
-    )
-=======
->>>>>>> upstream/master
 endif()
 
 llama_build(test-llama-archs.cpp)
@@ -515,35 +363,12 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
     llama_build_and_test(test-metal-graph-optimize.cpp  LABEL "main behavior backend"  LINK ggml ggml-metal)
     target_include_directories(test-metal-graph-optimize PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-metal)
 endif()
-<<<<<<< HEAD
-llama_build_and_test(test-backend-ops.cpp)
-# the tiled FLASH_ATTN_EXT backward gives plain attention's gradients on every backend (no model needed)
-llama_build_and_test(test-flash-attn-back.cpp)
-llama_build_and_test(test-moe-gather.cpp)
-=======
->>>>>>> upstream/master
 
 llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
-<<<<<<< HEAD
-# Test for state restore with fragmented KV cache
-# Requires a model, uses same args pattern as test-thread-safety
-llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
-llama_build_and_test(test-dup-quantized.cpp)
-llama_build_and_test(test-state-restore-streams.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
-set_tests_properties(test-state-restore-streams PROPERTIES FIXTURES_REQUIRED test-download-model)
-
-if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
-    # test-persona-blocks (built above with the internal-API tests) on the downloaded plain KV model
-    llama_test(test-persona-blocks LABEL "model" ARGS -m "${MODEL_DEST}")
-    set_tests_properties(test-persona-blocks PROPERTIES FIXTURES_REQUIRED test-download-model)
-endif()
-=======
 llama_build_and_test(test-backend-tensor.cpp LINK ggml)
 llama_build_and_test(test-sleep.cpp LINK ggml)
 llama_build_and_test(test-backend-sched.cpp LINK ggml)
->>>>>>> upstream/master
 
 if (BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-mmap.cpp ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp LABEL behavior)
@@ -617,3 +442,5 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+include(continuum-tests.cmake)
