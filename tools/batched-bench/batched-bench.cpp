@@ -83,23 +83,7 @@ int llama_batched_bench(int argc, char ** argv) {
         for (int32_t i = 0; i < batch.size(); i += n_batch) {
             const int32_t n_tokens = std::min(n_batch, batch.size() - i);
 
-<<<<<<< HEAD
-            llama_batch batch_view = {
-                n_tokens,
-                batch.token    + i,
-                nullptr,
-                batch.pos      + i,
-                batch.n_seq_id + i,
-                batch.seq_id   + i,
-                batch.logits   + i,
-                batch.label ? batch.label + i : nullptr,
-                batch.label && batch.label_weight ? batch.label_weight + i : nullptr,
-            };
-
-            const int ret = llama_decode(ctx, batch_view);
-=======
             const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(i, n_tokens));
->>>>>>> upstream/master
             if (ret != 0) {
                 LOG_ERR("failed to decode the batch, n_batch = %d, ret = %d\n", n_batch, ret);
                 return false;

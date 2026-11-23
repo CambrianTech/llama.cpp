@@ -843,48 +843,32 @@ struct llama_mmap::impl {
             pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
 
             if (pPrefetchVirtualMemory) {
-<<<<<<< HEAD
-                // A model larger than physical RAM (MoE with experts left on disk) must NOT
-                // be prefetched in full: PrefetchVirtualMemory populates the range into the
-                // working set, and populating > RAM wedges the Windows working-set manager
-                // (the multi-minute "load stall" observed on 663 GB K3). Cap the prefetch to
-                // a safe fraction of AVAILABLE physical RAM; the rest demand-pages lazily.
-                const uint64_t want = std::min<uint64_t>(size, (uint64_t) prefetch);
-                MEMORYSTATUSEX ms;
-                ms.dwLength = sizeof(ms);
-                bool do_prefetch = true;
-                if (GlobalMemoryStatusEx(&ms) && want > (uint64_t) (ms.ullAvailPhys / 2)) {
-                    // A model larger than RAM is loaded as many shards, each mmap'd + (here)
-                    // prefetched. Prefetching a shard bigger than the RAM budget just thrashes:
-                    // each shard's prefetch evicts the prior one, wasting minutes reading pages
-                    // that never stay resident (measured: 16x ~6s on 663GB K3 = the load stall).
-                    // A >RAM model's experts demand-page during decode anyway, so skip prefetch
-                    // and let the load touch only what it needs (dense weights -> GPU).
-                    LLAMA_LOG_INFO("%s: model larger than RAM budget (%.1f GB > %.1f GB) - skipping prefetch, experts demand-page during decode\n",
-                            __func__, (double) want / 1e9, (double) (ms.ullAvailPhys / 2) / 1e9);
-                    do_prefetch = false;
-                }
-                if (do_prefetch) {
-                    WIN32_MEMORY_RANGE_ENTRY range;
-                    range.VirtualAddress = addr;
-                    range.NumberOfBytes = (SIZE_T) want;
-                    if (!pPrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
-                        LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
-                                llama_format_win_err(GetLastError()).c_str());
-                    }
-=======
+                // Upstream prefetches only the ranges that are not lazily loaded.
                 std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+                uint64_t want = 0;
                 for (const auto & range : ranges_complement(lazy_ranges, std::min(size, prefetch))) {
                     WIN32_MEMORY_RANGE_ENTRY entry;
                     entry.VirtualAddress = (char *) addr + range.first;
                     entry.NumberOfBytes  = (SIZE_T) (range.second - range.first);
+                    want += range.second - range.first;
                     entries.push_back(entry);
+                }
+                // Continuum fork: a model larger than physical RAM (MoE with experts left on disk)
+                // must NOT be prefetched in full: populating more than RAM wedges the Windows
+                // working-set manager (the multi-minute load stall measured on the 663 GB K3:
+                // 16 shards x ~6 s, each shard's prefetch evicting the last). Past half of the
+                // AVAILABLE physical RAM, skip prefetch; the experts demand-page during decode.
+                MEMORYSTATUSEX ms;
+                ms.dwLength = sizeof(ms);
+                if (GlobalMemoryStatusEx(&ms) && want > (uint64_t) (ms.ullAvailPhys / 2)) {
+                    LLAMA_LOG_INFO("%s: model larger than RAM budget (%.1f GB > %.1f GB) - skipping prefetch, experts demand-page during decode\n",
+                            __func__, (double) want / 1e9, (double) (ms.ullAvailPhys / 2) / 1e9);
+                    entries.clear();
                 }
                 if (!entries.empty() &&
                         !pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0)) {
                     LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
                             llama_format_win_err(GetLastError()).c_str());
->>>>>>> upstream/master
                 }
             }
 #else
