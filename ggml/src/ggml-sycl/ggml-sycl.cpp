@@ -7734,13 +7734,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
         case GGML_OP_CUMSUM:
         case GGML_OP_DIAG:
-<<<<<<< HEAD
-=======
             return op->src[0]->type == GGML_TYPE_F32;
-        case GGML_OP_CROSS_ENTROPY_LOSS:
-        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
->>>>>>> upstream/master
-            return true;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             return op->src[1]->type == GGML_TYPE_F32; // no I32 targets on this backend yet
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:

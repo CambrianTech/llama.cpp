@@ -41,6 +41,10 @@ struct mmf_ids_data {
     int n_experts = 0;
     int max_tiles = 0;
     int sis1 = 0;
+    // Continuum fork [MOE-GATHER #23]: the optional expert base-offset table (dst->src[3]): expert_ptrs[e]
+    // is a BYTE offset from src0's start (ggml_mul_mat_id_gather, the Metal kernel's contract); nullptr
+    // means the classic contiguous expert stride.
+    const int64_t * expert_ptrs = nullptr;
 };
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
@@ -50,15 +54,8 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
 template <typename T, int rows_per_block, int cols_per_block, int nwarps>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
 static __global__ void mul_mat_f(
-<<<<<<< HEAD
-        const T * __restrict__ x, const float * __restrict__ y, const int32_t * __restrict__ ids,
-        const int64_t * __restrict__ expert_ptrs, float * __restrict__ dst,
-        const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
-        const int stride_col_id, const int stride_row_id,
-=======
         const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
         const int ncols, const int stride_row, const int stride_col_y, const int stride_col_dst,
->>>>>>> upstream/master
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
 // TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
@@ -105,31 +102,9 @@ static __global__ void mul_mat_f(
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
 
-<<<<<<< HEAD
-    // [MOE-GATHER #23] expert base from the pointer table when present (expert_ptrs[channel_x] is a
-    // BYTE offset from src0 start, per ggml_mul_mat_id_gather + M5's Metal kernel), else the classic
-    // contiguous channel stride. Address-generation only; matches the gather op contract bit-for-bit.
-    x   += int64_t(sample_x)  *stride_sample_x   + row0*stride_row ;
-    if (expert_ptrs != nullptr) {
-        x = (const T *) ((const char *) x + expert_ptrs[channel_x]);
-    } else {
-        x += int64_t(channel_x) *stride_channel_x;
-    }
-    y   += int64_t(sample_y)  *stride_sample_y   + (has_ids ? 0 : channel_y  *stride_channel_y);
-    dst += int64_t(sample_dst)*stride_sample_dst + (has_ids ? 0 : channel_dst*stride_channel_dst);
-
-    if constexpr (has_ids) {
-        constexpr int y_stride_scale = std::is_same_v<T, float> ? 1 : 2;
-        const int64_t col_offset = col_base;
-        y   += col_offset * stride_col_y * y_stride_scale;
-        dst += col_offset * stride_col_dst;
-        ids += col_offset * stride_row_id;
-    }
-=======
     x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x  + row0*stride_row ;
     y   += int64_t(sample_y)  *stride_sample_y   + channel_y  *stride_channel_y;
     dst += int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
->>>>>>> upstream/master
 
     [[maybe_unused]] const float2 * y2 = (const float2 *) y;
 
@@ -261,7 +236,7 @@ static __global__ void mul_mat_f_ids(
         const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 sis1_fd, const uint3 nch_fd) {
+        const uint3 sis1_fd, const uint3 nch_fd, const int64_t * __restrict__ expert_ptrs) {
 // TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 #if defined(AMD_WMMA_AVAILABLE)
@@ -319,7 +294,13 @@ static __global__ void mul_mat_f_ids(
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
 
-    x   += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x  + row0*stride_row;
+    // Continuum fork [MOE-GATHER #23]: expert base from the pointer table when present
+    x   += int64_t(sample_x)  *stride_sample_x   + row0*stride_row;
+    if (expert_ptrs != nullptr) {
+        x = (const T *) ((const char *) x + expert_ptrs[channel_x]);
+    } else {
+        x += int64_t(channel_x)*stride_channel_x;
+    }
     y   += int64_t(sample_y)  *stride_sample_y;
     dst += int64_t(sample_dst)*stride_sample_dst;
 
@@ -535,11 +516,7 @@ static __global__ void mul_mat_f_ids(
 
 template<typename T, int rows_per_block, int cols_per_block, int nwarps>
 static inline void mul_mat_f_switch_ids(
-<<<<<<< HEAD
-        const T * x, const float * y, const int32_t * ids, const int64_t * expert_ptrs, float * dst,
-=======
         const T * x, const float * y, float * dst,
->>>>>>> upstream/master
         const int64_t ncols_x, const int64_t ncols_dst, const int64_t nchannels_dst,
         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
         const int64_t channel_ratio, const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
@@ -564,34 +541,18 @@ static inline void mul_mat_f_switch_ids(
             ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
-            sis1_fd, nch_fd);
-<<<<<<< HEAD
-    } else if (ids) {
-        const int64_t col_tiles = (ncols_dst + cols_per_block - 1) / cols_per_block;
-        dim3 block_nums_ids = block_nums;
-        block_nums_ids.y *= col_tiles;
-
-        mul_mat_f<T, rows_per_block, cols_per_block, nwarps, true><<<block_nums_ids, block_dims, nbytes_shared_total, stream>>>
-            (x, y, ids, expert_ptrs, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-             stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
-    } else {
-        mul_mat_f<T, rows_per_block, cols_per_block, nwarps, false><<<block_nums, block_dims, nbytes_shared_total, stream>>>
-            (x, y, ids, /*expert_ptrs=*/nullptr, dst, ncols_x, cols_per_block, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-             stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-=======
+            sis1_fd, nch_fd, ids_data->expert_ptrs);
     } else {
         mul_mat_f<T, rows_per_block, cols_per_block, nwarps><<<block_nums, block_dims, nbytes_shared_total, stream>>>
             (x, y, dst, ncols_x, stride_row, stride_col_y, stride_col_dst,
              channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
->>>>>>> upstream/master
              sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
     }
 }
 
 template <typename T, int rows_per_block, int cols_per_block>
 void mul_mat_f_cuda(
-        const T * x, const float * y, const int32_t * ids, const int64_t * expert_ptrs, float * dst,
+        const T * x, const float * y, const int32_t * ids, float * dst,
         const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
         const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
@@ -637,61 +598,6 @@ void mul_mat_f_cuda(
     switch (nwarps_best) {
         case 1: {
             mul_mat_f_switch_ids<T, rows_per_block, cols_per_block, 1>(
-<<<<<<< HEAD
-                x, y, ids, expert_ptrs, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, nbytes_shared_total, stream,
-                ids_data);
-        } break;
-        case 2: {
-            mul_mat_f_switch_ids<T, rows_per_block, cols_per_block, 2>(
-                x, y, ids, expert_ptrs, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, nbytes_shared_total, stream,
-                ids_data);
-        } break;
-        case 3: {
-            mul_mat_f_switch_ids<T, rows_per_block, cols_per_block, 3>(
-                x, y, ids, expert_ptrs, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, nbytes_shared_total, stream,
-                ids_data);
-        } break;
-        case 4: {
-            mul_mat_f_switch_ids<T, rows_per_block, cols_per_block, 4>(
-                x, y, ids, expert_ptrs, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, nbytes_shared_total, stream,
-                ids_data);
-        } break;
-        case 5: {
-            mul_mat_f_switch_ids<T, rows_per_block, cols_per_block, 5>(
-                x, y, ids, expert_ptrs, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, nbytes_shared_total, stream,
-                ids_data);
-        } break;
-        case 6: {
-            mul_mat_f_switch_ids<T, rows_per_block, cols_per_block, 6>(
-                x, y, ids, expert_ptrs, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, nbytes_shared_total, stream,
-                ids_data);
-        } break;
-        case 7: {
-            mul_mat_f_switch_ids<T, rows_per_block, cols_per_block, 7>(
-                x, y, ids, expert_ptrs, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, nbytes_shared_total, stream,
-                ids_data);
-        } break;
-        case 8: {
-            mul_mat_f_switch_ids<T, rows_per_block, cols_per_block, 8>(
-                x, y, ids, expert_ptrs, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, nbytes_shared_total, stream,
-                ids_data);
-=======
                 x, y, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst, channel_ratio,
                 stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
                 block_nums, block_dims, nbytes_shared_total, stream, ids_data);
@@ -737,7 +643,6 @@ void mul_mat_f_cuda(
                 x, y, dst, ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst, channel_ratio,
                 stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,
                 block_nums, block_dims, nbytes_shared_total, stream, ids_data);
->>>>>>> upstream/master
         } break;
         default:
             GGML_ABORT("fatal error");
@@ -748,7 +653,7 @@ void mul_mat_f_cuda(
 
 template <typename T, int rows_per_block>
 static void mul_mat_f_switch_cols_per_block(
-        const T * x, const float * y, const int32_t * ids, const int64_t * expert_ptrs, float * dst,
+        const T * x, const float * y, const int32_t * ids, float * dst,
         const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
         const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
@@ -762,85 +667,6 @@ static void mul_mat_f_switch_cols_per_block(
 
     switch (ncols_case) {
         case  1: {
-<<<<<<< HEAD
-            mul_mat_f_cuda<T,  rows_per_block, 1>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case  2: {
-            mul_mat_f_cuda<T,  rows_per_block, 2>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case  3: {
-            mul_mat_f_cuda<T,  rows_per_block, 3>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case  4: {
-            mul_mat_f_cuda<T,  rows_per_block, 4>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case  5: {
-            mul_mat_f_cuda<T,  rows_per_block, 5>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y,  stride_sample_dst, stream, ids_data);
-        } break;
-        case  6: {
-            mul_mat_f_cuda<T,  rows_per_block, 6>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case  7: {
-            mul_mat_f_cuda<T,  rows_per_block, 7>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case  8: {
-            mul_mat_f_cuda<T,  rows_per_block, 8>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case  9: {
-            mul_mat_f_cuda<T,  rows_per_block, 9>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case 10: {
-            mul_mat_f_cuda<T, rows_per_block, 10>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case 11: {
-            mul_mat_f_cuda<T, rows_per_block, 11>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case 12: {
-            mul_mat_f_cuda<T, rows_per_block, 12>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case 13: {
-            mul_mat_f_cuda<T, rows_per_block, 13>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case 14: {
-            mul_mat_f_cuda<T, rows_per_block, 14>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case 15: {
-            mul_mat_f_cuda<T, rows_per_block, 15>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
-        } break;
-        case 16: {
-            mul_mat_f_cuda<T, rows_per_block, 16>(x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-=======
             mul_mat_f_cuda<T,  rows_per_block, 1>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
@@ -918,7 +744,6 @@ static void mul_mat_f_switch_cols_per_block(
         case 16: {
             mul_mat_f_cuda<T, rows_per_block, 16>(x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
->>>>>>> upstream/master
                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
         } break;
         default:
@@ -928,7 +753,7 @@ static void mul_mat_f_switch_cols_per_block(
 
 template <typename T>
 static void mul_mat_f_switch_rows_per_block(
-        const int rows_per_block, const T * x, const float * y, const int32_t * ids, const int64_t * expert_ptrs, float * dst,
+        const int rows_per_block, const T * x, const float * y, const int32_t * ids, float * dst,
         const int64_t ncols_x, const int64_t nrows_x, const int64_t ncols_dst,
         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
         const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
@@ -938,24 +763,14 @@ static void mul_mat_f_switch_rows_per_block(
     switch (rows_per_block) {
         case MMF_ROWS_PER_BLOCK: {
             mul_mat_f_switch_cols_per_block<T, MMF_ROWS_PER_BLOCK>(
-<<<<<<< HEAD
-                x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-=======
                 x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
->>>>>>> upstream/master
                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
         } break;
         case MMF_ROWS_PER_BLOCK_CDNA: {
             mul_mat_f_switch_cols_per_block<T, MMF_ROWS_PER_BLOCK_CDNA>(
-<<<<<<< HEAD
-                x, y, ids, expert_ptrs, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
-                stride_col_id, stride_row_id, nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-=======
                 x, y, ids, dst, ncols_x, nrows_x, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
->>>>>>> upstream/master
                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data);
         } break;
         default:
@@ -965,7 +780,7 @@ static void mul_mat_f_switch_rows_per_block(
 
 #define DECL_MMF_CASE_HELPER(T, nrows_dst, ncols_dst) \
     template void mul_mat_f_cuda<T, nrows_dst, ncols_dst>( \
-        const T * x, const float * y, const int32_t * ids, const int64_t * expert_ptrs, float * dst, \
+        const T * x, const float * y, const int32_t * ids, float * dst, \
         const int64_t ncols_x, const int64_t nrows_x, int64_t ncols_dst_total, const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst, \
         const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst, \
         const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, const int64_t nsamples_x,\
