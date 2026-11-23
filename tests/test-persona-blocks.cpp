@@ -490,9 +490,9 @@ int main(int argc, char ** argv) {
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);
         require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "a saved");
-        require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written to her file");
+        require_move(st(llama_persona_write_file(saved, path.c_str()).status), llama_persona_move::done, "a written to her file");
         // a second save to her fixed path replaces the first (Windows CRT rename refuses an existing destination)
-        require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written again over her file");
+        require_move(st(llama_persona_write_file(saved, path.c_str()).status), llama_persona_move::done, "a written again over her file");
         llama_persona_free(saved);
 
         llama_persona * other = llama_persona_init(f.ctx, 0xB, 1);
