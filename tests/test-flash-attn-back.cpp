@@ -41,12 +41,12 @@ static bool grads(ggml_backend_t be, bool flash, const shape & s, ggml_type kv_t
     ggml_tensor * out;
     if (flash) {
         out = ggml_flash_attn_ext(ctx, q, kk, vv, m, scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+        ggml_prec_set_acc(out, GGML_PREC_F32); // upstream renamed ggml_flash_attn_ext_set_prec
         ggml_flash_attn_ext_set_back_tile(out, s.tile);
     } else {
         ggml_tensor * mv = ggml_cont(ctx, ggml_cast(ctx, ggml_view_2d(ctx, m, s.m, s.n, m->nb[1], 0), GGML_TYPE_F32));
         ggml_tensor * kq = ggml_mul_mat(ctx, kk, q);
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_prec_set_acc(kq, GGML_PREC_F32); // upstream renamed ggml_mul_mat_set_prec
         kq = ggml_soft_max_ext(ctx, kq, mv, scale, 0.0f);
         ggml_tensor * kqv = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, vv)), kq);
         out = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));

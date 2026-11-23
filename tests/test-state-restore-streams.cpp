@@ -17,6 +17,17 @@
 #include <cstdio>
 #include <vector>
 
+// upstream removed common_batch_add with the move to llama_batch_ext; the test keeps the public llama_batch
+static void state_batch_add(llama_batch & batch, llama_token id, llama_pos pos, llama_seq_id seq, bool logits) {
+    GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
+    batch.token   [batch.n_tokens] = id;
+    batch.pos     [batch.n_tokens] = pos;
+    batch.n_seq_id[batch.n_tokens] = 1;
+    batch.seq_id  [batch.n_tokens][0] = seq;
+    batch.logits  [batch.n_tokens] = logits;
+    batch.n_tokens++;
+}
+
 static llama_context * make_ctx(llama_model * model, const common_params & base, int n_parallel, bool unified) {
     common_params params = base;
     params.n_parallel = n_parallel;
@@ -29,7 +40,7 @@ static llama_context * make_ctx(llama_model * model, const common_params & base,
 // decode `tok` at `pos` on `seq` and copy the logits out
 static bool next_logits(llama_context * ctx, llama_token tok, int pos, llama_seq_id seq, int n_vocab, std::vector<float> & out) {
     llama_batch batch = llama_batch_init(1, 0, 1);
-    common_batch_add(batch, tok, pos, {seq}, true);
+    state_batch_add(batch, tok, pos, seq, true);
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
     if (!ok) {
@@ -80,7 +91,7 @@ int main(int argc, char ** argv) {
     {
         llama_batch batch = llama_batch_init(n_prompt, 0, 1);
         for (int i = 0; i < n_prompt; ++i) {
-            common_batch_add(batch, (llama_token) (1 + i % 7), i, {seq}, false);
+            state_batch_add(batch, (llama_token) (1 + i % 7), i, seq, false);
         }
         if (llama_decode(writer, batch)) {
             fprintf(stderr, "%s : failed to decode the prompt\n", __func__);

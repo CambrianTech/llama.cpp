@@ -10,12 +10,13 @@ void llama_batch_label_copy(llama_batch_ext::token & t, const llama_batch & in, 
     t.label_weight = in.label_weight ? in.label_weight[i] : 1.0f;
 }
 
-// bind the ext batch's labels to the internal batch: nullptr when no row has a label, so inference stays label-free
+// bind the ext batch's labels to the internal batch: nullptr when every row is unlabelled (-1), so inference stays
+// label-free; any other value is bound and validated (a negative label other than -1 is refused, never dropped)
 void llama_batch_allocr::bind_labels(const llama_batch_ext & in) {
     const int32_t n_tok = (int32_t) in.tokens.size();
     bool any = false;
     for (int32_t i = 0; i < n_tok && !any; ++i) {
-        any = in.tokens[i].label >= 0;
+        any = in.tokens[i].label != -1; // a label other than "none" is bound, so an invalid one is refused, never dropped
     }
     label_vec.clear();
     label_weight_vec.clear();

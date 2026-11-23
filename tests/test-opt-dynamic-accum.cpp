@@ -473,7 +473,7 @@ static void run_label_projection(bool projected) {
     ggml_init_params cp = { GGML_DEFAULT_GRAPH_SIZE * ggml_tensor_overhead() + 4 * ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, true), nullptr, true };
     ggml_context * graph_ctx = ggml_init(cp);
     ggml_tensor * base = ggml_mul_mat(graph_ctx, identity, weights);
-    ggml_mul_mat_set_prec(base, GGML_PREC_F32);
+    ggml_prec_set_acc(base, GGML_PREC_F32); // upstream renamed ggml_mul_mat_set_prec
     ggml_tensor * rows = ggml_new_tensor_1d(graph_ctx, GGML_TYPE_I32, 2);
     ggml_tensor * public_rows = ggml_new_tensor_1d(graph_ctx, GGML_TYPE_I32, 3);
     ggml_set_input(rows);

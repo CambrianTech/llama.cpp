@@ -445,7 +445,10 @@ static void test_lora_helpers(testing & t) {
         // the adapter pointer is only read when the configs differ
         t.assert_true("both empty", !lora_should_clear_cache({}, {}));
         t.assert_true("same",       !lora_should_clear_cache({make(p0, 1.0f)}, {make(p0, 1.0f)}));
-        t.assert_true("to no lora", lora_should_clear_cache({make(p0, 0.0f)}, {}));
+        // Continuum fork: a dormant (scale 0) adapter never reached the graph, so a list holding only
+        // dormant ones equals an empty one and the KV computed under it stays valid (are_lora_equal: a
+        // runtime adapter load must not flush every slot's cache)
+        t.assert_true("dormant to no lora keeps the cache", !lora_should_clear_cache({make(p0, 0.0f)}, {}));
     });
 
     t.test("lora_get_enabled_ids", [&](testing & t) {

@@ -8496,7 +8496,21 @@ static void test_deepseek_v4_tool_result_ordering() {
     }
 }
 
-<<<<<<< HEAD
+// Continuum: our tests parse a reply as served; upstream removed its make_peg_parser helper when the parser
+// moved into common_chat_session, so this one parses through the session.
+struct make_peg_parser {
+    const common_chat_templates * tmpls_;
+    common_chat_templates_inputs  inputs_;
+
+    make_peg_parser(const common_chat_templates * tmpls, const common_chat_templates_inputs & inputs)
+        : tmpls_(tmpls), inputs_(inputs) {}
+
+    common_chat_msg parse(const std::string & msg, bool is_partial) const {
+        common_chat_session session(tmpls_, nullptr, inputs_);
+        return is_partial ? session.feed(common_chat_input(msg)) : session.finish(common_chat_input(msg));
+    }
+};
+
 static void test_learning_closed_transcript() {
     server_chat_params opt{};
     opt.tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
@@ -8589,9 +8603,9 @@ static void test_tail_tools() {
 
     const auto head_params   = common_chat_templates_apply(tmpls.get(), head);
     const auto loaded_params = common_chat_templates_apply(tmpls.get(), loaded);
-    assert_equals(head_params.prompt, loaded_params.prompt);
+    assert_equals(head_params.prompt.str(), loaded_params.prompt.str());
     assert_equals(head_params.generation_prompt, loaded_params.generation_prompt);
-    assert_not_contains(loaded_params.prompt, python_tool.description);
+    assert_not_contains(loaded_params.prompt.str(), python_tool.description);
     assert_not_contains(head_params.grammar, "python");
     assert_contains(loaded_params.grammar, "python");
 
@@ -8625,10 +8639,10 @@ static void test_tail_tools() {
     const json served = oaicompat_chat_params_parse(body, opt, files);
     json with_tail = body;
     with_tail["tail_tools"] = common_chat_tools_to_json_oaicompat({ python_tool });
-    const json served_tail = oaicompat_chat_params_parse(with_tail, opt, files);
+    common_chat_session session_tail; // upstream: grammar and the tool-call parser live in the session
+    const json served_tail = oaicompat_chat_params_parse(nullptr, with_tail, opt, files, session_tail);
     assert_equals(served.at("prompt").get<std::string>(), served_tail.at("prompt").get<std::string>());
-    assert_contains(served_tail.at("grammar").get<std::string>(), "python");
-    assert_equals(true, served_tail.at("parse_tool_calls").get<bool>());
+    assert_contains(session_tail.grammar(), "python");
 
     // Each template family a node serves, with a populated and an EMPTY head: the prompt bytes
     // are the head's alone; a tail verb's call streams (every prefix parses, the deltas add up to
@@ -8669,9 +8683,9 @@ static void test_tail_tools() {
 
             const auto hp = common_chat_templates_apply(t.get(), h);
             const auto lp = common_chat_templates_apply(t.get(), l);
-            assert_equals(hp.prompt, lp.prompt);
+            assert_equals(hp.prompt.str(), lp.prompt.str());
             assert_equals(hp.generation_prompt, lp.generation_prompt);
-            assert_not_contains(lp.prompt, python_tool.description);
+            assert_not_contains(lp.prompt.str(), python_tool.description);
             assert_contains(lp.grammar, "python");
             assert_equals(true, calls_python(t.get(), l, fam.call));
             assert_equals(false, calls_python(t.get(), h, fam.call));
@@ -8688,7 +8702,7 @@ static void test_tail_tools() {
             ln.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
             const auto hnp = common_chat_templates_apply(t.get(), hn);
             const auto lnp = common_chat_templates_apply(t.get(), ln);
-            assert_equals(hnp.prompt, lnp.prompt);
+            assert_equals(hnp.prompt.str(), lnp.prompt.str());
             assert_equals(hnp.grammar, lnp.grammar);
             assert_not_contains(lnp.grammar, "python");
             assert_equals(false, calls_python(t.get(), ln, fam.call));
@@ -8735,15 +8749,18 @@ static void test_tail_tools() {
 
     json none = tail_only;
     none["tool_choice"] = "none";
-    const json served_none = oaicompat_chat_params_parse(none, q25, files);
-    assert_equals(false, served_none.value("parse_tool_calls", false));
+    common_chat_session session_none;
+    oaicompat_chat_params_parse(nullptr, none, q25, files, session_none);
+    assert_not_contains(session_none.grammar(), "python"); // tool_choice "none": uncallable
 
     json no_tools = {{"messages", tail_only.at("messages")}};
     const json served_no_tools = oaicompat_chat_params_parse(no_tools, q25, files);
-    const json served_tail_only = oaicompat_chat_params_parse(tail_only, q25, files);
+    common_chat_session session_tail_only;
+    const json served_tail_only = oaicompat_chat_params_parse(nullptr, tail_only, q25, files, session_tail_only);
     assert_equals(served_no_tools.at("prompt").get<std::string>(), served_tail_only.at("prompt").get<std::string>());
-    assert_equals(true, served_tail_only.at("parse_tool_calls").get<bool>());
-=======
+    assert_contains(session_tail_only.grammar(), "python");
+}
+
 // DeepSeek V4.1: extra message keys, "\n\n" around media markers, reasoning_effort mapping, system-message tools
 static void test_deepseek_v4_1_message_fields() {
     LOG_DBG("%s\n", __func__);
@@ -8956,7 +8973,6 @@ static void test_chat_json_depth() {
     json_schema.messages    = { message_user };
     json_schema.json_schema = schema(deep);
     assert_equals(true, rejected([&] { common_chat_templates_apply(tmpls.get(), json_schema); }));
->>>>>>> upstream/master
 }
 
 static void test_reasoning_budget_tokens_per_request() {
@@ -9414,14 +9430,11 @@ int main(int argc, char ** argv) {
         test_inkling2_media_blocks();
         test_template_generation_prompt();
         test_reasoning_effort_caps();
-<<<<<<< HEAD
         test_learning_closed_transcript();
         test_tail_tools();
-=======
         test_prompt_parts();
         test_chat_session();
         test_chat_json_depth();
->>>>>>> upstream/master
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);
