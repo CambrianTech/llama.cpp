@@ -3025,7 +3025,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         // GGML_PREC_F32 on an F32 x F32 product is honored with the float-staged kernel (CUDA honors
         // the same request): the default stages through half, ~1e-3 relative per product, which the
         // training backward cannot afford (flash attention's tiled backward, continuum 2026-10-11)
-        const bool fp32 = !props_dev->has_tensor && ggml_get_op_params_i32(op, 0) == GGML_PREC_F32 &&
+        const bool fp32 = ggml_get_op_params_i32(op, 0) == GGML_PREC_F32 &&
                           op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         ggml_metal_encode_mul_mm(ctx, op, fp32);
     } else {
@@ -3376,7 +3376,6 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
     if (!has_tensor || ggml_metal_op_flash_attn_ext_use_vec(op)) {
         return false;
     }
-
     const int64_t ne01 = op->src[0]->ne[1];
     const int64_t ne02 = op->src[0]->ne[2];
     const int64_t ne03 = op->src[0]->ne[3];

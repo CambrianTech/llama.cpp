@@ -11,11 +11,13 @@ constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
+// Continuum fork: RELAXED is the tensor op's relaxed-precision flag. Inference keeps it (upstream's
+// default); a product that asks for GGML_PREC_F32 (training's backward) instantiates it off.
 template<
     typename SA, typename SA_4x4, typename SA_8x8,
     typename SB, typename SB_2x4, typename SB_8x8,
     typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
-    typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+    typename T0, typename T0_4x4, typename T1, typename T1_2x4, bool RELAXED = true>
 kernel void kernel_mul_mm(
         constant ggml_metal_kargs_mul_mm & args,
         device const char * srcA,
@@ -69,11 +71,11 @@ kernel void kernel_mul_mm(
     // ref: https://github.com/ggml-org/llama.cpp/pull/27064
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
-            NRB, NRA, static_cast<int>(dynamic_extent), false, true, true,
+            NRB, NRA, static_cast<int>(dynamic_extent), false, true, RELAXED,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
 
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
     // Accumulate partial results over K dimension
     for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
@@ -935,11 +937,15 @@ template [[host_name("kernel_mul_mm_tq2_0_f32")]]   kernel mul_mm_t kernel_mul_m
 // does not (Qwen3.5 0.8B LoRA backward, 2026-10-06: |grad| 131273, 95 values over, the
 // staged Inf turned 32k outputs of one OUT_PROD non-finite), and half staging also cost every
 // OUT_PROD ~1e-3 relative precision. Threadgroup memory: 64*32*4 + 32*32*4 = 12288 bytes.
-// The simdgroup kernel only (the tensor-API kernel has its own staging); the host asks for
-// this variant only when the tensor API is off.
+// With the tensor API, the same float staging with the tensor op's relaxed precision off: on the
+// M5 the default relaxed product put flash attention's backward at 8.5e-4 relative error against a
+// 1e-4 bound (1e-6 with the tensor API off; the 2026-11-22 upstream sync).
 #ifndef GGML_METAL_HAS_TENSOR
 typedef decltype(kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_fp32_t;
 template [[host_name("kernel_mul_mm_f32_f32_fp32")]] kernel mul_mm_fp32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>;
+#else
+typedef decltype(kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4, false>) mul_mm_fp32_t;
+template [[host_name("kernel_mul_mm_f32_f32_fp32")]] kernel mul_mm_fp32_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4, false>;
 #endif
 template [[host_name("kernel_mul_mm_f32_f16")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  half, half2x4>;
 template [[host_name("kernel_mul_mm_f16_f16")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   half, half2x4>;
