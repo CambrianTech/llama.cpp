@@ -261,6 +261,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+// Continuum fork: a state computed with an adapter that is about to be freed must not outlive it
+void server_prompt_cache::evict_lora(const llama_adapter_lora * adapter) {
+    states.remove_if([adapter](const server_prompt_cache_state & state) {
+        for (const auto & la : state.prompt.lora) {
+            if (la.ptr == adapter) {
+                return true;
+            }
+        }
+        return false;
+    });
+}
+
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {

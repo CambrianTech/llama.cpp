@@ -406,7 +406,7 @@
         const common_prompt_checkpoint * cp = nullptr;
         const bool needs_cp = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
         if (needs_cp) {
-            for (const auto & c : slot.prompt.checkpoints) {
+            for (const auto & c_ptr : slot.prompt.checkpoints) { const common_prompt_checkpoint & c = *c_ptr;
                 if (c.n_tokens == n0) {
                     cp = &c;
                 }
@@ -572,7 +572,7 @@
                 if (cp) { cp->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY); }
             }
             slot.prompt.tokens.keep_first(n0);
-            slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & c) { return c.n_tokens > n0; });
+            slot.prompt.checkpoints.remove_if([&](const std::shared_ptr<const common_prompt_checkpoint> & c) { return c->n_tokens > n0; });
         }
         learn_outcome out;
         out.ok       = ok && !pending.drained;

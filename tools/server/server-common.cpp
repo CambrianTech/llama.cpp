@@ -931,7 +931,6 @@ size_t server_tokens::get_common_prefix(const server_tokens & b) const {
     return max_idx; // all tokens are equal
 }
 
-<<<<<<< HEAD
 int32_t view_end_position(const json & messages, int64_t n_view, const common_chat_msg_delimiters & delims,
                           const common_chat_msg_spans & spans, size_t n_tokens, std::string & refusal) {
     if (!messages.is_array() || n_view <= 0 || n_view > (int64_t) messages.size()) {
@@ -995,7 +994,8 @@ int32_t view_end_position(const json & messages, int64_t n_view, const common_ch
         return (int32_t) got[n_before - 1].pos;
     }
     return n_before < got.size() ? (int32_t) got[n_before].pos : (int32_t) n_tokens;
-=======
+}
+
 void server_tokens::update_hashes() {
     const size_t n_blocks = tokens.size() / hash_block_size;
 
@@ -1054,7 +1054,6 @@ size_t server_tokens::get_common_prefix_lower(const std::vector<prefix_hash> & b
     }
 
     return n;
->>>>>>> upstream/master
 }
 
 common_chat_msg_spans server_tokens::find_message_spans(const common_chat_msg_delimiters & delims) const {
@@ -1582,17 +1581,24 @@ server_tokens tokenize_oai_content_array(const llama_vocab * vocab, mtmd_context
     return process_mtmd_prompt(mctx, prompt, files, init_opt);
 }
 
+// Continuum fork: the form our learning paths use (no vocab, no session out).
+json oaicompat_chat_params_parse(
+    json & body,
+    const server_chat_params & opt,
+    std::vector<raw_buffer> & out_files,
+    server_chat_render render) {
+    common_chat_session session;
+    return oaicompat_chat_params_parse(nullptr, body, opt, out_files, session, render);
+}
+
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
     const llama_vocab * vocab,
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
     std::vector<raw_buffer> & out_files,
-<<<<<<< HEAD
+    common_chat_session & out_session,
     server_chat_render render)
-=======
-    common_chat_session & out_session)
->>>>>>> upstream/master
 {
     json llama_params;
 
@@ -1693,15 +1699,10 @@ json oaicompat_chat_params_parse(
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
     inputs.use_jinja              = opt.use_jinja;
-<<<<<<< HEAD
-    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps["supports_parallel_tool_calls"]);
+    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps.at("supports_parallel_tool_calls").get<bool>());
+    // Continuum fork: a closed learning transcript never becomes an assistant prefill
     inputs.add_generation_prompt  = render == server_chat_render::closed_transcript ? false : json_value(body, "add_generation_prompt", true);
     inputs.continue_final_message = render == server_chat_render::closed_transcript ? COMMON_CHAT_CONTINUATION_NONE : body.contains("continue_final_message") ?
-=======
-    inputs.parallel_tool_calls    = json_value(body, "parallel_tool_calls", caps.at("supports_parallel_tool_calls").get<bool>());
-    inputs.add_generation_prompt  = json_value(body, "add_generation_prompt", true);
-    inputs.continue_final_message = body.contains("continue_final_message") ?
->>>>>>> upstream/master
         common_chat_continuation_parse(body.at("continue_final_message")) :
         COMMON_CHAT_CONTINUATION_NONE;
     if (render == server_chat_render::serving && inputs.continue_final_message == COMMON_CHAT_CONTINUATION_NONE && opt.prefill_assistant

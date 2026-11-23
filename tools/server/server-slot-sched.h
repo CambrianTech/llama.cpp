@@ -28,9 +28,17 @@ struct server_prompt {
     // TODO: slot files do not store it
     std::vector<common_adapter_lora_info> lora;
 
+    // Continuum fork: where the last prompt processed into these tokens put its view end, and the
+    // first position of the checkpoints made for its end (-1 = unknown), for the checkpoint subset
+    // a saved page keeps.
+    int32_t view_end = -1;
+    int32_t end_from = -1;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        view_end = -1;
+        end_from = -1;
     }
 
     int n_tokens() const {
@@ -42,6 +50,8 @@ struct server_prompt {
             tokens.clone(),
             checkpoints,
             lora,
+            view_end,
+            end_from,
         };
     }
 
@@ -99,6 +109,9 @@ struct server_prompt_cache {
 
     // lora_new: the lora config of the new prompt, the states made with another config are skipped
     bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // Continuum fork: drop every state computed with `adapter` active: it is about to be freed
+    void evict_lora(const llama_adapter_lora * adapter);
 
     void update();
 };

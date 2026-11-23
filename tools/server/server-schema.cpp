@@ -517,7 +517,6 @@ task_params eval_llama_cmpl_schema(
         f->eval(ctx, data);
     }
 
-<<<<<<< HEAD
     // learn a reply on this request's slot before it is released: {"reply": text, "lora_id", "lr"};
     // the reply is learned as the tokens the model would generate after this prompt (its text, then
     // the end of the turn)
@@ -537,15 +536,6 @@ task_params eval_llama_cmpl_schema(
         params.learn = std::move(L);
     }
 
-    // post-processing
-    {
-        // if "reasoning_format" is not provided, its handler will not be called, we will need to handle it here
-        auto reasoning_format = params.chat_parser_params.reasoning_format;
-        params.chat_parser_params.reasoning_in_content = params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
-    }
-
-=======
->>>>>>> upstream/master
     // debugging
     {
         auto budget = params.sampling.reasoning_budget_tokens;

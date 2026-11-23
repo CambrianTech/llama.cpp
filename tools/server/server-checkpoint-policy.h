@@ -2,10 +2,23 @@
 
 // Continuum fork (CONTINUUM-ENGINE 4.7.3, placed checkpoints): which of a slot's context checkpoints go,
 // as pure rules over the slot's list (oldest first), so a native test proves them without a model.
-// A checkpoint here needs `n_tokens` (its position) and `id_task` (the act that made it).
+// A checkpoint here needs `n_tokens` (its position) and `id_task` (the act that made it). The list holds
+// checkpoints or shared pointers to them (upstream shares a checkpoint between a slot and the prompt cache).
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+
+// The checkpoint an element of the list is, whether the list holds it or a shared pointer to it.
+template <typename T>
+const T & checkpoint_of(const T & checkpoint) {
+    return checkpoint;
+}
+
+template <typename T>
+const T & checkpoint_of(const std::shared_ptr<T> & checkpoint) {
+    return *checkpoint;
+}
 
 // Whether the prompt fill stops at a user turn's start (at `pos`) so a checkpoint is made there. The
 // first boundary always gets one: with an empty store it is her head, her restore point when her next
@@ -48,8 +61,8 @@ size_t erase_superseded_checkpoints(List & checkpoints, const Checkpoint & kept,
     const auto * head = &checkpoints.front();
     size_t erased = 0;
     for (auto it = checkpoints.begin(); it != checkpoints.end();) {
-        if (&*it != head && it->id_task != id_task) {
-            on_erase(*it);
+        if (&*it != head && checkpoint_of(*it).id_task != id_task) {
+            on_erase(checkpoint_of(*it));
             it = checkpoints.erase(it);
             ++erased;
             continue;

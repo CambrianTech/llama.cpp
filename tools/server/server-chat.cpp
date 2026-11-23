@@ -643,13 +643,9 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     }
 
     // Pass through common params
-<<<<<<< HEAD
-    // "learn" too: a learn on an Anthropic request was dropped here, so it never ran (a reply learned
-    // on the turn's own slot, task_params::learn)
-    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs", "learn"}) {
-=======
-    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs", "id_slot"}) {
->>>>>>> upstream/master
+    // Continuum fork: "learn" too: a learn on an Anthropic request was dropped here, so it never ran (a
+    // reply learned on the turn's own slot, task_params::learn)
+    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs", "id_slot", "learn"}) {
         if (body.contains(key)) {
             oai_body[key] = body.at(key);
         }

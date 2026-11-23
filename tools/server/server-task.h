@@ -65,16 +65,13 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_SLOT_PAGE_IO_DONE, // Continuum fork: a save's or restore's file IO finished on its worker
     SERVER_TASK_TYPE_SET_LORA,
-<<<<<<< HEAD
     SERVER_TASK_TYPE_LOAD_LORA,
     SERVER_TASK_TYPE_SAVE_LORA,
     SERVER_TASK_TYPE_UNLOAD_LORA,
     SERVER_TASK_TYPE_LEARN,
     SERVER_TASK_TYPE_LEARN_GRANTS,
     SERVER_TASK_TYPE_PROMPT_CACHE_LIMIT,
-=======
     SERVER_TASK_TYPE_TTS,
->>>>>>> upstream/master
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -95,7 +92,6 @@ enum stop_type {
     STOP_TYPE_LIMIT,
 };
 
-<<<<<<< HEAD
 // One reply learned on the slot that served its prompt, in this serving context (llama_opt_learn):
 // no second context, her prompt never decoded again. Asked by POST /learn, or carried by a
 // completion request (task_params::learn), which learns on its own slot before releasing it.
@@ -130,7 +126,8 @@ struct learn_outcome {
     double      max_restore_ms = 0.0;
     double      cleanup_ms = 0.0;
     json to_json() const;
-=======
+};
+
 enum server_control_action {
     SERVER_CONTROL_ACTION_NONE,
     SERVER_CONTROL_ACTION_REASONING_END,
@@ -151,7 +148,6 @@ struct server_control_response {
     int32_t                        n_predict = -1; // text tokens and audio frames, -1: until the context is full
     std::string                    lang;           // empty: model default
     std::string                    voice;          // empty: model default
->>>>>>> upstream/master
 };
 
 struct task_params {
@@ -359,7 +355,6 @@ struct server_task {
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
 
-<<<<<<< HEAD
     // used by SERVER_TASK_TYPE_LOAD_LORA: an adapter already read from `path` off the
     // server loop; the loop only appends it (dormant, scale 0) to the adapter list
     llama_adapter_lora * load_lora = nullptr;
@@ -381,10 +376,8 @@ struct server_task {
     // used by SERVER_TASK_TYPE_LEARN
     learn_request learn;
     json restore_checkpoint;
-=======
     // used by SERVER_TASK_TYPE_TTS
     mtmd_helper::gen_audio::inp tts_inp;
->>>>>>> upstream/master
 
     server_task() = default;
 
@@ -546,13 +539,9 @@ struct completion_token_output {
 };
 
 struct server_task_result_cmpl_final : server_task_result {
-<<<<<<< HEAD
     // the outcome of the request's learn (task_params::learn), run before its slot was released
     std::optional<learn_outcome> learned;
-    std::string content;
-=======
     common_chat_input content;
->>>>>>> upstream/master
     llama_tokens tokens;
 
     bool stream;
@@ -858,7 +847,6 @@ struct server_task_result_lora_change : server_task_result {
     virtual json to_json() override;
 };
 
-<<<<<<< HEAD
 struct server_task_result_learn_grants : server_task_result {
     json receipt;
     virtual json to_json() override { return receipt; }
@@ -869,95 +857,6 @@ struct server_task_result_learn : server_task_result {
     virtual json to_json() override { return outcome.to_json(); }
 };
 
-struct server_prompt {
-    server_tokens tokens;
-
-    std::list<common_prompt_checkpoint> checkpoints;
-
-    // Continuum fork: where the last prompt processed into these tokens put its view end, and the
-    // first position of the checkpoints made for its end (-1 = unknown), for the checkpoint subset
-    // a saved page keeps.
-    int32_t view_end = -1;
-    int32_t end_from = -1;
-
-    void clear() {
-        tokens.clear();
-        checkpoints.clear();
-        view_end = -1;
-        end_from = -1;
-    }
-
-    int n_tokens() const {
-        return tokens.size();
-    }
-
-    server_prompt clone() const {
-        return server_prompt {
-            tokens.clone(),
-            checkpoints,
-            view_end,
-            end_from,
-        };
-    }
-};
-
-struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
-
-    size_t size() const {
-        return main.size() + drft.size();
-    }
-};
-
-struct server_prompt_cache_state {
-    server_prompt prompt;
-    server_prompt_data data;
-
-    // the adapters the state was computed under; restored only into the same set
-    lora_active_set lora;
-
-    size_t size() const {
-        size_t res = data.size();
-
-        for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt.size();
-        }
-
-        return res;
-    }
-};
-
-struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
-
-    std::list<server_prompt_cache_state> states;
-
-    // in bytes, 0 = no limit
-    size_t limit_size = 0;
-
-    // in tokens, 0 = no limit
-    size_t limit_tokens = 0;
-
-    size_t size() const;
-
-    size_t n_tokens() const;
-
-    server_prompt_cache_state * alloc(const server_prompt & prompt, const lora_active_set & lora, size_t state_size_main, size_t state_size_drft);
-
-    bool load(server_prompt & prompt, const lora_active_set & lora, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
-
-    // drop every state computed with `adapter` active: it is about to be freed
-    void evict_lora(const llama_adapter_lora * adapter);
-
-    void update();
-};
-
-=======
->>>>>>> upstream/master
 // used exclusively by router mode
 struct server_task_result_router : server_task_result {
     json data;

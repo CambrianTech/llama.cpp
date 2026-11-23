@@ -28,16 +28,14 @@
 
 class server_http_context::Impl {
 public:
-<<<<<<< HEAD
-    std::unique_ptr<httplib::Server> srv;
-    std::mutex loading_mutex;
-    json loading_progress;
-=======
     std::vector<std::unique_ptr<httplib::Server>> servers;
     std::vector<std::string> hosts;
     std::vector<std::thread> threads; // one thread per listener
     std::unique_ptr<httplib::ThreadPool> pool; // single pool shared among all listeners
     int n_threads_http = 0;
+    // Continuum fork: the model's loading progress, served on /health while the server is not ready
+    std::mutex loading_mutex;
+    json loading_progress;
 };
 
 class server_http_task_queue : public httplib::TaskQueue {
@@ -47,7 +45,6 @@ public:
     bool enqueue(std::function<void()> fn) override { return pool.enqueue(std::move(fn)); }
     // note: must call join() to drain the pool
     void shutdown() override { /* no-op */ }
->>>>>>> upstream/master
 };
 
 server_http_context::server_http_context()

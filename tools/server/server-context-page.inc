@@ -20,7 +20,7 @@
         const int32_t end_from = slot.prompt.end_from;
         const bool keep_all = by_view ? end_from < 0 : keep < 0;
         const common_prompt_checkpoint * at_view_end = nullptr;
-        for (const auto & c : all) {
+        for (const auto & c_ptr : all) { const common_prompt_checkpoint & c = *c_ptr;
             if (by_view && view_end >= 0 && c.n_tokens <= view_end) {
                 at_view_end = &c;
             }
@@ -28,7 +28,7 @@
         const size_t n = all.size();
         size_t i = 0;
         std::string kept_at;
-        for (const auto & c : all) {
+        for (const auto & c_ptr : all) { const common_prompt_checkpoint & c = *c_ptr;
             const bool newest = keep > 0 && i + (size_t) keep >= n;
             const bool viewed = by_view && (&c == at_view_end || c.n_tokens >= end_from);
             if (keep_all || i == 0 || newest || viewed) {
@@ -712,7 +712,11 @@
         slot->prompt.tokens = std::move(*restored);
         slot->lora = std::move(page_lora);
         if (job.checkpoints_ok) {
-            slot->prompt.checkpoints = std::move(job.checkpoints);
+            slot->prompt.checkpoints.clear(); // a checkpoint is shared with the prompt cache by pointer (upstream)
+            for (auto & c : job.checkpoints) {
+                slot->prompt.checkpoints.push_back(std::make_shared<const common_prompt_checkpoint>(std::move(c)));
+            }
+            job.checkpoints.clear();
             SLT_INF(*slot, "restored %zu context checkpoints from the sidecar: %s\n", slot->prompt.checkpoints.size(), job.ckpt_path.c_str());
         } else {
             slot->prompt.checkpoints.clear();

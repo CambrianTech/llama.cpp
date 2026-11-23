@@ -421,7 +421,14 @@ json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
     std::vector<raw_buffer> & out_files,
-<<<<<<< HEAD
+    common_chat_session & out_session,
+    server_chat_render render = server_chat_render::serving); // Continuum fork: render
+
+// Continuum fork: the form our learning paths use (no vocab, no session out).
+json oaicompat_chat_params_parse(
+    json & body,
+    const server_chat_params & opt,
+    std::vector<raw_buffer> & out_files,
     server_chat_render render = server_chat_render::serving);
 
 // Continuum fork: the token position where the first `n_view` chat `messages` end in a prompt the
@@ -433,8 +440,6 @@ json oaicompat_chat_params_parse(
 // with the messages one to one (a template this rule does not describe).
 int32_t view_end_position(const json & messages, int64_t n_view, const common_chat_msg_delimiters & delims,
                           const common_chat_msg_spans & spans, size_t n_tokens, std::string & refusal);
-=======
-    common_chat_session & out_session);
 
 // used by /embeddings endpoint, content has the same format as a chat message content array
 server_tokens tokenize_oai_content_array(
@@ -445,7 +450,6 @@ server_tokens tokenize_oai_content_array(
     bool add_special,
     bool parse_special,
     const mtmd_helper_init_opt & init_opt);
->>>>>>> upstream/master
 
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(
