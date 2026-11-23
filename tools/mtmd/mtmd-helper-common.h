@@ -95,28 +95,8 @@ struct decode_embd_batch {
     decode_embd_batch(const float * embd, int32_t n_tokens, int n_pos_per_embd, int n_mmproj_embd)
             : n_pos_per_embd(n_pos_per_embd), n_mmproj_embd(n_mmproj_embd), n_tokens(n_tokens), embd(embd) {
         GGML_ASSERT(n_tokens > 0 && n_pos_per_embd > 0 && n_mmproj_embd > 0);
-<<<<<<< HEAD
-        pos     .resize((size_t) n_tokens * (size_t) n_pos_per_embd);
-        n_seq_id.resize(n_tokens);
-        seq_ids .resize(n_tokens + 1);
-        logits  .resize(n_tokens);
-        seq_id_0.resize(1);
-        seq_ids [n_tokens] = nullptr;
-        batch = {
-            /*n_tokens       =*/ n_tokens,
-            /*tokens         =*/ nullptr,
-            /*embd           =*/ embd,
-            /*pos            =*/ pos.data(),
-            /*n_seq_id       =*/ n_seq_id.data(),
-            /*seq_id         =*/ seq_ids.data(),
-            /*logits         =*/ logits.data(),
-            /*label          =*/ nullptr,
-            /*label_weight   =*/ nullptr,
-        };
-=======
         pos   .resize((size_t) n_tokens * (size_t) n_pos_per_embd);
         logits.resize(n_tokens);
->>>>>>> upstream/master
     }
 
     void set_position_normal(llama_pos pos_0, llama_seq_id seq_id) {
@@ -165,24 +145,12 @@ struct decode_embd_batch {
             pos_view.insert(pos_view.end(), pos.data() + src, pos.data() + src + n);
         }
         return {
-<<<<<<< HEAD
-            /*n_tokens       =*/ n_tokens,
-            /*tokens         =*/ nullptr,
-            /*embd           =*/ batch.embd     + offset * n_mmproj_embd,
-            /*pos            =*/ pos_ptr,
-            /*n_seq_id       =*/ batch.n_seq_id + offset,
-            /*seq_id         =*/ batch.seq_id   + offset,
-            /*logits         =*/ batch.logits   + offset,
-            /*label          =*/ batch.label ? batch.label + offset : nullptr,
-            /*label_weight   =*/ batch.label && batch.label_weight ? batch.label_weight + offset : nullptr,
-=======
             /*n_tokens =*/ n,
             /*embd     =*/ embd + (size_t) offset * n_mmproj_embd,
             /*n_embd   =*/ n_mmproj_embd,
             /*pos      =*/ pos_view.data(),
             /*n_pos    =*/ n_pos_per_embd,
             /*seq_id   =*/ seq_id,
->>>>>>> upstream/master
         };
     }
 

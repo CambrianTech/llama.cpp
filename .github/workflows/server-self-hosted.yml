@@ -139,11 +139,7 @@ jobs:
       - name: Build
         id: cmake_build
         run: |
-<<<<<<< HEAD
-          cmake -B build -DGGML_CUDA=ON -DGGML_SCHED_NO_REALLOC=ON -DLLAMA_SERVER_TEST_FAULTS=ON
-=======
-          cmake -B build -DGGML_CUDA=ON -DGGML_SCHED_NO_REALLOC=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
->>>>>>> upstream/master
+          cmake -B build -DGGML_CUDA=ON -DGGML_SCHED_NO_REALLOC=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DLLAMA_SERVER_TEST_FAULTS=ON
           cmake --build build --config Release -j $(nproc) --target llama-server
 
       - name: ccache-buckets-save
@@ -242,11 +238,7 @@ jobs:
       - name: Build
         id: cmake_build
         run: |
-<<<<<<< HEAD
-          cmake -B build -DGGML_SCHED_NO_REALLOC=ON -DGGML_CPU_KLEIDIAI=ON -DLLAMA_SERVER_TEST_FAULTS=ON
-=======
-          cmake -B build -DGGML_SCHED_NO_REALLOC=ON -DGGML_CPU_KLEIDIAI=ON -DLLAMA_FATAL_WARNINGS=ON
->>>>>>> upstream/master
+          cmake -B build -DGGML_SCHED_NO_REALLOC=ON -DGGML_CPU_KLEIDIAI=ON -DLLAMA_FATAL_WARNINGS=ON -DLLAMA_SERVER_TEST_FAULTS=ON
           cmake --build build --config Release -j $(nproc) --target llama-server
 
       - name: Python setup

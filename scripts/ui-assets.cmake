@@ -507,20 +507,15 @@ function(hf_download version out_var out_resolved)
         file(READ "${archive}.sha256" expected)
         string(REGEX MATCH "^[0-9a-fA-F]+" expected "${expected}")
         string(TOLOWER "${expected}" expected)
-<<<<<<< HEAD
-        # A sha256 recorded in the repo is the identity; the bucket's own file must agree with it.
+        # Continuum fork (card aecdb2f2): a sha256 recorded in the repo is the identity; the bucket's own
+        # file must agree with it.
         if(NOT "${HF_SHA256}" STREQUAL "" AND NOT "${expected}" STREQUAL "${HF_SHA256}")
             message(STATUS "UI: ${resolved} is published as ${expected}, not the recorded ${HF_SHA256}")
             continue()
         endif()
-        file(SHA256 "${archive}" actual)
-        if("${expected}" STREQUAL "" OR NOT "${actual}" STREQUAL "${expected}")
-            message(STATUS "UI: checksum mismatch for dist.tar.gz from ${resolved}")
-=======
         string(LENGTH "${expected}" expected_len)
         if(NOT expected_len EQUAL 64)
             message(STATUS "UI: invalid checksum from ${resolved}")
->>>>>>> upstream/master
             continue()
         endif()
 
@@ -596,29 +591,21 @@ endif()
 if(NOT provisioned AND HF_ENABLED)
     resolve_version(VERSION)
 
-<<<<<<< HEAD
-    # The cache receipt names what was verified: the version and, when the repo records one, its sha256 (Continuum
-    # fork, card aecdb2f2). A cache stamped by another version or digest, or by a version alone before a digest was
-    # recorded, is fetched and verified again, never reused unchecked.
-    set(receipt "${VERSION}")
-    if(NOT "${HF_SHA256}" STREQUAL "")
-        set(receipt "${VERSION} sha256=${HF_SHA256}")
-    endif()
-=======
     # Stamp a successful HF download: records bucket + requested version and
     # lets later steps distinguish downloaded assets from locally built ones.
     set(stamp_key "${HF_BUCKET}|${VERSION}")
->>>>>>> upstream/master
+    # Continuum fork (card aecdb2f2): when the repo records a sha256 the stamp names it too, so a cache
+    # stamped by another digest, or by a version alone before a digest was recorded, is fetched and
+    # verified again, never reused unchecked.
+    if(NOT "${HF_SHA256}" STREQUAL "")
+        set(stamp_key "${stamp_key}|sha256=${HF_SHA256}")
+    endif()
 
     set(stamp_ok FALSE)
     if(EXISTS "${STAMP_FILE}" AND EXISTS "${DIST_DIR}/index.html" AND NOT "${VERSION}" STREQUAL "")
         file(READ "${STAMP_FILE}" stamped)
         string(STRIP "${stamped}" stamped)
-<<<<<<< HEAD
-        if("${stamped}" STREQUAL "${receipt}")
-=======
         if(stamped STREQUAL "${stamp_key}")
->>>>>>> upstream/master
             set(stamp_ok TRUE)
         endif()
     endif()
@@ -629,14 +616,8 @@ if(NOT provisioned AND HF_ENABLED)
     else()
         hf_download("${VERSION}" HF_OK HF_RESOLVED)
         if(HF_OK)
-<<<<<<< HEAD
-            # written only after hf_download verified the archive against the recorded digest
-            file(WRITE "${STAMP_FILE}" "${receipt}")
-            message(STATUS "UI: HF download succeeded, stamp updated (${receipt})")
-=======
             file(WRITE "${STAMP_FILE}" "${stamp_key}")
             message(STATUS "UI: HF download succeeded, stamp updated (${stamp_key}, resolved: ${HF_RESOLVED})")
->>>>>>> upstream/master
             set(provisioned TRUE)
         elseif(NOT "${HF_SHA256}" STREQUAL "")
             # A bundle recorded by version and sha256 is required, never replaced by a build without the UI.

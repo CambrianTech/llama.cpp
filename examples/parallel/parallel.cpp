@@ -391,23 +391,7 @@ int main(int argc, char ** argv) {
 
             const int32_t n_tokens = std::min(n_batch, batch.size() - i);
 
-<<<<<<< HEAD
-            llama_batch batch_view = {
-                n_tokens,
-                batch.token    + i,
-                nullptr,
-                batch.pos      + i,
-                batch.n_seq_id + i,
-                batch.seq_id   + i,
-                batch.logits   + i,
-                batch.label ? batch.label + i : nullptr,
-                batch.label && batch.label_weight ? batch.label_weight + i : nullptr,
-            };
-
-            const int ret = llama_decode(ctx, batch_view);
-=======
             const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(i, n_tokens));
->>>>>>> upstream/master
             if (ret != 0) {
                 if (n_batch == 1 || ret < 0) {
                     // if you get here, it means the KV cache is full - try increasing it via the context size
