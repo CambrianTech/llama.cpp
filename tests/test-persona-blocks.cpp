@@ -17,6 +17,8 @@
 #include "../src/llama-context.h"
 
 #ifdef _WIN32
+#    include "../src/llama-persona.h"
+#    include <thread>
 #    ifndef NOMINMAX
 #        define NOMINMAX
 #    endif
@@ -509,12 +511,27 @@ int main(int argc, char ** argv) {
         HANDLE reader = CreateFileA(tmp.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                                     nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         require(reader != INVALID_HANDLE_VALUE, "temporary reader opened");
-        const auto rename_error = llama_persona_write_checkpoint(saved, path.c_str());
+        // Keep serialization out of the deadline measurement, independent of the model under test.
+        llama_persona checkpoint_fixture{};
+        checkpoint_fixture.blocks.owned = true;
+        const auto start = GetTickCount64();
+        const auto rename_error = llama_persona_write_checkpoint(&checkpoint_fixture, path.c_str());
+        const auto elapsed = GetTickCount64() - start;
         CloseHandle(reader);
         std::remove(tmp.c_str());
         require_move(st(rename_error.status), llama_persona_move::io_error, "held temporary refuses publication");
         require(rename_error.stage == LLAMA_PERSONA_FILE_RENAME && rename_error.os_error == ERROR_SHARING_VIOLATION,
                 "rename refusal retains its Win32 cause across cleanup");
+        require(elapsed >= 2000 && elapsed < 5000, "persistent sharing conflict consumes the bounded retry budget");
+        const std::string transient = path + ".transient";
+        reader = CreateFileA((transient + ".tmp").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        require(reader != INVALID_HANDLE_VALUE, "transient temporary reader opened");
+        std::thread release([reader] { Sleep(150); CloseHandle(reader); });
+        const auto published = llama_persona_write_checkpoint(&checkpoint_fixture, transient.c_str());
+        release.join();
+        require_move(st(published.status), llama_persona_move::done, "publication retries until the transient reader releases");
+        std::remove(transient.c_str());
 #endif
         llama_persona_free(saved);
 
