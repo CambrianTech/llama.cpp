@@ -23,8 +23,10 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
     opt_alloc_failed.store(false);
     opt_stop_requested.store(false);
     opt_failure.clear();
-    if (n_restore <= 0 || restore_tokens == nullptr || (int64_t) n_cached + n_restore > (int64_t) cparams.n_ctx_seq) {
-        opt_fail("live learn needs the exact served tail to restore within the existing window");
+    // n_restore == 0: no tail to restore; she is left at her served prefix, and her owner prefills what follows
+    // it under her own adapters (a tail re-decoded here would run under the shadow being trained)
+    if (n_restore < 0 || (n_restore > 0 && restore_tokens == nullptr) || (int64_t) n_cached + n_restore > (int64_t) cparams.n_ctx_seq) {
+        opt_fail("live learn restores no tail, or the exact served tail within the existing window");
         return false;
     }
     if (n <= 0 || n_cached < 0 || tokens == nullptr || labels == nullptr) {
@@ -194,6 +196,16 @@ llama_opt_learn_status llama_context::opt_learn_step() {
             opt_reply.reset();
             return LLAMA_OPT_LEARN_FAILED;
         }
+    }
+    // nothing to restore past her served prefix: she ends there, which is the reply's end
+    if (s.restoring && s.restore_tokens.empty()) {
+        const auto failure = s.failure;
+        opt_reply.reset();
+        if (!failure.empty()) {
+            opt_fail(failure.c_str());
+            return LLAMA_OPT_LEARN_FAILED;
+        }
+        return LLAMA_OPT_LEARN_DONE;
     }
     const int32_t end = s.restoring ? (int32_t) s.restore_tokens.size() : s.n_train;
     const int32_t m = !s.restoring && s.graph_nodes > 0 ? end - s.cursor : std::min(s.chunk_tokens, end - s.cursor);
