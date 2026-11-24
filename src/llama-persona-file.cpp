@@ -121,7 +121,7 @@ struct closes {
 
 } // namespace
 
-llama_persona_write_result llama_persona_write_file(const llama_persona * persona, const char * path) {
+llama_persona_write_result llama_persona_write_checkpoint(const llama_persona * persona, const char * path) {
     const auto & b = persona->blocks;
     if (!b.owned) {
         return {(int32_t) llama_persona_move::file_mismatch, LLAMA_PERSONA_FILE_NONE, 0}; // never saved: these blocks hold nothing of hers to write

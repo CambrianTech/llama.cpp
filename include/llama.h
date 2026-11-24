@@ -983,7 +983,7 @@ extern "C" {
         // errno, except for RENAME on Windows where this is GetLastError().
         uint32_t os_error;
     };
-    LLAMA_API struct llama_persona_write_result llama_persona_write_file(const struct llama_persona * persona, const char * path);
+    LLAMA_API struct llama_persona_write_result llama_persona_write_checkpoint(const struct llama_persona * persona, const char * path);
     LLAMA_API int32_t llama_persona_read_file(struct llama_persona * persona, const char * path);
 
     LLAMA_API const char * llama_persona_status_name(int32_t status);

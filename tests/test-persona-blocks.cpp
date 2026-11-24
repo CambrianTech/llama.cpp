@@ -16,6 +16,12 @@
 
 #include "../src/llama-context.h"
 
+#ifdef _WIN32
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <new>
@@ -490,9 +496,26 @@ int main(int argc, char ** argv) {
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);
         require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "a saved");
-        require_move(st(llama_persona_write_file(saved, path.c_str()).status), llama_persona_move::done, "a written to her file");
+        require_move(st(llama_persona_write_checkpoint(saved, path.c_str()).status), llama_persona_move::done, "a written to her file");
         // a second save to her fixed path replaces the first (Windows CRT rename refuses an existing destination)
-        require_move(st(llama_persona_write_file(saved, path.c_str()).status), llama_persona_move::done, "a written again over her file");
+        require_move(st(llama_persona_write_checkpoint(saved, path.c_str()).status), llama_persona_move::done, "a written again over her file");
+        // The file already exists, so opening a temporary beneath it must fail.
+        const auto open_error = llama_persona_write_checkpoint(saved, (path + "/child").c_str());
+        require_move(st(open_error.status), llama_persona_move::io_error, "open failure is an IO refusal");
+        require(open_error.stage == LLAMA_PERSONA_FILE_OPEN && open_error.os_error != 0, "open refusal carries errno");
+#ifdef _WIN32
+        // Keep a real reader on the temporary across the entire retry budget.
+        const std::string tmp = path + ".tmp";
+        HANDLE reader = CreateFileA(tmp.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        require(reader != INVALID_HANDLE_VALUE, "temporary reader opened");
+        const auto rename_error = llama_persona_write_checkpoint(saved, path.c_str());
+        CloseHandle(reader);
+        std::remove(tmp.c_str());
+        require_move(st(rename_error.status), llama_persona_move::io_error, "held temporary refuses publication");
+        require(rename_error.stage == LLAMA_PERSONA_FILE_RENAME && rename_error.os_error == ERROR_SHARING_VIOLATION,
+                "rename refusal retains its Win32 cause across cleanup");
+#endif
         llama_persona_free(saved);
 
         llama_persona * other = llama_persona_init(f.ctx, 0xB, 1);
