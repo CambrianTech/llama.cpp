@@ -268,9 +268,9 @@ int main(int argc, char ** argv) {
         require_move(ctx.persona_load(0, 1 - occupied, bad, A), llama_persona_move::layout_mismatch, "a layout mismatch");
         require(f.pos_max(0) < 0, "a refused load writes nothing");
         if (a.rs.has_state) { // hybrid: a rollback index past the snapshot groups is refused before any write
-            llama_persona_blocks far = a;
-            far.rs.rs_idx = 1u << 20;
-            require_move(ctx.persona_load(0, 1 - occupied, far, A), llama_persona_move::invalid_rollback, "a rollback out of bounds");
+            llama_persona_blocks invalid_rollback = a;
+            invalid_rollback.rs.rs_idx = 1u << 20;
+            require_move(ctx.persona_load(0, 1 - occupied, invalid_rollback, A), llama_persona_move::invalid_rollback, "a rollback out of bounds");
             require(f.pos_max(0) < 0, "a refused hybrid load writes neither half");
         }
 
