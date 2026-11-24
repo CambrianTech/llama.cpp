@@ -388,6 +388,10 @@ bool llama_context::opt_release(const llama_adapter_lora * adapter) {
         }
         opt_shadow = nullptr;
         opt_ctx    = nullptr;
+        // no optimizer is selected: the next graph is a serving graph (a reply that restored no tail
+        // left training on, and a serving decode built in training mode aborts the engine)
+        cparams.training    = false;
+        cparams.walk_active = false;
     }
     ggml_opt_free(mind->second);
     opt_minds.erase(mind);
@@ -1345,6 +1349,8 @@ bool llama_context::opt_refuses_ubatch(const llama_ubatch & ubatch, ggml_status 
 // fresh, and cparams.training is part of the reuse key, so a serving graph never reuses it.
 bool llama_context::opt_mark_training(const llama_ubatch & ubatch) {
     if (opt_ctx == nullptr) {
+        cparams.training    = false; // no optimizer: nothing trains
+        cparams.walk_active = false;
         return false;
     }
     const bool train = !opt_forward_only && ubatch.n_labels() > 0;

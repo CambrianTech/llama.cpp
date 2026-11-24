@@ -199,6 +199,8 @@ llama_opt_learn_status llama_context::opt_learn_step() {
     }
     // nothing to restore past her served prefix: she ends there, which is the reply's end
     if (s.restoring && s.restore_tokens.empty()) {
+        cparams.training    = false; // the last ubatch trained; no restore decode follows to say otherwise
+        cparams.walk_active = false;
         const auto failure = s.failure;
         opt_reply.reset();
         if (!failure.empty()) {
