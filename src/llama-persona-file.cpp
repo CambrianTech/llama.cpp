@@ -12,6 +12,7 @@
 #include "llama.h"
 #include "llama-persona.h"
 
+#include <cerrno>
 #include <cstdio>
 #ifdef _WIN32
 #    ifndef WIN32_LEAN_AND_MEAN
@@ -22,6 +23,7 @@
 #    endif
 #    include <windows.h>
 #endif
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -32,11 +34,16 @@ constexpr uint32_t VERSION = 1;
 
 struct writer {
     std::FILE * f;
-    bool ok = true;
-    template <typename T> void put(const T & v) { ok = ok && std::fwrite(&v, sizeof(T), 1, f) == 1; }
+    int error = 0;
+    void write(const void * data, size_t size) {
+        if (!error && size && std::fwrite(data, 1, size, f) != size) {
+            error = errno;
+        }
+    }
+    template <typename T> void put(const T & v) { write(&v, sizeof(v)); }
     void bytes(const std::vector<uint8_t> & b) {
         put<uint64_t>(b.size());
-        ok = ok && (b.empty() || std::fwrite(b.data(), 1, b.size(), f) == b.size());
+        write(b.data(), b.size());
     }
     void rows(const std::vector<std::vector<uint8_t>> & layers) {
         put<uint32_t>((uint32_t) layers.size());
@@ -83,11 +90,27 @@ struct reader {
 
 // Replace `path` with the finished `tmp` in one step. POSIX rename replaces an existing destination; the Windows CRT's
 // refuses one (Codex on #155, UCRT on BigMama: -1 with the old body intact), so a second save to her fixed path failed.
-bool replace_file(const std::string & tmp, const char * path) {
+uint32_t replace_file(const std::string & tmp, const char * path) {
 #ifdef _WIN32
-    return MoveFileExA(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    // A short-lived reader without FILE_SHARE_DELETE can hold the complete temporary
+    // file across fclose. Retry only the atomic rename, never the block write.
+    constexpr ULONGLONG sharing_deadline_ms = 2000;
+    const auto deadline = GetTickCount64() + sharing_deadline_ms;
+    DWORD delay_ms = 10;
+    for (;;) {
+        if (MoveFileExA(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            return 0;
+        }
+        const auto error = GetLastError();
+        const auto now = GetTickCount64();
+        if (error != ERROR_SHARING_VIOLATION || now >= deadline) {
+            return error;
+        }
+        Sleep(static_cast<DWORD>(std::min<ULONGLONG>(delay_ms, deadline - now)));
+        delay_ms = std::min<DWORD>(2 * delay_ms, 100);
+    }
 #else
-    return std::rename(tmp.c_str(), path) == 0;
+    return std::rename(tmp.c_str(), path) == 0 ? 0 : errno;
 #endif
 }
 
@@ -98,15 +121,15 @@ struct closes {
 
 } // namespace
 
-int32_t llama_persona_write_file(const llama_persona * persona, const char * path) {
+llama_persona_write_result llama_persona_write_checkpoint(const llama_persona * persona, const char * path) {
     const auto & b = persona->blocks;
     if (!b.owned) {
-        return (int32_t) llama_persona_move::file_mismatch; // never saved: these blocks hold nothing of hers to write
+        return {(int32_t) llama_persona_move::file_mismatch, LLAMA_PERSONA_FILE_NONE, 0}; // never saved: these blocks hold nothing of hers to write
     }
     const std::string tmp = std::string(path) + ".tmp";
     std::FILE * f = std::fopen(tmp.c_str(), "wb");
     if (f == nullptr) {
-        return (int32_t) llama_persona_move::io_error;
+        return {(int32_t) llama_persona_move::io_error, LLAMA_PERSONA_FILE_OPEN, (uint32_t) errno};
     }
     writer w { f };
     w.put(MAGIC);
@@ -144,13 +167,26 @@ int32_t llama_persona_write_file(const llama_persona * persona, const char * pat
     w.put<uint32_t>(b.rs.rs_idx);
     w.rows(b.rs.r);
     w.rows(b.rs.s);
-    const bool flushed = w.ok && std::fflush(f) == 0;
-    const bool closed = std::fclose(f) == 0;
-    if (!flushed || !closed || !replace_file(tmp, path)) {
-        std::remove(tmp.c_str());
-        return (int32_t) llama_persona_move::io_error;
+    llama_persona_write_result result {(int32_t) llama_persona_move::done, LLAMA_PERSONA_FILE_NONE, 0};
+    const auto io_error = (int32_t) llama_persona_move::io_error;
+    if (w.error) {
+        result = {io_error, LLAMA_PERSONA_FILE_WRITE, (uint32_t) w.error};
+    } else if (std::fflush(f) != 0) {
+        result = {io_error, LLAMA_PERSONA_FILE_FLUSH, (uint32_t) errno};
     }
-    return (int32_t) llama_persona_move::done;
+    if (std::fclose(f) != 0 && result.status == 0) {
+        result = {io_error, LLAMA_PERSONA_FILE_CLOSE, (uint32_t) errno};
+    }
+    if (result.status == 0) {
+        const uint32_t error = replace_file(tmp, path);
+        if (error) {
+            result = {io_error, LLAMA_PERSONA_FILE_RENAME, error};
+        }
+    }
+    if (result.status != 0) {
+        std::remove(tmp.c_str());
+    }
+    return result;
 }
 
 int32_t llama_persona_read_file(llama_persona * persona, const char * path) {

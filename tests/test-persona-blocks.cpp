@@ -16,6 +16,14 @@
 
 #include "../src/llama-context.h"
 
+#ifdef _WIN32
+#    include "../src/llama-persona.h"
+#    include <thread>
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <new>
@@ -260,9 +268,9 @@ int main(int argc, char ** argv) {
         require_move(ctx.persona_load(0, 1 - occupied, bad, A), llama_persona_move::layout_mismatch, "a layout mismatch");
         require(f.pos_max(0) < 0, "a refused load writes nothing");
         if (a.rs.has_state) { // hybrid: a rollback index past the snapshot groups is refused before any write
-            llama_persona_blocks far = a;
-            far.rs.rs_idx = 1u << 20;
-            require_move(ctx.persona_load(0, 1 - occupied, far, A), llama_persona_move::invalid_rollback, "a rollback out of bounds");
+            llama_persona_blocks invalid_rollback = a;
+            invalid_rollback.rs.rs_idx = 1u << 20;
+            require_move(ctx.persona_load(0, 1 - occupied, invalid_rollback, A), llama_persona_move::invalid_rollback, "a rollback out of bounds");
             require(f.pos_max(0) < 0, "a refused hybrid load writes neither half");
         }
 
@@ -490,9 +498,41 @@ int main(int argc, char ** argv) {
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);
         require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "a saved");
-        require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written to her file");
+        require_move(st(llama_persona_write_checkpoint(saved, path.c_str()).status), llama_persona_move::done, "a written to her file");
         // a second save to her fixed path replaces the first (Windows CRT rename refuses an existing destination)
-        require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written again over her file");
+        require_move(st(llama_persona_write_checkpoint(saved, path.c_str()).status), llama_persona_move::done, "a written again over her file");
+        // The file already exists, so opening a temporary beneath it must fail.
+        const auto open_error = llama_persona_write_checkpoint(saved, (path + "/child").c_str());
+        require_move(st(open_error.status), llama_persona_move::io_error, "open failure is an IO refusal");
+        require(open_error.stage == LLAMA_PERSONA_FILE_OPEN && open_error.os_error != 0, "open refusal carries errno");
+#ifdef _WIN32
+        // Keep a real reader on the temporary across the entire retry budget.
+        const std::string tmp = path + ".tmp";
+        HANDLE reader = CreateFileA(tmp.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        require(reader != INVALID_HANDLE_VALUE, "temporary reader opened");
+        // Keep serialization out of the deadline measurement, independent of the model under test.
+        llama_persona checkpoint_fixture{};
+        checkpoint_fixture.blocks.owned = true;
+        const auto start = GetTickCount64();
+        const auto rename_error = llama_persona_write_checkpoint(&checkpoint_fixture, path.c_str());
+        const auto elapsed = GetTickCount64() - start;
+        CloseHandle(reader);
+        std::remove(tmp.c_str());
+        require_move(st(rename_error.status), llama_persona_move::io_error, "held temporary refuses publication");
+        require(rename_error.stage == LLAMA_PERSONA_FILE_RENAME && rename_error.os_error == ERROR_SHARING_VIOLATION,
+                "rename refusal retains its Win32 cause across cleanup");
+        require(elapsed >= 2000 && elapsed < 5000, "persistent sharing conflict consumes the bounded retry budget");
+        const std::string transient = path + ".transient";
+        reader = CreateFileA((transient + ".tmp").c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        require(reader != INVALID_HANDLE_VALUE, "transient temporary reader opened");
+        std::thread release([reader] { Sleep(150); CloseHandle(reader); });
+        const auto published = llama_persona_write_checkpoint(&checkpoint_fixture, transient.c_str());
+        release.join();
+        require_move(st(published.status), llama_persona_move::done, "publication retries until the transient reader releases");
+        std::remove(transient.c_str());
+#endif
         llama_persona_free(saved);
 
         llama_persona * other = llama_persona_init(f.ctx, 0xB, 1);

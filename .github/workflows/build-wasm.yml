@@ -64,8 +64,9 @@ jobs:
         run: |
           git clone https://github.com/emscripten-core/emsdk.git
           cd emsdk
-          ./emsdk install latest
-          ./emsdk activate latest
+          EMSDK_VERSION=7.0.0
+          ./emsdk install "$EMSDK_VERSION"
+          ./emsdk activate "$EMSDK_VERSION"
 
       - name: Fetch emdawnwebgpu
         run: |
