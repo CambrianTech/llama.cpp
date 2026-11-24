@@ -277,6 +277,46 @@ static void run_pool(fixture & f) {
     mem->persona_commit_load(0, slot, a);
     g_fail_alloc = false;
     continues("P6 a after allocation-free commits", true);
+
+    // P7. what this catches (the M5, 2026-11-24: every preserved mind refused with file_mismatch after a restart that
+    //     seated a different number of minds): her file restores into a memory that seats another count. Written from
+    //     this pool of three, read into a pool of two on the same model, she binds and continues within the pool
+    //     tolerance of her own reference there.
+    {
+        auto st = [](int32_t s) { return (llama_persona_move) s; };
+        const std::string path = (std::filesystem::temp_directory_path() / "test-persona-blocks-pool.cpb").string();
+        llama_persona * saved = llama_persona_init(f.ctx, 0xA, 1);
+        require(saved != nullptr, "a persona to save");
+        seat_both();
+        require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "a saved from the pool of three");
+        require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written to her file");
+        llama_persona_free(saved);
+
+        llama_context_params params = llama_context_default_params();
+        params.n_ctx           = llama_n_ctx(f.ctx);
+        params.n_batch         = llama_n_batch(f.ctx);
+        params.n_seq_max       = 2;
+        params.kv_unified      = true;
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        llama_context * two = llama_init_from_model(const_cast<llama_model *>(llama_get_model(f.ctx)), params);
+        require(two != nullptr, "a pool of two");
+        fixture g;
+        g.ctx = two;
+        g.n_vocab = f.n_vocab;
+        g.n_prompt = f.n_prompt;
+        g.n_batch = f.n_batch;
+        const auto ref = g.reference(0, 1);
+        llama_memory_clear(llama_get_memory(two), true);
+        llama_persona * back = llama_persona_init(two, 0xA, 1);
+        require(back != nullptr, "a persona in the pool of two");
+        require_move(st(llama_persona_read_file(back, path.c_str())), llama_persona_move::done, "her file read into a pool seating another count");
+        require_move(st(llama_persona_bind(two, 0, back)), llama_persona_move::done, "she binds there");
+        require(g.pos_max(0) == f.n_prompt - 1, "she holds her prompt");
+        require_close("P7 a token 0 in the pool of two", ref[0], g.decode_one(0, 3 % g.n_vocab, g.n_prompt), 1e-3f);
+        llama_persona_free(back);
+        llama_free(two);
+        std::remove(path.c_str());
+    }
     fprintf(stderr, "pool: all checks passed\n");
 }
 

@@ -423,7 +423,8 @@ static uint64_t rs_layout_mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x10000
 
 uint64_t llama_memory_recurrent::compute_persona_layout() const {
     uint64_t h = rs_layout_mix(0xcbf29ce484222325ull, r_l.size());
-    h = rs_layout_mix(h, size);
+    // not the cell count: her rows are her own cell's, loaded into whichever cell is free, so a file restores
+    // into a memory seating any number of minds (a restart whose planner seated a different count)
     h = rs_layout_mix(h, n_rs_seq);
     for (size_t il = 0; il < r_l.size(); ++il) {
         for (const ggml_tensor * t : { r_l[il], s_l[il] }) {
