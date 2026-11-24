@@ -385,6 +385,7 @@ llama_kv_cache::llama_kv_cache(
 
     persona_layout_id = compute_persona_layout(true); // the allocation layout is immutable from here (Continuum)
     persona_rows_id   = compute_persona_layout(false);
+    persona_reserve_pool(); // Continuum: a pool several minds share moves them without allocating
 }
 
 void llama_kv_cache::init_rotation(const char * name_tag) {
@@ -469,7 +470,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (seq_id >= 0) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
-        cells.note_cut(p0); // a checkpoint at or past p0 no longer holds what it counted on
+        cells.note_cut(seq_id, p0); // her checkpoint at or past p0 no longer holds what it counted on
 
         const uint32_t new_head = cells.seq_rm(seq_id, p0, p1);
 
@@ -484,7 +485,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             auto & head  = v_heads[s];
 
             uint32_t new_head = cells.size();
-            cells.note_cut(p0); // every sequence in this stream loses what a checkpoint past p0 counted on
+            cells.note_cut(-1, p0); // every sequence in this stream loses what a checkpoint past p0 counted on
 
             for (uint32_t i = 0; i < cells.size(); ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
@@ -645,7 +646,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (shift == 0) {
         return;
     }
-    cells.note_cut(std::max<llama_pos>(p0, 0)); // a shift moves what a checkpoint past p0 counted on
+    cells.note_cut(seq_id, std::max<llama_pos>(p0, 0)); // a shift moves what a checkpoint past p0 counted on
 
     uint32_t new_head = cells.size();
 
@@ -696,7 +697,7 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     if (d == 1) {
         return;
     }
-    cells.note_cut(std::max<llama_pos>(p0, 0)); // a division moves what a checkpoint past p0 counted on
+    cells.note_cut(seq_id, std::max<llama_pos>(p0, 0)); // a division moves what a checkpoint past p0 counted on
 
     if (p0 < 0) {
         p0 = 0;

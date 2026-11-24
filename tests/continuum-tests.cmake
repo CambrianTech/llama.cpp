@@ -80,6 +80,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS -m "${MODEL_DIR}/qwen35moe-moe.gguf" --test-rs-seq 4
     )
     set_tests_properties(test-persona-blocks-rollback PROPERTIES FIXTURES_REQUIRED generate-models)
+    # minds sharing one unified pool: paged out and back, relocated, refused when full or shared (CONTINUUM-ENGINE 4.3)
+    llama_test(
+        test-persona-blocks
+        NAME test-persona-blocks-pool-hybrid
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35moe-moe.gguf" --test-pool
+    )
+    set_tests_properties(test-persona-blocks-pool-hybrid PROPERTIES FIXTURES_REQUIRED generate-models)
 
 endif()
 # the tiled FLASH_ATTN_EXT backward gives plain attention's gradients on every backend (no model needed)
@@ -93,6 +101,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # test-persona-blocks (built above with the internal-API tests) on the downloaded plain KV model
     llama_test(test-persona-blocks LABEL "model" ARGS -m "${MODEL_DEST}")
     set_tests_properties(test-persona-blocks PROPERTIES FIXTURES_REQUIRED test-download-model)
+    llama_test(test-persona-blocks NAME test-persona-blocks-pool LABEL "model" ARGS -m "${MODEL_DEST}" --test-pool)
+    set_tests_properties(test-persona-blocks-pool PROPERTIES FIXTURES_REQUIRED test-download-model)
 endif()
 
 add_executable(test-moe-residency test-moe-residency.cpp)

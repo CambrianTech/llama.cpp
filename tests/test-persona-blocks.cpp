@@ -71,6 +71,23 @@ static void require_identical(const char * what, const std::vector<float> & want
     require(identical, what);
 }
 
+// Close, not byte-identical: in a pool a mind's cells interleave with other minds' masked cells, and where her cells lie
+// changes how flash attention blocks the sum over them. Her argmax is the same and every logit within `tolerance` of
+// the largest's magnitude.
+static void require_close(const char * what, const std::vector<float> & want, const std::vector<float> & got, float tolerance) {
+    require(want.size() == got.size(), what);
+    float max_diff = 0.0f;
+    float scale    = 0.0f;
+    for (size_t i = 0; i < want.size(); ++i) {
+        max_diff = std::max(max_diff, std::fabs(want[i] - got[i]));
+        scale    = std::max(scale, std::fabs(want[i]));
+    }
+    const auto argmax = [](const std::vector<float> & v) { return std::max_element(v.begin(), v.end()) - v.begin(); };
+    fprintf(stderr, "%s: max|diff|=%g of max|logit| %g, argmax %ld vs %ld\n", what, max_diff, scale, (long) argmax(want), (long) argmax(got));
+    require(argmax(want) == argmax(got), what);
+    require(max_diff <= tolerance * std::max(scale, 1.0f), what);
+}
+
 // the owners in this test: each persona's blocks are saved and loaded under her identity
 static const llama_persona_identity A { 0xA, 1 };
 static const llama_persona_identity B { 0xB, 1 };
@@ -132,7 +149,115 @@ struct fixture {
     }
 
     llama_pos pos_max(llama_seq_id seq) const { return llama_memory_seq_pos_max(llama_get_memory(ctx), seq); }
+
+    std::vector<std::vector<float>> next_two(llama_seq_id seq) {
+        return { decode_one(seq, 3 % n_vocab, n_prompt), decode_one(seq, 5 % n_vocab, n_prompt + 1) };
+    }
 };
+
+// what this catches (CONTINUUM-ENGINE 4.3): minds that share one pool (unified KV, several sequences) moved only when the
+// pool runs out of cells, and then moved wrong. Every seated mind stays in place; a switch between them is no move at
+// all. Paging one out must take exactly her cells and leave the others untouched; paging her back must continue her
+// exactly where she was, in her old cells or wherever the pool has room; a full pool, or a cell she shares, is refused
+// by name and changes nothing; a cut of one mind never revokes another's checkpoint; and no commit allocates.
+static void run_pool(fixture & f) {
+    llama_context & ctx = *f.ctx;
+    llama_memory_t  mem = llama_get_memory(f.ctx);
+    require(llama_get_memory(f.ctx) != nullptr && llama_n_seq_max(f.ctx) >= 3, "a pool seating three");
+    const int n_prompt = f.n_prompt;
+    auto seat_both = [&]() {
+        llama_memory_clear(mem, true);
+        f.prompt(0, 1);
+        f.prompt(1, 2);
+    };
+    seat_both();
+    const auto ref_a = f.next_two(0);
+    const auto ref_b = f.next_two(1);
+    auto continues = [&](const char * what, bool exact) {
+        const auto got_a = f.next_two(0);
+        const auto got_b = f.next_two(1);
+        char label[160];
+        for (int t = 0; t < 2; ++t) {
+            snprintf(label, sizeof(label), "%s: a token %d", what, t);
+            exact ? require_identical(label, ref_a[t], got_a[t]) : require_close(label, ref_a[t], got_a[t], 1e-3f);
+            snprintf(label, sizeof(label), "%s: b token %d", what, t);
+            exact ? require_identical(label, ref_b[t], got_b[t]) : require_close(label, ref_b[t], got_b[t], 1e-3f);
+        }
+    };
+
+    llama_persona_blocks a;
+    require_move(ctx.persona_prepare(a), llama_persona_move::done, "prepare a in the pool");
+
+    // P1. out and back into the cells she left: nothing else moved, both continue byte-identically
+    seat_both();
+    require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a paged out of the pool");
+    require(f.pos_max(0) < 0 && f.pos_max(1) == n_prompt - 1, "only a left; b is untouched");
+    require(a.kv.n_rows == (uint32_t) n_prompt, "her blocks hold exactly her rows");
+    require_move(ctx.persona_load(0, 0, a, A), llama_persona_move::done, "a paged back in");
+    require(f.pos_max(0) == n_prompt - 1, "a holds her prompt again");
+    continues("P1 a out and back", true);
+
+    // P2. relocated: another mind takes the cells she left, so she lands elsewhere in the pool
+    seat_both();
+    require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a out (relocated)");
+    f.prompt(2, 3);
+    require_move(ctx.persona_load(0, 0, a, A), llama_persona_move::done, "a back into other cells");
+    llama_memory_seq_rm(mem, 2, -1, -1);
+    continues("P2 a relocated", false);
+
+    // P3. a full pool refuses her by name and changes nothing; room made, she binds
+    seat_both();
+    require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a out (pool full)");
+    const uint32_t pool = llama_n_ctx(f.ctx);
+    f.n_prompt = (int) pool - n_prompt - n_prompt / 2; // fewer free cells than her rows
+    f.prompt(2, 3);
+    f.n_prompt = n_prompt;
+    const llama_pos c_held = f.pos_max(2);
+    require_move(ctx.persona_load(0, 0, a, A), llama_persona_move::pool_full, "a refused: the pool is full");
+    require(f.pos_max(0) < 0 && f.pos_max(2) == c_held && f.pos_max(1) == n_prompt - 1, "the refusal changed nothing");
+    llama_memory_seq_rm(mem, 2, -1, -1);
+    require_move(ctx.persona_load(0, 0, a, A), llama_persona_move::done, "a in once room is made");
+    continues("P3 a after the pool made room", false);
+
+    // P4. a cell she shares with another sequence is not hers alone to move
+    seat_both();
+    llama_memory_seq_cp(mem, 0, 2, -1, -1);
+    require_move(ctx.persona_save(0, a, A), llama_persona_move::shared_cell, "a refused: her cells are shared");
+    require(f.pos_max(0) == n_prompt - 1 && f.pos_max(2) == n_prompt - 1, "the refusal moved nothing");
+
+    // P5. a cut of one mind never revokes another's checkpoint
+    {
+        auto st = [](int32_t s) { return (llama_persona_move) s; };
+        seat_both();
+        llama_persona_checkpoint * cp = llama_persona_checkpoint_init();
+        require(cp != nullptr, "a checkpoint");
+        require_move(st(llama_persona_checkpoint_take(f.ctx, 1, 0xB, 1, cp)), llama_persona_move::done, "b's checkpoint");
+        // whole removals: a recurrent memory refuses a partial cut, and a whole one is a cut from position 0
+        require(llama_memory_seq_rm(mem, 0, -1, -1), "a removed");
+        require_move(st(llama_persona_checkpoint_rewind(f.ctx, 1, 0xB, 1, cp)), llama_persona_move::done,
+                     "b rewinds after a was cut");
+        require(llama_memory_seq_rm(mem, 1, -1, -1), "b removed");
+        require(st(llama_persona_checkpoint_rewind(f.ctx, 1, 0xB, 1, cp)) != llama_persona_move::done,
+                "b's own cut revokes her checkpoint");
+        llama_persona_checkpoint_free(cp);
+    }
+
+    // P6. a pool's commits allocate nothing (they run with every allocation failing)
+    seat_both();
+    llama_synchronize(f.ctx);
+    require_move(mem->persona_check_save(0, a), llama_persona_move::done, "check a's save from the pool");
+    g_fail_alloc = true;
+    mem->persona_commit_save(0, a);
+    g_fail_alloc = false;
+    require(f.pos_max(0) < 0, "her commit took her out");
+    llama_persona_slot slot;
+    require_move(mem->persona_check_load(0, 0, a, slot), llama_persona_move::done, "check her load into the pool");
+    g_fail_alloc = true;
+    mem->persona_commit_load(0, slot, a);
+    g_fail_alloc = false;
+    continues("P6 a after allocation-free commits", true);
+    fprintf(stderr, "pool: all checks passed\n");
+}
 
 int main(int argc, char ** argv) {
     common_params params;
@@ -143,6 +268,17 @@ int main(int argc, char ** argv) {
     // --test-rs-seq N: the speculative configuration serving uses (draft-mtp, n_max N), which gives the context N
     // rollback snapshot groups (common_params_speculative::need_n_rs_seq); stripped before the common parse
     std::vector<char *> args(argv, argv + argc);
+    // --test-pool: one unified pool that three minds share (CONTINUUM-ENGINE 4.3); stripped before the common parse
+    bool pool = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (std::strcmp(args[i], "--test-pool") == 0) {
+            pool              = true;
+            params.kv_unified = true;
+            params.n_parallel = 3;
+            args.erase(args.begin() + i);
+            break;
+        }
+    }
     for (size_t i = 1; i + 1 < args.size(); ++i) {
         if (std::strcmp(args[i], "--test-rs-seq") == 0) {
             params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
@@ -164,6 +300,10 @@ int main(int argc, char ** argv) {
     llama_context & ctx = *f.ctx;
 
     f.n_batch = (int) llama_n_batch(f.ctx);
+    if (pool) {
+        run_pool(f);
+        return 0;
+    }
 
     llama_persona_blocks a, b;
     require_move(ctx.persona_prepare(a), llama_persona_move::done, "prepare persona a");

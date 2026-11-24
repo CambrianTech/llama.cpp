@@ -1,5 +1,11 @@
-// Continuum: a mind's KV moves (CONTINUUM-ENGINE 4.14): her stream's rows saved, loaded, checkpointed and
-// rewound as one unit, kept beside llama-kv-cache.cpp so upstream's cache merges without touching it.
+// Continuum: a mind's KV moves (CONTINUUM-ENGINE 4.14, 4.3): her rows saved, loaded, checkpointed and rewound as one
+// unit, kept beside llama-kv-cache.cpp so upstream's cache merges without touching it.
+//
+// Two layouts. Each stream one sequence's (a stream per sequence, or one stream and one sequence): her used rows of her
+// stream move per layer and her cells move by swap. A pool (one unified stream several minds share, each growing into
+// it as she needs): she stays in it while she is seated, and moves only when the pool runs out of cells and she is the
+// one paged out. Then her own cells are gathered out run by run, and on her return scattered into the pool's empty
+// cells; her metadata and index are built by the check and swapped in by the commit, so no commit allocates.
 #include "llama-kv-cache.h"
 
 #include "llama-impl.h"
@@ -33,21 +39,38 @@ uint64_t llama_kv_cache::compute_persona_layout(bool with_size) const {
     return h;
 }
 
-// Continuum fork: a persona move copies one sequence's own stream, so it needs every stream to belong to
-// exactly one sequence. That holds with a stream per sequence, and with one stream and one sequence (the
-// Core's context: the mind swapped in holds the whole of it). It does not hold for one stream shared by
-// several sequences (unified KV), where her rows are interleaved with others'.
-bool llama_kv_cache::persona_streams_are_own() const {
-    return n_stream > 1 || n_seq_max == 1;
+bool llama_kv_cache::persona_is_pool() const {
+    return n_stream == 1 && n_seq_max > 1;
+}
+
+void llama_kv_cache::persona_reserve_pool() {
+    if (persona_is_pool()) {
+        v_cells[0].persona_reserve_seqs(n_seq_max);
+    }
+}
+
+// Runs of consecutive rows on both sides: rows [from[k], from[k] + n) of one side are rows [to[k], to[k] + n) of the
+// other. `each(from_row, to_row, n)` copies one run.
+template <typename F>
+static void for_each_run(const std::vector<uint32_t> & from, const std::vector<uint32_t> & to, F && each) {
+    assert(from.size() == to.size());
+    for (size_t k = 0; k < from.size();) {
+        size_t n = 1;
+        while (k + n < from.size() && from[k + n] == from[k] + n && to[k + n] == to[k] + n) {
+            ++n;
+        }
+        each(from[k], to[k], (uint32_t) n);
+        k += n;
+    }
 }
 
 llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks) const {
-    if (!persona_streams_are_own()) {
-        return llama_persona_move::no_such_stream;
-    }
     blocks.kv_layout = persona_layout();
     blocks.kv_rows   = persona_rows_id;
     blocks.kv.cells.resize(get_size()); // once per persona, at her creation
+    if (persona_is_pool()) {
+        blocks.kv.staged.resize(get_size()); // her compacted metadata, built by each save's check
+    }
     blocks.kv.k.resize(layers.size());
     blocks.kv.v.resize(layers.size());
     // the row sizes a save copies (persona_check_save), recorded for a file read to check before it allocates
@@ -62,9 +85,6 @@ llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks
 }
 
 llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const {
-    if (!persona_streams_are_own()) {
-        return llama_persona_move::no_such_stream;
-    }
     if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
         return llama_persona_move::invalid_seq;
     }
@@ -77,8 +97,35 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama
     if (!cells_prepared(out.kv.cells, get_size()) || out.kv.k.size() != layers.size() || out.kv.v.size() != layers.size()) {
         return llama_persona_move::cells_not_prepared;
     }
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    uint32_t n_rows = 0;
+    if (persona_is_pool()) {
+        if (cells.get_has_shift()) {
+            return llama_persona_move::pending_shift;
+        }
+        // her cells, each hers alone (a cell another mind also holds is not hers to move)
+        out.kv.rows.clear();
+        for (uint32_t i = 0; i < cells.used_max_p1(); ++i) {
+            if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
+                continue;
+            }
+            if (cells.seq_count(i) != 1) {
+                return llama_persona_move::shared_cell;
+            }
+            out.kv.rows.push_back(i);
+        }
+        n_rows = (uint32_t) out.kv.rows.size();
+        if (out.kv.staged.size() != get_size()) {
+            return llama_persona_move::cells_not_prepared;
+        }
+        out.kv.staged.reset();
+        if (n_rows > 0) {
+            out.kv.staged.set(0, cells.cp(out.kv.rows)); // row j of her blocks is pool cell rows[j]
+        }
+    } else {
+        n_rows = cells.used_max_p1(); // her stream's rows as they lie, cell j at row j
+    }
     // reserve: every byte the commit copies, so the commit never allocates
-    const uint32_t n_rows = v_cells[seq_to_stream[seq_id]].used_max_p1();
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto & layer = layers[i];
         out.kv.k[i].resize(ggml_row_size(layer.k->type, layer.k->ne[0]) * n_rows);
@@ -91,6 +138,28 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama
 void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) {
     const uint32_t s = seq_to_stream[seq_id];
     auto & cells = v_cells[s];
+    if (persona_is_pool()) {
+        for (size_t i = 0; i < layers.size(); ++i) {
+            const auto & layer = layers[i];
+            const size_t k_row = ggml_row_size(layer.k->type, layer.k->ne[0]);
+            const size_t v_row = layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) : 0;
+            uint32_t j = 0; // her blocks' rows are dense: run after run, in pool order
+            for_each_run(out.kv.rows, out.kv.rows, [&](uint32_t from, uint32_t, uint32_t n) {
+                ggml_backend_tensor_get(layer.k_stream[s], out.kv.k[i].data() + j * k_row, from * k_row, n * k_row);
+                if (v_row) {
+                    ggml_backend_tensor_get(layer.v_stream[s], out.kv.v[i].data() + j * v_row, from * v_row, n * v_row);
+                }
+                j += n;
+            });
+        }
+        out.seq = seq_id;
+        out.kv.cells.swap(out.kv.staged); // hers out, compacted; staged keeps the empty object for her next save
+        cells.persona_release(out.kv.rows, seq_id);
+        if (!out.kv.rows.empty()) {
+            v_heads[s] = std::min(v_heads[s], out.kv.rows.front());
+        }
+        return;
+    }
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto & layer = layers[i];
         if (!out.kv.k[i].empty()) {
@@ -125,7 +194,7 @@ llama_persona_move llama_kv_cache::persona_check_checkpoint(llama_seq_id seq_id,
 
 void llama_kv_cache::persona_commit_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out) {
     out.seq = seq_id;
-    v_cells[seq_to_stream[seq_id]].mark_checkpoint(out.mark);
+    v_cells[seq_to_stream[seq_id]].mark_checkpoint(seq_id, out.mark);
 }
 
 llama_persona_move llama_kv_cache::persona_check_rewind(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const {
@@ -153,8 +222,11 @@ void llama_kv_cache::persona_commit_rewind(llama_seq_id seq_id, const llama_pers
 }
 
 int32_t llama_kv_cache::persona_empty_stream() const {
-    if (!persona_streams_are_own()) {
-        return -1; // unified: one stream holds every sequence, so there is nothing empty to bind into
+    if (persona_is_pool()) {
+        return 0; // the pool: whether it has room for her is the load's check
+    }
+    if (n_stream == 1 && n_seq_max == 1) {
+        return v_cells[0].get_used() == 0 ? 0 : -1;
     }
     for (uint32_t s = 0; s < n_stream; ++s) {
         if (v_cells[s].get_used() == 0) {
@@ -166,7 +238,7 @@ int32_t llama_kv_cache::persona_empty_stream() const {
 
 llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint32_t stream,
                                                      const llama_persona_blocks & in, llama_persona_slot & slot) const {
-    if (!persona_streams_are_own() || stream >= n_stream) {
+    if (stream >= n_stream) {
         return llama_persona_move::no_such_stream;
     }
     if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
@@ -174,9 +246,6 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
     }
     if (v_trans) {
         return llama_persona_move::transposed_v;
-    }
-    if (v_cells[stream].get_used() != 0) {
-        return llama_persona_move::stream_not_empty;
     }
     if (v_cells[seq_to_stream[seq_id]].seq_pos_max(seq_id) >= 0) {
         return llama_persona_move::seq_holds_state;
@@ -198,11 +267,56 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
         }
     }
     slot.stream = stream;
+    if (!persona_is_pool()) {
+        if (v_cells[stream].get_used() != 0) {
+            return llama_persona_move::stream_not_empty;
+        }
+        return llama_persona_move::done;
+    }
+    // her occupied rows, then as many of the pool's empty cells, first fit
+    const auto & cells = v_cells[0];
+    slot.src.clear();
+    for (uint32_t j = 0; j < kv.n_rows; ++j) {
+        if (!kv.cells.is_empty(j) && kv.cells.seq_has(j, in.seq)) {
+            slot.src.push_back(j);
+        }
+    }
+    if (cells.size() - cells.get_used() < slot.src.size()) {
+        return llama_persona_move::pool_full;
+    }
+    slot.dst.clear();
+    for (uint32_t i = 0; i < cells.size() && slot.dst.size() < slot.src.size(); ++i) {
+        if (cells.is_empty(i)) {
+            slot.dst.push_back(i);
+        }
+    }
+    std::vector<llama_kv_pos_cell> index;
+    index.reserve(slot.src.size());
+    for (size_t k = 0; k < slot.src.size(); ++k) {
+        index.emplace_back(kv.cells.pos_get(slot.src[k]), slot.dst[k]);
+    }
+    slot.index.settle(index);
     return llama_persona_move::done;
 }
 
 void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) {
     const uint32_t s = slot.stream;
+    if (persona_is_pool()) {
+        for (size_t i = 0; i < layers.size(); ++i) {
+            const auto & layer = layers[i];
+            const size_t k_row = ggml_row_size(layer.k->type, layer.k->ne[0]);
+            const size_t v_row = layer.v ? ggml_row_size(layer.v->type, layer.v->ne[0]) : 0;
+            for_each_run(slot.src, slot.dst, [&](uint32_t from, uint32_t to, uint32_t n) {
+                ggml_backend_tensor_set(layer.k_stream[s], in.kv.k[i].data() + from * k_row, to * k_row, n * k_row);
+                if (v_row) {
+                    ggml_backend_tensor_set(layer.v_stream[s], in.kv.v[i].data() + from * v_row, to * v_row, n * v_row);
+                }
+            });
+        }
+        v_cells[s].persona_adopt(slot.src, slot.dst, in.kv.cells, seq_id, slot.index);
+        in.kv.cells.reset(); // her blocks hold an empty, pool-sized object for her next save
+        return;
+    }
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto & layer = layers[i];
         if (!in.kv.k[i].empty()) {

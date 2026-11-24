@@ -20,6 +20,10 @@ struct llama_kv_stream_blocks {
     std::vector<std::vector<uint8_t>> k;     // per KV layer: n_rows rows of K
     std::vector<std::vector<uint8_t>> v;     // per KV layer: n_rows rows of V (empty for a layer without V)
     llama_kv_cells                    cells; // hers while she is out; an empty, stream-sized object while she is in
+    // a pool's save only: her cells in the pool (row j of her blocks is pool cell rows[j]) and her metadata compacted to
+    // rows 0..n_rows, both built by the check so the commit only copies rows and swaps `staged` with `cells`
+    std::vector<uint32_t>             rows;
+    llama_kv_cells                    staged;
 };
 
 // her recurrent state: per layer, her row in every snapshot group (live group 0, then the rollback groups), and her
@@ -77,6 +81,11 @@ struct llama_persona_slot {
     uint32_t                          stream = 0;
     int32_t                           cell   = -1;
     std::set<llama_seq_id>::node_type node;
+    // a pool's load only: her occupied rows `src` land in the pool's empty cells `dst`, and `index` is her (position,
+    // cell) index over `dst`, sorted
+    std::vector<uint32_t>             src;
+    std::vector<uint32_t>             dst;
+    llama_kv_seq_pos                  index;
 };
 
 enum class llama_persona_move {
@@ -101,6 +110,8 @@ enum class llama_persona_move {
     checkpoint_stale,   // her cells are not the lineage the checkpoint was taken from, or were cut at or below it since
     io_error,           // her blocks' file could not be written or read whole
     file_mismatch,      // her blocks' file is not hers or not this memory's (owner, epoch, layout, sizes): nothing was read
+    pool_full,          // the pool has fewer empty cells than her rows: page another mind out first
+    pending_shift,      // the pool holds a position shift not yet applied to its rows: her rows cannot move as they are
 };
 
 // A copy of a bound persona at one of her positions, taken WITHOUT moving her: her recurrent rows (every snapshot

@@ -100,30 +100,77 @@ public:
     }
 
     // Checkpoint handles own their positions. The cells retain a weak receipt for each
-    // live prefix. A cut revokes just the receipts whose prefix it changes.
+    // live prefix, under the sequence it was taken for. A cut revokes just the receipts whose
+    // prefix it changes: in a pool several minds share, a cut of one never revokes another's.
     using checkpoint_position = std::shared_ptr<const llama_pos>;
     uint64_t lineage() const { return lineage_id; }
 
-    void note_cut(llama_pos first) {
-        checkpoints.erase(std::remove_if(checkpoints.begin(), checkpoints.end(), [first](const auto & weak) {
-            const auto mark = weak.lock();
-            return !mark || *mark >= first;
+    // seq_id < 0: a cut of every sequence (a match-any removal)
+    void note_cut(llama_seq_id seq_id, llama_pos first) {
+        checkpoints.erase(std::remove_if(checkpoints.begin(), checkpoints.end(), [seq_id, first](const auto & held) {
+            const auto mark = held.second.lock();
+            return !mark || ((seq_id < 0 || held.first == seq_id) && *mark >= first);
         }), checkpoints.end());
     }
 
     void prepare_checkpoint() {
-        checkpoints.erase(std::remove_if(checkpoints.begin(), checkpoints.end(), [](const auto & weak) {
-            return weak.expired();
+        checkpoints.erase(std::remove_if(checkpoints.begin(), checkpoints.end(), [](const auto & held) {
+            return held.second.expired();
         }), checkpoints.end());
         checkpoints.reserve(checkpoints.size() + 1);
     }
 
-    void mark_checkpoint(const checkpoint_position & mark) { checkpoints.emplace_back(mark); }
+    void mark_checkpoint(llama_seq_id seq_id, const checkpoint_position & mark) { checkpoints.emplace_back(seq_id, mark); }
 
     bool holds_checkpoint(const checkpoint_position & mark) const {
-        return mark && std::any_of(checkpoints.begin(), checkpoints.end(), [&](const auto & weak) {
-            return weak.lock() == mark;
+        return mark && std::any_of(checkpoints.begin(), checkpoints.end(), [&](const auto & held) {
+            return held.second.lock() == mark;
         });
+    }
+
+    // Continuum fork (CONTINUUM-ENGINE 4.3): a pool several minds share. Her cells' sequence bits exist for every
+    // sequence the pool seats from construction, so moving her in never allocates.
+    void persona_reserve_seqs(uint32_t n_seq) {
+        for (uint32_t s = 0; s < n_seq && s < LLAMA_MAX_SEQ; ++s) {
+            if (seq_bits[s].empty()) {
+                seq_bits[s].assign((pos.size() + 63)/64, 0);
+            }
+        }
+    }
+
+    // Her cells leave the pool: each held only her sequence (the caller checked), so each becomes empty; her index and
+    // her checkpoint receipts go with them. Nothing allocates.
+    void persona_release(const std::vector<uint32_t> & rows, llama_seq_id seq_id) {
+        for (const uint32_t i : rows) {
+            seq[i].reset();
+            pos[i]   = -1;
+            ext[i].reset();
+            shift[i] =  0;
+            used.erase(i);
+            seq_bits[seq_id][i/64] &= ~(1ull << (i%64));
+        }
+        seq_pos[seq_id].clear();
+        stale.reset(seq_id);
+        note_cut(seq_id, 0);
+    }
+
+    // Her rows `src` of `from` (her blocks' cells) take the pool's empty cells `dst`, as sequence seq_id; `index` is her
+    // (position, cell) index over `dst`, built and sorted by the check, swapped in. Nothing allocates.
+    void persona_adopt(const std::vector<uint32_t> & src, const std::vector<uint32_t> & dst, const llama_kv_cells & from,
+                       llama_seq_id seq_id, llama_kv_seq_pos & index) {
+        for (size_t k = 0; k < dst.size(); ++k) {
+            const uint32_t i = dst[k];
+            const uint32_t j = src[k];
+            assert(pos[i] == -1 && seq[i].none());
+            pos[i]   = from.pos[j];
+            ext[i]   = from.ext[j];
+            shift[i] = 0;
+            seq[i].set(seq_id);
+            used.insert(i);
+            seq_bits[seq_id][i/64] |= 1ull << (i%64);
+        }
+        seq_pos[seq_id].swap(index);
+        stale.reset(seq_id);
     }
 
     // Continuum fork (CONTINUUM-ENGINE 4.14): recompute every stale sequence index now, on the thread that changed the
@@ -753,7 +800,7 @@ private:
         return next.fetch_add(1, std::memory_order_relaxed);
     }
     uint64_t  lineage_id = next_lineage();
-    std::vector<std::weak_ptr<const llama_pos>> checkpoints;
+    std::vector<std::pair<llama_seq_id, std::weak_ptr<const llama_pos>>> checkpoints;
 
     bool has_shift = false;
 
