@@ -102,6 +102,9 @@ bool llm_graph_context::build_training_head() const {
     if (!res->t_embd || !res->t_logits || pooling_type != LLAMA_POOLING_TYPE_NONE) {
         return false;
     }
+    // Upstream's models declare t_logits without expanding it (build_logits expands it after this);
+    // the head is projected from the expanded graph, so expand it here first.
+    ggml_build_forward_expand(gf, res->t_logits);
     const auto map = ubatch.rows();
     auto * input = training_rows();
     if (cparams.training) {
