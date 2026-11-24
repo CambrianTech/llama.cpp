@@ -122,6 +122,8 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama
         if (n_rows > 0) {
             out.kv.staged.set(0, cells.cp(out.kv.rows)); // row j of her blocks is pool cell rows[j]
         }
+        out.kv.marks.clear();
+        out.kv.marks.reserve(cells.persona_marks(seq_id)); // her checkpoint receipts go out with her
     } else {
         n_rows = cells.used_max_p1(); // her stream's rows as they lie, cell j at row j
     }
@@ -154,6 +156,7 @@ void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_bloc
         }
         out.seq = seq_id;
         out.kv.cells.swap(out.kv.staged); // hers out, compacted; staged keeps the empty object for her next save
+        cells.persona_take_marks(seq_id, out.kv.marks);
         cells.persona_release(out.kv.rows, seq_id);
         if (!out.kv.rows.empty()) {
             v_heads[s] = std::min(v_heads[s], out.kv.rows.front());
@@ -296,6 +299,7 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
         index.emplace_back(kv.cells.pos_get(slot.src[k]), slot.dst[k]);
     }
     slot.index.settle(index);
+    v_cells[0].persona_reserve_marks(in.kv.marks.size()); // her checkpoint receipts come back with her
     return llama_persona_move::done;
 }
 
@@ -314,6 +318,7 @@ void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot
             });
         }
         v_cells[s].persona_adopt(slot.src, slot.dst, in.kv.cells, seq_id, slot.index);
+        v_cells[s].persona_give_marks(seq_id, in.kv.marks);
         in.kv.cells.reset(); // her blocks hold an empty, pool-sized object for her next save
         return;
     }

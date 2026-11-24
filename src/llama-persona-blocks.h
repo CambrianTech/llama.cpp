@@ -24,6 +24,8 @@ struct llama_kv_stream_blocks {
     // rows 0..n_rows, both built by the check so the commit only copies rows and swaps `staged` with `cells`
     std::vector<uint32_t>             rows;
     llama_kv_cells                    staged;
+    // her checkpoint receipts while she is out of a pool (reserved by the save's check), hers again when she is back
+    std::vector<std::weak_ptr<const llama_pos>> marks;
 };
 
 // her recurrent state: per layer, her row in every snapshot group (live group 0, then the rollback groups), and her
