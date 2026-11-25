@@ -118,7 +118,7 @@ public:
         // lightning indexer keys are rotated with the indexer RoPE parameters
                        bool   is_indexer = false);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache(); // Continuum fork: releases the storage its stream views (llama-persona-storage.cpp)
 
     //
     // llama_memory_i
@@ -190,7 +190,7 @@ public:
     // a move by pointer (llama-persona-storage.cpp): the Core's one stream on host-addressed buffers
     bool persona_by_pointer() const;
     // the stream views a mind's storage (nullptr: its own memory); a mind's storage never changes hands
-    void persona_view(const llama_kv_storage * storage);
+    void persona_view(llama_kv_storage * storage);
     // zero what the stream reads now (its own buffers or a mind's), never a parked mind's storage
     bool persona_clear_view();
     size_t persona_storage_bytes() const override;
@@ -360,7 +360,7 @@ private:
         void *                extra  = nullptr;
     };
     std::vector<persona_memory> persona_own;              // per layer K then V: the stream's own memory, before its first view
-    const llama_kv_storage *    persona_viewed = nullptr; // the mind's storage the stream views now, or nullptr
+    llama_kv_storage *          persona_viewed = nullptr; // the mind's storage the stream views now, or nullptr
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

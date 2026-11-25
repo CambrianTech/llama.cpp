@@ -18,7 +18,7 @@ bool llama_kv_cache::persona_by_pointer() const {
 // them follow. `nullptr` points the stream back at its own memory, recorded before its first view. Nothing changes
 // hands: her storage is hers for life, so a storage over her file is never written by anyone else. A built graph holds
 // the old addresses, so the context drops its graphs after every move.
-void llama_kv_cache::persona_view(const llama_kv_storage * storage) {
+void llama_kv_cache::persona_view(llama_kv_storage * storage) {
     if (persona_own.empty()) {
         for (const auto & layer : layers) {
             for (const ggml_tensor * t : { layer.k, layer.v }) {
@@ -45,6 +45,12 @@ void llama_kv_cache::persona_view(const llama_kv_storage * storage) {
             point(layer.v, storage ? persona_memory { storage->v[i]->data, storage->v[i]->buffer, storage->v[i]->extra } : persona_own[2 * i + 1]);
             repoint(layer.v_stream[0], layer.v);
         }
+    }
+    if (persona_viewed != nullptr) {
+        persona_viewed->viewer = nullptr;
+    }
+    if (storage != nullptr) {
+        storage->viewer = this;
     }
     persona_viewed = storage;
 }
@@ -101,8 +107,19 @@ storage_layout lay_out(const Layers & layers, Each && each) {
 void no_placement(size_t, bool, size_t) {}
 } // namespace
 
+// The bytes one mind's storage takes, or 0 when the stream cannot view caller memory here: not the Core's shape, or a
+// KV device that cannot wrap host memory. The size is the capability, so a caller decides from it alone.
 size_t llama_kv_cache::persona_storage_bytes() const {
-    return persona_by_pointer() ? lay_out(layers, no_placement).bytes : 0;
+    if (!persona_by_pointer()) {
+        return 0;
+    }
+    const storage_layout layout = lay_out(layers, no_placement);
+    if (!layout.one_device || layout.dev == nullptr) {
+        return 0;
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(layout.dev, &props);
+    return props.caps.buffer_from_host_ptr ? layout.bytes : 0;
 }
 
 // Her storage built over `base..base+bytes`, memory the caller owns (a mapped file, UNIFIED-PAGING.md slice 2): the
@@ -156,4 +173,33 @@ llama_persona_move llama_kv_cache::persona_attach_storage(llama_persona_blocks &
     }
     blocks.kv.storage = std::move(fresh);
     return llama_persona_move::done;
+}
+
+// A storage dropped while a stream views it points that stream back at its own memory first, and a cache destroyed
+// while viewing a storage lets go of it: neither side can hold a pointer the other has freed. A storage moves only
+// while no stream views it (her blocks are built once, before any bind).
+llama_kv_storage::llama_kv_storage(llama_kv_storage && other) noexcept
+    : ctxs(std::move(other.ctxs)), bufs(std::move(other.bufs)), k(std::move(other.k)), v(std::move(other.v)) {
+    GGML_ASSERT(other.viewer == nullptr && "a viewed storage never moves");
+}
+
+llama_kv_storage & llama_kv_storage::operator=(llama_kv_storage && other) noexcept {
+    GGML_ASSERT(viewer == nullptr && other.viewer == nullptr && "a viewed storage never moves");
+    ctxs = std::move(other.ctxs);
+    bufs = std::move(other.bufs);
+    k    = std::move(other.k);
+    v    = std::move(other.v);
+    return *this;
+}
+
+llama_kv_storage::~llama_kv_storage() {
+    if (viewer != nullptr) {
+        viewer->persona_view(nullptr);
+    }
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    if (persona_viewed != nullptr) {
+        persona_view(nullptr);
+    }
 }
