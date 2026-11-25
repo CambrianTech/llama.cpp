@@ -14,6 +14,7 @@
 #include "ggml-backend.h"
 
 #include <cstdio>
+#include <cstring>
 #ifdef _WIN32
 #    ifndef WIN32_LEAN_AND_MEAN
 #        define WIN32_LEAN_AND_MEAN
@@ -34,11 +35,15 @@ constexpr uint32_t MAGIC   = 0x31425043; // "CPB1"
 constexpr uint32_t VERSION = 2;
 constexpr uint8_t ROWS_IN_RECORD  = 0;
 constexpr uint8_t ROWS_IN_STORAGE = 1;
+// one occupied cell on disk: index (u32), position, 2D extension x and y (i32 each), whether her sequence holds it (u8)
+constexpr size_t CELL_BYTES = 4 + 4 + 4 + 4 + 1;
 
 struct writer {
     std::FILE * f;
     bool ok = true;
     template <typename T> void put(const T & v) { ok = ok && std::fwrite(&v, sizeof(T), 1, f) == 1; }
+    // bytes already laid out, in one write
+    void raw(const std::vector<uint8_t> & b) { ok = ok && (b.empty() || std::fwrite(b.data(), 1, b.size(), f) == b.size()); }
     void bytes(const std::vector<uint8_t> & b) {
         put<uint64_t>(b.size());
         ok = ok && (b.empty() || std::fwrite(b.data(), 1, b.size(), f) == b.size());
@@ -73,6 +78,12 @@ struct reader {
         T v{};
         ok = ok && std::fread(&v, sizeof(T), 1, f) == 1;
         return v;
+    }
+    // exactly `n` bytes in one read (`n` from this memory's own bounds, never a length the file claims)
+    bool raw(std::vector<uint8_t> & out, size_t n) {
+        out.resize(n);
+        ok = ok && (n == 0 || std::fread(out.data(), 1, n, f) == n);
+        return ok;
     }
     // one layer's bytes, refused unless the file says exactly `expect` (from this memory's geometry): no buffer is ever
     // sized from a length the file claims, so a truncated or foreign file allocates nothing (Codex on #155)
@@ -159,17 +170,25 @@ int32_t llama_persona_write_file(const llama_persona * persona, const char * pat
         occupied += b.kv.cells.is_empty(i) ? 0 : 1;
     }
     w.put<uint32_t>(occupied);
+    // her occupied cells as one packed table (index, position, 2D extension, whether her sequence holds it), written in
+    // one transfer: at 30k cells a write per field cost milliseconds of a stop
+    std::vector<uint8_t> table(size_t(occupied) * CELL_BYTES);
+    uint8_t * at = table.data();
     for (uint32_t i = 0; i < n_cells; ++i) {
         if (b.kv.cells.is_empty(i)) {
             continue;
         }
         const auto & ext = b.kv.cells.ext_get(i);
-        w.put<uint32_t>(i);
-        w.put<llama_pos>(b.kv.cells.pos_get(i));
-        w.put<llama_pos>(ext.x);
-        w.put<llama_pos>(ext.y);
-        w.put<uint8_t>(b.seq >= 0 && b.kv.cells.seq_has(i, b.seq) ? 1 : 0);
+        const llama_pos pos = b.kv.cells.pos_get(i);
+        const uint8_t hers = b.seq >= 0 && b.kv.cells.seq_has(i, b.seq) ? 1 : 0;
+        std::memcpy(at, &i, 4);
+        std::memcpy(at + 4, &pos, 4);
+        std::memcpy(at + 8, &ext.x, 4);
+        std::memcpy(at + 12, &ext.y, 4);
+        at[16] = hers;
+        at += CELL_BYTES;
     }
+    w.raw(table);
     // recurrent: her rows in every snapshot group and her cell's record
     w.put<uint8_t>(b.rs.has_state ? 1 : 0);
     w.put<llama_pos>(b.rs.pos);
@@ -256,14 +275,21 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path, uint
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
     struct cell { uint32_t i; llama_pos pos; llama_kv_cell_ext ext; bool hers; };
+    // her cell table in one transfer, sized from `occupied` only once it is known to fit this stream (checked above)
+    std::vector<uint8_t> table;
+    if (!r.raw(table, size_t(occupied) * CELL_BYTES)) {
+        return (int32_t) llama_persona_move::io_error;
+    }
     std::vector<cell> cells(occupied);
+    const uint8_t * at = table.data();
     for (auto & c : cells) {
-        c.i = r.get<uint32_t>();
-        c.pos = r.get<llama_pos>();
-        c.ext.x = r.get<llama_pos>();
-        c.ext.y = r.get<llama_pos>();
-        c.hers = r.get<uint8_t>() != 0;
-        if (r.ok && c.i >= stream_cells) {
+        std::memcpy(&c.i, at, 4);
+        std::memcpy(&c.pos, at + 4, 4);
+        std::memcpy(&c.ext.x, at + 8, 4);
+        std::memcpy(&c.ext.y, at + 12, 4);
+        c.hers = at[16] != 0;
+        at += CELL_BYTES;
+        if (c.i >= stream_cells) {
             return mismatch;
         }
     }
