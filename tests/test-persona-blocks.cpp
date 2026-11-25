@@ -209,14 +209,19 @@ int main(int argc, char ** argv) {
         // each mind's storage is memory this test owns (the block layer's role: her mapped file), attached before her
         // first move; page-aligned by hand so the check runs the same on every platform
         const size_t storage = llama_persona_storage_bytes(f.ctx);
-        require(storage > 0, "the Core's memory can hold a mind's storage");
+        // the size is the capability: 0 where a KV device cannot wrap host memory (CUDA), whose minds keep the row-copy
+        // move. The A/B switches and her file are checked either way; attaching and the fresh bind only where it can.
+        const bool attaches = storage > 0;
+        fprintf(stderr, "core: storage the stream can view: %s\n", attaches ? "yes" : "no (row copy)");
         const size_t page = 1u << 16;
-        std::vector<uint8_t> mem_a(storage + 2 * page), mem_b(storage + 2 * page);
+        std::vector<uint8_t> mem_a(attaches ? storage + 2 * page : 0), mem_b(attaches ? storage + 2 * page : 0);
         auto aligned = [&](std::vector<uint8_t> & m) { return reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(m.data()) + page - 1) & ~(uintptr_t) (page - 1)); };
         const size_t attachable = storage + page; // whole pages past the aligned start
+        if (attaches) {
         require_move(llama_get_memory(f.ctx)->persona_attach_storage(a, aligned(mem_a), attachable), llama_persona_move::done, "A's storage attached");
         require_move(llama_get_memory(f.ctx)->persona_attach_storage(b, aligned(mem_b), attachable), llama_persona_move::done, "B's storage attached");
         require_move(llama_get_memory(f.ctx)->persona_attach_storage(a, aligned(mem_a), attachable), llama_persona_move::stream_not_empty, "attached once");
+        }
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);                                   // A in the stream
         require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "A out to bring B in");
@@ -243,7 +248,7 @@ int main(int argc, char ** argv) {
         // what this catches (the Rust engine binds a new mind before her first token, 2026-11-25): a fresh bind of
         // blocks never saved (no sequence yet) renaming sequence -1, which wrote past the cells' arrays and corrupted
         // the heap. Fresh blocks with attached storage bind, decode straight into it, and continue as her control.
-        {
+        if (attaches) {
             llama_persona_blocks fresh;
             require_move(ctx.persona_prepare(fresh), llama_persona_move::done, "prepare a fresh mind");
             std::vector<uint8_t> mem_c(storage + 2 * page);
