@@ -13,6 +13,7 @@
 #include "llama-persona.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #ifdef _WIN32
@@ -50,16 +51,29 @@ struct writer {
     }
     // her rows straight from her own storage (the Core's pointer move): each layer one device-to-host transfer of
     // exactly her rows into one reused buffer, then one write. The same format as rows(), so either reader takes it.
+    // The buffer is the device's pinned host memory where it has one (CUDA): the DMA lands where the write reads, with
+    // no driver bounce copy through pageable memory. A device without one (CPU, Metal's shared memory) has no faster
+    // host memory to offer, so the buffer is ordinary memory.
     void rows_of(const std::vector<ggml_tensor *> & layers, const std::vector<size_t> & row, uint32_t n_rows) {
         put<uint32_t>((uint32_t) layers.size());
-        std::vector<uint8_t> staging;
+        size_t largest = 0;
+        ggml_backend_buffer_type_t pinned = nullptr;
+        for (size_t i = 0; i < layers.size(); ++i) {
+            if (layers[i] != nullptr) {
+                largest = std::max(largest, row[i] * n_rows);
+                const ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(layers[i]->buffer));
+                pinned = pinned ? pinned : (dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr);
+            }
+        }
+        ggml_backend_buffer_ptr held(pinned && largest > 0 ? ggml_backend_buft_alloc_buffer(pinned, largest) : nullptr);
+        std::vector<uint8_t> ordinary(held ? 0 : largest);
+        uint8_t * staging = held ? static_cast<uint8_t *>(ggml_backend_buffer_get_base(held.get())) : ordinary.data();
         for (size_t i = 0; i < layers.size() && ok; ++i) {
             const size_t n = layers[i] ? row[i] * n_rows : 0;
             put<uint64_t>(n);
             if (n > 0) {
-                staging.resize(n);
-                ggml_backend_tensor_get(layers[i], staging.data(), 0, n);
-                ok = ok && std::fwrite(staging.data(), 1, n, f) == n;
+                ggml_backend_tensor_get(layers[i], staging, 0, n);
+                ok = ok && std::fwrite(staging, 1, n, f) == n;
             }
         }
     }
