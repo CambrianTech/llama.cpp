@@ -128,36 +128,6 @@ public:
         });
     }
 
-    // Continuum fork (CONTINUUM-ENGINE 4.3): her checkpoint receipts travel with her. Paged out of a pool, the live
-    // ones move into `out` (reserved by the check to hold them); paged back in, they are hers again under the sequence
-    // she is bound as. Her positions are unchanged by a move, so a checkpoint she took before still rewinds her after.
-    size_t persona_marks(llama_seq_id seq_id) const {
-        return (size_t) std::count_if(checkpoints.begin(), checkpoints.end(), [seq_id](const auto & held) {
-            return held.first == seq_id && !held.second.expired();
-        });
-    }
-
-    void persona_take_marks(llama_seq_id seq_id, std::vector<std::weak_ptr<const llama_pos>> & out) {
-        out.clear();
-        for (auto & held : checkpoints) {
-            if (held.first == seq_id && !held.second.expired() && out.size() < out.capacity()) {
-                out.push_back(std::move(held.second)); // the moved-from receipt is empty: note_cut drops it
-            }
-        }
-        note_cut(seq_id, 0);
-    }
-
-    void persona_reserve_marks(size_t n) { checkpoints.reserve(checkpoints.size() + n); }
-
-    void persona_give_marks(llama_seq_id seq_id, std::vector<std::weak_ptr<const llama_pos>> & in) {
-        for (auto & mark : in) {
-            if (!mark.expired() && checkpoints.size() < checkpoints.capacity()) {
-                checkpoints.emplace_back(seq_id, std::move(mark));
-            }
-        }
-        in.clear();
-    }
-
     // Continuum fork (CONTINUUM-ENGINE 4.3): a pool several minds share. Her cells' sequence bits exist for every
     // sequence the pool seats from construction, so moving her in never allocates.
     void persona_reserve_seqs(uint32_t n_seq) {

@@ -225,27 +225,6 @@ static void run_pool(fixture & f) {
     require_move(ctx.persona_save(0, a, A), llama_persona_move::shared_cell, "a refused: her cells are shared");
     require(f.pos_max(0) == n_prompt - 1 && f.pos_max(2) == n_prompt - 1, "the refusal moved nothing");
 
-    // P4b. her checkpoint travels with her: taken while seated, it still rewinds her after she was paged out and back
-    //      in elsewhere in the pool (a lost receipt re-prefills her whole view on her next act: the engine's validator,
-    //      2026-11-24, reused 0 of 456 tokens after a page-out against 438 in place)
-    {
-        auto st = [](int32_t s) { return (llama_persona_move) s; };
-        seat_both();
-        llama_persona_checkpoint * cp = llama_persona_checkpoint_init();
-        require(cp != nullptr, "a checkpoint");
-        require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "a's checkpoint at her prompt's end");
-        f.decode_one(0, 9 % f.n_vocab, n_prompt); // she moves past it
-        require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "a out with her checkpoint");
-        f.prompt(2, 3); // another mind takes her cells
-        require_move(ctx.persona_load(0, 0, a, A), llama_persona_move::done, "a back elsewhere");
-        require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done,
-                     "her checkpoint rewinds her after the round trip");
-        require(f.pos_max(0) == n_prompt - 1, "rewound to her prompt's end");
-        llama_memory_seq_rm(mem, 2, -1, -1);
-        continues("P4b a after a rewind across a page-out", false);
-        llama_persona_checkpoint_free(cp);
-    }
-
     // P5. a cut of one mind never revokes another's checkpoint
     {
         auto st = [](int32_t s) { return (llama_persona_move) s; };
