@@ -189,6 +189,8 @@ public:
     bool persona_streams_are_own() const;
     // a move by pointer (llama-persona-storage.cpp): the Core's one stream on host-addressed buffers
     bool persona_by_pointer() const;
+    // the cache's own tensors, each layer's K then V: the order a mind's storage is laid out and viewed in
+    std::vector<ggml_tensor *> persona_tensors() const;
     // the stream views a mind's storage (nullptr: its own memory); a mind's storage never changes hands
     void persona_view(llama_kv_storage * storage);
     // zero what the stream reads now (its own buffers or a mind's), never a parked mind's storage
@@ -356,12 +358,7 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
-    struct persona_memory {
-        void *                data   = nullptr;
-        ggml_backend_buffer_t buffer = nullptr;
-        void *                extra  = nullptr;
-    };
-    std::vector<persona_memory> persona_own;              // per layer K then V: the stream's own memory, before its first view
+    std::vector<llama_persona_memory> persona_own;        // per layer K then V: the stream's own memory, before its first view
     llama_kv_storage *          persona_viewed = nullptr; // the mind's storage the stream views now, or nullptr
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())

@@ -122,6 +122,15 @@ bool replace_file(const std::string & tmp, const char * path) {
 #endif
 }
 
+// her recurrent storage's r (`which` 0) or s (1) tensor of every layer, from its layer-major r, s, p list
+std::vector<ggml_tensor *> recurrent(const llama_rs_storage & storage, size_t which) {
+    std::vector<ggml_tensor *> out;
+    for (size_t i = which; i < storage.own.t.size(); i += 3) {
+        out.push_back(storage.own.t[i]);
+    }
+    return out;
+}
+
 struct closes {
     std::FILE * f;
     ~closes() { if (f) { std::fclose(f); } }
@@ -189,12 +198,20 @@ int32_t llama_persona_write_file(const llama_persona * persona, const char * pat
         at += CELL_BYTES;
     }
     w.raw(table);
-    // recurrent: her rows in every snapshot group and her cell's record
+    // recurrent: her cell's record, then her rows in every snapshot group unless they are in her attached storage
     w.put<uint8_t>(b.rs.has_state ? 1 : 0);
     w.put<llama_pos>(b.rs.pos);
     w.put<uint32_t>(b.rs.rs_idx);
-    w.rows(b.rs.r);
-    w.rows(b.rs.s);
+    if (attached > 0 && b.rs.storage.held()) {
+        // nothing: her recurrent rows are her storage too (slice 2c)
+    } else if (b.rs.storage.held()) {
+        const uint32_t whole = b.rs.has_state ? 1 : 0; // her storage tensor is her rows in every group: whole or none
+        w.rows_of(recurrent(b.rs.storage, 0), b.geometry.r_bytes, whole);
+        w.rows_of(recurrent(b.rs.storage, 1), b.geometry.s_bytes, whole);
+    } else {
+        w.rows(b.rs.r);
+        w.rows(b.rs.s);
+    }
     const bool flushed = w.ok && std::fflush(f) == 0;
     const bool closed = std::fclose(f) == 0;
     if (!flushed || !closed || !replace_file(tmp, path)) {
@@ -299,7 +316,9 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path, uint
     // her recurrent rows are whole when she held state and absent when she did not (persona_check_save)
     const std::vector<size_t> r_bytes = has_state ? g.r_bytes : std::vector<size_t>(g.r_bytes.size(), 0);
     const std::vector<size_t> s_bytes = has_state ? g.s_bytes : std::vector<size_t>(g.s_bytes.size(), 0);
-    if (!r.ok || !r.rows(rs_r, r_bytes) || !r.rows(rs_s, s_bytes)) {
+    // her recurrent rows are here unless her record says her rows are in storage and she holds recurrent storage
+    const bool rs_here = rows_here || !b.rs.storage.held();
+    if (!r.ok || (rs_here && (!r.rows(rs_r, r_bytes) || !r.rows(rs_s, s_bytes)))) {
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
     // every check passed: commit. Her cells start from the empty, stream-sized object her preparation made.
@@ -327,8 +346,17 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path, uint
     b.rs.has_state = has_state;
     b.rs.pos = rs_pos;
     b.rs.rs_idx = rs_idx;
-    b.rs.r.swap(rs_r);
-    b.rs.s.swap(rs_s);
+    if (b.rs.storage.held()) {
+        // her recurrent rows land in her own storage, one transfer per tensor (none when they are already there)
+        const std::vector<ggml_tensor *> rs_r_to = recurrent(b.rs.storage, 0), rs_s_to = recurrent(b.rs.storage, 1);
+        for (size_t i = 0; i < rs_r.size() && i < rs_r_to.size(); ++i) {
+            if (!rs_r[i].empty()) { ggml_backend_tensor_set(rs_r_to[i], rs_r[i].data(), 0, rs_r[i].size()); }
+            if (!rs_s[i].empty()) { ggml_backend_tensor_set(rs_s_to[i], rs_s[i].data(), 0, rs_s[i].size()); }
+        }
+    } else {
+        b.rs.r.swap(rs_r);
+        b.rs.s.swap(rs_s);
+    }
     b.seq = seq;
     b.owned = true;
     b.owner = owner;

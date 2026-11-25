@@ -27,7 +27,7 @@ public:
                      uint32_t   n_rs_seq,
         const layer_filter_cb & filter);
 
-    ~llama_memory_recurrent() = default;
+    ~llama_memory_recurrent(); // Continuum fork: lets go of the storage it views (llama-persona-recurrent-storage.cpp)
 
     //
     // llama_memory_i
@@ -105,6 +105,18 @@ public:
     llama_persona_move persona_check_rewind_rows(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in) const;
     void persona_commit_rewind_rows(llama_seq_id seq_id, const llama_persona_checkpoint_blocks & in);
 
+    // Her recurrent state by pointer (llama-persona-recurrent-storage.cpp, UNIFIED-PAGING slice 2c): on the Core's one
+    // cell each layer's r, s and p tensors are exactly her rows, so binding her points them at her storage and parking
+    // her points them back; no row is copied.
+    bool persona_by_pointer() const;
+    std::vector<ggml_tensor *> persona_tensors() const; // per layer r, s, p (nullptr where absent), layer-major
+    void persona_view(llama_rs_storage * storage);
+    bool persona_clear_view(); // zero what the memory reads now, never a parked mind's storage
+    size_t persona_storage_bytes() const override;
+    bool persona_storage_viewable() const override;
+    llama_persona_move persona_reserve_storage(llama_persona_blocks & blocks) const override;
+    llama_persona_move persona_attach_storage(llama_persona_blocks & blocks, void * base, size_t bytes) const override;
+
     // an undo of a draft is pending on this sequence: its next read takes a snapshot group, not the
     // live state (group 0) a training graph reads and writes (llm_graph_context::rs_keep)
     bool rollback_pending(llama_seq_id seq_id) const {
@@ -157,6 +169,8 @@ private:
     // this memory's persona layout fingerprint, computed once at construction (the allocation layout is immutable)
     uint64_t persona_layout_id = 0;
     uint64_t compute_persona_layout() const;
+    std::vector<llama_persona_memory> persona_own;        // per layer r, s, p: this memory's own, before its first view
+    llama_rs_storage *                persona_viewed = nullptr; // the mind's storage this memory views now, or nullptr
     //const llama_model & model;
     const llama_hparams & hparams;
 

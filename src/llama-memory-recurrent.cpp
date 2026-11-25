@@ -156,7 +156,7 @@ void llama_memory_recurrent::clear(bool data) {
     head = 0;
     used = 0;
 
-    if (data) {
+    if (data && !persona_clear_view()) { // Continuum fork: a viewed mind's storage is what it reads (slice 2c)
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
@@ -466,6 +466,9 @@ llama_persona_move llama_memory_recurrent::persona_check_save(llama_seq_id seq_i
     if (tail >= 0 && cells[tail].seq_id.size() != 1) {
         return llama_persona_move::shared_cell;
     }
+    if (persona_by_pointer() && out.rs.storage.held()) {
+        return llama_persona_move::done; // her rows are her storage: nothing to reserve, nothing copied
+    }
     // reserve: every byte the commit copies, so the commit never allocates
     const uint32_t n_groups = 1 + n_rs_seq;
     for (size_t il = 0; il < r_l.size(); ++il) {
@@ -480,11 +483,23 @@ void llama_memory_recurrent::persona_commit_save(llama_seq_id seq_id, llama_pers
     const int32_t tail = cells[seq_id].tail;
     rs.has_state = tail >= 0;
     out.seq = seq_id;
+    const bool by_pointer = persona_by_pointer() && rs.storage.held();
+    if (by_pointer && persona_viewed == &rs.storage) {
+        persona_view(nullptr); // her rows stay in her storage; the memory reads its own again
+    } else if (by_pointer && rs.has_state) {
+        // decoded before she held storage: carried into it on the device, once
+        const std::vector<ggml_tensor *> own = persona_tensors();
+        for (size_t i = 0; i < own.size(); ++i) {
+            if (own[i] != nullptr) {
+                ggml_backend_tensor_copy(own[i], rs.storage.own.t[i]);
+            }
+        }
+    }
     if (!rs.has_state) {
         return;
     }
     const uint32_t n_groups = 1 + n_rs_seq;
-    // her row of one state tensor, in every snapshot group, into her reserved bytes
+    // her row of one state tensor, in every snapshot group, into her reserved bytes (a memory without her storage)
     const auto rows_out = [&](const ggml_tensor * src, std::vector<uint8_t> & dst) {
         if (src == nullptr || dst.empty()) {
             return;
@@ -494,7 +509,7 @@ void llama_memory_recurrent::persona_commit_save(llama_seq_id seq_id, llama_pers
             ggml_backend_tensor_get(src, dst.data() + g * row, (size_t) (g * size + tail) * src->nb[1], row);
         }
     };
-    for (size_t il = 0; il < r_l.size(); ++il) {
+    for (size_t il = 0; il < r_l.size() && !by_pointer; ++il) {
         rows_out(r_l[il], rs.r[il]);
         rows_out(s_l[il], rs.s[il]);
     }
@@ -536,7 +551,8 @@ llama_persona_move llama_memory_recurrent::persona_check_load(llama_seq_id seq_i
         return llama_persona_move::layout_mismatch;
     }
     const uint32_t n_groups = 1 + n_rs_seq;
-    for (size_t il = 0; il < r_l.size(); ++il) {
+    // rows she brings as bytes must be whole; rows in her storage are her storage, shaped as this memory by construction
+    for (size_t il = 0; il < r_l.size() && !(persona_by_pointer() && rs.storage.held()); ++il) {
         const size_t r_bytes = r_l[il] ? ggml_row_size(r_l[il]->type, r_l[il]->ne[0]) * n_groups : 0;
         const size_t s_bytes = s_l[il] ? ggml_row_size(s_l[il]->type, s_l[il]->ne[0]) * n_groups : 0;
         if (rs.r[il].size() != r_bytes || rs.s[il].size() != s_bytes) {
@@ -557,7 +573,13 @@ llama_persona_move llama_memory_recurrent::persona_check_load(llama_seq_id seq_i
 
 void llama_memory_recurrent::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot,
                                                  llama_persona_blocks & in) {
-    const auto & rs = in.rs;
+    auto & rs = in.rs;
+    // her storage: the memory views it, so her rows are where her next step reads and writes them; nothing is copied.
+    // Viewed even without state: her first step zeroes her cell into her own storage.
+    const bool by_pointer = persona_by_pointer() && rs.storage.held();
+    if (by_pointer) {
+        persona_view(&rs.storage);
+    }
     if (!rs.has_state) {
         return;
     }
@@ -573,7 +595,7 @@ void llama_memory_recurrent::persona_commit_load(llama_seq_id seq_id, llama_pers
             ggml_backend_tensor_set(dst, src.data() + g * row, (size_t) (g * size + cell_id) * dst->nb[1], row);
         }
     };
-    for (size_t il = 0; il < r_l.size(); ++il) {
+    for (size_t il = 0; il < r_l.size() && !by_pointer; ++il) {
         rows_in(r_l[il], rs.r[il]);
         rows_in(s_l[il], rs.s[il]);
     }

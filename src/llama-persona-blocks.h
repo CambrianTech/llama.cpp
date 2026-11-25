@@ -52,12 +52,47 @@ struct llama_kv_stream_blocks {
     llama_kv_cells                    cells; // hers while she is out; an empty, stream-sized object while she is in
 };
 
+// a memory tensor's own data, recorded before its first view so a view can point it back (llama-persona-view.h)
+struct llama_persona_memory {
+    void *                data   = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    void *                extra  = nullptr;
+};
+
+// a mind's tensors shaped exactly as a memory's own list, and the memory they live in (llama-persona-view.h)
+struct llama_persona_tensors {
+    std::vector<ggml_context_ptr>        ctxs;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    std::vector<ggml_tensor *>           t;
+};
+
+// her recurrent state in storage of her own, for life, on the Core (one cell, so each layer's r, s and p tensors are
+// exactly her rows in every snapshot group): the memory views it while she is bound, so a switch copies none of it
+// (UNIFIED-PAGING.md, slice 2c). Laid out after her KV in the same run of memory.
+class llama_memory_recurrent;
+
+struct llama_rs_storage {
+    llama_persona_tensors    own; // per recurrent layer r, s, p (nullptr where the memory has none), layer-major
+    // the memory viewing this storage now, or nullptr: a storage dropped while viewed first points it back
+    llama_memory_recurrent * viewer = nullptr;
+    bool held() const { return !own.t.empty(); }
+
+    llama_rs_storage() = default;
+    llama_rs_storage(const llama_rs_storage &) = delete;
+    llama_rs_storage & operator=(const llama_rs_storage &) = delete;
+    llama_rs_storage(llama_rs_storage && other) noexcept;
+    llama_rs_storage & operator=(llama_rs_storage && other) noexcept;
+    ~llama_rs_storage();
+};
+
 // her recurrent state: per layer, her row in every snapshot group (live group 0, then the rollback groups), and her
 // cell's record
 struct llama_rs_seq_blocks {
     bool                              has_state = false;
     llama_pos                         pos       = -1;
     uint32_t                          rs_idx    = 0;
+    // the Core: her rows in her own storage, viewed by pointer (r and s below stay empty)
+    llama_rs_storage                  storage;
     std::vector<std::vector<uint8_t>> r; // per layer: (1 + n_rs_seq) rows of r, group-major
     std::vector<std::vector<uint8_t>> s; // per layer: (1 + n_rs_seq) rows of s, group-major
 };
