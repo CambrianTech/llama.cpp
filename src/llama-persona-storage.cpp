@@ -1,76 +1,35 @@
-// Continuum fork (THE-LANE-ON-SAGE.md, the pointer move): a mind's attention KV in storage of her own, moved by
-// pointer. On the Core (one stream), the stream and every parked mind each own one storage of the stream's exact shape;
-// a save or bind exchanges the stream's storage with hers (each layer tensor's data, buffer and extra, the stream views
-// over them, and the buffers' ownership). No byte of KV is copied, at any depth.
+// Continuum fork (UNIFIED-PAGING.md, slice 2): a mind's attention KV in storage of her own, for life, built over memory
+// the block layer owns (her mapped file). On the Core (one stream), binding her points the stream's layer tensors at
+// her storage and parking her points them back: the stream is a view, and no byte of KV is copied at any depth. A
+// device that cannot wrap host memory keeps the row-copy move (the discrete adapter, slice 4).
 // Kept beside llama-kv-cache.cpp so upstream's cache merges without touching it.
 #include "llama-kv-cache.h"
 
+#include <algorithm>
 #include <map>
 #include <utility>
 
-// A move by pointer needs only the Core's shape: one stream, so the stream is the whole layer tensor. The exchange
-// swaps which buffer the device reads and the CPU never touches the data, so it holds for any buffer type (Metal shared
-// or private, VRAM, host). What differs by memory is capacity: a parked mind's storage stays where it was allocated
-// until a tier moves it, never copied in or out by a switch.
+// The stream can view a mind's storage on the Core's shape: one stream, so the stream is the whole layer tensor.
 bool llama_kv_cache::persona_by_pointer() const {
     return n_stream == 1;
 }
 
-// Her storage: per layer a K and a V tensor of the stream's exact type and shape, in buffers of the stream's own types,
-// reserved by her first save (a mind never parked never costs it). Cleared once, as the cache clears its own, so no
-// padding a kernel reads is NaN.
-bool llama_kv_cache::persona_reserve_storage(llama_kv_storage & storage) const {
-    if (storage.held()) {
-        return true;
-    }
-    llama_kv_storage fresh;
-    std::map<ggml_backend_buffer_type_t, ggml_context *> by_type;
-    auto shaped_as = [&](const ggml_tensor * t) -> ggml_tensor * {
-        if (t == nullptr) {
-            return nullptr;
-        }
-        const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
-        auto it = by_type.find(buft);
-        if (it == by_type.end()) {
-            ggml_init_params params = { /*.mem_size =*/ 2u * layers.size() * ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
-            ggml_context * ctx = ggml_init(params);
-            if (ctx == nullptr) {
-                return nullptr;
+// The stream views her storage: each layer tensor's data, buffer and extra point at hers, and the stream views over
+// them follow. `nullptr` points the stream back at its own memory, recorded before its first view. Nothing changes
+// hands: her storage is hers for life, so a storage over her file is never written by anyone else. A built graph holds
+// the old addresses, so the context drops its graphs after every move.
+void llama_kv_cache::persona_view(const llama_kv_storage * storage) {
+    if (persona_own.empty()) {
+        for (const auto & layer : layers) {
+            for (const ggml_tensor * t : { layer.k, layer.v }) {
+                persona_own.push_back(t ? persona_memory { t->data, t->buffer, t->extra } : persona_memory {});
             }
-            fresh.ctxs.emplace_back(ctx);
-            it = by_type.emplace(buft, ctx).first;
         }
-        return ggml_new_tensor(it->second, t->type, GGML_MAX_DIMS, t->ne);
-    };
-    for (const auto & layer : layers) {
-        ggml_tensor * k = shaped_as(layer.k);
-        ggml_tensor * v = shaped_as(layer.v);
-        if ((layer.k && !k) || (layer.v && !v)) {
-            return false;
-        }
-        fresh.k.push_back(k);
-        fresh.v.push_back(v);
     }
-    for (const auto & [buft, ctx] : by_type) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-        if (buf == nullptr) {
-            return false;
-        }
-        ggml_backend_buffer_clear(buf, 0);
-        fresh.bufs.emplace_back(buf);
-    }
-    storage = std::move(fresh);
-    return true;
-}
-
-// The exchange: each layer tensor's storage swapped with hers, the stream views (offset 0: one stream) pointed at the
-// stream's new storage, and the buffers' ownership swapped with the data (the stream's side is `persona_resident`; empty
-// while it reads its own `ctxs_bufs`). The graph owner rebuilds after a move: a built graph holds the old addresses.
-void llama_kv_cache::persona_exchange_storage(llama_kv_storage & storage) {
-    auto exchange = [](ggml_tensor * a, ggml_tensor * b) {
-        std::swap(a->data, b->data);
-        std::swap(a->buffer, b->buffer);
-        std::swap(a->extra, b->extra);
+    auto point = [](ggml_tensor * t, const persona_memory & m) {
+        t->data   = m.data;
+        t->buffer = m.buffer;
+        t->extra  = m.extra;
     };
     auto repoint = [](ggml_tensor * view, const ggml_tensor * base) {
         view->data   = static_cast<char *>(base->data) + view->view_offs;
@@ -79,21 +38,21 @@ void llama_kv_cache::persona_exchange_storage(llama_kv_storage & storage) {
     for (size_t i = 0; i < layers.size(); ++i) {
         auto & layer = layers[i];
         if (layer.k) {
-            exchange(layer.k, storage.k[i]);
+            point(layer.k, storage ? persona_memory { storage->k[i]->data, storage->k[i]->buffer, storage->k[i]->extra } : persona_own[2 * i]);
             repoint(layer.k_stream[0], layer.k);
         }
         if (layer.v) {
-            exchange(layer.v, storage.v[i]);
+            point(layer.v, storage ? persona_memory { storage->v[i]->data, storage->v[i]->buffer, storage->v[i]->extra } : persona_own[2 * i + 1]);
             repoint(layer.v_stream[0], layer.v);
         }
     }
-    std::swap(storage.bufs, persona_resident.bufs);
+    persona_viewed = storage;
 }
 
-// A clear of the data zeroes what the stream reads now. While that is a mind's storage (a pointer move put it there),
-// the cache's own buffers belong to a parked mind and are not the cache's to clear.
-bool llama_kv_cache::persona_clear_resident() {
-    if (persona_resident.bufs.empty()) {
+// A clear of the data zeroes what the stream views. While that is a mind's storage, the stream's own memory is not
+// what it reads, so the upstream clear of its own buffers would miss her and is skipped.
+bool llama_kv_cache::persona_clear_view() {
+    if (persona_viewed == nullptr) {
         return false;
     }
     for (const auto & layer : layers) {
@@ -104,4 +63,97 @@ bool llama_kv_cache::persona_clear_resident() {
         }
     }
     return true;
+}
+
+// One mind's storage laid out over one run of memory: each layer's K then V, each at an offset aligned for its buffer
+// type, all on one device. Shared by the size a caller asks for and the attach that builds over it, so they agree.
+namespace {
+struct storage_layout {
+    ggml_backend_dev_t dev        = nullptr;
+    bool               one_device = true;
+    size_t             bytes      = 0;
+    size_t             largest    = 0;
+};
+
+// `each(layer, is_v, offset)` for every present tensor, in layout order
+template <typename Layers, typename Each>
+storage_layout lay_out(const Layers & layers, Each && each) {
+    storage_layout out;
+    for (size_t l = 0; l < layers.size(); ++l) {
+        for (const bool is_v : { false, true }) {
+            const ggml_tensor * t = is_v ? layers[l].v : layers[l].k;
+            if (t == nullptr) {
+                continue;
+            }
+            const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+            const ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            out.one_device = out.one_device && (out.dev == nullptr || out.dev == dev);
+            out.dev = dev;
+            out.bytes = GGML_PAD(out.bytes, ggml_backend_buft_get_alignment(buft));
+            each(l, is_v, out.bytes);
+            out.bytes += ggml_nbytes(t);
+            out.largest = std::max(out.largest, ggml_nbytes(t));
+        }
+    }
+    return out;
+}
+
+void no_placement(size_t, bool, size_t) {}
+} // namespace
+
+size_t llama_kv_cache::persona_storage_bytes() const {
+    return persona_by_pointer() ? lay_out(layers, no_placement).bytes : 0;
+}
+
+// Her storage built over `base..base+bytes`, memory the caller owns (a mapped file, UNIFIED-PAGING.md slice 2): the
+// tensors are the stream's exact shape, placed by the same layout as persona_storage_bytes, in one device buffer that
+// wraps the memory where it lies (`ggml_backend_dev_buffer_from_host_ptr`; Metal: newBufferWithBytesNoCopy, shared).
+// Nothing is cleared: the memory is hers (her file's bytes, or a fresh file's zeros). Refused as unsupported where a
+// KV device cannot wrap host memory (CUDA: its storage stays the fork's own until the discrete adapter, slice 4).
+llama_persona_move llama_kv_cache::persona_attach_storage(llama_persona_blocks & blocks, void * base, size_t bytes) const {
+    if (!persona_by_pointer() || base == nullptr) {
+        return llama_persona_move::unsupported;
+    }
+    if (blocks.kv.storage.held()) {
+        return llama_persona_move::stream_not_empty; // she already holds storage: attach once, before her first move
+    }
+    const storage_layout probe = lay_out(layers, no_placement);
+    if (!probe.one_device || probe.dev == nullptr) {
+        return llama_persona_move::unsupported;
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(probe.dev, &props);
+    if (!props.caps.buffer_from_host_ptr) {
+        return llama_persona_move::unsupported;
+    }
+    if (bytes < probe.bytes) {
+        return llama_persona_move::layout_mismatch;
+    }
+    llama_kv_storage fresh;
+    ggml_init_params params = { /*.mem_size =*/ 2u * layers.size() * ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return llama_persona_move::out_of_memory;
+    }
+    fresh.ctxs.emplace_back(ctx);
+    for (const auto & layer : layers) {
+        fresh.k.push_back(layer.k ? ggml_new_tensor(ctx, layer.k->type, GGML_MAX_DIMS, layer.k->ne) : nullptr);
+        fresh.v.push_back(layer.v ? ggml_new_tensor(ctx, layer.v->type, GGML_MAX_DIMS, layer.v->ne) : nullptr);
+    }
+    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(probe.dev, base, bytes, probe.largest);
+    if (buf == nullptr) {
+        return llama_persona_move::out_of_memory;
+    }
+    fresh.bufs.emplace_back(buf);
+    char * at = static_cast<char *>(base);
+    bool placed = true;
+    lay_out(layers, [&](size_t l, bool is_v, size_t offset) {
+        ggml_tensor * t = is_v ? fresh.v[l] : fresh.k[l];
+        placed = placed && ggml_backend_tensor_alloc(buf, t, at + offset) == GGML_STATUS_SUCCESS;
+    });
+    if (!placed) {
+        return llama_persona_move::layout_mismatch;
+    }
+    blocks.kv.storage = std::move(fresh);
+    return llama_persona_move::done;
 }

@@ -441,7 +441,7 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
-    if (data && persona_clear_resident()) {
+    if (data && persona_clear_view()) {
         return; // the stream reads storage a pointer move gave it: clear that, not the buffers a parked mind now holds
     }
     if (data) {

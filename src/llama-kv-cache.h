@@ -189,10 +189,12 @@ public:
     bool persona_streams_are_own() const;
     // a move by pointer (llama-persona-storage.cpp): the Core's one stream on host-addressed buffers
     bool persona_by_pointer() const;
-    bool persona_reserve_storage(llama_kv_storage & storage) const;
-    void persona_exchange_storage(llama_kv_storage & storage);
+    // the stream views a mind's storage (nullptr: its own memory); a mind's storage never changes hands
+    void persona_view(const llama_kv_storage * storage);
     // zero what the stream reads now (its own buffers or a mind's), never a parked mind's storage
-    bool persona_clear_resident();
+    bool persona_clear_view();
+    size_t persona_storage_bytes() const override;
+    llama_persona_move persona_attach_storage(llama_persona_blocks & blocks, void * base, size_t bytes) const override;
     llama_persona_move persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const override;
     llama_persona_move persona_check_load(llama_seq_id seq_id, uint32_t stream, const llama_persona_blocks & in,
                                           llama_persona_slot & slot) const override;
@@ -352,8 +354,13 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
-    // the buffers the stream reads when a pointer move put a mind's there (empty: the stream reads ctxs_bufs)
-    llama_kv_storage persona_resident;
+    struct persona_memory {
+        void *                data   = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        void *                extra  = nullptr;
+    };
+    std::vector<persona_memory> persona_own;              // per layer K then V: the stream's own memory, before its first view
+    const llama_kv_storage *    persona_viewed = nullptr; // the mind's storage the stream views now, or nullptr
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

@@ -78,12 +78,12 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama
         return llama_persona_move::cells_not_prepared;
     }
     const uint32_t n_rows = v_cells[seq_to_stream[seq_id]].used_max_p1();
-    if (persona_by_pointer()) {
-        // her rows stay where she wrote them: the commit exchanges storage, and the stream takes the storage she
-        // brings. A mind parked for the first time brings storage reserved here, so a mind that never leaves the
-        // stream (a one-off, a turn never preempted) never costs a window of memory
+    if (persona_by_pointer() && out.kv.storage.held()) {
+        // she holds her own storage: viewed, her rows are already there and the commit points the stream away; not
+        // viewed (her rows are in the stream's own memory, decoded before she was attached), the commit carries
+        // them into her storage on the device, once
         out.kv.n_rows = n_rows;
-        return persona_reserve_storage(out.kv.storage) ? llama_persona_move::done : llama_persona_move::out_of_memory;
+        return llama_persona_move::done;
     }
     // reserve: every byte the commit copies, so the commit never allocates
     for (size_t i = 0; i < layers.size(); ++i) {
@@ -98,8 +98,15 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama
 void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) {
     const uint32_t s = seq_to_stream[seq_id];
     auto & cells = v_cells[s];
-    if (persona_by_pointer()) {
-        persona_exchange_storage(out.kv.storage); // she keeps the storage she decoded in
+    if (persona_by_pointer() && out.kv.storage.held()) {
+        if (persona_viewed == &out.kv.storage) {
+            persona_view(nullptr); // her rows stay in her storage; the stream views its own memory again
+        } else {
+            for (size_t i = 0; i < layers.size(); ++i) { // decoded before she was attached: carried to her storage once
+                if (layers[i].k) { ggml_backend_tensor_copy(layers[i].k, out.kv.storage.k[i]); }
+                if (layers[i].v) { ggml_backend_tensor_copy(layers[i].v, out.kv.storage.v[i]); }
+            }
+        }
         out.seq = seq_id;
         out.kv.cells.swap(cells);
         v_heads[s] = 0;
@@ -203,8 +210,8 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
         kv.k.size() != layers.size() || kv.v.size() != layers.size()) {
         return llama_persona_move::layout_mismatch;
     }
-    // her KV in her own storage: bound by exchange. Without one (a mind never parked, or restored from her file, whose
-    // rows are the bytes below) she binds into the stream's own storage as it is
+    // her KV in her own storage: bound by pointing the stream at it. Without one (a device that cannot wrap host
+    // memory, or rows restored from her file as bytes) her rows are written into the stream's own memory below
     if (persona_by_pointer() && kv.storage.held()) {
         slot.stream = stream;
         return llama_persona_move::done;
@@ -223,12 +230,12 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
 
 void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) {
     const uint32_t s = slot.stream;
-    const bool exchanged = persona_by_pointer() && in.kv.storage.held();
-    if (exchanged) {
-        persona_exchange_storage(in.kv.storage); // hers becomes the stream's; she keeps the stream's empty one
+    const bool viewed = persona_by_pointer() && in.kv.storage.held();
+    if (viewed) {
+        persona_view(&in.kv.storage); // the stream views her storage; nothing is copied
     }
-    // rows she brought as bytes (her file), written into the stream: the one transfer a restore needs
-    for (size_t i = 0; i < layers.size() && !exchanged; ++i) {
+    // rows she brought as bytes (her file, or a device that cannot wrap host memory), written into the stream's own memory
+    for (size_t i = 0; i < layers.size() && !viewed; ++i) {
         const auto & layer = layers[i];
         if (!in.kv.k[i].empty()) {
             ggml_backend_tensor_set(layer.k_stream[s], in.kv.k[i].data(), 0, in.kv.k[i].size());

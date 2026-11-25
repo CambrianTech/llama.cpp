@@ -206,6 +206,17 @@ int main(int argc, char ** argv) {
             timed(ctx.persona_load(0, 0, in, in_who), what);
             moved_us += ggml_time_us() - t;
         };
+        // each mind's storage is memory this test owns (the block layer's role: her mapped file), attached before her
+        // first move; page-aligned by hand so the check runs the same on every platform
+        const size_t storage = llama_persona_storage_bytes(f.ctx);
+        require(storage > 0, "the Core's memory can hold a mind's storage");
+        const size_t page = 1u << 16;
+        std::vector<uint8_t> mem_a(storage + 2 * page), mem_b(storage + 2 * page);
+        auto aligned = [&](std::vector<uint8_t> & m) { return reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(m.data()) + page - 1) & ~(uintptr_t) (page - 1)); };
+        const size_t attachable = storage + page; // whole pages past the aligned start
+        require_move(llama_get_memory(f.ctx)->persona_attach_storage(a, aligned(mem_a), attachable), llama_persona_move::done, "A's storage attached");
+        require_move(llama_get_memory(f.ctx)->persona_attach_storage(b, aligned(mem_b), attachable), llama_persona_move::done, "B's storage attached");
+        require_move(llama_get_memory(f.ctx)->persona_attach_storage(a, aligned(mem_a), attachable), llama_persona_move::stream_not_empty, "attached once");
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);                                   // A in the stream
         require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "A out to bring B in");
@@ -255,7 +266,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "core: her file %.1f MB, write %.1f ms, read %.1f ms\n", bytes / 1e6, written_us / 1e3, read_us / 1e3);
         }
         fprintf(stderr, "core: depth %d, %d moves, %.3f ms per switch (save + bind), by pointer: %s\n", core_depth, moves,
-                moved_us / 1e3 / 2.0, a.kv.storage.held() ? "yes" : "no");
+                moved_us / 1e3 / 2.0, a.kv.storage.held() && b.kv.storage.held() ? "yes (attached)" : "no");
         return 0;
     }
 

@@ -91,6 +91,10 @@ public:
     llama_persona_move persona_prepare(llama_persona_blocks & blocks) const override;
     llama_persona_move persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const override;
     int32_t persona_empty_stream() const override { return mem_attn->persona_empty_stream(); }
+    size_t persona_storage_bytes() const override { return mem_attn->persona_storage_bytes(); }
+    llama_persona_move persona_attach_storage(llama_persona_blocks & blocks, void * base, size_t bytes) const override {
+        return mem_attn->persona_attach_storage(blocks, base, bytes);
+    }
     llama_persona_move persona_check_load(llama_seq_id seq_id, uint32_t stream, const llama_persona_blocks & in,
                                           llama_persona_slot & slot) const override;
     void persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) override;

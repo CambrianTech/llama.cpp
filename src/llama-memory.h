@@ -205,6 +205,13 @@ struct llama_memory_i {
     // An empty stream for a load to place her in, chosen by the memory that owns the streams (the caller never numbers
     // them); -1 when none is empty or the memory has no streams to move into.
     virtual int32_t persona_empty_stream() const { return -1; }
+    // Continuum fork (UNIFIED-PAGING.md, slice 2): one mind's KV storage built over memory the caller owns (a mapped
+    // file), so her KV is a block of the block layer; 0 bytes / unsupported where the memory has no attention storage
+    virtual size_t persona_storage_bytes() const { return 0; }
+    virtual llama_persona_move persona_attach_storage(llama_persona_blocks & blocks, void * base, size_t bytes) const {
+        (void) blocks; (void) base; (void) bytes;
+        return llama_persona_move::unsupported;
+    }
     virtual void persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) { (void) seq_id; (void) out; }
     virtual void persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) {
         (void) seq_id; (void) slot; (void) in;

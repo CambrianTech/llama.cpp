@@ -230,3 +230,16 @@ void llama_context::persona_moved() {
     }
     gf_res_prev_active = nullptr;
 }
+
+size_t llama_persona_storage_bytes(const llama_context * ctx) {
+    const llama_memory_t memory = llama_get_memory(ctx);
+    return memory ? memory->persona_storage_bytes() : 0;
+}
+
+int32_t llama_persona_storage_attach(llama_context * ctx, llama_persona * persona, void * base, size_t bytes) {
+    const llama_memory_t memory = llama_get_memory(ctx);
+    if (memory == nullptr) {
+        return (int32_t) llama_persona_move::unsupported;
+    }
+    return (int32_t) memory->persona_attach_storage(persona->blocks, base, bytes);
+}
