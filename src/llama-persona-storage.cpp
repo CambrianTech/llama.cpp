@@ -17,7 +17,8 @@ bool llama_kv_cache::persona_by_pointer() const {
 }
 
 // Her storage: per layer a K and a V tensor of the stream's exact type and shape, in buffers of the stream's own types,
-// allocated once at her prepare. Cleared once, as the cache clears its own, so no padding a kernel reads is NaN.
+// reserved by her first save (a mind never parked never costs it). Cleared once, as the cache clears its own, so no
+// padding a kernel reads is NaN.
 bool llama_kv_cache::persona_reserve_storage(llama_kv_storage & storage) const {
     if (storage.held()) {
         return true;

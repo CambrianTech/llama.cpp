@@ -211,23 +211,24 @@ int main(int argc, char ** argv) {
         require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "A out to bring B in");
         f.prompt(0, 2);                                   // B in the emptied stream
         switch_to(b, B, a, A, "B out, A in");
-        // the graph a move costs: her first token after the switch (a graph built against the new storage) against
-        // her second (the graph reused)
-        const int64_t t_first = ggml_time_us();
-        f.decode_one(0, 3 % f.n_vocab, f.n_prompt);
-        llama_synchronize(f.ctx);
-        const int64_t first_us = ggml_time_us() - t_first;
-        const int64_t t_second = ggml_time_us();
-        f.decode_one(0, 5 % f.n_vocab, f.n_prompt + 1);
-        llama_synchronize(f.ctx);
-        const int64_t second_us = ggml_time_us() - t_second;
-        fprintf(stderr, "core: token after a switch %.2f ms, the next %.2f ms\n", first_us / 1e3, second_us / 1e3);
-        llama_memory_seq_rm(llama_get_memory(f.ctx), 0, f.n_prompt, -1);
         f.require_continues("A after B", 0, ref_a);
         // A decoded two tokens past her control; her control's next two were measured from n_prompt, so cut her back
         llama_memory_seq_rm(llama_get_memory(f.ctx), 0, f.n_prompt, -1);
         switch_to(a, A, b, B, "A out, B in");
         f.require_continues("B after A", 0, ref_b);
+        switch_to(b, B, a, A, "B out, A in, for the timing");
+        switch_to(a, A, b, B, "A out, B in, for the timing");
+        // the graph a move costs (measured last: a recurrent state cannot be cut back after): B's first token after
+        // her switch (a graph built against the new storage) against her second (the graph reused); switched again first
+        const int64_t t_first = ggml_time_us();
+        f.decode_one(0, 7 % f.n_vocab, f.n_prompt + 2);
+        llama_synchronize(f.ctx);
+        const int64_t first_us = ggml_time_us() - t_first;
+        const int64_t t_second = ggml_time_us();
+        f.decode_one(0, 11 % f.n_vocab, f.n_prompt + 3);
+        llama_synchronize(f.ctx);
+        const int64_t second_us = ggml_time_us() - t_second;
+        fprintf(stderr, "core: token after a switch %.2f ms, the next %.2f ms\n", first_us / 1e3, second_us / 1e3);
         // her file from her own storage, read into a fresh persona and bound on the Core: she continues as her control
         {
             auto st = [](int32_t s) { return (llama_persona_move) s; };

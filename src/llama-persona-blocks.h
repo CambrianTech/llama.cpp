@@ -17,7 +17,7 @@
 // her attention KV in storage of her own, on the Core (one stream): per KV layer a K and a V tensor shaped exactly as
 // the Core's one stream, in buffers of the cache's own types. A move exchanges this storage with the stream's (data,
 // buffer, extra) and the buffers' ownership with them: whoever's tensors point into a buffer owns it, so freeing a
-// parked mind frees only memory no one else reads. Allocated once, at her prepare.
+// parked mind frees only memory no one else reads. Reserved by her first save: a mind never parked never costs it.
 struct llama_kv_storage {
     std::vector<ggml_context_ptr>        ctxs; // her tensors' metadata: stays with her
     std::vector<ggml_backend_buffer_ptr> bufs; // the memory her tensors point into now: travels with the data

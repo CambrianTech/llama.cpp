@@ -48,9 +48,6 @@ llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks
     blocks.kv_layout = persona_layout();
     blocks.kv_rows   = persona_rows_id;
     blocks.kv.cells.resize(get_size()); // once per persona, at her creation
-    if (persona_by_pointer() && !persona_reserve_storage(blocks.kv.storage)) {
-        return llama_persona_move::out_of_memory; // her own storage, moved by pointer from here on
-    }
     blocks.kv.k.resize(layers.size());
     blocks.kv.v.resize(layers.size());
     // the row sizes a save copies (persona_check_save), recorded for a file read to check before it allocates
@@ -82,8 +79,11 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama
     }
     const uint32_t n_rows = v_cells[seq_to_stream[seq_id]].used_max_p1();
     if (persona_by_pointer()) {
-        out.kv.n_rows = n_rows; // her rows stay where she wrote them: the commit exchanges storage
-        return out.kv.storage.held() ? llama_persona_move::done : llama_persona_move::cells_not_prepared;
+        // her rows stay where she wrote them: the commit exchanges storage, and the stream takes the storage she
+        // brings. A mind parked for the first time brings storage reserved here, so a mind that never leaves the
+        // stream (a one-off, a turn never preempted) never costs a window of memory
+        out.kv.n_rows = n_rows;
+        return persona_reserve_storage(out.kv.storage) ? llama_persona_move::done : llama_persona_move::out_of_memory;
     }
     // reserve: every byte the commit copies, so the commit never allocates
     for (size_t i = 0; i < layers.size(); ++i) {
@@ -203,10 +203,9 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
         kv.k.size() != layers.size() || kv.v.size() != layers.size()) {
         return llama_persona_move::layout_mismatch;
     }
-    if (persona_by_pointer()) {
-        if (!kv.storage.held()) {
-            return llama_persona_move::cells_not_prepared;
-        }
+    // her KV in her own storage: bound by exchange. Without one (a mind never parked, or restored from her file, whose
+    // rows are the bytes below) she binds into the stream's own storage as it is
+    if (persona_by_pointer() && kv.storage.held()) {
         slot.stream = stream;
         return llama_persona_move::done;
     }
@@ -224,10 +223,12 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
 
 void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) {
     const uint32_t s = slot.stream;
-    if (persona_by_pointer()) {
+    const bool exchanged = persona_by_pointer() && in.kv.storage.held();
+    if (exchanged) {
         persona_exchange_storage(in.kv.storage); // hers becomes the stream's; she keeps the stream's empty one
     }
-    for (size_t i = 0; i < layers.size() && !persona_by_pointer(); ++i) {
+    // rows she brought as bytes (her file), written into the stream: the one transfer a restore needs
+    for (size_t i = 0; i < layers.size() && !exchanged; ++i) {
         const auto & layer = layers[i];
         if (!in.kv.k[i].empty()) {
             ggml_backend_tensor_set(layer.k_stream[s], in.kv.k[i].data(), 0, in.kv.k[i].size());
