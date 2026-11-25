@@ -1024,13 +1024,17 @@ extern "C" {
     LLAMA_API bool    llama_persona_storage_viewable(const struct llama_context * ctx);
     LLAMA_API int32_t llama_persona_storage_reserve(struct llama_context * ctx, struct llama_persona * persona);
 
-    // Continuum fork (CONTINUUM-ENGINE 4.16): her saved blocks on disk and back, so a restart demotes her instead of
-    // dropping her. write_file writes blocks a completed save holds (file_mismatch when none) to `path` through
-    // `<path>.tmp` and a rename. read_file fills a persona made by llama_persona_init on a context of the same memory
-    // layout, for the owner and epoch her file names; file_mismatch (another owner, epoch, layout or size) and io_error
-    // leave her as she was. Bind her afterwards as after a save.
-    LLAMA_API int32_t llama_persona_write_file(const struct llama_persona * persona, const char * path);
-    LLAMA_API int32_t llama_persona_read_file(struct llama_persona * persona, const char * path);
+    // Continuum fork (CONTINUUM-ENGINE 4.16; UNIFIED-PAGING slice 2): her record on disk and back, so a restart demotes
+    // her instead of dropping her. write_file writes what a completed save holds (file_mismatch when none) to `path`
+    // through `<path>.tmp` and a rename, stamped with the stop's `generation`. Where her storage is attached (caller
+    // memory: her mapped file) her attention rows are already there, so the record names the storage's bytes and holds
+    // none of them; otherwise it holds her rows. read_file fills a persona made by llama_persona_init on a context of the
+    // same memory layout, for the owner, epoch and generation her record names; a record whose rows are in storage
+    // binds only to attached storage of exactly its bytes (attach her file first). A format-1 record (rows inside, no
+    // generation) is read as one holding her rows: the migration of minds a format-1 stop preserved. file_mismatch and
+    // io_error leave her as she was. Bind her afterwards as after a save.
+    LLAMA_API int32_t llama_persona_write_file(const struct llama_persona * persona, const char * path, uint64_t generation);
+    LLAMA_API int32_t llama_persona_read_file(struct llama_persona * persona, const char * path, uint64_t generation);
 
     LLAMA_API const char * llama_persona_status_name(int32_t status);
 

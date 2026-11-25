@@ -29,7 +29,11 @@
 namespace {
 
 constexpr uint32_t MAGIC   = 0x31425043; // "CPB1"
-constexpr uint32_t VERSION = 1;
+// 2: the stop's generation, and where her attention rows are (in her attached storage, or in this record).
+// 1 is read as a record holding her rows with no generation: the one migration of minds a format-1 stop preserved.
+constexpr uint32_t VERSION = 2;
+constexpr uint8_t ROWS_IN_RECORD  = 0;
+constexpr uint8_t ROWS_IN_STORAGE = 1;
 
 struct writer {
     std::FILE * f;
@@ -114,7 +118,7 @@ struct closes {
 
 } // namespace
 
-int32_t llama_persona_write_file(const llama_persona * persona, const char * path) {
+int32_t llama_persona_write_file(const llama_persona * persona, const char * path, uint64_t generation) {
     const auto & b = persona->blocks;
     if (!b.owned) {
         return (int32_t) llama_persona_move::file_mismatch; // never saved: these blocks hold nothing of hers to write
@@ -132,9 +136,16 @@ int32_t llama_persona_write_file(const llama_persona * persona, const char * pat
     w.put<int32_t>(b.seq);
     w.put<uint64_t>(b.kv_rows); // not the stream size: a restart's window may differ
     w.put<uint64_t>(b.rs_layout);
-    // attention: her rows, then her occupied cells (position, 2D extension, whether her sequence holds it)
+    w.put<uint64_t>(generation);
+    // attention: where her rows are, then her occupied cells (position, 2D extension, whether her sequence holds it).
+    // In attached storage they are already in the caller's file: the record names its bytes and carries none of them.
+    const size_t attached = b.kv.storage.attached_bytes;
+    w.put<uint8_t>(attached > 0 ? ROWS_IN_STORAGE : ROWS_IN_RECORD);
+    w.put<uint64_t>(attached);
     w.put<uint32_t>(b.kv.n_rows);
-    if (b.kv.storage.held()) {
+    if (attached > 0) {
+        // nothing: her rows are her storage
+    } else if (b.kv.storage.held()) {
         w.rows_of(b.kv.storage.k, b.geometry.k_row, b.kv.n_rows);
         w.rows_of(b.kv.storage.v, b.geometry.v_row, b.kv.n_rows);
     } else {
@@ -174,7 +185,7 @@ int32_t llama_persona_write_file(const llama_persona * persona, const char * pat
     return (int32_t) llama_persona_move::done;
 }
 
-int32_t llama_persona_read_file(llama_persona * persona, const char * path) {
+int32_t llama_persona_read_file(llama_persona * persona, const char * path, uint64_t generation) {
     auto & b = persona->blocks;
     std::FILE * f = std::fopen(path, "rb");
     if (f == nullptr) {
@@ -183,7 +194,9 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path) {
     closes guard { f };
     reader r { f };
     const auto mismatch = (int32_t) llama_persona_move::file_mismatch;
-    if (r.get<uint32_t>() != MAGIC || r.get<uint32_t>() != VERSION || !r.ok) {
+    const uint32_t magic = r.get<uint32_t>();
+    const uint32_t version = r.get<uint32_t>();
+    if (!r.ok || magic != MAGIC || (version != VERSION && version != 1)) {
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
     const uint64_t owner = r.get<uint64_t>();
@@ -201,6 +214,23 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path) {
     if (r.get<uint64_t>() != b.kv_rows || r.get<uint64_t>() != b.rs_layout || !r.ok) {
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
+    // format 2: this stop's record only, and where her rows are. A record whose rows are in storage binds only to attached
+    // storage of exactly the bytes it names (her own file, mapped by the caller); one whose rows are here fills any storage.
+    uint8_t rows_in = ROWS_IN_RECORD;
+    if (version == VERSION) {
+        const uint64_t written_in = r.get<uint64_t>();
+        rows_in = r.get<uint8_t>();
+        const uint64_t storage_bytes = r.get<uint64_t>();
+        if (!r.ok) {
+            return (int32_t) llama_persona_move::io_error;
+        }
+        if (written_in != generation || rows_in > ROWS_IN_STORAGE) {
+            return mismatch;
+        }
+        if (rows_in == ROWS_IN_STORAGE && (storage_bytes == 0 || storage_bytes != b.kv.storage.attached_bytes)) {
+            return mismatch;
+        }
+    }
     const uint32_t stream_cells = b.kv.cells.size();
     const uint32_t n_rows = r.get<uint32_t>();
     if (r.ok && n_rows > stream_cells) {
@@ -216,7 +246,8 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path) {
         v_bytes[i] = g.v_row[i] * n_rows;
     }
     std::vector<std::vector<uint8_t>> k, v, rs_r, rs_s;
-    if (!r.ok || !r.rows(k, k_bytes) || !r.rows(v, v_bytes)) {
+    const bool rows_here = rows_in == ROWS_IN_RECORD;
+    if (!r.ok || (rows_here && (!r.rows(k, k_bytes) || !r.rows(v, v_bytes)))) {
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
     const uint32_t n_cells = r.get<uint32_t>();

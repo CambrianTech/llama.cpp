@@ -227,6 +227,7 @@ llama_persona_move llama_kv_cache::persona_attach_storage(llama_persona_blocks &
     if (!placed) {
         return llama_persona_move::layout_mismatch;
     }
+    fresh.attached_bytes = probe.bytes;
     blocks.kv.storage = std::move(fresh);
     return llama_persona_move::done;
 }
@@ -235,7 +236,8 @@ llama_persona_move llama_kv_cache::persona_attach_storage(llama_persona_blocks &
 // while viewing a storage lets go of it: neither side can hold a pointer the other has freed. A storage moves only
 // while no stream views it (her blocks are built once, before any bind).
 llama_kv_storage::llama_kv_storage(llama_kv_storage && other) noexcept
-    : ctxs(std::move(other.ctxs)), bufs(std::move(other.bufs)), k(std::move(other.k)), v(std::move(other.v)) {
+    : ctxs(std::move(other.ctxs)), bufs(std::move(other.bufs)), k(std::move(other.k)), v(std::move(other.v)),
+      attached_bytes(other.attached_bytes) {
     GGML_ASSERT(other.viewer == nullptr && "a viewed storage never moves");
 }
 
@@ -245,6 +247,7 @@ llama_kv_storage & llama_kv_storage::operator=(llama_kv_storage && other) noexce
     bufs = std::move(other.bufs);
     k    = std::move(other.k);
     v    = std::move(other.v);
+    attached_bytes = other.attached_bytes;
     return *this;
 }
 

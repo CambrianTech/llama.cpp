@@ -281,6 +281,7 @@ int main(int argc, char ** argv) {
             require(f.pos_max(0) == f.n_prompt + 1, "she holds her prompt and the two tokens she decoded");
             require_move(ctx.persona_save(0, reserved, A), llama_persona_move::done, "the reserved mind out again");
         }
+        uintmax_t with_rows = 0; // her file with her rows in it, for the same prompt: what her record must undercut
         // her file from her own storage, read into a fresh persona and bound on the Core: she continues as her control
         {
             auto st = [](int32_t s) { return (llama_persona_move) s; };
@@ -291,20 +292,59 @@ int main(int argc, char ** argv) {
             require(saved != nullptr, "a persona to write");
             require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "her save on the Core");
             const int64_t t_write = ggml_time_us();
-            require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "her file from her storage");
+            require_move(st(llama_persona_write_file(saved, path.c_str(), 7)), llama_persona_move::done, "her file from her storage");
             const int64_t written_us = ggml_time_us() - t_write;
             llama_persona_free(saved);
             llama_persona * back = llama_persona_init(f.ctx, 0xC, 1);
             require(back != nullptr, "a fresh persona to read into");
             const int64_t t_read = ggml_time_us();
-            require_move(st(llama_persona_read_file(back, path.c_str())), llama_persona_move::done, "her file into her storage");
+            require_move(st(llama_persona_read_file(back, path.c_str(), 7)), llama_persona_move::done, "her file into her storage");
             const int64_t read_us = ggml_time_us() - t_read;
             require_move(st(llama_persona_bind(f.ctx, 0, back)), llama_persona_move::done, "she binds from her file");
             f.require_continues("her after her file", 0, ref_a);
             llama_persona_free(back);
             const auto bytes = std::filesystem::file_size(path);
+            with_rows = bytes;
             std::remove(path.c_str());
             fprintf(stderr, "core: her file %.1f MB, write %.1f ms, read %.1f ms\n", bytes / 1e6, written_us / 1e3, read_us / 1e3);
+        }
+        // what this catches (UNIFIED-PAGING slice 2, custody by rename): her attention rows copied through a staging
+        // buffer at every stop and back at every restore, though her attached storage (her mapped file) already holds
+        // them. With storage attached her record carries none of her rows; a fresh persona that attaches the same memory
+        // takes only her record and continues as her control. Without attached storage the record is refused.
+        if (attaches) {
+            auto st = [](int32_t s) { return (llama_persona_move) s; };
+            const std::string path = (std::filesystem::temp_directory_path() / "test-persona-core-attached.cpb").string();
+            std::vector<uint8_t> mem_c(storage + 2 * page);
+            llama_memory_clear(llama_get_memory(f.ctx), true);
+            llama_persona * saved = llama_persona_init(f.ctx, 0xD, 1);
+            require(saved != nullptr, "a persona to write");
+            require_move(st(llama_persona_storage_attach(f.ctx, saved, aligned(mem_c), attachable)), llama_persona_move::done, "her storage attached");
+            require_move(st(llama_persona_bind(f.ctx, 0, saved)), llama_persona_move::done, "she binds her own storage fresh");
+            f.prompt(0, 1);
+            require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "her save into her own storage");
+            const int64_t t_write = ggml_time_us();
+            require_move(st(llama_persona_write_file(saved, path.c_str(), 11)), llama_persona_move::done, "her record, her rows left in her storage");
+            const int64_t written_us = ggml_time_us() - t_write;
+            llama_persona_free(saved); // her memory (mem_c) outlives her, as her mapped file does
+            llama_persona * bare = llama_persona_init(f.ctx, 0xD, 1);
+            require(bare != nullptr, "a persona without storage");
+            require_move(st(llama_persona_read_file(bare, path.c_str(), 11)), llama_persona_move::file_mismatch, "a record of rows in storage needs her storage attached");
+            llama_persona_free(bare);
+            llama_persona * back = llama_persona_init(f.ctx, 0xD, 1);
+            require(back != nullptr, "a fresh persona to read into");
+            require_move(st(llama_persona_storage_attach(f.ctx, back, aligned(mem_c), attachable)), llama_persona_move::done, "her same storage attached");
+            const int64_t t_read = ggml_time_us();
+            require_move(st(llama_persona_read_file(back, path.c_str(), 11)), llama_persona_move::done, "her record over her storage");
+            const int64_t read_us = ggml_time_us() - t_read;
+            llama_memory_clear(llama_get_memory(f.ctx), true);
+            require_move(st(llama_persona_bind(f.ctx, 0, back)), llama_persona_move::done, "she binds from her record and her storage");
+            f.require_continues("her after her record over her storage", 0, ref_a);
+            llama_persona_free(back);
+            const auto bytes = std::filesystem::file_size(path);
+            std::remove(path.c_str());
+            require(with_rows > 0 && bytes < with_rows, "her record carries none of her attention rows (her recurrent rows stay in it)");
+            fprintf(stderr, "core: her record %.1f KB over %.1f MB of attached storage, write %.2f ms, read %.2f ms\n", bytes / 1e3, storage / 1e6, written_us / 1e3, read_us / 1e3);
         }
         fprintf(stderr, "core: depth %d, %d moves, %.3f ms per switch (save + bind), by pointer: %s\n", core_depth, moves,
                 moved_us / 1e3 / 2.0, a.kv.storage.held() && b.kv.storage.held() ? "yes (attached)" : "no");
@@ -643,34 +683,36 @@ int main(int argc, char ** argv) {
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);
         require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "a saved");
-        require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written to her file");
+        require_move(st(llama_persona_write_file(saved, path.c_str(), 7)), llama_persona_move::done, "a written to her file");
         // a second save to her fixed path replaces the first (Windows CRT rename refuses an existing destination)
-        require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "a written again over her file");
+        require_move(st(llama_persona_write_file(saved, path.c_str(), 7)), llama_persona_move::done, "a written again over her file");
         llama_persona_free(saved);
 
         llama_persona * other = llama_persona_init(f.ctx, 0xB, 1);
         llama_persona * stale = llama_persona_init(f.ctx, 0xA, 2);
         llama_persona * back  = llama_persona_init(f.ctx, 0xA, 1);
         require(other != nullptr && stale != nullptr && back != nullptr, "fresh personas to read into");
-        require_move(st(llama_persona_read_file(other, path.c_str())), llama_persona_move::file_mismatch, "another owner's file is refused");
-        require_move(st(llama_persona_read_file(stale, path.c_str())), llama_persona_move::file_mismatch, "another epoch of her is refused");
-        require_move(st(llama_persona_read_file(back, path.c_str())), llama_persona_move::done, "a read back from her file");
+        require_move(st(llama_persona_read_file(other, path.c_str(), 7)), llama_persona_move::file_mismatch, "another owner's file is refused");
+        require_move(st(llama_persona_read_file(stale, path.c_str(), 7)), llama_persona_move::file_mismatch, "another epoch of her is refused");
+        require_move(st(llama_persona_read_file(back, path.c_str(), 8)), llama_persona_move::file_mismatch, "another stop's generation is refused");
+        require_move(st(llama_persona_read_file(back, path.c_str(), 7)), llama_persona_move::done, "a read back from her file");
         // a truncated file is refused before anything is sized from it, and leaves the blocks she holds as they were
         const std::string cut = path + ".cut";
         std::filesystem::copy_file(path, cut, std::filesystem::copy_options::overwrite_existing);
         std::filesystem::resize_file(cut, std::filesystem::file_size(cut) / 2);
-        const auto refused = st(llama_persona_read_file(back, cut.c_str()));
+        const auto refused = st(llama_persona_read_file(back, cut.c_str(), 7));
         require(refused == llama_persona_move::io_error || refused == llama_persona_move::file_mismatch, "a truncated file is refused");
-        // a length the file claims beyond this memory's geometry (here, its first K layer's, at byte 52: magic, version,
-        // owner, epoch, seq, row id, recurrent layout, row and layer counts) is refused before any buffer is sized from it
+        // a length the file claims beyond this memory's geometry (here, its first K layer's, at byte 69: magic, version,
+        // owner, epoch, seq, row id, recurrent layout, generation, where her rows are, attached bytes, row and layer
+        // counts) is refused before any buffer is sized from it
         std::filesystem::copy_file(path, cut, std::filesystem::copy_options::overwrite_existing);
         {
             std::fstream patch(cut, std::ios::in | std::ios::out | std::ios::binary);
             const uint64_t huge = UINT64_C(1) << 62;
-            patch.seekp(52);
+            patch.seekp(69);
             patch.write(reinterpret_cast<const char *>(&huge), sizeof(huge));
         }
-        require_move(st(llama_persona_read_file(back, cut.c_str())), llama_persona_move::file_mismatch, "a length past the geometry is refused");
+        require_move(st(llama_persona_read_file(back, cut.c_str(), 7)), llama_persona_move::file_mismatch, "a length past the geometry is refused");
         std::remove(cut.c_str());
         llama_memory_clear(llama_get_memory(f.ctx), true);
         require_move(st(llama_persona_bind(f.ctx, 0, back)), llama_persona_move::done, "a bound from her file");

@@ -27,6 +27,9 @@ struct llama_kv_storage {
     // the cache whose stream views this storage now, or nullptr: a storage dropped while viewed first
     // points that stream back at its own memory, so a stream never views freed memory
     llama_kv_cache * viewer = nullptr;
+    // nonzero only when her storage is memory the caller owns (her mapped file): her rows are already in it, so
+    // her record never carries them, and a record that says so binds only to storage of exactly these bytes
+    size_t attached_bytes = 0;
     bool held() const { return !k.empty(); }
 
     llama_kv_storage() = default;
