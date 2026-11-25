@@ -208,6 +208,11 @@ struct llama_memory_i {
     // Continuum fork (UNIFIED-PAGING.md, slice 2): one mind's KV storage built over memory the caller owns (a mapped
     // file), so her KV is a block of the block layer; 0 bytes / unsupported where the memory has no attention storage
     virtual size_t persona_storage_bytes() const { return 0; }
+    virtual bool persona_storage_viewable() const { return false; }
+    virtual llama_persona_move persona_reserve_storage(llama_persona_blocks & blocks) const {
+        (void) blocks;
+        return llama_persona_move::unsupported;
+    }
     virtual llama_persona_move persona_attach_storage(llama_persona_blocks & blocks, void * base, size_t bytes) const {
         (void) blocks; (void) base; (void) bytes;
         return llama_persona_move::unsupported;

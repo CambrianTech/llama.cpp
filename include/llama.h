@@ -1018,6 +1018,11 @@ extern "C" {
     // must outlive her. unsupported where a KV device cannot wrap host memory; layout_mismatch when bytes is short.
     LLAMA_API size_t  llama_persona_storage_bytes(const struct llama_context * ctx);
     LLAMA_API int32_t llama_persona_storage_attach(struct llama_context * ctx, struct llama_persona * persona, void * base, size_t bytes);
+    // Whether her storage can be caller memory (the KV device wraps host memory). Where it cannot, storage_reserve
+    // gives her storage in the fork's own device memory (VRAM), hers for life and viewed the same way; out_of_memory
+    // when it does not fit, and she moves by row copy until room is made.
+    LLAMA_API bool    llama_persona_storage_viewable(const struct llama_context * ctx);
+    LLAMA_API int32_t llama_persona_storage_reserve(struct llama_context * ctx, struct llama_persona * persona);
 
     // Continuum fork (CONTINUUM-ENGINE 4.16): her saved blocks on disk and back, so a restart demotes her instead of
     // dropping her. write_file writes blocks a completed save holds (file_mismatch when none) to `path` through

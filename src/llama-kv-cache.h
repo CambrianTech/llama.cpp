@@ -194,6 +194,8 @@ public:
     // zero what the stream reads now (its own buffers or a mind's), never a parked mind's storage
     bool persona_clear_view();
     size_t persona_storage_bytes() const override;
+    bool persona_storage_viewable() const override;
+    llama_persona_move persona_reserve_storage(llama_persona_blocks & blocks) const override;
     llama_persona_move persona_attach_storage(llama_persona_blocks & blocks, void * base, size_t bytes) const override;
     llama_persona_move persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const override;
     llama_persona_move persona_check_load(llama_seq_id seq_id, uint32_t stream, const llama_persona_blocks & in,

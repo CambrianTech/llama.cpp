@@ -211,8 +211,8 @@ int main(int argc, char ** argv) {
         const size_t storage = llama_persona_storage_bytes(f.ctx);
         // the size is the capability: 0 where a KV device cannot wrap host memory (CUDA), whose minds keep the row-copy
         // move. The A/B switches and her file are checked either way; attaching and the fresh bind only where it can.
-        const bool attaches = storage > 0;
-        fprintf(stderr, "core: storage the stream can view: %s\n", attaches ? "yes" : "no (row copy)");
+        const bool attaches = storage > 0 && llama_get_memory(f.ctx)->persona_storage_viewable();
+        fprintf(stderr, "core: her storage: %s\n", attaches ? "attached (caller memory)" : "reserved on the device");
         const size_t page = 1u << 16;
         std::vector<uint8_t> mem_a(attaches ? storage + 2 * page : 0), mem_b(attaches ? storage + 2 * page : 0);
         auto aligned = [&](std::vector<uint8_t> & m) { return reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(m.data()) + page - 1) & ~(uintptr_t) (page - 1)); };
@@ -221,6 +221,10 @@ int main(int argc, char ** argv) {
         require_move(llama_get_memory(f.ctx)->persona_attach_storage(a, aligned(mem_a), attachable), llama_persona_move::done, "A's storage attached");
         require_move(llama_get_memory(f.ctx)->persona_attach_storage(b, aligned(mem_b), attachable), llama_persona_move::done, "B's storage attached");
         require_move(llama_get_memory(f.ctx)->persona_attach_storage(a, aligned(mem_a), attachable), llama_persona_move::stream_not_empty, "attached once");
+        } else {
+            // a device that cannot wrap host memory (CUDA): her storage reserved in its own memory, viewed the same way
+            require_move(llama_get_memory(f.ctx)->persona_reserve_storage(a), llama_persona_move::done, "A's storage reserved on the device");
+            require_move(llama_get_memory(f.ctx)->persona_reserve_storage(b), llama_persona_move::done, "B's storage reserved on the device");
         }
         llama_memory_clear(llama_get_memory(f.ctx), true);
         f.prompt(0, 1);                                   // A in the stream
@@ -258,6 +262,21 @@ int main(int argc, char ** argv) {
             f.require_continues("a fresh mind bound before her first token", 0, ref_a);
             require_move(ctx.persona_save(0, fresh, A), llama_persona_move::done, "the fresh mind out");
             require(fresh.seq == 0, "her blocks carry the sequence she was saved from");
+        }
+        // what this catches (the 5090: a device that cannot wrap host memory fell back to the row copy, 74-109 ms per
+        // switch): storage the fork reserves in the device's own memory, bound fresh and viewed like attached storage.
+        // Reserving works on every device, so this runs here too, and CUDA's path is checked on every machine.
+        {
+            llama_persona_blocks reserved;
+            require_move(ctx.persona_prepare(reserved), llama_persona_move::done, "prepare a mind for reserved storage");
+            require_move(llama_get_memory(f.ctx)->persona_reserve_storage(reserved), llama_persona_move::done, "her storage reserved on the device");
+            require_move(ctx.persona_load(0, 0, reserved, A), llama_persona_move::done, "a reserved mind in (the stream is empty: the fresh mind left it)");
+            f.prompt(0, 1);
+            f.require_continues("a mind on reserved storage", 0, ref_a);
+            require_move(ctx.persona_save(0, reserved, A), llama_persona_move::done, "the reserved mind out");
+            require_move(ctx.persona_load(0, 0, reserved, A), llama_persona_move::done, "the reserved mind back by pointer");
+            require(f.pos_max(0) == f.n_prompt + 1, "she holds her prompt and the two tokens she decoded");
+            require_move(ctx.persona_save(0, reserved, A), llama_persona_move::done, "the reserved mind out again");
         }
         // her file from her own storage, read into a fresh persona and bound on the Core: she continues as her control
         {

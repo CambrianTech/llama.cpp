@@ -107,19 +107,75 @@ storage_layout lay_out(const Layers & layers, Each && each) {
 void no_placement(size_t, bool, size_t) {}
 } // namespace
 
-// The bytes one mind's storage takes, or 0 when the stream cannot view caller memory here: not the Core's shape, or a
-// KV device that cannot wrap host memory. The size is the capability, so a caller decides from it alone.
+// The bytes one mind's storage takes on the Core (0: not the Core's shape, or KV on more than one device).
 size_t llama_kv_cache::persona_storage_bytes() const {
     if (!persona_by_pointer()) {
         return 0;
     }
     const storage_layout layout = lay_out(layers, no_placement);
-    if (!layout.one_device || layout.dev == nullptr) {
-        return 0;
+    return layout.one_device && layout.dev != nullptr ? layout.bytes : 0;
+}
+
+// Whether her storage can be memory the caller owns (a mapped file): the KV device wraps host memory. Where it cannot
+// (CUDA), the fork reserves her storage in its own device memory instead, viewed the same way.
+bool llama_kv_cache::persona_storage_viewable() const {
+    if (persona_storage_bytes() == 0) {
+        return false;
     }
+    const storage_layout layout = lay_out(layers, no_placement);
     ggml_backend_dev_props props;
     ggml_backend_dev_get_props(layout.dev, &props);
-    return props.caps.buffer_from_host_ptr ? layout.bytes : 0;
+    return props.caps.buffer_from_host_ptr;
+}
+
+// Her storage reserved in the cache's own buffer types (VRAM on a discrete GPU), hers for life and viewed exactly as an
+// attached one, for a device that cannot wrap host memory. Cleared once, as the cache clears its own, so no padding a
+// kernel reads is NaN. out_of_memory leaves her without storage: she moves by row copy until room is made.
+llama_persona_move llama_kv_cache::persona_reserve_storage(llama_persona_blocks & blocks) const {
+    if (persona_storage_bytes() == 0) {
+        return llama_persona_move::unsupported;
+    }
+    if (blocks.kv.storage.held()) {
+        return llama_persona_move::stream_not_empty;
+    }
+    llama_kv_storage fresh;
+    std::map<ggml_backend_buffer_type_t, ggml_context *> by_type;
+    auto shaped_as = [&](const ggml_tensor * t) -> ggml_tensor * {
+        if (t == nullptr) {
+            return nullptr;
+        }
+        const ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+        auto it = by_type.find(buft);
+        if (it == by_type.end()) {
+            ggml_init_params params = { /*.mem_size =*/ 2u * layers.size() * ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+            ggml_context * ctx = ggml_init(params);
+            if (ctx == nullptr) {
+                return nullptr;
+            }
+            fresh.ctxs.emplace_back(ctx);
+            it = by_type.emplace(buft, ctx).first;
+        }
+        return ggml_new_tensor(it->second, t->type, GGML_MAX_DIMS, t->ne);
+    };
+    for (const auto & layer : layers) {
+        ggml_tensor * k = shaped_as(layer.k);
+        ggml_tensor * v = shaped_as(layer.v);
+        if ((layer.k && !k) || (layer.v && !v)) {
+            return llama_persona_move::out_of_memory;
+        }
+        fresh.k.push_back(k);
+        fresh.v.push_back(v);
+    }
+    for (const auto & [buft, ctx] : by_type) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+        if (buf == nullptr) {
+            return llama_persona_move::out_of_memory;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        fresh.bufs.emplace_back(buf);
+    }
+    blocks.kv.storage = std::move(fresh);
+    return llama_persona_move::done;
 }
 
 // Her storage built over `base..base+bytes`, memory the caller owns (a mapped file, UNIFIED-PAGING.md slice 2): the

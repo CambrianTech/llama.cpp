@@ -243,3 +243,16 @@ int32_t llama_persona_storage_attach(llama_context * ctx, llama_persona * person
     }
     return (int32_t) memory->persona_attach_storage(persona->blocks, base, bytes);
 }
+
+bool llama_persona_storage_viewable(const llama_context * ctx) {
+    const llama_memory_t memory = llama_get_memory(ctx);
+    return memory && memory->persona_storage_viewable();
+}
+
+int32_t llama_persona_storage_reserve(llama_context * ctx, llama_persona * persona) {
+    const llama_memory_t memory = llama_get_memory(ctx);
+    if (memory == nullptr) {
+        return (int32_t) llama_persona_move::unsupported;
+    }
+    return (int32_t) memory->persona_reserve_storage(persona->blocks);
+}
