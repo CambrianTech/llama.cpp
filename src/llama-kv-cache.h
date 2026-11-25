@@ -178,19 +178,15 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
-    // Continuum fork (CONTINUUM-ENGINE 4.14, 4.3): a mind moves between this memory and her blocks as raw rows, in one
-    // of two layouts. Each stream one sequence's (a stream per sequence, or one stream and one sequence): her used rows
-    // of her stream copied per layer, her cells exchanged by swap with an already-empty object, her sequence id bound to
-    // the stream she lands on. A pool (one unified stream that several minds share, each growing into it): her own
-    // cells gathered out run by run and scattered into the pool's empty cells, her metadata and index built by the
-    // check and swapped in by the commit. Either way flash attention (untransposed V), and no commit allocates.
+    // Continuum fork (CONTINUUM-ENGINE 4.14): her used rows of her stream copied raw per layer, her cells exchanged by
+    // swap with an already-empty object (never reset or walked), her own sequence id bound to the stream she lands on
+    // (seq_to_stream stays a permutation; her cells are never retagged). Requires each stream to be one sequence's (a
+    // stream per sequence, or one stream and one sequence; never unified KV shared by several) and flash attention.
     llama_persona_move persona_prepare(llama_persona_blocks & blocks) const override;
     uint64_t persona_layout() const { return persona_layout_id; }
     int32_t persona_empty_stream() const override;
-    // one unified stream shared by several sequences: minds share its cells
-    bool persona_is_pool() const;
-    // a pool's sequence bits exist for every sequence it seats, from construction
-    void persona_reserve_pool();
+    // every stream belongs to one sequence: a stream per sequence, or one stream and one sequence
+    bool persona_streams_are_own() const;
     llama_persona_move persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const override;
     llama_persona_move persona_check_load(llama_seq_id seq_id, uint32_t stream, const llama_persona_blocks & in,
                                           llama_persona_slot & slot) const override;
