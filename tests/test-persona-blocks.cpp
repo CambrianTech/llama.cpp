@@ -240,6 +240,20 @@ int main(int argc, char ** argv) {
         llama_synchronize(f.ctx);
         const int64_t second_us = ggml_time_us() - t_second;
         fprintf(stderr, "core: token after a switch %.2f ms, the next %.2f ms\n", first_us / 1e3, second_us / 1e3);
+        // what this catches (the Rust engine binds a new mind before her first token, 2026-11-25): a fresh bind of
+        // blocks never saved (no sequence yet) renaming sequence -1, which wrote past the cells' arrays and corrupted
+        // the heap. Fresh blocks with attached storage bind, decode straight into it, and continue as her control.
+        {
+            llama_persona_blocks fresh;
+            require_move(ctx.persona_prepare(fresh), llama_persona_move::done, "prepare a fresh mind");
+            std::vector<uint8_t> mem_c(storage + 2 * page);
+            require_move(llama_get_memory(f.ctx)->persona_attach_storage(fresh, aligned(mem_c), attachable), llama_persona_move::done, "her storage attached");
+            switch_to(b, B, fresh, A, "B out, a fresh mind in");
+            f.prompt(0, 1);
+            f.require_continues("a fresh mind bound before her first token", 0, ref_a);
+            require_move(ctx.persona_save(0, fresh, A), llama_persona_move::done, "the fresh mind out");
+            require(fresh.seq == 0, "her blocks carry the sequence she was saved from");
+        }
         // her file from her own storage, read into a fresh persona and bound on the Core: she continues as her control
         {
             auto st = [](int32_t s) { return (llama_persona_move) s; };

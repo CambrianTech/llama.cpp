@@ -245,7 +245,9 @@ void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot
         }
     }
     in.kv.cells.swap(v_cells[s]); // hers in; her blocks keep the stream's empty object for her next save
-    v_cells[s].seq_rename(in.seq, seq_id); // her cells answer to the sequence she is bound as now
+    if (in.seq >= 0) {
+        v_cells[s].seq_rename(in.seq, seq_id); // her cells answer to the sequence she is bound as now
+    } // blocks never saved (a fresh bind) hold no cells of hers: nothing to rename, and -1 indexes no sequence
     v_heads[s] = 0;
     // bind her own sequence id to stream s; the sequence that held s takes her old stream (both empty of others)
     const uint32_t old = seq_to_stream[seq_id];
