@@ -8,15 +8,31 @@
 
 #include "llama.h"
 #include "llama-kv-cells.h"
+#include "ggml-cpp.h"
 
 #include <cstdint>
 #include <set>
 #include <vector>
 
+// her attention KV in storage of her own, on the Core (one stream): per KV layer a K and a V tensor shaped exactly as
+// the Core's one stream, in buffers of the cache's own types. A move exchanges this storage with the stream's (data,
+// buffer, extra) and the buffers' ownership with them: whoever's tensors point into a buffer owns it, so freeing a
+// parked mind frees only memory no one else reads. Allocated once, at her prepare.
+struct llama_kv_storage {
+    std::vector<ggml_context_ptr>        ctxs; // her tensors' metadata: stays with her
+    std::vector<ggml_backend_buffer_ptr> bufs; // the memory her tensors point into now: travels with the data
+    std::vector<ggml_tensor *> k; // per KV layer
+    std::vector<ggml_tensor *> v; // per KV layer (nullptr for a layer without V)
+    bool held() const { return !k.empty(); }
+};
+
 // her attention state: per KV layer, the rows she uses of one stream, and her cell metadata OWNED here (exchanged with
 // the stream's by swap; the stream receives an already-empty object, so a move never resets or walks cells)
 struct llama_kv_stream_blocks {
     uint32_t                          n_rows = 0;
+    // the Core (one stream): her KV in her own storage, exchanged by pointer (k and v below stay empty)
+    llama_kv_storage                  storage;
+    // several streams: her rows copied out
     std::vector<std::vector<uint8_t>> k;     // per KV layer: n_rows rows of K
     std::vector<std::vector<uint8_t>> v;     // per KV layer: n_rows rows of V (empty for a layer without V)
     llama_kv_cells                    cells; // hers while she is out; an empty, stream-sized object while she is in

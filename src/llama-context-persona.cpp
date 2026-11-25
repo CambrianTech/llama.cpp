@@ -58,6 +58,7 @@ llama_persona_move llama_context::persona_save(llama_seq_id seq_id, llama_person
         return checked;
     }
     memory->persona_commit_save(seq_id, out);
+    persona_moved();
     out.owned       = true; // a completed save stamps her blocks with her owner
     out.owner       = who.persona;
     out.owner_epoch = who.epoch;
@@ -78,6 +79,7 @@ llama_persona_move llama_context::persona_load(llama_seq_id seq_id, uint32_t str
         return checked;
     }
     memory->persona_commit_load(seq_id, slot, in);
+    persona_moved();
     return llama_persona_move::done;
 }
 
@@ -218,4 +220,13 @@ size_t llama_persona_checkpoint_bytes(const llama_persona_checkpoint * checkpoin
 
 const char * llama_persona_status_name(int32_t status) {
     return llama_persona_move_name((llama_persona_move) status);
+}
+
+// A move by pointer leaves every built graph's KV views at addresses the stream no longer owns, so none is reused:
+// the next decode builds against the stream's new storage (the same reset a memory update takes, llama-context.cpp).
+void llama_context::persona_moved() {
+    for (auto & res : gf_res_prev) {
+        res->reset();
+    }
+    gf_res_prev_active = nullptr;
 }

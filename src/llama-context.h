@@ -67,6 +67,8 @@ struct llama_context {
     llama_persona_move persona_prepare(llama_persona_blocks & blocks) const;
     llama_persona_move persona_save(llama_seq_id seq_id, llama_persona_blocks & out, const llama_persona_identity & who);
     llama_persona_move persona_load(llama_seq_id seq_id, uint32_t stream, llama_persona_blocks & in, const llama_persona_identity & who);
+    // a move may exchange the KV storage a built graph points into: no graph is reused across it
+    void persona_moved();
     // load her into an empty stream the memory chooses (no_empty_stream when none is)
     llama_persona_move persona_bind(llama_seq_id seq_id, llama_persona_blocks & in, const llama_persona_identity & who);
     llama_persona_move persona_checkpoint(llama_seq_id seq_id, llama_persona_checkpoint_blocks & out, const llama_persona_identity & who);

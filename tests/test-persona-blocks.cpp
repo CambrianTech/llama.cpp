@@ -143,6 +143,18 @@ int main(int argc, char ** argv) {
     // --test-rs-seq N: the speculative configuration serving uses (draft-mtp, n_max N), which gives the context N
     // rollback snapshot groups (common_params_speculative::need_n_rs_seq); stripped before the common parse
     std::vector<char *> args(argv, argv + argc);
+    // --test-core N: the Core's own shape (one stream, so a move is by pointer where the buffers are host-addressed):
+    // two minds of N prompt tokens switched A, B, A, B; each one's next tokens must equal her isolated control
+    int core_depth = 0;
+    for (size_t i = 1; i + 1 < args.size(); ++i) {
+        if (std::strcmp(args[i], "--test-core") == 0) {
+            core_depth     = std::atoi(args[i + 1]);
+            params.n_parallel = 1;
+            params.n_ctx   = core_depth + 64;
+            args.erase(args.begin() + i, args.begin() + i + 2);
+            break;
+        }
+    }
     for (size_t i = 1; i + 1 < args.size(); ++i) {
         if (std::strcmp(args[i], "--test-rs-seq") == 0) {
             params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
@@ -168,6 +180,71 @@ int main(int argc, char ** argv) {
     llama_persona_blocks a, b;
     require_move(ctx.persona_prepare(a), llama_persona_move::done, "prepare persona a");
     require_move(ctx.persona_prepare(b), llama_persona_move::done, "prepare persona b");
+
+    if (core_depth > 0) {
+        // what this catches (Codex's validator for a move by pointer): a switch that leaves a built graph reading the
+        // other mind's storage, or a storage exchanged with the wrong layer. A and B at the same shape, switched
+        // A/B/A/B through one stream; each mind's next tokens equal her own isolated control after every switch.
+        f.n_prompt = core_depth;
+        auto control = [&](int salt) {
+            llama_memory_clear(llama_get_memory(f.ctx), true);
+            f.prompt(0, salt);
+            return f.reference(0, salt);
+        };
+        const auto ref_a = control(1);
+        const auto ref_b = control(2);
+        int64_t moved_us = 0;
+        int moves = 0;
+        auto timed = [&](llama_persona_move got, const char * what) {
+            require_move(got, llama_persona_move::done, what);
+            ++moves;
+        };
+        auto switch_to = [&](llama_persona_blocks & out, const llama_persona_identity & out_who, llama_persona_blocks & in, const llama_persona_identity & in_who, const char * what) {
+            llama_synchronize(f.ctx);
+            const int64_t t = ggml_time_us();
+            timed(ctx.persona_save(0, out, out_who), what);
+            timed(ctx.persona_load(0, 0, in, in_who), what);
+            moved_us += ggml_time_us() - t;
+        };
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 1);                                   // A in the stream
+        require_move(ctx.persona_save(0, a, A), llama_persona_move::done, "A out to bring B in");
+        f.prompt(0, 2);                                   // B in the emptied stream
+        switch_to(b, B, a, A, "B out, A in");
+        f.require_continues("A after B", 0, ref_a);
+        // A decoded two tokens past her control; her control's next two were measured from n_prompt, so cut her back
+        llama_memory_seq_rm(llama_get_memory(f.ctx), 0, f.n_prompt, -1);
+        switch_to(a, A, b, B, "A out, B in");
+        f.require_continues("B after A", 0, ref_b);
+        // her file from her own storage, read into a fresh persona and bound on the Core: she continues as her control
+        {
+            auto st = [](int32_t s) { return (llama_persona_move) s; };
+            const std::string path = (std::filesystem::temp_directory_path() / "test-persona-core.cpb").string();
+            llama_memory_clear(llama_get_memory(f.ctx), true);
+            f.prompt(0, 1);
+            llama_persona * saved = llama_persona_init(f.ctx, 0xC, 1);
+            require(saved != nullptr, "a persona to write");
+            require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "her save on the Core");
+            const int64_t t_write = ggml_time_us();
+            require_move(st(llama_persona_write_file(saved, path.c_str())), llama_persona_move::done, "her file from her storage");
+            const int64_t written_us = ggml_time_us() - t_write;
+            llama_persona_free(saved);
+            llama_persona * back = llama_persona_init(f.ctx, 0xC, 1);
+            require(back != nullptr, "a fresh persona to read into");
+            const int64_t t_read = ggml_time_us();
+            require_move(st(llama_persona_read_file(back, path.c_str())), llama_persona_move::done, "her file into her storage");
+            const int64_t read_us = ggml_time_us() - t_read;
+            require_move(st(llama_persona_bind(f.ctx, 0, back)), llama_persona_move::done, "she binds from her file");
+            f.require_continues("her after her file", 0, ref_a);
+            llama_persona_free(back);
+            const auto bytes = std::filesystem::file_size(path);
+            std::remove(path.c_str());
+            fprintf(stderr, "core: her file %.1f MB, write %.1f ms, read %.1f ms\n", bytes / 1e6, written_us / 1e3, read_us / 1e3);
+        }
+        fprintf(stderr, "core: depth %d, %d moves, %.3f ms per switch (save + bind), by pointer: %s\n", core_depth, moves,
+                moved_us / 1e3 / 2.0, a.kv.storage.held() ? "yes" : "no");
+        return 0;
+    }
 
     if (params.n_predict > 0) {
         // measure mode: what recomputing her costs (prefill) vs her native state moved out and back. Recurrent state
@@ -264,15 +341,18 @@ int main(int argc, char ** argv) {
         require_move(ctx.persona_load(0, occupied, a, A), llama_persona_move::stream_not_empty, "load over b's stream");
         require(f.pos_max(1) == f.n_prompt - 1, "b untouched by the refused load");
 
-        llama_persona_blocks bad = a; // the same persona with one layer's rows missing
-        bad.kv.k.pop_back();
-        require_move(ctx.persona_load(0, 1 - occupied, bad, A), llama_persona_move::layout_mismatch, "a layout mismatch");
+        // her blocks own their storage (moved, never copied), so each refusal is set on hers and undone after
+        auto missing = std::move(a.kv.k.back()); // the same persona with one layer's rows missing
+        a.kv.k.pop_back();
+        require_move(ctx.persona_load(0, 1 - occupied, a, A), llama_persona_move::layout_mismatch, "a layout mismatch");
         require(f.pos_max(0) < 0, "a refused load writes nothing");
+        a.kv.k.push_back(std::move(missing));
         if (a.rs.has_state) { // hybrid: a rollback index past the snapshot groups is refused before any write
-            llama_persona_blocks far = a;
-            far.rs.rs_idx = 1u << 20;
-            require_move(ctx.persona_load(0, 1 - occupied, far, A), llama_persona_move::invalid_rollback, "a rollback out of bounds");
+            const uint32_t kept = a.rs.rs_idx;
+            a.rs.rs_idx = 1u << 20;
+            require_move(ctx.persona_load(0, 1 - occupied, a, A), llama_persona_move::invalid_rollback, "a rollback out of bounds");
             require(f.pos_max(0) < 0, "a refused hybrid load writes neither half");
+            a.rs.rs_idx = kept;
         }
 
         require_move(ctx.persona_load(0, 1 - occupied, a, A), llama_persona_move::done, "a back after the refusals");

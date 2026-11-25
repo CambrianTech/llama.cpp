@@ -187,6 +187,12 @@ public:
     int32_t persona_empty_stream() const override;
     // every stream belongs to one sequence: a stream per sequence, or one stream and one sequence
     bool persona_streams_are_own() const;
+    // a move by pointer (llama-persona-storage.cpp): the Core's one stream on host-addressed buffers
+    bool persona_by_pointer() const;
+    bool persona_reserve_storage(llama_kv_storage & storage) const;
+    void persona_exchange_storage(llama_kv_storage & storage);
+    // zero what the stream reads now (its own buffers or a mind's), never a parked mind's storage
+    bool persona_clear_resident();
     llama_persona_move persona_check_save(llama_seq_id seq_id, llama_persona_blocks & out) const override;
     llama_persona_move persona_check_load(llama_seq_id seq_id, uint32_t stream, const llama_persona_blocks & in,
                                           llama_persona_slot & slot) const override;
@@ -346,6 +352,8 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     llama_memory_bufs ctxs_bufs;
+    // the buffers the stream reads when a pointer move put a mind's there (empty: the stream reads ctxs_bufs)
+    llama_kv_storage persona_resident;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

@@ -441,6 +441,9 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    if (data && persona_clear_resident()) {
+        return; // the stream reads storage a pointer move gave it: clear that, not the buffers a parked mind now holds
+    }
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);

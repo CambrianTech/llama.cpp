@@ -33,6 +33,7 @@ set(LLAMA_CORE_SOURCES
     llama-io.cpp
     llama-kv-cache.cpp
     llama-kv-cache-persona.cpp
+    llama-persona-storage.cpp
     llama-memory-train.cpp
     llama-kv-cache-iswa.cpp
     llama-kv-cache-dsa.cpp

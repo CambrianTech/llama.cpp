@@ -48,6 +48,9 @@ llama_persona_move llama_kv_cache::persona_prepare(llama_persona_blocks & blocks
     blocks.kv_layout = persona_layout();
     blocks.kv_rows   = persona_rows_id;
     blocks.kv.cells.resize(get_size()); // once per persona, at her creation
+    if (persona_by_pointer() && !persona_reserve_storage(blocks.kv.storage)) {
+        return llama_persona_move::out_of_memory; // her own storage, moved by pointer from here on
+    }
     blocks.kv.k.resize(layers.size());
     blocks.kv.v.resize(layers.size());
     // the row sizes a save copies (persona_check_save), recorded for a file read to check before it allocates
@@ -77,8 +80,12 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama
     if (!cells_prepared(out.kv.cells, get_size()) || out.kv.k.size() != layers.size() || out.kv.v.size() != layers.size()) {
         return llama_persona_move::cells_not_prepared;
     }
-    // reserve: every byte the commit copies, so the commit never allocates
     const uint32_t n_rows = v_cells[seq_to_stream[seq_id]].used_max_p1();
+    if (persona_by_pointer()) {
+        out.kv.n_rows = n_rows; // her rows stay where she wrote them: the commit exchanges storage
+        return out.kv.storage.held() ? llama_persona_move::done : llama_persona_move::cells_not_prepared;
+    }
+    // reserve: every byte the commit copies, so the commit never allocates
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto & layer = layers[i];
         out.kv.k[i].resize(ggml_row_size(layer.k->type, layer.k->ne[0]) * n_rows);
@@ -91,6 +98,13 @@ llama_persona_move llama_kv_cache::persona_check_save(llama_seq_id seq_id, llama
 void llama_kv_cache::persona_commit_save(llama_seq_id seq_id, llama_persona_blocks & out) {
     const uint32_t s = seq_to_stream[seq_id];
     auto & cells = v_cells[s];
+    if (persona_by_pointer()) {
+        persona_exchange_storage(out.kv.storage); // she keeps the storage she decoded in
+        out.seq = seq_id;
+        out.kv.cells.swap(cells);
+        v_heads[s] = 0;
+        return;
+    }
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto & layer = layers[i];
         if (!out.kv.k[i].empty()) {
@@ -189,6 +203,13 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
         kv.k.size() != layers.size() || kv.v.size() != layers.size()) {
         return llama_persona_move::layout_mismatch;
     }
+    if (persona_by_pointer()) {
+        if (!kv.storage.held()) {
+            return llama_persona_move::cells_not_prepared;
+        }
+        slot.stream = stream;
+        return llama_persona_move::done;
+    }
     for (size_t i = 0; i < layers.size(); ++i) {
         const auto & layer = layers[i];
         const size_t k_bytes = ggml_row_size(layer.k->type, layer.k->ne[0]) * kv.n_rows;
@@ -203,7 +224,10 @@ llama_persona_move llama_kv_cache::persona_check_load(llama_seq_id seq_id, uint3
 
 void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot & slot, llama_persona_blocks & in) {
     const uint32_t s = slot.stream;
-    for (size_t i = 0; i < layers.size(); ++i) {
+    if (persona_by_pointer()) {
+        persona_exchange_storage(in.kv.storage); // hers becomes the stream's; she keeps the stream's empty one
+    }
+    for (size_t i = 0; i < layers.size() && !persona_by_pointer(); ++i) {
         const auto & layer = layers[i];
         if (!in.kv.k[i].empty()) {
             ggml_backend_tensor_set(layer.k_stream[s], in.kv.k[i].data(), 0, in.kv.k[i].size());

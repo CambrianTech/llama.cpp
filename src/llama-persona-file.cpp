@@ -11,6 +11,7 @@
 
 #include "llama.h"
 #include "llama-persona.h"
+#include "ggml-backend.h"
 
 #include <cstdio>
 #ifdef _WIN32
@@ -37,6 +38,21 @@ struct writer {
     void bytes(const std::vector<uint8_t> & b) {
         put<uint64_t>(b.size());
         ok = ok && (b.empty() || std::fwrite(b.data(), 1, b.size(), f) == b.size());
+    }
+    // her rows straight from her own storage (the Core's pointer move): each layer one device-to-host transfer of
+    // exactly her rows into one reused buffer, then one write. The same format as rows(), so either reader takes it.
+    void rows_of(const std::vector<ggml_tensor *> & layers, const std::vector<size_t> & row, uint32_t n_rows) {
+        put<uint32_t>((uint32_t) layers.size());
+        std::vector<uint8_t> staging;
+        for (size_t i = 0; i < layers.size() && ok; ++i) {
+            const size_t n = layers[i] ? row[i] * n_rows : 0;
+            put<uint64_t>(n);
+            if (n > 0) {
+                staging.resize(n);
+                ggml_backend_tensor_get(layers[i], staging.data(), 0, n);
+                ok = ok && std::fwrite(staging.data(), 1, n, f) == n;
+            }
+        }
     }
     void rows(const std::vector<std::vector<uint8_t>> & layers) {
         put<uint32_t>((uint32_t) layers.size());
@@ -118,8 +134,13 @@ int32_t llama_persona_write_file(const llama_persona * persona, const char * pat
     w.put<uint64_t>(b.rs_layout);
     // attention: her rows, then her occupied cells (position, 2D extension, whether her sequence holds it)
     w.put<uint32_t>(b.kv.n_rows);
-    w.rows(b.kv.k);
-    w.rows(b.kv.v);
+    if (b.kv.storage.held()) {
+        w.rows_of(b.kv.storage.k, b.geometry.k_row, b.kv.n_rows);
+        w.rows_of(b.kv.storage.v, b.geometry.v_row, b.kv.n_rows);
+    } else {
+        w.rows(b.kv.k);
+        w.rows(b.kv.v);
+    }
     const uint32_t n_cells = b.kv.cells.size();
     w.put<uint32_t>(n_cells);
     uint32_t occupied = 0;
@@ -235,8 +256,16 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path) {
         }
     }
     b.kv.n_rows = n_rows;
-    b.kv.k.swap(k);
-    b.kv.v.swap(v);
+    if (b.kv.storage.held()) {
+        // the Core's pointer move: her rows land in her own storage, one transfer per layer
+        for (size_t i = 0; i < k.size(); ++i) {
+            if (!k[i].empty()) { ggml_backend_tensor_set(b.kv.storage.k[i], k[i].data(), 0, k[i].size()); }
+            if (!v[i].empty()) { ggml_backend_tensor_set(b.kv.storage.v[i], v[i].data(), 0, v[i].size()); }
+        }
+    } else {
+        b.kv.k.swap(k);
+        b.kv.v.swap(v);
+    }
     b.kv.cells.swap(restored);
     b.rs.has_state = has_state;
     b.rs.pos = rs_pos;
