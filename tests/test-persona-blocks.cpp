@@ -270,7 +270,10 @@ int main(int argc, char ** argv) {
             llama_persona_blocks reserved;
             require_move(ctx.persona_prepare(reserved), llama_persona_move::done, "prepare a mind for reserved storage");
             require_move(llama_get_memory(f.ctx)->persona_reserve_storage(reserved), llama_persona_move::done, "her storage reserved on the device");
-            require_move(ctx.persona_load(0, 0, reserved, A), llama_persona_move::done, "a reserved mind in (the stream is empty: the fresh mind left it)");
+            if (!attaches) { // the fresh-bind check above ran only where storage attaches: there B is still in the stream
+                require_move(ctx.persona_save(0, b, B), llama_persona_move::done, "B out before the reserved mind");
+            }
+            require_move(ctx.persona_load(0, 0, reserved, A), llama_persona_move::done, "a reserved mind into the empty stream");
             f.prompt(0, 1);
             f.require_continues("a mind on reserved storage", 0, ref_a);
             require_move(ctx.persona_save(0, reserved, A), llama_persona_move::done, "the reserved mind out");
