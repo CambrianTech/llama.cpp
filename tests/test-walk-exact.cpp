@@ -723,6 +723,7 @@ int main(int argc, char ** argv) {
         g_cache_type = GGML_TYPE_F32;
 
       for (const bool streams : { false, true }) {
+        if (getenv("WALK_LIVE_STREAMS_ONLY") && !streams) { continue; } // the Core's layout alone: each mind's KV its own stream
         // unified F32 cache with explicit attention, then a stream per slot with an f16 cache and
         // flash attention: how a serving lane runs (each slot attends over its own stream)
         printf("  live sequence, %s:\n", streams ? "a stream per slot, f16 cache, flash attention" : "one unified F32 cache, explicit attention");
@@ -933,7 +934,7 @@ int main(int argc, char ** argv) {
             decode_span(ctx, 0, tokens.data(), 0, r0);
             decode_span(ctx, 2, neighbour, 0, 200);
         }
-        ggml_opt_result_t tile_result = getenv("WALK_LIVE_TILES") ? ggml_opt_result_init() : nullptr; // diagnostic: the tiled walk's loss
+        ggml_opt_result_t tile_result = (getenv("WALK_LIVE_TILES") || getenv("WALK_LIVE_LOSS")) ? ggml_opt_result_init() : nullptr; // diagnostic: the learned loss
         GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, tokens.data() + r0, WINDOW - r0, tile_result));
         // What this catches (Codex on the join): tiles that lose the gradient a later token carries into the
         // earlier ones, a walk that disturbs her neighbour between its steps, or a restore that is not her served

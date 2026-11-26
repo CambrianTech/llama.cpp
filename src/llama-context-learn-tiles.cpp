@@ -113,6 +113,7 @@ bool llama_context::opt_learn_tile(uint32_t tile) {
     opt_stop_requested.store(false);
     opt_alloc_failed.store(false);
     tiles->walk.acc.unbind(); // bound only while a step runs
+    if (getenv("WALK_TILES_DEBUG")) { for (const auto & r : walk.plan.runs) { for (size_t j = r.j0; j < r.j1; ++j) { const auto & c = walk.plan.chunks[j]; fprintf(stderr, "TILES chunk %zu c0=%u n=%u labels=%u scale=%f period_end=%d grad_from=%u surrogate=%d\n", j, c.c0, c.n, c.n_labels, c.loss_scale, (int) c.period_end, c.grad_from, (int) c.surrogate); } } fprintf(stderr, "TILES prefix=%d n_train=%d plan.n_labels=%u last_label=%lld tokens=%zu\n", (int) s.prefix, s.n_train, walk.plan.n_labels, (long long) walk.plan.last_label, tiles->tokens.size()); }
     s.tiles = std::move(tiles);
     return true;
 }
@@ -194,6 +195,7 @@ bool llama_context::opt_tiles_unit(opt_tiles & t) {
     if (!walk.rewind(plan.chunks[run.j0 + cp].c0, t.snaps[cp], c.c0)) {
         return fail("a tile's rewind to its checkpoint failed");
     }
+    if (getenv("WALK_TILES_DEBUG")) { fprintf(stderr, "TILES reverse j=%zu c0=%u pos_max(seq %d)=%d pos_min=%d\n", j, c.c0, (int) s.seq, (int) memory->seq_pos_max(s.seq), (int) memory->seq_pos_min(s.seq)); }
     const bool state_surrogate = walk.recr != nullptr && j + 1 < run.j1 && walk.acc.state_ready;
     llama_walk_chunk cc = c;
     cc.grad_from = std::max(r0, llama_walk_plan::grad_from(cc.c0, opt_walk_horizon));
