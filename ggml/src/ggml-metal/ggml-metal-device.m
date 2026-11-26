@@ -1801,8 +1801,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_FLASH_ATTN_EXT:
             // K/V row lists (ggml_flash_attn_ext_rows): one list of cache rows per q slice
-            if (op->src[5] != NULL) {
-                const struct ggml_tensor * kv_rows = op->src[5];
+            if (op->src[GGML_FA_SRC_KV_ROWS] != NULL) {
+                const struct ggml_tensor * kv_rows = op->src[GGML_FA_SRC_KV_ROWS];
 
                 if (kv_rows->type != GGML_TYPE_I32 ||
                     !ggml_is_contiguous(kv_rows) ||

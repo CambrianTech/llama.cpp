@@ -1044,7 +1044,7 @@ void launch_fattn(
 
     const ggml_tensor * mask    = dst->src[3];
     const ggml_tensor * sinks   = dst->src[4];
-    const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * kv_rows = dst->src[GGML_FA_SRC_KV_ROWS];
 
     // with kv_rows the kernel iterates over the mask columns and reads K/V rows through kv_rows
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];

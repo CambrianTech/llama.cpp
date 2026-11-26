@@ -5515,7 +5515,7 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
-    result->src[5] = kv_rows;
+    result->src[GGML_FA_SRC_KV_ROWS] = kv_rows;
 
     return result;
 }
@@ -5576,10 +5576,10 @@ void ggml_flash_attn_ext_set_grad_sinks(
     GGML_ASSERT(k_cur->ne[0] == k->ne[0] && k_cur->ne[1] == k->ne[2] && v_cur->ne[0] == v->ne[0] && v_cur->ne[1] == v->ne[2]);
     GGML_ASSERT(!k_tap || (k_tap->ne[0] == k->ne[0] && k_tap->ne[1] == k->ne[2] && v_tap->ne[0] == v->ne[0] && v_tap->ne[1] == v->ne[2]));
     // src[4] is sinks (the attention's own); the gradient sinks follow it
-    a->src[5] = k_tap;
-    a->src[6] = k_cur;
-    a->src[7] = v_tap;
-    a->src[8] = v_cur;
+    a->src[GGML_FA_SRC_K_TAP] = k_tap;
+    a->src[GGML_FA_SRC_K_CUR] = k_cur;
+    a->src[GGML_FA_SRC_V_TAP] = v_tap;
+    a->src[GGML_FA_SRC_V_CUR] = v_cur;
 }
 
 void ggml_flash_attn_ext_set_n_kv_max(
@@ -6980,7 +6980,7 @@ static bool ggml_backward_needs_grad(struct ggml_cgraph * cgraph, const bool * g
 // grad sinks when the attention has them (ggml_flash_attn_ext_set_grad_sinks), else to K/V itself
 static void ggml_fa_back_route_kv(struct ggml_context * ctx, struct ggml_cgraph * cgraph, const bool * grads_needed,
         struct ggml_tensor * tensor, int part, struct ggml_tensor * g, size_t isrc, bool needed) {
-    if (tensor->src[6] == NULL) {
+    if (tensor->src[GGML_FA_SRC_K_CUR] == NULL) {
         if (needed) {
             const struct ggml_tensor * kv = tensor->src[1 + part];
             ggml_add_or_set(ctx, cgraph, isrc, ggml_reshape_4d(ctx, ggml_cont(ctx, g), kv->ne[0], kv->ne[1], kv->ne[2], kv->ne[3]));
@@ -6989,7 +6989,7 @@ static void ggml_fa_back_route_kv(struct ggml_context * ctx, struct ggml_cgraph 
     }
     int64_t r = 0;
     for (int s = 0; s < 2; ++s) {
-        struct ggml_tensor * sink = tensor->src[5 + 2*part + s]; // tap, then the chunk's own
+        struct ggml_tensor * sink = tensor->src[GGML_FA_SRC_K_TAP + 2*part + s]; // tap, then the chunk's own
         size_t is = 0;
         if (sink == NULL) {
             continue;
@@ -7032,12 +7032,12 @@ static void ggml_flash_attn_ext_backward(
     GGML_ASSERT(q->ne[3] == 1 && "flash_attn_ext backward: one sequence stream");
 
     // with grad sinks only K/V's last rows carry a gradient: from kv0 on, and nothing to K/V itself
-    const bool sunk = tensor->src[6] != NULL;
-    const int64_t kv0 = sunk ? k->ne[1] - tensor->src[6]->ne[2] - (tensor->src[5] ? tensor->src[5]->ne[2] : 0) : 0;
+    const bool sunk = tensor->src[GGML_FA_SRC_K_CUR] != NULL;
+    const int64_t kv0 = sunk ? k->ne[1] - tensor->src[GGML_FA_SRC_K_CUR]->ne[2] - (tensor->src[GGML_FA_SRC_K_TAP] ? tensor->src[GGML_FA_SRC_K_TAP]->ne[2] : 0) : 0;
     if (sunk) {
         size_t is = 0;
-        dk_needed = ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[5], &is) || ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[6], &is);
-        dv_needed = ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[7], &is) || ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[8], &is);
+        dk_needed = ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[GGML_FA_SRC_K_TAP], &is) || ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[GGML_FA_SRC_K_CUR], &is);
+        dv_needed = ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[GGML_FA_SRC_V_TAP], &is) || ggml_backward_needs_grad(cgraph, grads_needed, tensor->src[GGML_FA_SRC_V_CUR], &is);
     }
 
     int32_t tile = ggml_get_op_params_i32(tensor, 5); // slot 4 is upstream's n_kv_max
@@ -7887,7 +7887,7 @@ static const char * ggml_compute_backward(
     // shape. A break is a defect in that op's backward on this graph's shapes; it is returned, so
     // a caller that must not abort (training inside a serving process) refuses the graph by name.
     // An attention with grad sinks puts its K/V gradient on the sinks, never on K/V themselves.
-    const bool kv_sunk = tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[6] != NULL;
+    const bool kv_sunk = tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[GGML_FA_SRC_K_CUR] != NULL;
     if (src0_needs_grads && !ggml_backward_grad_fits(cgraph, src0, isrc0)) {
         return "its backward gave src[0] no gradient or one of another shape";
     }

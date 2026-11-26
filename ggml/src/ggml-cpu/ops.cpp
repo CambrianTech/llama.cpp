@@ -8898,7 +8898,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
-    const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * kv_rows = dst->src[GGML_FA_SRC_KV_ROWS];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9183,7 +9183,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
 
     // with kv_rows the loop runs over the mask columns and reads K/V rows through kv_rows
-    const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * kv_rows = dst->src[GGML_FA_SRC_KV_ROWS];
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
 
     int ir = ir0;
@@ -9522,7 +9522,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     // with kv_rows the loops run over the mask columns, the split KV path does not support it
-    const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * kv_rows = dst->src[GGML_FA_SRC_KV_ROWS];
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);

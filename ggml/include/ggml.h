@@ -2359,6 +2359,15 @@ extern "C" {
     GGML_API float ggml_flash_attn_back_scale(float max_abs_do);
     GGML_API size_t ggml_flash_attn_back_offset(const struct ggml_tensor * back, int part);
 
+    // FLASH_ATTN_EXT's sources past its own five (q, k, v, mask, sinks), each in its own slot, read by name and
+    // never by number: two features once shared src[5], so the CPU and CUDA kernels read the exact walk's F32 K tap
+    // as row indices and faulted (Continuum, 2026-11-26)
+    #define GGML_FA_SRC_KV_ROWS 5 // ggml_flash_attn_ext_rows: one list of cache rows per q slice
+    #define GGML_FA_SRC_K_TAP   6 // ggml_flash_attn_ext_set_grad_sinks: the run's cached K rows
+    #define GGML_FA_SRC_K_CUR   7 //   and the chunk's own K
+    #define GGML_FA_SRC_V_TAP   8 //   the run's cached V rows
+    #define GGML_FA_SRC_V_CUR   9 //   and the chunk's own V
+
     // Where FLASH_ATTN_EXT's K/V gradient goes when only the last rows of its K/V can carry one:
     // k_tap / v_tap (or NULL) and k_cur / v_cur, each [D, Hkv, rows], hold the values of K/V's last
     // rows in order, ending at M (a run's cached rows, then the chunk's own). The backward computes

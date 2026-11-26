@@ -3408,7 +3408,7 @@ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool
     }
 
     // with kv_rows, the attention runs over the compacted row lists (padded to 256), not over the cache
-    const int64_t ne11_attn = op->src[5] ? op->src[5]->ne[0] : op->src[1]->ne[1];
+    const int64_t ne11_attn = op->src[GGML_FA_SRC_KV_ROWS] ? op->src[GGML_FA_SRC_KV_ROWS]->ne[0] : op->src[1]->ne[1];
 
     return ne11_attn % OP_FLASH_ATTN_EXT_TENSOR_NCPSG == 0;
 }
@@ -3420,7 +3420,7 @@ static int ggml_metal_op_flash_attn_ext_n_kv_max_sparse(const ggml_tensor * op) 
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     // K/V row lists are handled by the dense kernels, not by the sparse path
-    if (op->src[5] != nullptr) {
+    if (op->src[GGML_FA_SRC_KV_ROWS] != nullptr) {
         return 0;
     }
 
@@ -3675,7 +3675,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_idx(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_rows(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    const ggml_tensor * kv_rows = op->src[5];
+    const ggml_tensor * kv_rows = op->src[GGML_FA_SRC_KV_ROWS];
 
     if (!kv_rows) {
         return 0;
@@ -3728,9 +3728,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(!op->src[3] || op->src[3]->ne[1] >= op->src[0]->ne[1] &&
             "the Flash-Attention Metal kernel requires the mask to be at least n_queries big");
 
-    // K/V row lists (ggml_flash_attn_ext_rows): src[5] holds one list of cache rows per q slice
+    // K/V row lists (ggml_flash_attn_ext_rows): src[GGML_FA_SRC_KV_ROWS] holds one list of cache rows per q slice
     // the attention loops then run over the mask columns and read K/V rows through the lists
-    const ggml_tensor * kv_rows = op->src[5];
+    const ggml_tensor * kv_rows = op->src[GGML_FA_SRC_KV_ROWS];
     const bool has_rows = kv_rows != nullptr;
 
     GGML_ASSERT(!has_rows || (kv_rows->type == GGML_TYPE_I32 && ggml_is_contiguous(kv_rows)));
