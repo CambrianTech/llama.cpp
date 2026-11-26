@@ -812,6 +812,8 @@ int main(int argc, char ** argv) {
         lopt.get_opt_pars   = sgd_pars;
         lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
         lopt.adapter        = adapter;
+        // a reply learning in tiles walks exactly (UNIFIED-PAGING.md, "A long reply learns in tiles")
+        lopt.walk_exact     = getenv("WALK_LIVE_TILES") != nullptr || getenv("WALK_LIVE_EXACT_ONLY") != nullptr;
         lopt.static_admission = [](ggml_backend_buffer_type_t, const char *, size_t, void * data) {
             ++static_cast<admission_counts *>(data)->statics;
             return true;
@@ -932,6 +934,11 @@ int main(int argc, char ** argv) {
             decode_span(ctx, 2, neighbour, 0, 200);
         }
         GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, tokens.data() + r0, WINDOW - r0, nullptr));
+        // What this catches (Codex on the join): tiles that lose the gradient a later token carries into the
+        // earlier ones, a walk that disturbs her neighbour between its steps, or a restore that is not her served
+        // self. The reply learns through the exact walk in tiles of WINDOW / 8, one per step, and every assertion
+        // below holds: the step is the walk's exact step, her cache a stable decode, the neighbour untouched.
+        if (getenv("WALK_LIVE_TILES")) { GGML_ASSERT(llama_opt_learn_tile(ctx, getenv("WALK_LIVE_TILE_ROWS") ? (uint32_t) atoi(getenv("WALK_LIVE_TILE_ROWS")) : WINDOW / 8)); }
         // Diagnostic: change only scheduling boundaries, not the served graph/window
         // or the independent whole-reply gradient oracle. No production chunk policy.
         if (getenv("WALK_LIVE_SMALL_CHUNKS")) {
@@ -987,7 +994,7 @@ int main(int argc, char ** argv) {
                     GGML_ASSERT(llama_opt_learn_drain(ctx));
                     GGML_ASSERT(ctx->opt_reply->drain_graph);
                 }
-                if (!shifted_neighbour_pending && (!getenv("WALK_LIVE_GRAPH_CONTINUATION") || (getenv("WALK_LIVE_GRAPH_NEIGHBOUR") && yielded % 128 == 0))) {
+                if (!getenv("WALK_LIVE_NO_NEIGHBOUR") && !shifted_neighbour_pending && (!getenv("WALK_LIVE_GRAPH_CONTINUATION") || (getenv("WALK_LIVE_GRAPH_NEIGHBOUR") && yielded % 128 == 0))) {
                     GGML_ASSERT(llama_state_seq_set_data(ctx, neighbour_before.data(), neighbour_before.size(), 1) == neighbour_before.size());
                     if (getenv("WALK_LIVE_GRAPH_SHIFT") && graph_neighbour_turns == 0 && llama_memory_can_shift(llama_get_memory(ctx))) {
                         // A queued K shift must not be consumed or silently skipped beside a retained graph.
@@ -1021,6 +1028,7 @@ int main(int argc, char ** argv) {
                     }
                     decode_span(ctx, 1, neighbour + 200, 200, 1);
                     ++graph_neighbour_turns;
+                    if (getenv("WALK_LIVE_TILES") && seq_state(ctx, 1) != want_neighbour_turn) { const auto got_n = seq_state(ctx, 1); size_t diff = 0, first = SIZE_MAX; for (size_t b = 0; b < std::min(got_n.size(), want_neighbour_turn.size()); ++b) { if (got_n[b] != want_neighbour_turn[b]) { ++diff; first = std::min(first, b); } } fprintf(stderr, "DEBUG neighbour differs at yield %d: size %zu vs %zu, %zu bytes differ, first at %zu\n", yielded, got_n.size(), want_neighbour_turn.size(), diff, first); }
                     GGML_ASSERT(seq_state(ctx, 1) == want_neighbour_turn);
                 }
                 ++yielded;

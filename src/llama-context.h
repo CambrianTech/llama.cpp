@@ -279,6 +279,8 @@ struct llama_context {
     ggml_opt_params opt_params_for(llama_opt_params params);
     int64_t opt_shadow_steps(const llama_adapter_lora * shadow) const;
 
+    struct opt_tiles; // a live reply learning in tiles through the exact walk (llama-context-learn-tiles.cpp)
+    struct opt_tiles_free { void operator()(opt_tiles * tiles) const; };
     struct opt_live_reply {
         llama_seq_id seq;
         llama_pos prefix;
@@ -305,6 +307,7 @@ struct llama_context {
         llm_graph_result_ptr serving_reserve;
         bool drain_graph = false;
         bool restoring = false;
+        std::unique_ptr<opt_tiles, opt_tiles_free> tiles; // set: the reply learns in tiles, one per step
         std::string failure;
         ~opt_live_reply() { if (batch.token) { llama_batch_free(batch); } }
     };
@@ -317,6 +320,9 @@ struct llama_context {
     bool opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const llama_token * tokens,
             const llama_token * labels, int32_t n, const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result);
     llama_opt_learn_status opt_learn_step();
+    bool opt_learn_tile(uint32_t tile);
+    llama_opt_learn_status opt_tiles_step();
+    bool opt_tiles_unit(opt_tiles & tiles);
     bool opt_learn_drain();
     bool opt_learn_needs_gradient() const;
 

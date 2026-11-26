@@ -92,6 +92,10 @@ struct llama_walk_acc {
     // zeroed accumulators for n_pos positions, bound into cparams; false: the host memory
     // could not be allocated
     bool init(const llama_hparams & hparams, const llama_memory_recurrent * recr, uint32_t n_pos, llama_cparams & cparams);
+    // into `cparams` for one owner step, and out again: a walk that yields between steps (a live reply learning
+    // in tiles) binds only while it runs, so a neighbour's decode between its steps never reads its accumulators
+    void bind(llama_cparams & cparams);
+    void unbind();
     // zeroed again for the run starting at position base (row 0)
     void start_run(uint32_t base);
 
@@ -101,6 +105,7 @@ struct llama_walk_acc {
 
 private:
     llama_cparams *         bound = nullptr;
+    uint32_t                base  = 0;
     ggml_context_ptr        ctx;
     ggml_backend_buffer_ptr buf;
 };

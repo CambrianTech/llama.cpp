@@ -22,6 +22,7 @@ set(LLAMA_CORE_SOURCES
     llama-context-opt.cpp
     llama-context-opt-measure.cpp
     llama-context-learn.cpp
+    llama-context-learn-tiles.cpp
     llama-walk.cpp
     llama-cparams.cpp
     llama-grammar.cpp

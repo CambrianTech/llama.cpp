@@ -138,26 +138,37 @@ bool llama_walk_acc::init(const llama_hparams & hparams, const llama_memory_recu
         return false;
     }
     ggml_backend_buffer_clear(buf.get(), 0);
-    bound = &cparams;
-    cparams.walk_acc_k = k.data();
-    cparams.walk_acc_v = v.data();
-    cparams.walk_acc_base = 0;
+    bind(cparams);
     return true;
 }
 
-void llama_walk_acc::start_run(uint32_t base) {
-    GGML_ASSERT(bound != nullptr);
-    ggml_backend_buffer_clear(buf.get(), 0);
-    state_ready = false;
-    bound->walk_acc_base = base;
+void llama_walk_acc::bind(llama_cparams & cparams) {
+    bound = &cparams;
+    cparams.walk_acc_k = k.data();
+    cparams.walk_acc_v = v.data();
+    cparams.walk_acc_base = base;
 }
 
-llama_walk_acc::~llama_walk_acc() {
+void llama_walk_acc::unbind() {
     if (bound != nullptr) {
         bound->walk_acc_k = nullptr;
         bound->walk_acc_v = nullptr;
         bound->walk_acc_base = 0;
+        bound = nullptr;
     }
+}
+
+void llama_walk_acc::start_run(uint32_t run_base) {
+    ggml_backend_buffer_clear(buf.get(), 0);
+    state_ready = false;
+    base = run_base;
+    if (bound != nullptr) {
+        bound->walk_acc_base = base;
+    }
+}
+
+llama_walk_acc::~llama_walk_acc() {
+    unbind();
 }
 
 void llama_walk_fill(llama_batch & batch, const std::vector<llama_token> & tokens, uint32_t c0, uint32_t n, llama_seq_id seq) {

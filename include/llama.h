@@ -2227,6 +2227,12 @@ extern "C" {
     LLAMA_API enum llama_opt_learn_status llama_opt_learn_step(struct llama_context * ctx);
     // The minimum graph segment: one indivisible node, retaining the whole reply graph.
     LLAMA_API enum llama_opt_learn_status llama_opt_learn_graph_step(struct llama_context * ctx);
+    // Continuum (UNIFIED-PAGING.md, "A long reply learns in tiles"): learn the reply through the exact walk in
+    // tiles of `tile` rows, one tile per step (its forward with recurrent checkpoints, then its reverse last to
+    // first, gradients carried into the earlier tiles' K/V and state, one optimizer update), instead of one graph
+    // for the whole reply. Call after begin, before the first step; the optimizer must walk exactly. Steps go
+    // through llama_opt_learn_step; restoration follows as for any reply.
+    LLAMA_API bool llama_opt_learn_tile(struct llama_context * ctx, uint32_t tile);
     LLAMA_API bool llama_opt_learn_draining_graph(const struct llama_context * ctx);
     // Stop admitting gradient chunks, but keep custody until step drains the original served
     // tail. Already committed optimizer steps remain committed. Call only between steps.

@@ -117,6 +117,12 @@ bool llama_context::opt_learn_drain() {
         opt_reply->drain_graph = true;
         return true;
     }
+    if (opt_reply->tiles && !opt_reply->restoring) { // Continuum: a tiled reply's accumulated gradient is never applied
+        ggml_opt_reset(opt_ctx, false);
+        opt_reply->cursor = opt_reply->n_train;
+        opt_reply->tiles.reset();
+        return true;
+    }
     if (!opt_reply->restoring && opt_reply->cursor < opt_reply->n_train) {
         // The full reply is one optimizer update. A revoked partial reply has only
         // accumulated gradients: clear those, preserving moments and completed updates.
@@ -182,6 +188,7 @@ llama_opt_learn_status llama_context::opt_learn_step() {
         if (s.drain_graph) { s.cursor = s.n_train; }
         return LLAMA_OPT_LEARN_MORE;
     }
+    if (s.tiles && !s.restoring && s.cursor < s.n_train) { return opt_tiles_step(); } // Continuum: a reply learning in tiles (llama-context-learn-tiles.cpp)
     if (!s.restoring && s.cursor >= s.n_train) {
         s.restoring = true;
         s.cursor = 0;
