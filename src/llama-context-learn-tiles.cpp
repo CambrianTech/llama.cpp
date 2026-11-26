@@ -66,6 +66,14 @@ bool llama_context::opt_learn_tile(uint32_t tile) {
         opt_fail("llama_opt_learn_tile: a tile of zero rows");
         return false;
     }
+    if (cparams.kv_unified && cparams.n_seq_max > 1) {
+        // the walk's contract, stated where it starts (llama-graph-train.cpp reads her window as the cells
+        // [0, n_win) of one stream): her positions are her stream's slots. A cache shared by several sequences
+        // puts her cells after others', and the walk would read theirs. The Core keeps each mind's KV in her own
+        // stream; a context that does not is never here for tiles, said before anything runs.
+        opt_fail("llama_opt_learn_tile: tiles walk her own stream; this context shares one cache among sequences");
+        return false;
+    }
     if (!opt_walk_exact) {
         // independent tiles lose the gradient a later token carries into the earlier ones (Codex): exact or none
         opt_fail("llama_opt_learn_tile: tiles learn only through the exact walk (walk_exact)");

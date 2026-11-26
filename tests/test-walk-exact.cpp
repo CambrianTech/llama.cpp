@@ -940,7 +940,9 @@ int main(int argc, char ** argv) {
         // earlier ones, a walk that disturbs her neighbour between its steps, or a restore that is not her served
         // self. The reply learns through the exact walk in tiles of WINDOW / 8, one per step, and every assertion
         // below holds: the step is the walk's exact step, her cache a stable decode, the neighbour untouched.
-        if (getenv("WALK_LIVE_TILES")) { GGML_ASSERT(llama_opt_learn_tile(ctx, getenv("WALK_LIVE_TILE_ROWS") ? (uint32_t) atoi(getenv("WALK_LIVE_TILE_ROWS")) : WINDOW / 8)); }
+        // the walk's layout contract, both ways: refused up front on a shared cache (the reply still learns, by its
+        // ordinary path), accepted on the Core's layout, a stream per mind
+        if (getenv("WALK_LIVE_TILES")) { GGML_ASSERT(llama_opt_learn_tile(ctx, getenv("WALK_LIVE_TILE_ROWS") ? (uint32_t) atoi(getenv("WALK_LIVE_TILE_ROWS")) : WINDOW / 8) == streams); }
         // Diagnostic: change only scheduling boundaries, not the served graph/window
         // or the independent whole-reply gradient oracle. No production chunk policy.
         if (getenv("WALK_LIVE_SMALL_CHUNKS")) {
