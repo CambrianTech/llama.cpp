@@ -99,6 +99,11 @@
         if (reply_rows <= 0 || reply_rows > llama_n_ctx_seq(ctx_tgt)) {
             return refuse("invalid", "reply_rows must describe a nonempty example within the served window");
         }
+        // the whole lesson its attention reads (context and reply): attention is priced at it, never the window
+        const int64_t lesson_rows = body.value("lesson_rows", int64_t(0));
+        if (lesson_rows < reply_rows || lesson_rows > llama_n_ctx_seq(ctx_tgt)) {
+            return refuse("invalid", "lesson_rows must hold the reply within the served window");
+        }
         // The loop serializes this with decoding and adapter unload. Restore the active
         // default composition on exit; update_slots installs each batched slot before decode.
         auto saved = construct_lora_list({});
@@ -110,7 +115,7 @@
         auto set = construct_lora_list({});
         set[id].scale = 1.0f;
         common_set_adapter_lora(ctx_tgt, set);
-        const bool ok = llama_opt_measure_shadow_graph(ctx_tgt, learning_shadow_params((int32_t) id), (uint32_t) reply_rows, [](const llama_adapter_lora *, const char * device,
+        const bool ok = llama_opt_measure_shadow_graph(ctx_tgt, learning_shadow_params((int32_t) id), (uint32_t) reply_rows, (uint32_t) lesson_rows, [](const llama_adapter_lora *, const char * device,
                 const char * buft, const char * kind, size_t bytes, bool host, void * data) {
             static_cast<json *>(data)->push_back({{"device", device}, {"buffer_type", buft},
                 {"kind", kind}, {"bytes", bytes}, {"host", host}});
@@ -118,6 +123,7 @@
         if (!ok) { return refuse("unsupported", llama_opt_failure(ctx_tgt)); }
         out["lora_id"] = id;
         out["reply_rows"] = reply_rows;
+        out["lesson_rows"] = lesson_rows;
         out["served_window"] = llama_n_ctx_seq(ctx_tgt);
         return out;
     }
