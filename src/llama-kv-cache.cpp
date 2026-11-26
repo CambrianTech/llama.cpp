@@ -1327,7 +1327,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad = 256;
+    const uint32_t n_pad = n_kv_pad;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
@@ -3037,7 +3037,7 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv, bool single_stream, uint32_t rows) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = rows ? std::min(kv->get_size(), std::max(256u, GGML_PAD(rows, 256u))) : kv->get_size(); // Continuum: a lesson reads its own rows, padded as get_n_kv pads a live step
+    n_kv = rows ? std::min(kv->get_size(), std::max(llama_kv_cache::n_kv_pad, GGML_PAD(rows, llama_kv_cache::n_kv_pad))) : kv->get_size(); // Continuum: a lesson reads its own rows, padded as get_n_kv pads a live step
 
     // worst case for graph reservation, only a unified cache splits into per-sequence lists
     n_kv_rows = single_stream || kv->get_n_stream() == 1 ? n_kv : 0; // Continuum: a single-stream context (one mind) reads one stream

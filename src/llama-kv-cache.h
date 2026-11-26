@@ -231,6 +231,8 @@ public:
     // graph_build API
     //
 
+    // the cells a step's view is padded to; a learning measure pads its lesson by the same (Continuum)
+    static constexpr uint32_t n_kv_pad = 256;
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
