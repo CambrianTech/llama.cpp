@@ -712,8 +712,11 @@ int main(int argc, char ** argv) {
         // the step must be the walk's exact step for the same window (one chunk per run), her
         // sequence must end as a stable decode of the reply would leave it, and the neighbour's
         // state must not change by a byte.
+        // WALK_LIVE_LATE_LABELS=K: her reply's first K rows unlabelled, so a run starts K rows past the served prefix
+        // and the walk decodes that context before it (Codex: a long unlabelled prefix must still be one tile per unit)
+        const uint32_t late = getenv("WALK_LIVE_LATE_LABELS") ? (uint32_t) atoi(getenv("WALK_LIVE_LATE_LABELS")) : 0;
         std::vector<uint8_t> reply(WINDOW + 1, 0);
-        for (uint32_t i = WINDOW / 2 + 37; i <= WINDOW; ++i) {
+        for (uint32_t i = WINDOW / 2 + 37 + late; i <= WINDOW; ++i) {
             reply[i] = 1;
         }
         const llama_pos r0 = WINDOW / 2 + 36; // the first labelled position
@@ -862,7 +865,7 @@ int main(int argc, char ** argv) {
         }
         std::vector<llama_token> labels(WINDOW - r0);
         for (int32_t i = 0; i < (int32_t) WINDOW - r0; ++i) {
-            labels[i] = tokens[r0 + i + 1];
+            labels[i] = (uint32_t) i < late ? -1 : tokens[r0 + i + 1];
         }
         // refusals come before any change: her sequence byte-identical after each
         {
@@ -966,7 +969,20 @@ int main(int argc, char ** argv) {
             if (getenv("WALK_LIVE_SMALL_CHUNKS") && !llama_opt_learn_needs_gradient(ctx)) {
                 ctx->opt_reply->chunk_tokens = WINDOW; // retain the control's restoration segmentation
             }
+            // what this catches (Codex on c6d40d7917): a tile step that decodes more than its tile in one unit
+            // (the context before a run, a reverse replay from a stride checkpoint, a run restored between runs),
+            // holding the Core past the slack the tile was sized to. Every tiled unit advances her cache by at most
+            // one tile.
+            const bool tiled = ctx->opt_reply != nullptr && ctx->opt_reply->tiles != nullptr;
+            const llama_pos at_before = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
             progress = llama_opt_learn_step(ctx);
+            if (tiled && getenv("WALK_LIVE_TILE_ROWS")) {
+                const llama_pos advanced = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) - at_before;
+                if (advanced > (llama_pos) atoi(getenv("WALK_LIVE_TILE_ROWS"))) {
+                    fprintf(stderr, "FAILED: one tiled unit decoded %d rows, past its tile of %s\n", (int) advanced, getenv("WALK_LIVE_TILE_ROWS"));
+                    ++failures;
+                }
+            }
             if (progress == LLAMA_OPT_LEARN_MORE) {
                 if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS") && yielded == 0) {
                     auto paired = llama_batch_init(2, 0, 1);
@@ -1140,7 +1156,7 @@ int main(int argc, char ** argv) {
             GGML_ASSERT(llama_adapter_lora_save(adapter, checkpoint.c_str()) != 0);
             GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) != 0);
             llama_batch quarantined_batch = llama_batch_get_one(tokens.data(), 1);
-            quarantined_batch.label = labels.data();
+            quarantined_batch.label = labels.data() + late; // a labelled row: the guard is on training decodes
             GGML_ASSERT(llama_decode(ctx, quarantined_batch) == -3);
             GGML_ASSERT(std::string(llama_opt_failure(ctx)).find("restore is uncertain") != std::string::npos);
             GGML_ASSERT(llama_encode(ctx, quarantined_batch) == -3);

@@ -37,6 +37,12 @@ struct llama_context::opt_tiles {
     uint32_t served = 0;   // the cache holds [0, served) as served
     size_t stride = 1;
     std::vector<std::vector<uint8_t>> snaps;
+    // EVERY UNIT IS ONE TILE OF WORK (Codex on c6d40d7917; Joel: "everyone comply"). A span the walk must decode
+    // (the context before a run, a reverse replay from its stride checkpoint, a run restored under her stable set)
+    // is pending here and decoded one tile per unit, so no unit holds the Core longer than the tile it was sized by.
+    uint32_t span_at = 0, span_to = 0;
+    bool span_shadow = false;
+    bool rewound = false;  // the reverse tile's checkpoint is set back; its replay (if any) is the pending span
 
     opt_tiles(llama_context & lctx, const opt_live_reply & s, uint32_t tile)
         : tokens(make(s, /*labels =*/ false)), labels(make(s, /*labels =*/ true)),
@@ -164,17 +170,29 @@ bool llama_context::opt_tiles_unit(opt_tiles & t) {
         s.cursor = s.n_train;
         return false;
     };
+    // a pending span goes first, one tile of it per unit: the unit's work is never more than the tile
+    const auto span = [&](uint32_t from, uint32_t to, bool shadow) {
+        t.span_at = from;
+        t.span_to = to;
+        t.span_shadow = shadow;
+    };
+    if (t.span_at < t.span_to) {
+        const uint32_t to = std::min(t.span_to, t.span_at + t.tile);
+        if (!walk.decode_span(t.span_at, to, t.span_shadow)) {
+            return fail("a tile of a span the walk decodes (context, replay or restore) did not decode");
+        }
+        t.span_at = to;
+        return true;
+    }
     const llama_walk_run & run = plan.runs[t.run];
     const uint32_t r0 = plan.begin(run);
     if (t.before) {
-        if (!walk.decode_span(t.served, r0, /*shadow =*/ false)) {
-            return fail("the context before a run of the reply did not decode");
-        }
         t.before = false;
         t.chunk = run.j0;
         t.snaps.assign(run.j1 - run.j0, {});
         if (t.served < r0) {
-            return true; // the context was a unit of its own; the run's first tile is the next
+            span(t.served, r0, /*shadow =*/ false); // the context before the run, under her stable set
+            return true;
         }
         // nothing came before the run: its first tile is this unit, never an empty step
     }
@@ -194,15 +212,24 @@ bool llama_context::opt_tiles_unit(opt_tiles & t) {
         }
         return true;
     }
-    // the reverse pass, last tile first: back to its checkpoint, forward to its start, train it at the full
-    // horizon. A tile that does not fit is refused, never retried at a shorter horizon: that would drop
-    // attention gradient and still call itself exact (Codex). The seat learns at a smaller tile instead.
-    const size_t j = --t.chunk;
+    // the reverse pass, last tile first: back to its checkpoint, forward to its start (one tile per unit), then
+    // train it at the full horizon
+    const size_t j = t.chunk - 1;
     const llama_walk_chunk & c = plan.chunks[j];
-    const size_t cp = walk.recr != nullptr ? (j - run.j0) - (j - run.j0) % t.stride : j - run.j0;
-    if (!walk.rewind(plan.chunks[run.j0 + cp].c0, t.snaps[cp], c.c0)) {
-        return fail("a tile's rewind to its checkpoint failed");
+    if (!t.rewound) {
+        const size_t cp = walk.recr != nullptr ? (j - run.j0) - (j - run.j0) % t.stride : j - run.j0;
+        const uint32_t at = plan.chunks[run.j0 + cp].c0;
+        if (!walk.rewind(at, t.snaps[cp], at)) {
+            return fail("a tile's rewind to its checkpoint failed");
+        }
+        t.rewound = true;
+        if (at < c.c0) {
+            span(at, c.c0, /*shadow =*/ true); // the replay from the stride checkpoint to the tile
+            return true;
+        }
     }
+    t.chunk = j;
+    t.rewound = false;
     if (getenv("WALK_TILES_DEBUG")) { fprintf(stderr, "TILES reverse j=%zu c0=%u pos_max(seq %d)=%d pos_min=%d\n", j, c.c0, (int) s.seq, (int) memory->seq_pos_max(s.seq), (int) memory->seq_pos_min(s.seq)); }
     const bool state_surrogate = walk.recr != nullptr && j + 1 < run.j1 && walk.acc.state_ready;
     llama_walk_chunk cc = c;
@@ -221,10 +248,11 @@ bool llama_context::opt_tiles_unit(opt_tiles & t) {
     }
     walk.acc.state_ready = false;
     if (t.run + 1 < plan.runs.size()) {
-        // the run restored to her stable self, so the next run reads it as served
-        if (!walk.restore(run, t.snaps[0])) {
-            return fail("a run of the reply could not be restored under her stable set");
+        // the run restored to her stable self, one tile per unit, so the next run reads it as served
+        if (!walk.rewind(r0, t.snaps[0], r0)) {
+            return fail("a run of the reply could not be set back to its checkpoint");
         }
+        span(r0, plan.end(run), /*shadow =*/ false);
         t.served = plan.end(run);
         ++t.run;
         t.before = true;
