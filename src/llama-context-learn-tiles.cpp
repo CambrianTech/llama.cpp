@@ -172,7 +172,9 @@ bool llama_context::opt_tiles_unit(opt_tiles & t) {
     if (!t.reverse) {
         const llama_walk_chunk & c = plan.chunks[t.chunk];
         if ((t.chunk - run.j0) % t.stride == 0) {
-            t.snaps[t.chunk - run.j0] = walk.checkpoint();
+            if (!walk.checkpoint(t.snaps[t.chunk - run.j0])) {
+                return fail("a tile's recurrent checkpoint could not be read");
+            }
         }
         if (!walk.decode_span(c.c0, c.c0 + c.n, /*shadow =*/ true)) {
             return fail("a tile's forward under the shadow did not decode");

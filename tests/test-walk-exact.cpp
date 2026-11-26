@@ -933,7 +933,8 @@ int main(int argc, char ** argv) {
             decode_span(ctx, 0, tokens.data(), 0, r0);
             decode_span(ctx, 2, neighbour, 0, 200);
         }
-        GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, tokens.data() + r0, WINDOW - r0, nullptr));
+        ggml_opt_result_t tile_result = getenv("WALK_LIVE_TILES") ? ggml_opt_result_init() : nullptr; // diagnostic: the tiled walk's loss
+        GGML_ASSERT(llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0, tokens.data() + r0, WINDOW - r0, tile_result));
         // What this catches (Codex on the join): tiles that lose the gradient a later token carries into the
         // earlier ones, a walk that disturbs her neighbour between its steps, or a restore that is not her served
         // self. The reply learns through the exact walk in tiles of WINDOW / 8, one per step, and every assertion
@@ -1034,6 +1035,7 @@ int main(int argc, char ** argv) {
                 ++yielded;
             }
         } while (progress == LLAMA_OPT_LEARN_MORE);
+        if (tile_result) { double loss = 0, unc = 0; ggml_opt_result_loss(tile_result, &loss, &unc); printf("  DEBUG tiled walk: training loss %f\n", loss); ggml_opt_result_free(tile_result); }
         GGML_ASSERT(yielded >= 1);
         if (injected_graph_failure) {
             GGML_ASSERT(progress == LLAMA_OPT_LEARN_FAILED && !ctx->opt_reply);

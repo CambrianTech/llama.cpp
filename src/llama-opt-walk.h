@@ -64,7 +64,9 @@ struct llama_context::opt_walk {
 
     bool yield_point();
     bool decode_span(uint32_t p0, uint32_t p1, bool shadow);
-    std::vector<uint8_t> checkpoint();
+    // the recurrent state at the walk's position into `snap`; false (and the walk stopped, by name) when it could
+    // not be read: a refusal, never an abort, since the walk runs inside serving
+    bool checkpoint(std::vector<uint8_t> & snap);
     bool rewind(uint32_t p_pop, const std::vector<uint8_t> & snap, uint32_t p_to);
     bool train_chunk(uint32_t pos_ctx, uint32_t n_chunk);
     bool restore(const llama_walk_run & run, const std::vector<uint8_t> & snap);

@@ -470,14 +470,18 @@ bool llama_context::opt_walk::decode_span(uint32_t p0, uint32_t p1, bool shadow)
 // only, PARTIAL_ONLY), after waiting for the queued decode; empty for a model with none. A
 // hand-rolled per-layer copy skipped that wait and, on Metal, carried a torn mid-graph state into
 // the reverse pass (2026-10-11).
-std::vector<uint8_t> llama_context::opt_walk::checkpoint() {
-    std::vector<uint8_t> snap;
-    if (recr != nullptr) {
-        lctx.synchronize();
-        snap.resize(lctx.state_seq_get_size(seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-        GGML_ASSERT(lctx.state_seq_get_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap.size());
+bool llama_context::opt_walk::checkpoint(std::vector<uint8_t> & snap) {
+    snap.clear();
+    if (recr == nullptr) {
+        return true;
     }
-    return snap;
+    lctx.synchronize();
+    snap.resize(lctx.state_seq_get_size(seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    if (lctx.state_seq_get_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != snap.size()) {
+        lctx.opt_fail("the walk could not read the recurrent state of sequence " + std::to_string(seq) + " at a checkpoint");
+        return false;
+    }
+    return true;
 }
 
 // back to position p_pop: the cache holds [0, p_pop), the recurrent state is `snap` (taken at
@@ -496,7 +500,10 @@ bool llama_context::opt_walk::rewind(uint32_t p_pop, const std::vector<uint8_t> 
     }
     if (recr != nullptr) {
         lctx.synchronize();
-        GGML_ASSERT(lctx.state_seq_set_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap.size());
+        if (lctx.state_seq_set_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != snap.size()) {
+            lctx.opt_fail("the walk could not set the recurrent state of sequence " + std::to_string(seq) + " back to a checkpoint");
+            return false;
+        }
     }
     return p_pop >= p_to || decode_span(p_pop, p_to, /*shadow =*/ true);
 }
@@ -727,7 +734,9 @@ void llama_context::opt_walk::run_exact() {
         std::vector<std::vector<uint8_t>> snaps(run.j1 - run.j0);
         for (size_t j = run.j0; j < run.j1; ++j) {
             if ((j - run.j0) % stride == 0) {
-                snaps[j - run.j0] = checkpoint();
+                if (!checkpoint(snaps[j - run.j0])) {
+                    return;
+                }
             }
             if (!decode_span(chunks[j].c0, chunks[j].c0 + chunks[j].n, /*shadow =*/ true)) {
                 return;
@@ -806,7 +815,10 @@ void llama_context::opt_walk::run_plain() {
         if (!decode_span(p, plan.begin(run), /*shadow =*/ false)) {
             return;
         }
-        const std::vector<uint8_t> at_run = checkpoint();
+        std::vector<uint8_t> at_run;
+        if (!checkpoint(at_run)) {
+            return;
+        }
         for (size_t j = run.j0; j < run.j1; ++j) {
             const llama_walk_chunk & c = plan.chunks[j];
             if (!yield_point()) {
@@ -814,7 +826,10 @@ void llama_context::opt_walk::run_plain() {
             }
             // the training forward advances a recurrent state in place and may write the chunk's
             // cells: back to the chunk's start, then decode it under the stepped shadow
-            const std::vector<uint8_t> at_chunk = j + 1 < run.j1 ? checkpoint() : std::vector<uint8_t>();
+            std::vector<uint8_t> at_chunk;
+            if (j + 1 < run.j1 && !checkpoint(at_chunk)) {
+                return;
+            }
             if (!train_chunk(c.c0, c.n)) {
                 return;
             }
