@@ -911,6 +911,7 @@ struct llm_graph_params {
     // rows (n_shadow_rows of them); a ubatch with no label never applies it, so serving is the stable set's graph
     const llama_adapter_lora * shadow = nullptr;
     uint32_t                   n_shadow_rows = 0;
+    bool                       reserve_mixed_inputs = false;
     // the physical attention stream of each of the ubatch's unique sequences (seq_id_unq order): the graph's K/V
     // views are built at these streams, so a graph is reused only when they match
     std::vector<uint32_t> streams = {};
@@ -1157,6 +1158,7 @@ struct llm_graph_context {
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
+    const bool reserve_mixed_inputs;
 
     const llama_prec_policy & prec_policy;
 
