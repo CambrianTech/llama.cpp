@@ -2233,6 +2233,10 @@ extern "C" {
     // for the whole reply. Call after begin, before the first step; the optimizer must walk exactly. Steps go
     // through llama_opt_learn_step; restoration follows as for any reply.
     LLAMA_API bool llama_opt_learn_tile(struct llama_context * ctx, uint32_t tile);
+    // What the last tiled step did: the rows it decoded (a span tile, a forward tile, the rows its train decodes) and
+    // the rows it trained. The lane's measure of one unit's work, and the proof no unit does more than its tile.
+    struct llama_opt_learn_unit { uint32_t decoded; uint32_t trained; };
+    LLAMA_API struct llama_opt_learn_unit llama_opt_learn_last_unit(const struct llama_context * ctx);
     LLAMA_API bool llama_opt_learn_draining_graph(const struct llama_context * ctx);
     // Stop admitting gradient chunks, but keep custody until step drains the original served
     // tail. Already committed optimizer steps remain committed. Call only between steps.

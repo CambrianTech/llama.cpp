@@ -945,6 +945,9 @@ int main(int argc, char ** argv) {
         // below holds: the step is the walk's exact step, her cache a stable decode, the neighbour untouched.
         // the walk's layout contract, both ways: refused up front on a shared cache (the reply still learns, by its
         // ordinary path), accepted on the Core's layout, a stream per mind
+        // WALK_LIVE_HOST_BUDGET=bytes: a host budget that forces a checkpoint stride above 1, so the reverse replays
+        // from a stride checkpoint to each tile (Codex: that replay must still be one tile per unit)
+        if (getenv("WALK_LIVE_HOST_BUDGET")) { llama_opt_set_walk_host_budget(ctx, (size_t) atoll(getenv("WALK_LIVE_HOST_BUDGET"))); }
         if (getenv("WALK_LIVE_TILES")) { GGML_ASSERT(llama_opt_learn_tile(ctx, getenv("WALK_LIVE_TILE_ROWS") ? (uint32_t) atoi(getenv("WALK_LIVE_TILE_ROWS")) : WINDOW / 8) == streams); }
         // Diagnostic: change only scheduling boundaries, not the served graph/window
         // or the independent whole-reply gradient oracle. No production chunk policy.
@@ -960,6 +963,7 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(!llama_opt_state_write(ctx, partial_state, "active-live-reply"));
         fclose(partial_state);
         llama_opt_learn_status progress;
+        uint32_t tiled_units = 0, tiled_decoded = 0, tiled_most = 0; // every tiled step's work, for the receipt
         int yielded = 0;
         int graph_neighbour_turns = 0;
         bool shifted_neighbour_pending = false;
@@ -971,15 +975,18 @@ int main(int argc, char ** argv) {
             }
             // what this catches (Codex on c6d40d7917): a tile step that decodes more than its tile in one unit
             // (the context before a run, a reverse replay from a stride checkpoint, a run restored between runs),
-            // holding the Core past the slack the tile was sized to. Every tiled unit advances her cache by at most
-            // one tile.
+            // holding the Core past the slack the tile was sized to. Each tiled step reports its own work
+            // (llama_opt_learn_last_unit), and no step decodes more than one tile. Counted at the decode, since a
+            // reverse pops her cache back to its checkpoint before it replays: the position she ends at hides a replay.
             const bool tiled = ctx->opt_reply != nullptr && ctx->opt_reply->tiles != nullptr;
-            const llama_pos at_before = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
             progress = llama_opt_learn_step(ctx);
             if (tiled && getenv("WALK_LIVE_TILE_ROWS")) {
-                const llama_pos advanced = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) - at_before;
-                if (advanced > (llama_pos) atoi(getenv("WALK_LIVE_TILE_ROWS"))) {
-                    fprintf(stderr, "FAILED: one tiled unit decoded %d rows, past its tile of %s\n", (int) advanced, getenv("WALK_LIVE_TILE_ROWS"));
+                const llama_opt_learn_unit unit = llama_opt_learn_last_unit(ctx);
+                ++tiled_units;
+                tiled_decoded += unit.decoded;
+                tiled_most = std::max(tiled_most, unit.decoded);
+                if (unit.decoded > (uint32_t) atoi(getenv("WALK_LIVE_TILE_ROWS"))) {
+                    fprintf(stderr, "FAILED: one tiled unit decoded %u rows, past its tile of %s\n", unit.decoded, getenv("WALK_LIVE_TILE_ROWS"));
                     ++failures;
                 }
             }
@@ -1054,6 +1061,7 @@ int main(int argc, char ** argv) {
                 ++yielded;
             }
         } while (progress == LLAMA_OPT_LEARN_MORE);
+        if (tiled_units > 0) { printf("  tiled units: %u, %u rows decoded, at most %u in one\n", tiled_units, tiled_decoded, tiled_most); }
         if (tile_result) { double loss = 0, unc = 0; ggml_opt_result_loss(tile_result, &loss, &unc); printf("  DEBUG tiled walk: training loss %f\n", loss); ggml_opt_result_free(tile_result); }
         GGML_ASSERT(yielded >= 1);
         if (injected_graph_failure) {

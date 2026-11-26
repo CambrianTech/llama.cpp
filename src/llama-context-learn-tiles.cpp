@@ -127,7 +127,7 @@ bool llama_context::opt_learn_tile(uint32_t tile) {
     opt_stop_requested.store(false);
     opt_alloc_failed.store(false);
     tiles->walk.acc.unbind(); // bound only while a step runs
-    if (getenv("WALK_TILES_DEBUG")) { for (const auto & r : walk.plan.runs) { for (size_t j = r.j0; j < r.j1; ++j) { const auto & c = walk.plan.chunks[j]; fprintf(stderr, "TILES chunk %zu c0=%u n=%u labels=%u scale=%f period_end=%d grad_from=%u surrogate=%d\n", j, c.c0, c.n, c.n_labels, c.loss_scale, (int) c.period_end, c.grad_from, (int) c.surrogate); } } fprintf(stderr, "TILES prefix=%d n_train=%d plan.n_labels=%u last_label=%lld tokens=%zu\n", (int) s.prefix, s.n_train, walk.plan.n_labels, (long long) walk.plan.last_label, tiles->tokens.size()); }
+    if (getenv("WALK_TILES_DEBUG")) { for (const auto & r : walk.plan.runs) { for (size_t j = r.j0; j < r.j1; ++j) { const auto & c = walk.plan.chunks[j]; fprintf(stderr, "TILES chunk %zu c0=%u n=%u labels=%u scale=%f period_end=%d grad_from=%u surrogate=%d\n", j, c.c0, c.n, c.n_labels, c.loss_scale, (int) c.period_end, c.grad_from, (int) c.surrogate); } } fprintf(stderr, "TILES prefix=%d n_train=%d plan.n_labels=%u last_label=%lld tokens=%zu stride=%zu host_bytes=%zu\n", (int) s.prefix, s.n_train, walk.plan.n_labels, (long long) walk.plan.last_label, tiles->tokens.size(), tiles->stride, bytes); }
     s.tiles = std::move(tiles);
     return true;
 }
@@ -150,6 +150,7 @@ llama_opt_learn_status llama_context::opt_tiles_step() {
         cparams.n_batch = cparams.n_ubatch = t.tile;
         t.walk.acc.bind(cparams);
         t.walk.first_unit = true; // each step is one unit: nothing inside it waits for a yield
+        opt_last_unit = {0, 0};
         finished = !opt_tiles_unit(t);
     }
     if (finished) {
@@ -181,6 +182,7 @@ bool llama_context::opt_tiles_unit(opt_tiles & t) {
         if (!walk.decode_span(t.span_at, to, t.span_shadow)) {
             return fail("a tile of a span the walk decodes (context, replay or restore) did not decode");
         }
+        opt_last_unit.decoded += to - t.span_at;
         t.span_at = to;
         return true;
     }
@@ -203,6 +205,7 @@ bool llama_context::opt_tiles_unit(opt_tiles & t) {
                 return fail("a tile's recurrent checkpoint could not be read");
             }
         }
+        opt_last_unit.decoded += c.n;
         if (!walk.decode_span(c.c0, c.c0 + c.n, /*shadow =*/ true)) {
             return fail("a tile's forward under the shadow did not decode");
         }
@@ -236,6 +239,8 @@ bool llama_context::opt_tiles_unit(opt_tiles & t) {
     cc.grad_from = std::max(r0, llama_walk_plan::grad_from(cc.c0, opt_walk_horizon));
     walk.set_flags(true, cc.grad_from, c.surrogate, state_surrogate);
     walk.xc = &cc;
+    opt_last_unit.decoded += cc.n;
+    opt_last_unit.trained += cc.n;
     const bool ok = walk.train_chunk(cc.c0, cc.n);
     walk.xc = nullptr;
     walk.set_flags(false, 0, false, false);
@@ -266,3 +271,5 @@ bool llama_context::opt_tiles_unit(opt_tiles & t) {
 }
 
 bool llama_opt_learn_tile(llama_context * ctx, uint32_t tile) { return ctx && ctx->opt_learn_tile(tile); }
+
+llama_opt_learn_unit llama_opt_learn_last_unit(const llama_context * ctx) { return ctx ? ctx->opt_last_unit : llama_opt_learn_unit{0, 0}; }

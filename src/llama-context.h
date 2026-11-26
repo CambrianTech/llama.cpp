@@ -323,6 +323,7 @@ struct llama_context {
     bool opt_learn_tile(uint32_t tile);
     llama_opt_learn_status opt_tiles_step();
     bool opt_tiles_unit(opt_tiles & tiles);
+    llama_opt_learn_unit opt_last_unit = {0, 0}; // the last tiled step's work (llama_opt_learn_last_unit)
     bool opt_learn_drain();
     bool opt_learn_needs_gradient() const;
 
