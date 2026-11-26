@@ -55,7 +55,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
-    llama_memory_context_ptr init_full_single_stream() override;
+    llama_memory_context_ptr init_full_single_stream(uint32_t rows) override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
     bool has_pending_update() const override { return mem_attn->has_pending_update() || mem_recr->has_pending_update(); }
@@ -123,7 +123,7 @@ public:
     explicit llama_memory_hybrid_context(llama_memory_status status);
 
     // init full
-    explicit llama_memory_hybrid_context(llama_memory_hybrid * mem, bool single_stream = false);
+    explicit llama_memory_hybrid_context(llama_memory_hybrid * mem, bool single_stream = false, uint32_t rows = 0);
 
     // init update
     explicit llama_memory_hybrid_context(

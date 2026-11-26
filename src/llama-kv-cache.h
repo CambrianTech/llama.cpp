@@ -132,7 +132,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
-    llama_memory_context_ptr init_full_single_stream() override;
+    llama_memory_context_ptr init_full_single_stream(uint32_t rows) override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
     bool has_pending_update() const override { return get_has_shift() || !sc_info.empty(); }
@@ -432,7 +432,7 @@ public:
 
     // used to create a full-cache context
     llama_kv_cache_context(
-            llama_kv_cache * kv, bool single_stream = false);
+            llama_kv_cache * kv, bool single_stream = false, uint32_t rows = 0);
 
     // used to create an update context
     llama_kv_cache_context(

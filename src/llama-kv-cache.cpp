@@ -3036,8 +3036,8 @@ void llama_kv_cache::state_clear(llama_seq_id seq_id, uint32_t strm, const slot_
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv, bool single_stream) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+        llama_kv_cache * kv, bool single_stream, uint32_t rows) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+    n_kv = rows ? std::min(kv->get_size(), std::max(256u, GGML_PAD(rows, 256u))) : kv->get_size(); // Continuum: a lesson reads its own rows, padded as get_n_kv pads a live step
 
     // worst case for graph reservation, only a unified cache splits into per-sequence lists
     n_kv_rows = single_stream || kv->get_n_stream() == 1 ? n_kv : 0; // Continuum: a single-stream context (one mind) reads one stream

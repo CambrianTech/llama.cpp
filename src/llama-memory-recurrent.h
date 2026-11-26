@@ -41,7 +41,7 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
-    llama_memory_context_ptr init_full_single_stream() override { return init_full(); }
+    llama_memory_context_ptr init_full_single_stream(uint32_t rows) override { (void) rows; return init_full(); } // recurrent state has no rows to bound
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
     bool has_pending_update() const override { return false; }

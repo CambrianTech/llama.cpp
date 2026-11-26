@@ -2152,10 +2152,12 @@ extern "C" {
             llama_opt_memory_callback callback, void * user_data);
     // One whole-reply optimizer graph, yielded by graph nodes, never token batches.
     // Measures the commit graph only: accumulation-only callers use the general
-    // preflight above. Rows describe the actual example, not a context/window limit.
+    // preflight above. Rows describe the actual example, not a context/window limit:
+    // reply_rows are the rows it trains, lesson_rows the whole lesson its attention reads
+    // (context and reply), so attention is priced at the lesson, never the served window.
     // Execution remeasures its geometry and re-admits growth before mutation.
     LLAMA_API bool llama_opt_measure_shadow_graph(struct llama_context * ctx, struct llama_opt_params params,
-            uint32_t reply_rows, llama_opt_memory_callback callback, void * user_data);
+            uint32_t reply_rows, uint32_t lesson_rows, llama_opt_memory_callback callback, void * user_data);
     LLAMA_API bool llama_opt_measure_memory(struct llama_context * ctx,
             llama_opt_memory_callback callback, void * user_data);
 

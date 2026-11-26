@@ -6,17 +6,22 @@
 #include <algorithm>
 #include <limits>
 
-bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void * user_data, opt_measure_phase phases, ggml_backend_sched_t held, uint32_t reply_rows) {
+bool llama_context::opt_measure_memory(llama_opt_memory_callback callback, void * user_data, opt_measure_phase phases, ggml_backend_sched_t held, uint32_t reply_rows, uint32_t lesson_rows) {
     if (!callback || !opt_shadow || opt_reply || !memory) {
         opt_failure = "learning preflight requires a selected shadow and an idle learning boundary";
         return false;
     }
-    if (reply_rows > cparams.n_ctx_seq) {
+    if (reply_rows > cparams.n_ctx_seq || lesson_rows > cparams.n_ctx_seq) {
         opt_failure = "reply geometry exceeds the served window";
         return false;
     }
+    // a lesson holds its reply: attention priced at fewer rows than it trains would underprice it
+    if (lesson_rows != 0 && lesson_rows < reply_rows) {
+        opt_failure = "a lesson's rows are fewer than its reply's";
+        return false;
+    }
     synchronize();
-    auto mctx = memory->init_full_single_stream();
+    auto mctx = memory->init_full_single_stream(lesson_rows);
     if (!mctx || llama_memory_status_is_fail(mctx->get_status())) {
         opt_failure = "cannot describe the served memory for learning preflight";
         return false;

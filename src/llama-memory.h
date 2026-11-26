@@ -151,7 +151,8 @@ struct llama_memory_i {
 
     // Full served capacity for one learning sequence, without applying/cache mutation.
     // Unsupported memory owners refuse explicitly rather than building multi-stream backward.
-    virtual llama_memory_context_ptr init_full_single_stream() { return nullptr; }
+    // Continuum: rows > 0 bounds attention at that many cells (padded as a live step pads), 0 the whole capacity.
+    virtual llama_memory_context_ptr init_full_single_stream(uint32_t rows) { (void) rows; return nullptr; }
 
 
     // prepare for any pending memory updates, such as shifts, copies, etc.

@@ -118,7 +118,7 @@ ggml_opt_params llama_context::opt_params_for(llama_opt_params lopt_params) {
     return opt_params;
 }
 
-bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory_callback callback, void * user_data, opt_measure_phase phase, uint32_t reply_rows) {
+bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory_callback callback, void * user_data, opt_measure_phase phase, uint32_t reply_rows, uint32_t lesson_rows) {
     if (!callback || !params.adapter || opt_reply) {
         opt_failure = "shadow preflight requires an idle learning boundary";
         return false;
@@ -135,9 +135,12 @@ bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory
         ggml_opt_params opt_params;
         uint32_t window;
         const llama_adapter_lora * shadow;
+        // constructed before the owners below are taken: a map whose construction throws (MSVC's
+        // allocates) leaves the scheduler and graph slots where they were, since the guard's
+        // destructor never runs for a guard not fully built (the 5090's bad_alloc, 2026-11-26)
+        std::unordered_map<ggml_tensor *, int32_t> flags;
         ggml_backend_sched_ptr scheduler;
         std::array<llm_graph_result_ptr, 2> graph; // both result slots
-        std::unordered_map<ggml_tensor *, int32_t> flags;
         ~restore_measurement() {
             ctx.sched = std::move(scheduler);
             ctx.gf_res_prev = std::move(graph);
@@ -148,8 +151,8 @@ bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory
             ctx.opt_shadow = shadow;
             for (const auto & item : flags) { item.first->flags = item.second; }
         }
-    } restore{*this, cparams, opt_params_base, opt_n_ctx_train, opt_shadow,
-              std::move(sched), std::move(gf_res_prev), {}};
+    } restore{*this, cparams, opt_params_base, opt_n_ctx_train, opt_shadow, {},
+              std::move(sched), std::move(gf_res_prev)};
     for (const auto * adapter : {opt_shadow, static_cast<const llama_adapter_lora *>(params.adapter)}) {
         if (!adapter) { continue; }
         for (const auto & item : adapter->ab_map) {
@@ -175,7 +178,7 @@ bool llama_context::opt_measure_shadow(llama_opt_params params, llama_opt_memory
                 max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     opt_reset_graph_results(max_nodes);
     opt_params_base = opt_params_for(params);
-    return opt_measure_memory(callback, user_data, phase, held_scheduler, reply_rows);
+    return opt_measure_memory(callback, user_data, phase, held_scheduler, reply_rows, lesson_rows);
 }
 
 bool llama_opt_measure_shadow(llama_context * ctx, llama_opt_params params,
@@ -183,10 +186,10 @@ bool llama_opt_measure_shadow(llama_context * ctx, llama_opt_params params,
     return ctx && ctx->opt_measure_shadow(params, callback, user_data, llama_context::opt_measure_phase::accumulation_and_commit);
 }
 
-bool llama_opt_measure_shadow_graph(llama_context * ctx, llama_opt_params params, uint32_t reply_rows,
+bool llama_opt_measure_shadow_graph(llama_context * ctx, llama_opt_params params, uint32_t reply_rows, uint32_t lesson_rows,
         llama_opt_memory_callback callback, void * user_data) {
     return ctx && reply_rows > 0 && ctx->opt_measure_shadow(params, callback, user_data,
-            llama_context::opt_measure_phase::whole_reply_commit, reply_rows);
+            llama_context::opt_measure_phase::whole_reply_commit, reply_rows, lesson_rows);
 }
 
 static void opt_bind_admission(ggml_opt_context_t optimizer, const llama_opt_params & params) {
@@ -1163,7 +1166,7 @@ bool llama_context::opt_prepare_restore(const llama_batch & retained) {
     }
     // Use the same full-capacity single-stream planning view as admission. Never apply, decode, or
     // graph_reserve here: allocation does not insert cache cells or execute a retained sample.
-    auto planning = memory ? memory->init_full_single_stream() : llama_memory_context_ptr{};
+    auto planning = memory ? memory->init_full_single_stream(0) : llama_memory_context_ptr{};
     if (memory && (!planning || llama_memory_status_is_fail(planning->get_status()))) {
         opt_fail("restore memory planning refused");
         return false;

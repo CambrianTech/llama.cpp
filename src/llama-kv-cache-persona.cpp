@@ -261,8 +261,8 @@ void llama_kv_cache::persona_commit_load(llama_seq_id seq_id, llama_persona_slot
 }
 
 
-llama_memory_context_ptr llama_kv_cache::init_full_single_stream() {
-    return std::make_unique<llama_kv_cache_context>(this, true);
+llama_memory_context_ptr llama_kv_cache::init_full_single_stream(uint32_t rows) {
+    return std::make_unique<llama_kv_cache_context>(this, true, rows);
 }
 
 
