@@ -3171,10 +3171,12 @@ void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
 }
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (!dst->buffer) { return; } // Continuum: left out of the graph (training past the cache): nothing reads it
     kv->set_input_k_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (!dst->buffer) { return; } // Continuum: left out of the graph (training past the cache): nothing reads it
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
