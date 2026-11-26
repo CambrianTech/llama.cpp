@@ -238,6 +238,7 @@ struct llama_context {
     void perf_reset();
 
     llama_context_buffer_bytes buffer_bytes() const;
+    int32_t memory_rows(llama_context_memory_row * out, int32_t n_max) const; // Continuum, llama-context-api.cpp
     llama_memory_breakdown memory_breakdown() const;
 
     //

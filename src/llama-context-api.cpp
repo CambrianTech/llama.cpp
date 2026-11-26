@@ -52,6 +52,40 @@ bool llama_context_get_buffer_bytes(const llama_context * ctx, llama_context_buf
     }
 }
 
+int32_t llama_context::memory_rows(llama_context_memory_row * out, int32_t n_max) const {
+    auto rows = memory_breakdown();
+    const ggml_backend_buffer_type_t output = buf_output ? ggml_backend_buffer_get_type(buf_output.get()) : nullptr;
+    if (output) {
+        rows[output]; // the output buffer's type has a row
+    }
+    int32_t n = 0;
+    for (const auto & [buft, bytes] : rows) {
+        if (n < n_max) {
+            out[n] = {
+                /*.buffer_type =*/ buft,
+                /*.model       =*/ bytes.model,
+                /*.context     =*/ bytes.context,
+                /*.compute     =*/ bytes.compute,
+                /*.output      =*/ buft == output ? ggml_backend_buffer_get_size(buf_output.get()) : 0,
+            };
+        }
+        ++n;
+    }
+    return n;
+}
+
+int32_t llama_context_memory_rows(const llama_context * ctx, llama_context_memory_row * out, int32_t n_max) {
+    if (!ctx || (n_max > 0 && !out)) {
+        return -1;
+    }
+    try {
+        return ctx->memory_rows(out, n_max);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        return -1;
+    }
+}
+
 // Continuum: the context parameters upstream's constructor does not read (called from it, one line)
 void llama_context::continuum_params(const llama_context_params & params) {
     if (params.embeddings_only && (!params.embeddings || params.pooling_type == LLAMA_POOLING_TYPE_NONE || params.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED)) {

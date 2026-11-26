@@ -597,6 +597,22 @@ extern "C" {
     LLAMA_API bool llama_context_get_buffer_bytes(
             const struct llama_context * ctx, struct llama_context_buffer_bytes * out);
 
+    // Continuum (UNIFIED-PAGING.md, slice 3b): every byte this context holds, per allocator buffer type, by
+    // what it is: the model's weights, the context's memory (KV, recurrent state, the expert cache), the
+    // scheduler's compute workspace (serving's and a reply's), and the output buffer. The buffer type is the
+    // identity (a handle, never its name), so a caller places each row on the memory it lives in.
+    struct llama_context_memory_row {
+        ggml_backend_buffer_type_t buffer_type;
+        uint64_t model;
+        uint64_t context;
+        uint64_t compute;
+        uint64_t output;
+    };
+    // Writes at most `n_max` rows to `out` and returns how many there are (more than `n_max`: call again
+    // with room for all). -1 when the context could not account for its buffers.
+    LLAMA_API int32_t llama_context_memory_rows(
+            const struct llama_context * ctx, struct llama_context_memory_row * out, int32_t n_max);
+
     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
