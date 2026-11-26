@@ -3066,7 +3066,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    gparams.reserve_mixed_inputs = true;
 
     res->reset();
 

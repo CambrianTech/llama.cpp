@@ -1693,6 +1693,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hparams          (model.hparams),
     cparams          (params.cparams),
     ubatch           (params.ubatch),
+    reserve_mixed_inputs(params.reserve_mixed_inputs),
     prec_policy      (model.prec_policy),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
@@ -2757,7 +2758,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
     // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it
-    const bool has_mixed = llm_arch_supports_mixed_batch(model.arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+    // Reserve for a mixed batch, but only put its row writes into an execution graph
+    // when the batch supplies the slot indices consumed by those writes.
+    const bool has_mixed = (reserve_mixed_inputs || ubatch.is_mixed()) &&
+            llm_arch_supports_mixed_batch(model.arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
 
     const int64_t n_tok_rows = has_mixed ? llm_graph_n_tok_rows(ubatch) : 0;
 
