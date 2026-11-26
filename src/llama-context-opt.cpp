@@ -446,6 +446,9 @@ struct llama_context::opt_walk {
     int64_t                          t_loop_start;
     uint32_t                         n_ctx;
     uint32_t                         n_batch;
+    // the sequence it walks: 0 for an epoch over a dataset window; a live reply's own sequence when it
+    // learns in tiles beside serving (UNIFIED-PAGING.md, "The join")
+    llama_seq_id                     seq;
     llama_walk_plan                  plan;
 
     // a recurrent part (pure recurrent or hybrid) carries its state across chunks; a hybrid's
@@ -461,10 +464,10 @@ struct llama_context::opt_walk {
     opt_walk(llama_context & lctx, ggml_opt_dataset_t dataset, ggml_opt_result_t result,
             const std::vector<llama_token> & tokens, const std::vector<llama_token> & labels, llama_batch & batch,
             ggml_opt_epoch_callback callback, bool train, int64_t idata_in_loop, int64_t ndata_in_loop, int64_t t_loop_start,
-            uint32_t n_ctx, uint32_t n_batch)
+            uint32_t n_ctx, uint32_t n_batch, llama_seq_id seq)
         : lctx(lctx), dataset(dataset), result(result), tokens(tokens), labels(labels), batch(batch), callback(callback),
           train(train), idata_in_loop(idata_in_loop), ndata_in_loop(ndata_in_loop), t_loop_start(t_loop_start),
-          n_ctx(n_ctx), n_batch(n_batch), plan(llama_walk_plan::of(labels, n_ctx, n_batch)) {}
+          n_ctx(n_ctx), n_batch(n_batch), seq(seq), plan(llama_walk_plan::of(labels, n_ctx, n_batch)) {}
 
     bool yield_point();
     bool decode_span(uint32_t p0, uint32_t p1, bool shadow);
@@ -507,7 +510,7 @@ bool llama_context::opt_walk::decode_span(uint32_t p0, uint32_t p1, bool shadow)
             return false; // stopped or cancelled at a chunk boundary: not a decode failure
         }
         const uint32_t c1 = std::min(c0 + n_batch, p1);
-        llama_walk_fill(batch, tokens, c0, c1 - c0);
+        llama_walk_fill(batch, tokens, c0, c1 - c0, seq);
         for (uint32_t i = 0; shadow && i < c1 - c0; ++i) {
             // a label marks the row the shadow sees; the allocator wants it an output row
             batch.label [i] = labels[c0 + i];
@@ -535,8 +538,8 @@ std::vector<uint8_t> llama_context::opt_walk::checkpoint() {
     std::vector<uint8_t> snap;
     if (recr != nullptr) {
         lctx.synchronize();
-        snap.resize(lctx.state_seq_get_size(0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
-        GGML_ASSERT(lctx.state_seq_get_data(0, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap.size());
+        snap.resize(lctx.state_seq_get_size(seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+        GGML_ASSERT(lctx.state_seq_get_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap.size());
     }
     return snap;
 }
@@ -549,7 +552,7 @@ std::vector<uint8_t> llama_context::opt_walk::checkpoint() {
 // prepare the ubatch at all (the 5090, 2026-10-10: "init_batch: failed to prepare attention
 // ubatches" after "retrying at 512").
 bool llama_context::opt_walk::rewind(uint32_t p_pop, const std::vector<uint8_t> & snap, uint32_t p_to) {
-    const bool popped = recr != nullptr ? (attn == nullptr || attn->seq_rm(0, p_pop, -1)) : lctx.memory->seq_rm(0, p_pop, -1);
+    const bool popped = recr != nullptr ? (attn == nullptr || attn->seq_rm(seq, p_pop, -1)) : lctx.memory->seq_rm(seq, p_pop, -1);
     if (!popped) {
         LLAMA_LOG_ERROR("%s: could not pop the cache to [0, %u)\n", __func__, p_pop);
         lctx.opt_stop_requested.store(true);
@@ -557,7 +560,7 @@ bool llama_context::opt_walk::rewind(uint32_t p_pop, const std::vector<uint8_t> 
     }
     if (recr != nullptr) {
         lctx.synchronize();
-        GGML_ASSERT(lctx.state_seq_set_data(0, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap.size());
+        GGML_ASSERT(lctx.state_seq_set_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == snap.size());
     }
     return p_pop >= p_to || decode_span(p_pop, p_to, /*shadow =*/ true);
 }
@@ -567,7 +570,7 @@ bool llama_context::opt_walk::rewind(uint32_t p_pop, const std::vector<uint8_t> 
 // then llama_context::opt_ubatch). This function only fills the chunk's tokens and labels and
 // says whose walk it is.
 bool llama_context::opt_walk::train_chunk(uint32_t pos_ctx, uint32_t n_chunk) {
-    llama_walk_fill(batch, tokens, pos_ctx, n_chunk);
+    llama_walk_fill(batch, tokens, pos_ctx, n_chunk, seq);
     for (uint32_t pos_batch = 0; pos_batch < n_chunk; ++pos_batch) {
         batch.logits[pos_batch] = false;
         batch.label [pos_batch] = labels[pos_ctx + pos_batch];
@@ -742,7 +745,7 @@ void llama_context::opt_walk::run_exact() {
     // one (llm_graph_context::rs_keep), so they train in that context. Only a PENDING undo reads a
     // snapshot instead of the live state: that alone is refused, by name, never asserted, since
     // training runs inside the serving process (2026-10-07 04:09Z on the 5090).
-    if (recr != nullptr && recr->rollback_pending(0)) {
+    if (recr != nullptr && recr->rollback_pending(seq)) {
         lctx.opt_fail("the exact walk cannot train a sequence with a pending recurrent rollback (n_rs_seq = "
             + std::to_string(lctx.cparams.n_rs_seq) + "): finish or drop the draft first");
         return;
@@ -914,7 +917,7 @@ void llama_context::opt_epoch_iter(
     memory->clear(true);
 
     opt_walk walk(*this, dataset, result, tokens, labels_sparse, batch, callback, train,
-        idata_in_loop, ndata_in_loop, t_loop_start, n_ctx, n_batch);
+        idata_in_loop, ndata_in_loop, t_loop_start, n_ctx, n_batch, /*seq =*/ 0); // an epoch walks its window as sequence 0 (the memory was just cleared)
     if (walk.plan.last_label < 0) {
         LLAMA_LOG_ERROR("%s: a training window with no labelled position: nothing to learn from it\n", __func__);
         return;

@@ -107,4 +107,4 @@ private:
 
 // positions [c0, c0 + n) of the window into the batch, one sequence, no output row: the
 // caller marks the rows it wants out
-void llama_walk_fill(llama_batch & batch, const std::vector<llama_token> & tokens, uint32_t c0, uint32_t n);
+void llama_walk_fill(llama_batch & batch, const std::vector<llama_token> & tokens, uint32_t c0, uint32_t n, llama_seq_id seq);

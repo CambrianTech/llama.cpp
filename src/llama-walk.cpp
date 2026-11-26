@@ -160,13 +160,13 @@ llama_walk_acc::~llama_walk_acc() {
     }
 }
 
-void llama_walk_fill(llama_batch & batch, const std::vector<llama_token> & tokens, uint32_t c0, uint32_t n) {
+void llama_walk_fill(llama_batch & batch, const std::vector<llama_token> & tokens, uint32_t c0, uint32_t n, llama_seq_id seq) {
     batch.n_tokens = n;
     for (uint32_t i = 0; i < n; ++i) {
         batch.token   [i]    = tokens[c0 + i];
         batch.pos     [i]    = c0 + i;
         batch.n_seq_id[i]    = 1;
-        batch.seq_id  [i][0] = 0;
+        batch.seq_id  [i][0] = seq;
         batch.logits  [i]    = false;
     }
 }
