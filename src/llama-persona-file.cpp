@@ -393,7 +393,7 @@ constexpr uint32_t CHECKPOINT_VERSION = 1;
 
 } // namespace
 
-int32_t llama_persona_checkpoint_write_file(const llama_persona * persona, const llama_persona_checkpoint * checkpoint, const char * path, uint64_t generation) {
+static int32_t checkpoint_write_file(const llama_persona * persona, const llama_persona_checkpoint * checkpoint, const char * path, uint64_t generation) {
     const auto & b = persona->blocks;
     const auto & c = checkpoint->blocks;
     if (!c.taken) {
@@ -439,7 +439,7 @@ int32_t llama_persona_checkpoint_write_file(const llama_persona * persona, const
     return (int32_t) llama_persona_move::done;
 }
 
-int32_t llama_persona_checkpoint_read_file(llama_persona * persona, const char * path, uint64_t generation, llama_persona_checkpoint * out) {
+static int32_t checkpoint_read_file(llama_persona * persona, const char * path, uint64_t generation, llama_persona_checkpoint * out) {
     auto & b = persona->blocks;
     auto & c = out->blocks;
     c.taken = false; // a refused read leaves nothing taken, never a stale checkpoint
@@ -479,14 +479,10 @@ int32_t llama_persona_checkpoint_read_file(llama_persona * persona, const char *
     if (!r.rows(rs_r, r_bytes) || !r.rows(rs_s, s_bytes)) {
         return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
     }
-    // every check passed: bind it to her restored cells, as a take would have
-    llama_kv_cells::checkpoint_position mark;
-    try {
-        mark = std::make_shared<const llama_pos>(pos);
-        b.kv.cells.prepare_checkpoint();
-    } catch (const std::bad_alloc &) {
-        return (int32_t) llama_persona_move::out_of_memory;
-    }
+    // every check passed: bind it to her restored cells, as a take would have. Both allocations come first (a refusal
+    // here leaves her cells and the checkpoint as they were); what follows reserves nothing and cannot throw.
+    llama_kv_cells::checkpoint_position mark = std::make_shared<const llama_pos>(pos);
+    b.kv.cells.prepare_checkpoint();
     b.kv.cells.mark_checkpoint(mark);
     c.seq          = b.seq;
     c.pos          = pos;
@@ -501,4 +497,25 @@ int32_t llama_persona_checkpoint_read_file(llama_persona * persona, const char *
     c.rs.s.swap(rs_s);
     c.taken = true;
     return (int32_t) llama_persona_move::done;
+}
+
+// The exported boundary of both (Codex on #164): every allocation inside them (the path's staging name, row lengths from
+// the geometry, the rows read, the receipt) may throw std::bad_alloc under memory pressure, and nothing may cross the C
+// ABI into the caller. A refused write leaves no file of hers changed (the staging file is the only one opened, and only
+// after its name is allocated); a refused read leaves nothing taken and her cells as they were (its commit allocates first).
+int32_t llama_persona_checkpoint_write_file(const llama_persona * persona, const llama_persona_checkpoint * checkpoint, const char * path, uint64_t generation) {
+    try {
+        return checkpoint_write_file(persona, checkpoint, path, generation);
+    } catch (const std::bad_alloc &) {
+        return (int32_t) llama_persona_move::out_of_memory;
+    }
+}
+
+int32_t llama_persona_checkpoint_read_file(llama_persona * persona, const char * path, uint64_t generation, llama_persona_checkpoint * out) {
+    try {
+        return checkpoint_read_file(persona, path, generation, out);
+    } catch (const std::bad_alloc &) {
+        out->blocks.taken = false;
+        return (int32_t) llama_persona_move::out_of_memory;
+    }
 }
