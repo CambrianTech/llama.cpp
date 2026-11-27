@@ -48,6 +48,12 @@
 #include <sstream>
 #include <filesystem>
 
+// A container file of its own for one test, under the system temp dir. tmpnam is deprecated and its result unchecked
+// failed -Werror on Linux; a fixed name per test is enough here (each test removes or rewrites its own).
+static std::string temp_container(const char * tag) {
+    return (std::filesystem::temp_directory_path() / (std::string("test-moe-residency-") + tag + ".moec")).string();
+}
+
 // ------------------------------------------------------------------------------------------------
 // tiny test harness
 // ------------------------------------------------------------------------------------------------
@@ -181,8 +187,7 @@ static void test_derive_budget_from_system_capabilities() {
 static void test_container_roundtrip_real_io() {
     const uint64_t stride = ggml_moe::moec_align_up(8192);        // small aligned record for the test
     ggml_moe::ContainerHeader h = make_header(3, 4, stride);      // 3 layers x 4 experts
-    char path[L_tmpnam]; std::tmpnam(path);
-    std::string p = std::string(path) + ".moec";
+    std::string p = temp_container("roundtrip");
 
     // marker byte for (layer, expert) — distinct per record, written at both ends of the payload.
     auto marker = [](uint32_t L, uint32_t E) -> unsigned char { return (unsigned char)(1 + L * 4 + E); };
@@ -226,8 +231,7 @@ static void test_container_roundtrip_real_io() {
 static void test_container_fetcher_reads_right_expert() {
     const uint64_t stride = ggml_moe::moec_align_up(8192);
     ggml_moe::ContainerHeader h = make_header(3, 5, stride);
-    char path[L_tmpnam]; std::tmpnam(path);
-    std::string p = std::string(path) + ".moec";
+    std::string p = temp_container("fetcher");
     auto marker = [](uint32_t L, uint32_t E) -> unsigned char { return (unsigned char)(7 + L * 5 + E); };
     {   // pack
         std::ofstream out(p, std::ios::binary);
@@ -266,8 +270,7 @@ struct SyntheticSource : ggml_moe::ExpertSource {
 static void test_packer_fetcher_end_to_end() {
     const uint64_t stride = ggml_moe::moec_align_up(4096);
     const uint32_t layers = 4, experts = 6;
-    char path[L_tmpnam]; std::tmpnam(path);
-    std::string p = std::string(path) + ".moec";
+    std::string p = temp_container("packer-fetcher");
 
     SyntheticSource src;
     const bool packed = ggml_moe::moec_pack(p.c_str(), layers, experts, stride, ggml_moe::MOEC_Q_RVQ3, src);
@@ -354,8 +357,7 @@ struct WexpSource : ggml_moe::ExpertSource {
 static void test_wexp_source_packs_valid_records() {
     const uint64_t stride = ggml_moe::moec_align_up(4096);
     const uint32_t layers = 3, experts = 4;
-    char path[L_tmpnam]; std::tmpnam(path);
-    std::string p = std::string(path) + ".moec";
+    std::string p = temp_container("wexp-source");
     WexpSource src((uint32_t) (stride / 4096));
     CHECK(ggml_moe::moec_pack(p.c_str(), layers, experts, stride, ggml_moe::MOEC_Q_RVQ3, src),
           "pack a container of real WEXP records");
@@ -482,7 +484,6 @@ static void test_iq2_source_packs_and_reads_back() {
     CHECK(ggml_moe::moec_pack_dir(dir.string().c_str(), "kimi-k3-iq2", ggml_moe::MOEC_Q_IQ2,
           layers, experts, record_bytes, top_k * layers, top_k, src), "pack IQ2 container");
 
-    ggml_moe::ContainerHeader h = make_header(layers, experts, record_bytes);
     bool ok = true;
     for (uint32_t L = 0; L < layers && ok; L++) {
         std::ifstream in(dir / ("experts-L" + std::to_string(L) + ".bin"), std::ios::binary);
