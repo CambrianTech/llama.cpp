@@ -46,12 +46,12 @@ struct llama_context::opt_tiles {
 
     opt_tiles(llama_context & lctx, const opt_live_reply & s, uint32_t tile)
         : tokens(make(s, /*labels =*/ false)), labels(make(s, /*labels =*/ true)),
-          batch(llama_batch_init((int32_t) tile, 0, 1)),
+          batch(llama_batch_init_impl((int32_t) tile, 0, 1)),
           walk(lctx, /*dataset =*/ nullptr, s.result, tokens, labels, batch, /*callback =*/ nullptr, /*train =*/ true,
                0, 0, ggml_time_us(), (uint32_t) tokens.size(), tile, s.seq),
           tile(tile), served((uint32_t) s.prefix) {}
 
-    ~opt_tiles() { llama_batch_free(batch); }
+    ~opt_tiles() { llama_batch_free_impl(batch); }
 
     static std::vector<llama_token> make(const opt_live_reply & s, bool labels) {
         std::vector<llama_token> by_pos((size_t) s.prefix + (size_t) s.n_train, labels ? -1 : 0);

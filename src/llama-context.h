@@ -309,7 +309,7 @@ struct llama_context {
         bool restoring = false;
         std::unique_ptr<opt_tiles, opt_tiles_free> tiles; // set: the reply learns in tiles, one per step
         std::string failure;
-        ~opt_live_reply() { if (batch.token) { llama_batch_free(batch); } }
+        ~opt_live_reply() { if (batch.token) { llama_batch_free_impl(batch); } }
     };
     std::unique_ptr<opt_live_reply> opt_reply;
     bool opt_serving_continuation = false;

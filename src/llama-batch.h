@@ -13,6 +13,11 @@
 #include <unordered_map>
 #include <unordered_set>
 
+// Continuum: the batch allocation the deprecated public llama_batch_init/llama_batch_free wrap, for the
+// library's own callers (the learn path), which must not call a deprecated API under -Werror.
+llama_batch llama_batch_init_impl(int32_t n_tokens_alloc, int32_t embd, int32_t n_seq_max);
+void        llama_batch_free_impl(llama_batch batch);
+
 // keep this struct lightweight
 struct llama_ubatch {
     struct row_map {

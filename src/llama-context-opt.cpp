@@ -915,7 +915,7 @@ void llama_context::opt_epoch(
 
     const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
 
-    struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    struct llama_batch batch = llama_batch_init_impl(n_batch, 0, 1);
     std::vector<llama_token>        tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
 
@@ -946,7 +946,7 @@ void llama_context::opt_epoch(
         }
     }
 
-    llama_batch_free(batch);
+    llama_batch_free_impl(batch);
 }
 
 //

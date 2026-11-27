@@ -90,7 +90,7 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
     state->recurrent = recr;
     state->attention = attn;
     state->chunk_tokens = n_batch();
-    state->batch = llama_batch_init(std::max<int32_t>(n_batch(), n), 0, 1);
+    state->batch = llama_batch_init_impl(std::max<int32_t>(n_batch(), n), 0, 1);
     state->result = result;
     state->n_train = n;
     while (state->n_train > 0 && labels[state->n_train - 1] < 0) { --state->n_train; }

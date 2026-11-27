@@ -1216,6 +1216,14 @@ struct llama_batch llama_batch_get_one(
 }
 
 struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_t n_seq_max) {
+    return llama_batch_init_impl(n_tokens_alloc, embd, n_seq_max);
+}
+
+void llama_batch_free(struct llama_batch batch) {
+    llama_batch_free_impl(batch);
+}
+
+llama_batch llama_batch_init_impl(int32_t n_tokens_alloc, int32_t embd, int32_t n_seq_max) {
     llama_batch batch = {
         /*n_tokens =*/ 0,
         /*tokens   =*/ nullptr,
@@ -1251,7 +1259,7 @@ struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_
     return batch;
 }
 
-void llama_batch_free(struct llama_batch batch) {
+void llama_batch_free_impl(llama_batch batch) {
     if (batch.token)    free(batch.token);
     if (batch.embd)     free(batch.embd);
     if (batch.pos)      free(batch.pos);
