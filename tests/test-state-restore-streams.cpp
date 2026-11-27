@@ -17,17 +17,6 @@
 #include <cstdio>
 #include <vector>
 
-// upstream removed common_batch_add with the move to llama_batch_ext; the test keeps the public llama_batch
-static void state_batch_add(llama_batch & batch, llama_token id, llama_pos pos, llama_seq_id seq, bool logits) {
-    GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
-    batch.token   [batch.n_tokens] = id;
-    batch.pos     [batch.n_tokens] = pos;
-    batch.n_seq_id[batch.n_tokens] = 1;
-    batch.seq_id  [batch.n_tokens][0] = seq;
-    batch.logits  [batch.n_tokens] = logits;
-    batch.n_tokens++;
-}
-
 static llama_context * make_ctx(llama_model * model, const common_params & base, int n_parallel, bool unified) {
     common_params params = base;
     params.n_parallel = n_parallel;
@@ -39,14 +28,12 @@ static llama_context * make_ctx(llama_model * model, const common_params & base,
 
 // decode `tok` at `pos` on `seq` and copy the logits out
 static bool next_logits(llama_context * ctx, llama_token tok, int pos, llama_seq_id seq, int n_vocab, std::vector<float> & out) {
-    llama_batch batch = llama_batch_init(1, 0, 1);
-    state_batch_add(batch, tok, pos, seq, true);
-    const bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
-    if (!ok) {
+    common_batch batch(ctx);
+    batch.add(tok, pos, seq, true);
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
         return false;
     }
-    const float * logits = llama_get_logits_ith(ctx, -1);
+    const float * logits = llama_get_logits_ith(ctx, 0);
     out.assign(logits, logits + n_vocab);
     return true;
 }
@@ -89,15 +76,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
     {
-        llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+        common_batch batch(writer);
         for (int i = 0; i < n_prompt; ++i) {
-            state_batch_add(batch, (llama_token) (1 + i % 7), i, seq, false);
+            batch.add((llama_token) (1 + i % 7), i, seq, false);
         }
-        if (llama_decode(writer, batch)) {
+        if (llama_process(writer, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             fprintf(stderr, "%s : failed to decode the prompt\n", __func__);
             return 1;
         }
-        llama_batch_free(batch);
     }
 
     std::vector<uint8_t> state(llama_state_seq_get_size(writer, seq));

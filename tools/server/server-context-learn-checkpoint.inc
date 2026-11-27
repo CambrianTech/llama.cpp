@@ -74,8 +74,8 @@
         common_set_adapter_lora(ctx_tgt, attached);
         learn_lr = request.lr;
         if (!select_learning_shadow(id)) { return refuse(llama_opt_failure(ctx_tgt)); }
-        llama_batch retained = llama_batch_init((int32_t) request.reply.size(), 0, 1);
-        struct free_batch { llama_batch & batch; ~free_batch() { llama_batch_free(batch); } } batch_cleanup{retained};
+        llama_batch retained = llama_opt_batch_init((int32_t) request.reply.size());
+        struct free_batch { llama_batch & batch; ~free_batch() { llama_opt_batch_free(batch); } } batch_cleanup{retained};
         retained.n_tokens = (int32_t) request.reply.size();
         for (int32_t i = 0; i < retained.n_tokens; ++i) {
             retained.token[i] = i == 0 ? request.prompt.back() : request.reply[i - 1];
