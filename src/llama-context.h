@@ -241,6 +241,7 @@ struct llama_context {
     llama_context_buffer_bytes buffer_bytes() const;
     int32_t memory_rows(llama_context_memory_row * out, int32_t n_max) const; // Continuum, llama-context-api.cpp
     bool set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids); // Continuum, llama-pinned-experts.cpp
+    void drop_reusable_graphs(); // Continuum: no cached graph is reused across a change it cannot see
     llama_pinned_experts pinned_experts; // Continuum: a lesson's lived routing (llama-pinned-experts.h)
     llama_memory_breakdown memory_breakdown() const;
 

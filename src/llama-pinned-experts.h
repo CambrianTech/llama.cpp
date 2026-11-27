@@ -37,6 +37,7 @@ public:
     virtual ~llm_graph_input_pinned_experts() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * ids  = nullptr; // I32 [n_used, n_rows], 0 on a routed row
     ggml_tensor * mask = nullptr; // F32 [1, n_rows]

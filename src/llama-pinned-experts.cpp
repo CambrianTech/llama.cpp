@@ -38,16 +38,17 @@ void llm_graph_input_pinned_experts::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(row == ids->ne[1]);
 }
 
+bool llm_graph_input_pinned_experts::can_reuse(const llm_graph_params & params) {
+    // the same pin is still set (setting or clearing one also drops the cached graphs)
+    return params.cparams.pinned_experts == &pinned;
+}
+
 ggml_tensor * llama_pin_experts(const llm_graph_context & graph, int32_t il, ggml_tensor * routed) {
     const llama_pinned_experts * pinned = graph.cparams.pinned_experts;
+    // While a pin is set, every MoE layer carries it, covered rows or not: the graph's shape does not
+    // depend on which rows a ubatch covers, so a reused graph never skips a pin (Codex on #167); its
+    // input sets each row's mask per ubatch.
     if (pinned == nullptr || pinned->n_used != routed->ne[0] || il >= pinned->n_layer) {
-        return routed;
-    }
-    bool any = false;
-    for (uint32_t i = 0; i < graph.ubatch.n_tokens && !any; ++i) {
-        any = pinned->pinned(graph.ubatch, i);
-    }
-    if (!any) {
         return routed;
     }
     const int64_t n_used = routed->ne[0], n_rows = routed->ne[1];
@@ -71,6 +72,7 @@ bool llama_context::set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_
     if (n_pos == 0) {
         pinned_experts = {};
         cparams.pinned_experts = nullptr;
+        drop_reusable_graphs();
         return true;
     }
     const auto & hp = model.hparams;
@@ -90,7 +92,15 @@ bool llama_context::set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_
     pinned_experts.n_pos   = n_pos;
     pinned_experts.ids.assign(ids, ids + n);
     cparams.pinned_experts = &pinned_experts;
+    drop_reusable_graphs(); // a graph built without this pin has no input to carry it
     return true;
+}
+
+void llama_context::drop_reusable_graphs() {
+    for (auto & res : gf_res_prev) {
+        res->reset();
+    }
+    gf_res_prev_active = nullptr;
 }
 
 bool llama_set_pinned_experts(llama_context * ctx, llama_seq_id seq, int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids) {
