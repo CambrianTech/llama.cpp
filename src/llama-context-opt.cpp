@@ -1163,6 +1163,14 @@ bool llama_opt_prepare_restore(llama_context * ctx, llama_batch retained) {
     return ctx && ctx->opt_prepare_restore(retained);
 }
 
+llama_batch llama_opt_batch_init(int32_t n_tokens) {
+    return llama_batch_init_impl(n_tokens, 0, 1);
+}
+
+void llama_opt_batch_free(llama_batch batch) {
+    llama_batch_free_impl(batch);
+}
+
 bool llama_context::opt_state_restore(llama_adapter_lora * shadow,
         FILE * weights, FILE * optimizer, const char * binding) {
     if (opt_reply || !shadow || opt_shadow != shadow || !opt_ctx) { return false; }

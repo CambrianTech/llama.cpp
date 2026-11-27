@@ -2112,6 +2112,10 @@ extern "C" {
     // The optimizer enforces both gates. Nonfresh rejection preserves existing graph ownership.
     // This is not a journal commit or adoption.
     LLAMA_API bool llama_opt_prepare_restore(struct llama_context * ctx, struct llama_batch retained);
+    // The labelled batch llama_opt_prepare_restore takes (tokens, positions, one sequence, logits, labels), allocated for
+    // n_tokens and freed by its pair: the opt path's own allocator, since the general llama_batch_init is deprecated.
+    LLAMA_API struct llama_batch llama_opt_batch_init(int32_t n_tokens);
+    LLAMA_API void               llama_opt_batch_free(struct llama_batch batch);
     LLAMA_API bool llama_opt_state_restore(struct llama_context * ctx, struct llama_adapter_lora * shadow,
             FILE * weights, FILE * optimizer, const char * binding);
 

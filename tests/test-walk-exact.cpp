@@ -35,7 +35,7 @@
 #include <chrono>
 #include <vector>
 
-// The test drives the public llama_batch (decoded through upstream's llama_batch_compat); upstream removed
+// The test drives the labelled public llama_batch (llama_opt_batch_init, decoded by walk_decode below); upstream removed
 // common_batch_clear/common_batch_add with the move to llama_batch_ext, so the test keeps its own two.
 static void walk_batch_clear(llama_batch & batch) {
     batch.n_tokens = 0;
@@ -52,6 +52,11 @@ static void walk_batch_add(llama_batch & batch, llama_token id, llama_pos pos,
     }
     batch.logits  [batch.n_tokens] = logits;
     batch.n_tokens++;
+}
+
+// one decode of the labelled batch: the context's own decode, as the deprecated llama_decode wrapper calls it
+static int32_t walk_decode(llama_context * ctx, const llama_batch & batch) {
+    return ctx->decode(batch);
 }
 
 static const float    LR     = 1e-3f; // an SGD step is linear in the gradient at any lr
@@ -224,7 +229,7 @@ static std::vector<float> step_delta(const common_params & params, llama_model *
 static std::vector<uint8_t> stable_state(const common_params & params, llama_model * model,
                                          const std::vector<llama_token> & tokens, uint32_t r0, uint32_t r1, uint32_t chunk) {
     llama_context * ctx = make_ctx(params, model, chunk);
-    llama_batch batch = llama_batch_init(chunk, 0, 1);
+    llama_batch batch = llama_opt_batch_init(chunk);
     for (const auto & [p0, p1] : { std::make_pair(0u, r0), std::make_pair(r0, r1) }) {
         for (uint32_t c0 = p0; c0 < p1; c0 += chunk) {
             const uint32_t n = std::min(c0 + chunk, p1) - c0;
@@ -232,12 +237,12 @@ static std::vector<uint8_t> stable_state(const common_params & params, llama_mod
             for (uint32_t i = 0; i < n; ++i) {
                 walk_batch_add(batch, tokens[c0 + i], c0 + i, { 0 }, i + 1 == n);
             }
-            GGML_ASSERT(llama_decode(ctx, batch) == 0);
+            GGML_ASSERT(walk_decode(ctx, batch) == 0);
         }
     }
     std::vector<uint8_t> state(llama_state_seq_get_size(ctx, 0));
     GGML_ASSERT(llama_state_seq_get_data(ctx, state.data(), state.size(), 0) == state.size());
-    llama_batch_free(batch);
+    llama_opt_batch_free(batch);
     llama_free(ctx);
     return state;
 }
@@ -318,22 +323,22 @@ static void mixed_decode(const common_params & params, llama_model * model, cons
     op.get_opt_pars = sgd_pars;
     op.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
     op.adapter = adapter;
-    llama_batch batch = llama_batch_init(2, 0, 1);
+    llama_batch batch = llama_opt_batch_init(2);
     walk_batch_add(batch, tokens[0], 0, {0}, true);
     walk_batch_add(batch, tokens[1], 0, {1}, true);
-    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    GGML_ASSERT(walk_decode(ctx, batch) == 0);
     const auto reference_neighbor = sequence_state(ctx, 1);
     const auto reference_target = sequence_state(ctx, 0);
     batch.label[0] = tokens[2];
     batch.pos[0] = batch.pos[1] = 1;
-    GGML_ASSERT(llama_decode(ctx, batch) != 0);
+    GGML_ASSERT(walk_decode(ctx, batch) != 0);
     GGML_ASSERT(sequence_state(ctx, 0) == reference_target && sequence_state(ctx, 1) == reference_neighbor);
     llama_memory_clear(llama_get_memory(ctx), true);
     batch.pos[0] = batch.pos[1] = 0;
     llama_opt_init(ctx, model, op);
     const auto initial_weights = adapter_params(adapter);
     batch.label[0] = tokens[2];
-    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    GGML_ASSERT(walk_decode(ctx, batch) == 0);
     GGML_ASSERT(llama_get_logits_ith(ctx, 0) && llama_get_logits_ith(ctx, 1));
     const auto neighbor = sequence_state(ctx, 1);
     GGML_ASSERT(neighbor == reference_neighbor);
@@ -344,11 +349,11 @@ static void mixed_decode(const common_params & params, llama_model * model, cons
     walk_batch_clear(batch);
     walk_batch_add(batch, tokens[2], 1, {0}, true);
     batch.label[0] = llama_vocab_n_tokens(llama_model_get_vocab(model));
-    GGML_ASSERT(llama_decode(ctx, batch) != 0);
+    GGML_ASSERT(walk_decode(ctx, batch) != 0);
     GGML_ASSERT(sequence_state(ctx, 0) == trained && sequence_state(ctx, 1) == neighbor);
     GGML_ASSERT(adapter_params(adapter) == weights);
     batch.label[0] = tokens[3];
-    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    GGML_ASSERT(walk_decode(ctx, batch) == 0);
     GGML_ASSERT(sequence_state(ctx, 1) == neighbor);
     GGML_ASSERT(adapter_params(adapter) != weights);
     if (undo) {
@@ -362,12 +367,12 @@ static void mixed_decode(const common_params & params, llama_model * model, cons
         const auto pending = sequence_state(ctx, 0);
         const auto pending_weights = adapter_params(adapter);
         batch.pos[0] = 2;
-        GGML_ASSERT(llama_decode(ctx, batch) != 0);
+        GGML_ASSERT(walk_decode(ctx, batch) != 0);
         GGML_ASSERT(sequence_state(ctx, 0) == pending && sequence_state(ctx, 1) == neighbor);
         GGML_ASSERT(adapter_params(adapter) == pending_weights);
     }
     printf("mixed decode flash=%d cache=%s undo=%u: same-position sequences, neighbour preservation, admission refusal OK\n", flash, ggml_type_name(cache_type), undo);
-    llama_batch_free(batch);
+    llama_opt_batch_free(batch);
     llama_free(ctx);
     llama_adapter_lora_free(adapter);
 }
@@ -395,7 +400,7 @@ static void multi_label_decode(const common_params & params, llama_model * model
         op.adapter = adapter;
         llama_opt_init(ctx, model, op);
         const auto before = adapter_params(adapter);
-        llama_batch batch = llama_batch_init(2, 0, 1);
+        llama_batch batch = llama_opt_batch_init(2);
         for (size_t k = 0; k < sequences.size(); ++k) {
             const int seq = sequences[k];
             walk_batch_add(batch, tokens[seq], 0, {seq}, true);
@@ -408,13 +413,13 @@ static void multi_label_decode(const common_params & params, llama_model * model
         if (weights.empty()) {
             batch.label_weight = nullptr; // unweighted: the loss every backend has
         }
-        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        GGML_ASSERT(walk_decode(ctx, batch) == 0);
         batch.label_weight = kept_weights;
         auto delta = adapter_params(adapter);
         for (size_t i = 0; i < delta.size(); ++i) {
             delta[i] -= before[i];
         }
-        llama_batch_free(batch);
+        llama_opt_batch_free(batch);
         llama_free(ctx);
         llama_adapter_lora_free(adapter);
         return delta;
@@ -461,7 +466,7 @@ static void sparse_head_decode(const common_params & params, llama_model * model
             llama_opt_init(ctx, model, op);
         }
         const auto before = adapter_params(adapter);
-        llama_batch batch = llama_batch_init(3, 0, 1);
+        llama_batch batch = llama_opt_batch_init(3);
         int neighbour_row = -1;
         const std::vector<int> order = reversed ? std::vector<int>{2, 0, 1} : std::vector<int>{0, 1, 2};
         for (int row : order) {
@@ -474,7 +479,7 @@ static void sparse_head_decode(const common_params & params, llama_model * model
                 neighbour_row = batch.n_tokens - 1;
             }
         }
-        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+        GGML_ASSERT(walk_decode(ctx, batch) == 0);
         printf("sparse head allocation: train=%d public=%d reversed=%d cache=%s graph_bytes=%zu\n",
                 train, public_mode, reversed, ggml_type_name(cp.type_k), llama_opt_graph_bytes(ctx));
         result out;
@@ -488,7 +493,7 @@ static void sparse_head_decode(const common_params & params, llama_model * model
             out.logits.assign(logits, logits + llama_vocab_n_tokens(llama_model_get_vocab(model)));
         }
         out.neighbour = sequence_state(ctx, 1);
-        llama_batch_free(batch);
+        llama_opt_batch_free(batch);
         llama_free(ctx);
         llama_adapter_lora_free(adapter);
         return out;
@@ -751,17 +756,17 @@ int main(int argc, char ** argv) {
             return llama_init_from_model(model, cp);
         };
         auto decode_span = [&](llama_context * c, llama_seq_id sq, const llama_token * t, llama_pos p0, int32_t n) {
-            llama_batch b = llama_batch_init(WINDOW, 0, 1);
+            llama_batch b = llama_opt_batch_init(WINDOW);
             for (int32_t first = 0; first < n;) {
                 const int32_t last = std::min(n, first + (int32_t) llama_n_batch(c));
                 walk_batch_clear(b);
                 for (int32_t i = first; i < last; ++i) {
                     walk_batch_add(b, t[i], p0 + i, { sq }, i + 1 == n);
                 }
-                GGML_ASSERT(llama_decode(c, b) == 0);
+                GGML_ASSERT(walk_decode(c, b) == 0);
                 first = last;
             }
-            llama_batch_free(b);
+            llama_opt_batch_free(b);
         };
         auto seq_state = [&](llama_context * c, llama_seq_id sq) {
             std::vector<uint8_t> st(llama_state_seq_get_size(c, sq));
@@ -778,7 +783,7 @@ int main(int argc, char ** argv) {
         decode_span(ctl, 0, tokens.data() + r0, r0, WINDOW - r0);
         const std::vector<uint8_t> want_her = seq_state(ctl, 0);
         if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS")) {
-            auto paired = llama_batch_init(2, 0, 1);
+            auto paired = llama_opt_batch_init(2);
             paired.n_tokens = 2;
             for (int i = 0; i < 2; ++i) {
                 paired.token[i] = neighbour[200]; paired.pos[i] = 200;
@@ -788,9 +793,9 @@ int main(int argc, char ** argv) {
                 decode_span(ctl, 1, neighbour + 200, 200, 1);
                 decode_span(ctl, 2, neighbour + 200, 200, 1);
             } else {
-                GGML_ASSERT(llama_decode(ctl, paired) == 0);
+                GGML_ASSERT(walk_decode(ctl, paired) == 0);
             }
-            llama_batch_free(paired);
+            llama_opt_batch_free(paired);
         } else {
             decode_span(ctl, 1, neighbour + 200, 200, 1);
         }
@@ -1012,15 +1017,15 @@ int main(int argc, char ** argv) {
             }
             if (progress == LLAMA_OPT_LEARN_MORE) {
                 if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS") && yielded == 0) {
-                    auto paired = llama_batch_init(2, 0, 1);
+                    auto paired = llama_opt_batch_init(2);
                     paired.n_tokens = 2;
                     for (int i = 0; i < 2; ++i) {
                         paired.token[i] = neighbour[200]; paired.pos[i] = 200;
                         paired.n_seq_id[i] = 1; paired.seq_id[i][0] = i + 1; paired.logits[i] = true;
                     }
                     const auto held0 = seq_state(ctx, 0);
-                    GGML_ASSERT(llama_decode(ctx, paired) == 0);
-                    llama_batch_free(paired);
+                    GGML_ASSERT(walk_decode(ctx, paired) == 0);
+                    llama_opt_batch_free(paired);
                     GGML_ASSERT(ctx->opt_reply->graph_meta);
                     GGML_ASSERT(seq_state(ctx, 0) == held0);
                 }
@@ -1046,27 +1051,27 @@ int main(int argc, char ** argv) {
                     if (getenv("WALK_LIVE_GRAPH_SHIFT") && graph_neighbour_turns == 0 && llama_memory_can_shift(llama_get_memory(ctx))) {
                         // A queued K shift must not be consumed or silently skipped beside a retained graph.
                         llama_memory_seq_add(llama_get_memory(ctx), 1, 0, -1, 1);
-                        auto shifted = llama_batch_init(1, 0, 1);
+                        auto shifted = llama_opt_batch_init(1);
                         shifted.n_tokens = 1;
                         shifted.token[0] = neighbour[200]; shifted.pos[0] = 201;
                         shifted.n_seq_id[0] = 1; shifted.seq_id[0][0] = 1; shifted.logits[0] = true;
-                        GGML_ASSERT(llama_decode(ctx, shifted) != 0);
-                        GGML_ASSERT(llama_decode(ctx, shifted) != 0);
-                        llama_batch_free(shifted);
+                        GGML_ASSERT(walk_decode(ctx, shifted) != 0);
+                        GGML_ASSERT(walk_decode(ctx, shifted) != 0);
+                        llama_opt_batch_free(shifted);
                         shifted_neighbour_pending = true;
                         ++yielded;
                         continue; // keep the actual queued shift until the training graph completes
                     }
                     if (getenv("WALK_LIVE_GRAPH_NEIGHBOUR") && graph_neighbour_turns == 0) {
                         const auto held = llama_get_memory_breakdown(ctx);
-                        auto denied = llama_batch_init(1, 0, 1);
+                        auto denied = llama_opt_batch_init(1);
                         denied.n_tokens = 1;
                         denied.token[0] = neighbour[200]; denied.pos[0] = 200;
                         denied.n_seq_id[0] = 1; denied.seq_id[0][0] = 1; denied.logits[0] = true;
                         current_admission.allow_workspace = false;
-                        GGML_ASSERT(llama_decode(ctx, denied) != 0);
+                        GGML_ASSERT(walk_decode(ctx, denied) != 0);
                         current_admission.allow_workspace = true;
-                        llama_batch_free(denied);
+                        llama_opt_batch_free(denied);
                         const auto after_refusal = llama_get_memory_breakdown(ctx);
                         for (const auto & row : held) {
                             GGML_ASSERT(after_refusal.at(row.first).compute == row.second.compute);
@@ -1183,11 +1188,13 @@ int main(int argc, char ** argv) {
             GGML_ASSERT(adapter->restore_quarantined);
             GGML_ASSERT(llama_adapter_lora_save(adapter, checkpoint.c_str()) != 0);
             GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) != 0);
-            llama_batch quarantined_batch = llama_batch_get_one(tokens.data(), 1);
+            llama_batch quarantined_batch {}; // what llama_batch_get_one returned: one token, positions and sequence inferred
+            quarantined_batch.n_tokens = 1;
+            quarantined_batch.token = tokens.data();
             quarantined_batch.label = labels.data() + late; // a labelled row: the guard is on training decodes
-            GGML_ASSERT(llama_decode(ctx, quarantined_batch) == -3);
+            GGML_ASSERT(walk_decode(ctx, quarantined_batch) == -3);
             GGML_ASSERT(std::string(llama_opt_failure(ctx)).find("restore is uncertain") != std::string::npos);
-            GGML_ASSERT(llama_encode(ctx, quarantined_batch) == -3);
+            GGML_ASSERT(ctx->encode(quarantined_batch) == -3); // the context's own encode, as the deprecated llama_encode calls it
             GGML_ASSERT(std::string(llama_opt_failure(ctx)).find("restore is uncertain") != std::string::npos);
             float zero_scale = 0.0f;
             GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &zero_scale) == 0);
@@ -1202,7 +1209,7 @@ int main(int argc, char ** argv) {
             adapter->alora_invocation_tokens.clear();
             GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
             GGML_ASSERT(llama_state_seq_set_data(ctx, generation_prefix.data(), generation_prefix.size(), 0) == generation_prefix.size());
-            llama_batch retained = llama_batch_init(WINDOW - r0, 0, 1);
+            llama_batch retained = llama_opt_batch_init(WINDOW - r0);
             walk_batch_clear(retained);
             for (uint32_t i = 0; i < WINDOW - r0; ++i) {
                 walk_batch_add(retained, tokens[r0 + i], r0 + i, {0}, true);
@@ -1244,7 +1251,7 @@ int main(int argc, char ** argv) {
             FILE * uninitialized = tmpfile();
             GGML_ASSERT(uninitialized && !llama_opt_state_write(fresh, uninitialized, "fixture-generation"));
             fclose(uninitialized);
-            llama_batch_free(retained);
+            llama_opt_batch_free(retained);
             GGML_ASSERT(llama_set_adapters_lora(fresh, nullptr, 0, nullptr) == 0);
             adapter->alora_invocation_tokens = {tokens[0], tokens[1]};
             rewind(weights); rewind(optimizer);
