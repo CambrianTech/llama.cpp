@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #ifdef _WIN32
 #    ifndef WIN32_LEAN_AND_MEAN
 #        define WIN32_LEAN_AND_MEAN
@@ -376,4 +377,145 @@ int32_t llama_persona_read_file(llama_persona * persona, const char * path, uint
     b.owner = owner;
     b.owner_epoch = epoch;
     return (int32_t) llama_persona_move::done;
+}
+
+// Her checkpoint across a restart (CONTINUUM-ENGINE 4.15 and 4.16): the recurrent rows a checkpoint holds and where she
+// was, beside her record of the same stop. Without it a hybrid mind restored with every token she held could not rewind
+// to her view's end, so the first turn after a restart re-prefilled her whole prompt (the M5, 2026-11-27: Aiko shared
+// 214,911 of 246,764 tokens with what she held and prefilled 1,019 s). Its validity before the stop is a receipt in her
+// cells (lineage and an uncut mark); a restart gives her new cells, so the read stamps it with theirs: a checkpoint is
+// written only while that receipt holds against the blocks it is written with, and read only into blocks restored
+// from the record of the same generation, holding its position.
+namespace {
+
+constexpr uint32_t CHECKPOINT_MAGIC   = 0x314B5043; // "CPK1"
+constexpr uint32_t CHECKPOINT_VERSION = 1;
+
+} // namespace
+
+static int32_t checkpoint_write_file(const llama_persona * persona, const llama_persona_checkpoint * checkpoint, const char * path, uint64_t generation) {
+    const auto & b = persona->blocks;
+    const auto & c = checkpoint->blocks;
+    if (!c.taken) {
+        return (int32_t) llama_persona_move::no_checkpoint;
+    }
+    if (!b.owned || c.owner.persona != b.owner || c.owner.epoch != b.owner_epoch) {
+        return (int32_t) llama_persona_move::wrong_owner;
+    }
+    if (c.rs_layout != b.rs_layout) {
+        return (int32_t) llama_persona_move::layout_mismatch;
+    }
+    // still hers as taken: the cells it was taken from, uncut at or below its position since, holding it
+    if (b.kv.cells.lineage() != c.lineage || !b.kv.cells.holds_checkpoint(c.mark)) {
+        return (int32_t) llama_persona_move::checkpoint_stale;
+    }
+    if (b.seq < 0 || c.pos > b.kv.cells.seq_pos_max(b.seq)) {
+        return (int32_t) llama_persona_move::checkpoint_ahead;
+    }
+    const std::string tmp = std::string(path) + ".tmp";
+    std::FILE * f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+        return (int32_t) llama_persona_move::io_error;
+    }
+    writer w { f };
+    w.put(CHECKPOINT_MAGIC);
+    w.put(CHECKPOINT_VERSION);
+    w.put<uint64_t>(b.owner);
+    w.put<uint64_t>(b.owner_epoch);
+    w.put<uint64_t>(b.rs_layout);
+    w.put<uint64_t>(generation);
+    w.put<llama_pos>(c.pos);
+    w.put<uint8_t>(c.rs.has_state ? 1 : 0);
+    w.put<llama_pos>(c.rs.pos);
+    w.put<uint32_t>(c.rs.rs_idx);
+    w.rows(c.rs.r);
+    w.rows(c.rs.s);
+    const bool flushed = w.ok && std::fflush(f) == 0;
+    const bool closed = std::fclose(f) == 0;
+    if (!flushed || !closed || !replace_file(tmp, path)) {
+        std::remove(tmp.c_str());
+        return (int32_t) llama_persona_move::io_error;
+    }
+    return (int32_t) llama_persona_move::done;
+}
+
+static int32_t checkpoint_read_file(llama_persona * persona, const char * path, uint64_t generation, llama_persona_checkpoint * out) {
+    auto & b = persona->blocks;
+    auto & c = out->blocks;
+    c.taken = false; // a refused read leaves nothing taken, never a stale checkpoint
+    if (!b.owned) {
+        return (int32_t) llama_persona_move::file_mismatch; // her record was not read back: nothing to bind it to
+    }
+    std::FILE * f = std::fopen(path, "rb");
+    if (f == nullptr) {
+        return (int32_t) llama_persona_move::io_error;
+    }
+    closes guard { f };
+    reader r { f };
+    const auto mismatch = (int32_t) llama_persona_move::file_mismatch;
+    const uint32_t magic   = r.get<uint32_t>();
+    const uint32_t version = r.get<uint32_t>();
+    const uint64_t owner   = r.get<uint64_t>();
+    const uint64_t epoch   = r.get<uint64_t>();
+    const uint64_t layout  = r.get<uint64_t>();
+    const uint64_t written = r.get<uint64_t>();
+    const llama_pos pos    = r.get<llama_pos>();
+    const bool has_state   = r.get<uint8_t>() != 0;
+    const llama_pos rs_pos = r.get<llama_pos>();
+    const uint32_t rs_idx  = r.get<uint32_t>();
+    if (!r.ok) {
+        return (int32_t) llama_persona_move::io_error;
+    }
+    // hers, of this stop, for this memory, at a position her restored cells hold
+    if (magic != CHECKPOINT_MAGIC || version != CHECKPOINT_VERSION || owner != b.owner || epoch != b.owner_epoch ||
+        layout != b.rs_layout || written != generation || pos < 0 || b.seq < 0 || pos > b.kv.cells.seq_pos_max(b.seq)) {
+        return mismatch;
+    }
+    // every row length from this memory's geometry (persona_prepare), never one the file claims
+    const auto & g = b.geometry;
+    const std::vector<size_t> r_bytes = has_state ? g.r_bytes : std::vector<size_t>(g.r_bytes.size(), 0);
+    const std::vector<size_t> s_bytes = has_state ? g.s_bytes : std::vector<size_t>(g.s_bytes.size(), 0);
+    std::vector<std::vector<uint8_t>> rs_r, rs_s;
+    if (!r.rows(rs_r, r_bytes) || !r.rows(rs_s, s_bytes)) {
+        return r.ok ? mismatch : (int32_t) llama_persona_move::io_error;
+    }
+    // every check passed: bind it to her restored cells, as a take would have. Both allocations come first (a refusal
+    // here leaves her cells and the checkpoint as they were); what follows reserves nothing and cannot throw.
+    llama_kv_cells::checkpoint_position mark = std::make_shared<const llama_pos>(pos);
+    b.kv.cells.prepare_checkpoint();
+    b.kv.cells.mark_checkpoint(mark);
+    c.seq          = b.seq;
+    c.pos          = pos;
+    c.owner        = llama_persona_identity { owner, epoch };
+    c.lineage      = b.kv.cells.lineage();
+    c.mark         = std::move(mark);
+    c.rs_layout    = layout;
+    c.rs.has_state = has_state;
+    c.rs.pos       = rs_pos;
+    c.rs.rs_idx    = rs_idx;
+    c.rs.r.swap(rs_r);
+    c.rs.s.swap(rs_s);
+    c.taken = true;
+    return (int32_t) llama_persona_move::done;
+}
+
+// The exported boundary of both (Codex on #164): every allocation inside them (the path's staging name, row lengths from
+// the geometry, the rows read, the receipt) may throw std::bad_alloc under memory pressure, and nothing may cross the C
+// ABI into the caller. A refused write leaves no file of hers changed (the staging file is the only one opened, and only
+// after its name is allocated); a refused read leaves nothing taken and her cells as they were (its commit allocates first).
+int32_t llama_persona_checkpoint_write_file(const llama_persona * persona, const llama_persona_checkpoint * checkpoint, const char * path, uint64_t generation) {
+    try {
+        return checkpoint_write_file(persona, checkpoint, path, generation);
+    } catch (const std::bad_alloc &) {
+        return (int32_t) llama_persona_move::out_of_memory;
+    }
+}
+
+int32_t llama_persona_checkpoint_read_file(llama_persona * persona, const char * path, uint64_t generation, llama_persona_checkpoint * out) {
+    try {
+        return checkpoint_read_file(persona, path, generation, out);
+    } catch (const std::bad_alloc &) {
+        out->blocks.taken = false;
+        return (int32_t) llama_persona_move::out_of_memory;
+    }
 }

@@ -1071,6 +1071,14 @@ extern "C" {
     // The position a taken checkpoint holds through (-1 when none is taken), and the bytes its buffers hold allocated.
     LLAMA_API llama_pos llama_persona_checkpoint_pos(const struct llama_persona_checkpoint * checkpoint);
     LLAMA_API size_t    llama_persona_checkpoint_bytes(const struct llama_persona_checkpoint * checkpoint);
+    // Her checkpoint across a restart, beside her record of the same stop's generation. A write takes only a checkpoint
+    // still valid against the parked blocks it is written with (her owner, her cells' lineage, uncut at or below its
+    // position since it was taken); a read fills `out` for blocks already read back from her record of that generation,
+    // checked against them (owner, epoch, sequence, recurrent layout, every row length from their geometry, a position
+    // they hold), and binds it to their restored cells, so it rewinds exactly as one taken before the stop. A refused
+    // read leaves `out` holding nothing taken. 0 when done, else a status for llama_persona_status_name.
+    LLAMA_API int32_t llama_persona_checkpoint_write_file(const struct llama_persona * persona, const struct llama_persona_checkpoint * checkpoint, const char * path, uint64_t generation);
+    LLAMA_API int32_t llama_persona_checkpoint_read_file(struct llama_persona * persona, const char * path, uint64_t generation, struct llama_persona_checkpoint * out);
 
     // Her blocks move only under her owner (the persona and epoch she was made for): a completed save stamps them; a
     // load of blocks stamped by another persona or another epoch of her returns wrong_owner before anything is

@@ -723,6 +723,72 @@ int main(int argc, char ** argv) {
         std::remove(path.c_str());
     }
 
+    // 10. what this catches (CONTINUUM-ENGINE 4.15 + 4.16; the M5, 2026-11-27: Aiko restored with 214,911 of 246,764
+    // tokens still hers re-prefilled 1,019 s, her checkpoint gone with the process): her checkpoint written beside her
+    // record and read into the blocks restored from it rewinds her so a different continuation is byte-identical to
+    // decoding it in place. Another stop's generation is refused; so is a write for blocks that are not hers. An
+    // allocation failure inside the read or the write returns out_of_memory across the C boundary (Codex on #164),
+    // leaves the checkpoint untaken and writes no file, and she still binds and serves.
+    {
+        auto st = [](int32_t s) { return (llama_persona_move) s; };
+        const std::string record = (std::filesystem::temp_directory_path() / "test-persona-checkpoint.cpb").string();
+        const std::string kept   = (std::filesystem::temp_directory_path() / "test-persona-checkpoint.ckp").string();
+        const std::string unwritten = kept + ".refused";
+        const llama_token other = 9 % f.n_vocab;
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 1);
+        const std::vector<float> in_place = f.decode_one(0, other, f.n_prompt);
+
+        llama_persona_checkpoint * cp = llama_persona_checkpoint_init();
+        require(cp != nullptr, "a checkpoint");
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        f.prompt(0, 1);
+        require_move(st(llama_persona_checkpoint_take(f.ctx, 0, 0xA, 1, cp)), llama_persona_move::done, "her checkpoint at her prompt's end");
+        f.decode_one(0, 3 % f.n_vocab, f.n_prompt); // she goes on past it before the stop
+        llama_persona * saved = llama_persona_init(f.ctx, 0xA, 1);
+        llama_persona * stranger = llama_persona_init(f.ctx, 0xB, 1);
+        require(saved != nullptr && stranger != nullptr, "personas to write");
+        require_move(st(llama_persona_save(f.ctx, 0, saved)), llama_persona_move::done, "she parks at the stop");
+        require_move(st(llama_persona_write_file(saved, record.c_str(), 13)), llama_persona_move::done, "her record");
+        require_move(st(llama_persona_checkpoint_write_file(stranger, cp, kept.c_str(), 13)), llama_persona_move::wrong_owner, "never written for blocks that are not hers");
+        g_fail_alloc = true;
+        const auto write_refused = st(llama_persona_checkpoint_write_file(saved, cp, unwritten.c_str(), 13));
+        g_fail_alloc = false;
+        require_move(write_refused, llama_persona_move::out_of_memory, "a write that cannot allocate refuses");
+        require(!std::filesystem::exists(unwritten) && !std::filesystem::exists(unwritten + ".tmp"), "and writes no file");
+        require_move(st(llama_persona_checkpoint_write_file(saved, cp, kept.c_str(), 13)), llama_persona_move::done, "her checkpoint beside her record");
+        llama_persona_free(saved);
+        llama_persona_free(stranger);
+        llama_persona_checkpoint_free(cp);
+
+        // the restart: a fresh persona from her record, then her checkpoint into it
+        llama_persona * back = llama_persona_init(f.ctx, 0xA, 1);
+        llama_persona_checkpoint * restored = llama_persona_checkpoint_init();
+        require(back != nullptr && restored != nullptr, "a fresh persona and checkpoint");
+        require_move(st(llama_persona_checkpoint_read_file(back, kept.c_str(), 13, restored)), llama_persona_move::file_mismatch, "nothing to bind it to before her record is read");
+        require_move(st(llama_persona_read_file(back, record.c_str(), 13)), llama_persona_move::done, "her record back");
+        require_move(st(llama_persona_checkpoint_read_file(back, kept.c_str(), 14, restored)), llama_persona_move::file_mismatch, "another stop's generation is refused");
+        require(llama_persona_checkpoint_pos(restored) == -1, "and leaves nothing taken");
+        g_fail_alloc = true;
+        const auto read_refused = st(llama_persona_checkpoint_read_file(back, kept.c_str(), 13, restored));
+        g_fail_alloc = false;
+        require_move(read_refused, llama_persona_move::out_of_memory, "a read that cannot allocate refuses");
+        require(llama_persona_checkpoint_pos(restored) == -1, "and leaves nothing taken");
+        fprintf(stderr, "checkpoint file, every allocation failing: write %s (no file written), read %s (taken position %d)\n",
+                llama_persona_move_name(write_refused), llama_persona_move_name(read_refused), (int) llama_persona_checkpoint_pos(restored));
+        require_move(st(llama_persona_checkpoint_read_file(back, kept.c_str(), 13, restored)), llama_persona_move::done, "her checkpoint back");
+        require(llama_persona_checkpoint_pos(restored) == f.n_prompt - 1, "it holds through her last prompt position");
+        llama_memory_clear(llama_get_memory(f.ctx), true);
+        require_move(st(llama_persona_bind(f.ctx, 0, back)), llama_persona_move::done, "she binds from her record");
+        require_move(st(llama_persona_checkpoint_rewind(f.ctx, 0, 0xA, 1, restored)), llama_persona_move::done, "she rewinds to her restored checkpoint");
+        require(f.pos_max(0) == f.n_prompt - 1, "what she held past it is cut");
+        require_identical("a different continuation after a restart", in_place, f.decode_one(0, other, f.n_prompt));
+        llama_persona_checkpoint_free(restored);
+        llama_persona_free(back);
+        std::remove(record.c_str());
+        std::remove(kept.c_str());
+    }
+
     fprintf(stderr, "test-persona-blocks: ok (%zu attention layers, %zu recurrent layers)\n", a.kv.k.size(), a.rs.r.size());
     return 0;
 }
