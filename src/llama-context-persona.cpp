@@ -182,10 +182,6 @@ bool llama_persona_owner(const llama_persona * persona, uint64_t * persona_id, u
     return true;
 }
 
-struct llama_persona_checkpoint {
-    llama_persona_checkpoint_blocks blocks;
-};
-
 llama_persona_checkpoint * llama_persona_checkpoint_init(void) {
     return new (std::nothrow) llama_persona_checkpoint();
 }
