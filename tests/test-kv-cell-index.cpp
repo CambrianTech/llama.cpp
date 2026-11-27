@@ -259,7 +259,7 @@ void cost(uint32_t n) {
 } // namespace
 
 // Counts this binary's allocations while a workload runs (counting is off otherwise).
-void * operator new(std::size_t size) {
+static void * counted_alloc(std::size_t size) {
     if (counting.load(std::memory_order_relaxed)) {
         allocations.fetch_add(1, std::memory_order_relaxed);
     }
@@ -268,14 +268,14 @@ void * operator new(std::size_t size) {
     }
     throw std::bad_alloc();
 }
-
-void operator delete(void * p) noexcept {
-    std::free(p);
-}
-
-void operator delete(void * p, std::size_t) noexcept {
-    std::free(p);
-}
+// the whole family, through one helper, as test-persona-blocks replaces them (which builds clean under
+// the Linux CI's GCC -Werror; this file's direct malloc in operator new tripped -Wmismatched-new-delete)
+void * operator new(std::size_t size) { return counted_alloc(size); }
+void * operator new[](std::size_t size) { return counted_alloc(size); }
+void operator delete(void * p) noexcept { std::free(p); }
+void operator delete[](void * p) noexcept { std::free(p); }
+void operator delete(void * p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void * p, std::size_t) noexcept { std::free(p); }
 
 int main(int argc, char ** /* argv: only the flag count is read */) {
     for (uint32_t seed = 1; seed <= 8 && !failures; ++seed) {
