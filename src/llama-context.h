@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-pinned-experts.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -239,6 +240,8 @@ struct llama_context {
 
     llama_context_buffer_bytes buffer_bytes() const;
     int32_t memory_rows(llama_context_memory_row * out, int32_t n_max) const; // Continuum, llama-context-api.cpp
+    bool set_pinned_experts(int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids); // Continuum, llama-pinned-experts.cpp
+    llama_pinned_experts pinned_experts; // Continuum: a lesson's lived routing (llama-pinned-experts.h)
     llama_memory_breakdown memory_breakdown() const;
 
     //

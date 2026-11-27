@@ -165,6 +165,68 @@ static std::vector<std::pair<std::string, size_t>> adapter_layout(const llama_ad
 }
 static std::vector<std::pair<std::string, size_t>> g_layout;
 
+
+// A lesson's routing as it was lived: every layer's chosen experts for each position of the window,
+// read from the graph's own ffn_moe_topk tensors during one served forward of the window.
+struct lived_routing {
+    int32_t n_layer = 0;
+    int32_t n_used  = 0;
+    int32_t n_pos   = 0;
+    std::vector<int32_t> ids; // [layer][position][n_used]
+};
+static const lived_routing * g_pinned = nullptr;
+
+static bool routing_eval(ggml_tensor * t, bool ask, void * user_data) {
+    const char * name = ggml_get_name(t);
+    const bool topk = std::strncmp(name, "ffn_moe_topk-", 13) == 0;
+    if (ask) {
+        return topk;
+    }
+    if (!topk) {
+        return true;
+    }
+    auto * r = (lived_routing *) user_data;
+    const int32_t il = std::atoi(name + 13);
+    const int64_t n_used = t->ne[0], n_tokens = t->ne[1];
+    if (r->n_used == 0) {
+        r->n_used = (int32_t) n_used;
+        r->ids.assign((size_t) r->n_layer * r->n_pos * n_used, 0);
+    }
+    GGML_ASSERT(n_used == r->n_used && n_tokens == r->n_pos && il < r->n_layer);
+    for (int64_t i = 0; i < n_tokens; ++i) { // a view of the argsort: read row by row
+        ggml_backend_tensor_get(t, &r->ids[((size_t) il * r->n_pos + i) * n_used], i * t->nb[1], n_used * sizeof(int32_t));
+    }
+    return true;
+}
+
+static lived_routing record_routing(common_params params, llama_model * model, const std::string & init,
+                                    const std::vector<llama_token> & tokens) {
+    lived_routing r;
+    r.n_layer = llama_model_n_layer(model);
+    r.n_pos   = (int32_t) g_window;
+    params.cb_eval           = routing_eval;
+    params.cb_eval_user_data = &r;
+    llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
+    GGML_ASSERT(adapter != nullptr);
+    llama_context * ctx = make_ctx(params, model, g_window);
+    float scale = 1.0f;
+    GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
+    llama_batch batch = llama_batch_init((int32_t) g_window, 0, 1);
+    for (uint32_t i = 0; i < g_window; ++i) {
+        batch.token[i]     = tokens[i];
+        batch.pos[i]       = (llama_pos) i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = true; // every row an output, so the last layer routes them all too
+    }
+    batch.n_tokens = (int32_t) g_window;
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_adapter_lora_free(adapter);
+    GGML_ASSERT(r.n_used > 0 && "the model has no MoE layer to pin");
+    return r;
+}
 // one SGD step from the fresh adapter: the step itself, -lr * the gradient it took
 static std::vector<float> step_delta(const common_params & params, llama_model * model, const std::string & init,
                                      const std::vector<llama_token> & tokens, const std::vector<uint8_t> & labelled,
@@ -176,6 +238,9 @@ static std::vector<float> step_delta(const common_params & params, llama_model *
     g_layout = adapter_layout(adapter);
 
     llama_context * ctx = make_ctx(params, model, chunk);
+    if (g_pinned) { // the lesson's routing as it was lived, replayed by every graph that trains its rows
+        GGML_ASSERT(llama_set_pinned_experts(ctx, g_pinned->n_layer, g_pinned->n_used, 0, g_pinned->n_pos, g_pinned->ids.data()));
+    }
     float scale = 1.0f;
     GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
     llama_opt_params lopt{};
@@ -625,6 +690,32 @@ int main(int argc, char ** argv) {
         }
         std::remove(init.c_str());
         return 0;
+    }
+
+    // WALK_PINNED: on a mixture-of-experts base, is the tiled walk's disagreement with one graph the
+    // walk, or routing flips between row shapes? Both are measured: each graph routing for itself, then
+    // both replaying the routing the window was served with. If pinning restores agreement, routing
+    // was the cause, and the walk replays the lived routing by design.
+    if (getenv("WALK_PINNED")) {
+        std::vector<uint8_t> all(WINDOW + 1, 1);
+        all[0] = 0;
+        const uint32_t tile = getenv("WALK_PINNED_TILE") ? (uint32_t) atoi(getenv("WALK_PINNED_TILE")) : 64;
+        const auto ref_routed  = step_delta(params, model, init, tokens, all, WINDOW, true);
+        const auto tile_routed = step_delta(params, model, init, tokens, all, tile, true);
+        compare("routed by each graph: tiles vs one graph", tile_routed, ref_routed);
+        const lived_routing lived = record_routing(params, model, init, tokens);
+        g_pinned = &lived;
+        const auto ref_pinned  = step_delta(params, model, init, tokens, all, WINDOW, true);
+        const auto tile_pinned = step_delta(params, model, init, tokens, all, tile, true);
+        g_pinned = nullptr;
+        const agreement pinned = compare("routing pinned as lived: tiles vs one graph", tile_pinned, ref_pinned);
+        if (pinned.cosine < 0.997) {
+            worst_tensors(tile_pinned, ref_pinned, 12);
+        }
+        std::remove(init.c_str());
+        llama_model_free(model);
+        llama_backend_free();
+        return pinned.cosine < 0.997 ? 1 : 0;
     }
 
     const bool recompute_only = getenv("WALK_RECOMPUTE_ONLY") != nullptr;

@@ -2202,6 +2202,13 @@ extern "C" {
     // name before anything is decoded (llama_opt_failure). Set before llama_opt_epoch.
     LLAMA_API void llama_opt_set_walk_host_budget(struct llama_context * lctx, size_t bytes);
 
+    // Replay a lesson's routing as it was lived (Continuum): `ids` holds, for each MoE layer and each
+    // position in [pos0, pos0 + n_pos), its n_used chosen experts ([n_layer][n_pos][n_used]). A graph
+    // whose rows all lie in that range replays them instead of routing again; n_pos 0 clears. Returns
+    // false when the shape does not match the model (no layer, or not its experts per token).
+    LLAMA_API bool llama_set_pinned_experts(struct llama_context * ctx, int32_t n_layer, int32_t n_used,
+            llama_pos pos0, int32_t n_pos, const int32_t * ids);
+
     // The host bytes the exact walk's largest window so far kept (0 before one ran, or when the
     // walk is not exact): what a run of this shape needs, from the run's own arithmetic.
     LLAMA_API size_t llama_opt_walk_host_bytes(struct llama_context * lctx);
