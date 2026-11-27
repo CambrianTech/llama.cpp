@@ -165,6 +165,232 @@ static std::vector<std::pair<std::string, size_t>> adapter_layout(const llama_ad
 }
 static std::vector<std::pair<std::string, size_t>> g_layout;
 
+
+// A lesson's routing as it was lived: every layer's chosen experts for each position of the window,
+// read from the graph's own ffn_moe_topk tensors during one served forward of the window.
+struct lived_routing {
+    int32_t n_layer = 0;
+    int32_t n_used  = 0;
+    int32_t n_pos   = 0;
+    std::vector<int32_t> ids; // [layer][position][n_used]
+    int32_t row0 = 0;         // the row the next decode's first row records at (several decodes, one record)
+};
+static const lived_routing * g_pinned = nullptr;
+
+static bool routing_eval(ggml_tensor * t, bool ask, void * user_data) {
+    const char * name = ggml_get_name(t);
+    const bool topk = std::strncmp(name, "ffn_moe_topk-", 13) == 0;
+    if (ask) {
+        return topk;
+    }
+    if (!topk) {
+        return true;
+    }
+    auto * r = (lived_routing *) user_data;
+    const int32_t il = std::atoi(name + 13);
+    const int64_t n_used = t->ne[0], n_tokens = t->ne[1];
+    if (r->n_used == 0) {
+        r->n_used = (int32_t) n_used;
+        r->ids.assign((size_t) r->n_layer * r->n_pos * n_used, 0);
+    }
+    GGML_ASSERT(n_used == r->n_used && r->row0 + n_tokens <= r->n_pos && il < r->n_layer);
+    for (int64_t i = 0; i < n_tokens; ++i) { // a view of the argsort: read row by row
+        ggml_backend_tensor_get(t, &r->ids[((size_t) il * r->n_pos + r->row0 + i) * n_used], i * t->nb[1], n_used * sizeof(int32_t));
+    }
+    return true;
+}
+
+static lived_routing record_routing(common_params params, llama_model * model, const std::string & init,
+                                    const std::vector<llama_token> & tokens) {
+    lived_routing r;
+    r.n_layer = llama_model_n_layer(model);
+    r.n_pos   = (int32_t) g_window;
+    params.cb_eval           = routing_eval;
+    params.cb_eval_user_data = &r;
+    llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
+    GGML_ASSERT(adapter != nullptr);
+    llama_context * ctx = make_ctx(params, model, g_window);
+    float scale = 1.0f;
+    GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
+    llama_batch batch = llama_batch_init((int32_t) g_window, 0, 1);
+    for (uint32_t i = 0; i < g_window; ++i) {
+        batch.token[i]     = tokens[i];
+        batch.pos[i]       = (llama_pos) i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = true; // every row an output, so the last layer routes them all too
+    }
+    batch.n_tokens = (int32_t) g_window;
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_adapter_lora_free(adapter);
+    GGML_ASSERT(r.n_used > 0 && "the model has no MoE layer to pin");
+    return r;
+}
+
+// Two residents in one ubatch at the same positions, the lesson's range covering only part of hers:
+// routing per row, every row an output, rows in batch order (seq 0's, then seq 1's).
+static lived_routing route_two(const common_params & params_in, llama_model * model, const std::vector<llama_token> & tokens,
+                               uint32_t n, const lived_routing * pin, llama_pos pin0, int32_t pin_n) {
+    common_params params = params_in;
+    lived_routing r;
+    r.n_layer = llama_model_n_layer(model);
+    r.n_pos   = (int32_t) (2 * n);
+    params.cb_eval           = routing_eval;
+    params.cb_eval_user_data = &r;
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_ctx      = 4 * n;
+    cparams.n_batch    = 2 * n;
+    cparams.n_ubatch   = 2 * n;
+    cparams.n_seq_max  = 2;
+    cparams.kv_unified = true;
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    GGML_ASSERT(ctx != nullptr);
+    if (pin) {
+        // the lesson's lived ids for positions [pin0, pin0 + pin_n) of seq 0, from its rows of `pin`
+        std::vector<int32_t> ids((size_t) pin->n_layer * pin_n * pin->n_used);
+        for (int32_t il = 0; il < pin->n_layer; ++il) {
+            for (int32_t p = 0; p < pin_n; ++p) {
+                std::memcpy(&ids[((size_t) il * pin_n + p) * pin->n_used],
+                            &pin->ids[((size_t) il * pin->n_pos + pin0 + p) * pin->n_used], sizeof(int32_t) * pin->n_used);
+            }
+        }
+        GGML_ASSERT(llama_set_pinned_experts(ctx, 0, pin->n_layer, pin->n_used, pin0, pin_n, ids.data()));
+    }
+    llama_batch batch = llama_batch_init((int32_t) (2 * n), 0, 2);
+    for (uint32_t s = 0; s < 2; ++s) {
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t k = s * n + i;
+            batch.token[k]     = tokens[s * n + i]; // a neighbour with its own text at the same positions
+            batch.pos[k]       = (llama_pos) i;
+            batch.n_seq_id[k]  = 1;
+            batch.seq_id[k][0] = (llama_seq_id) s;
+            batch.logits[k]    = true;
+        }
+    }
+    batch.n_tokens = (int32_t) (2 * n);
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    llama_batch_free(batch);
+    llama_free(ctx);
+    GGML_ASSERT(r.n_used > 0 && "the model has no MoE layer to pin");
+    return r;
+}
+
+// the model's expert count, from its own metadata (<arch>.expert_count)
+static int32_t model_n_expert(const llama_model * model) {
+    char arch[64], val[32];
+    GGML_ASSERT(llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0);
+    GGML_ASSERT(llama_model_meta_val_str(model, (std::string(arch) + ".expert_count").c_str(), val, sizeof(val)) > 0);
+    return (int32_t) std::atoi(val);
+}
+// what this catches (Codex on fork #167): a context-wide pin that hands a neighbour the lesson's experts
+// at the same positions, or drops the whole ubatch to the router when one row is uncovered.
+static int pinned_rows_are_per_sequence(const common_params & params, llama_model * model, const std::vector<llama_token> & tokens) {
+    const uint32_t n = 64;
+    const llama_pos pin0 = 32;
+    const int32_t   pin_n = 32;
+    const lived_routing served = route_two(params, model, tokens, n, nullptr, 0, 0);
+    const int32_t n_expert = model_n_expert(model);
+    lived_routing fake = served; // deliberately not what routing picks, so a replay is unmistakable
+    for (auto & e : fake.ids) {
+        e = (e + 1) % n_expert;
+    }
+    const lived_routing pinned = route_two(params, model, tokens, n, &fake, pin0, pin_n);
+    int wrong = 0;
+    for (int32_t il = 0; il < served.n_layer; ++il) {
+        for (uint32_t row = 0; row < 2 * n; ++row) {
+            const size_t o = ((size_t) il * served.n_pos + row) * served.n_used;
+            const bool covered = row < n && (llama_pos) row >= pin0 && (llama_pos) row < pin0 + pin_n;
+            const auto & want = covered ? fake.ids : served.ids;
+            if (std::memcmp(&pinned.ids[o], &want[o], sizeof(int32_t) * served.n_used) != 0) {
+                ++wrong;
+            }
+        }
+    }
+    printf("  pinned per sequence: %d of %u rows x %d layers differ from (seq 0 [%d,%d) replayed, the rest routed)\n",
+           wrong, 2 * n, served.n_layer, pin0, pin0 + pin_n);
+    return wrong == 0 ? 0 : 1;
+}
+
+// One sequence decoded as two same-shape ubatches, [0, n) then [n, 2n), on one context (the second may
+// reuse the first's graph). `when` says when the pin (of positions [n, 2n), from `pin`) is set: never,
+// before the first decode, or between the two.
+enum class pin_when { never, before, between };
+static lived_routing route_halves(const common_params & params_in, llama_model * model, const std::vector<llama_token> & tokens,
+                                  uint32_t n, const lived_routing * pin, pin_when when) {
+    common_params params = params_in;
+    lived_routing r;
+    r.n_layer = llama_model_n_layer(model);
+    r.n_pos   = (int32_t) (2 * n);
+    params.cb_eval           = routing_eval;
+    params.cb_eval_user_data = &r;
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_ctx      = 4 * n;
+    cparams.n_batch    = n;
+    cparams.n_ubatch   = n;
+    cparams.kv_unified = true;
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    GGML_ASSERT(ctx != nullptr);
+    auto set_pin = [&]() {
+        std::vector<int32_t> ids((size_t) pin->n_layer * n * pin->n_used);
+        for (int32_t il = 0; il < pin->n_layer; ++il) {
+            std::memcpy(&ids[(size_t) il * n * pin->n_used], &pin->ids[((size_t) il * pin->n_pos + n) * pin->n_used],
+                        sizeof(int32_t) * n * pin->n_used);
+        }
+        GGML_ASSERT(llama_set_pinned_experts(ctx, 0, pin->n_layer, pin->n_used, (llama_pos) n, (int32_t) n, ids.data()));
+    };
+    if (when == pin_when::before) {
+        set_pin();
+    }
+    llama_batch batch = llama_batch_init((int32_t) n, 0, 1);
+    for (uint32_t half = 0; half < 2; ++half) {
+        if (half == 1 && when == pin_when::between) {
+            set_pin();
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            batch.token[i]     = tokens[half * n + i];
+            batch.pos[i]       = (llama_pos) (half * n + i);
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]    = true;
+        }
+        batch.n_tokens = (int32_t) n;
+        r.row0 = (int32_t) (half * n);
+        GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    }
+    llama_batch_free(batch);
+    llama_free(ctx);
+    return r;
+}
+
+// what this catches (Codex on fork #167 at 83d4edd52): a graph built with no covered row, reused for a
+// covered ubatch of the same shape, skipping the pin; and one built before the pin was set, reused after.
+static int pinned_rows_survive_graph_reuse(const common_params & params, llama_model * model, const std::vector<llama_token> & tokens) {
+    const uint32_t n = 32;
+    const lived_routing served = route_halves(params, model, tokens, n, nullptr, pin_when::never);
+    const int32_t n_expert = model_n_expert(model);
+    lived_routing fake = served;
+    for (auto & e : fake.ids) {
+        e = (e + 1) % n_expert;
+    }
+    int failed = 0;
+    for (const pin_when when : { pin_when::before, pin_when::between }) {
+        const lived_routing got = route_halves(params, model, tokens, n, &fake, when);
+        int wrong = 0;
+        for (int32_t il = 0; il < served.n_layer; ++il) {
+            for (uint32_t row = 0; row < 2 * n; ++row) {
+                const size_t o = ((size_t) il * served.n_pos + row) * served.n_used;
+                const auto & want = row >= n ? fake.ids : served.ids;
+                wrong += std::memcmp(&got.ids[o], &want[o], sizeof(int32_t) * served.n_used) != 0;
+            }
+        }
+        printf("  pinned across graph reuse (pin set %s): %d of %u rows x %d layers differ from ([0,%u) routed, [%u,%u) replayed)\n",
+               when == pin_when::before ? "before the first decode" : "between the decodes", wrong, 2 * n, served.n_layer, n, n, 2 * n);
+        failed += wrong != 0;
+    }
+    return failed;
+}
 // one SGD step from the fresh adapter: the step itself, -lr * the gradient it took
 static std::vector<float> step_delta(const common_params & params, llama_model * model, const std::string & init,
                                      const std::vector<llama_token> & tokens, const std::vector<uint8_t> & labelled,
@@ -176,6 +402,9 @@ static std::vector<float> step_delta(const common_params & params, llama_model *
     g_layout = adapter_layout(adapter);
 
     llama_context * ctx = make_ctx(params, model, chunk);
+    if (g_pinned) { // the lesson's routing as it was lived, replayed by every graph that trains its rows
+        GGML_ASSERT(llama_set_pinned_experts(ctx, 0, g_pinned->n_layer, g_pinned->n_used, 0, g_pinned->n_pos, g_pinned->ids.data()));
+    }
     float scale = 1.0f;
     GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
     llama_opt_params lopt{};
@@ -625,6 +854,36 @@ int main(int argc, char ** argv) {
         }
         std::remove(init.c_str());
         return 0;
+    }
+
+    // WALK_PINNED: on a mixture-of-experts base, is the tiled walk's disagreement with one graph the
+    // walk, or routing flips between row shapes? Both are measured: each graph routing for itself, then
+    // both replaying the routing the window was served with. If pinning restores agreement, routing
+    // was the cause, and the walk replays the lived routing by design.
+    if (getenv("WALK_PINNED")) {
+        if (pinned_rows_are_per_sequence(params, model, tokens) != 0 || pinned_rows_survive_graph_reuse(params, model, tokens) != 0) {
+            fprintf(stderr, "FAILED: a pinned row is not its own sequence's (Codex on fork #167)\n");
+            return 1;
+        }
+        std::vector<uint8_t> all(WINDOW + 1, 1);
+        all[0] = 0;
+        const uint32_t tile = getenv("WALK_PINNED_TILE") ? (uint32_t) atoi(getenv("WALK_PINNED_TILE")) : 64;
+        const auto ref_routed  = step_delta(params, model, init, tokens, all, WINDOW, true);
+        const auto tile_routed = step_delta(params, model, init, tokens, all, tile, true);
+        compare("routed by each graph: tiles vs one graph", tile_routed, ref_routed);
+        const lived_routing lived = record_routing(params, model, init, tokens);
+        g_pinned = &lived;
+        const auto ref_pinned  = step_delta(params, model, init, tokens, all, WINDOW, true);
+        const auto tile_pinned = step_delta(params, model, init, tokens, all, tile, true);
+        g_pinned = nullptr;
+        const agreement pinned = compare("routing pinned as lived: tiles vs one graph", tile_pinned, ref_pinned);
+        if (pinned.cosine < 0.997) {
+            worst_tensors(tile_pinned, ref_pinned, 12);
+        }
+        std::remove(init.c_str());
+        llama_model_free(model);
+        llama_backend_free();
+        return pinned.cosine < 0.997 ? 1 : 0;
     }
 
     const bool recompute_only = getenv("WALK_RECOMPUTE_ONLY") != nullptr;

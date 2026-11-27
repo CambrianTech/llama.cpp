@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-pinned-experts.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -2455,6 +2456,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
+    selected_experts = llama_pin_experts(*this, il, selected_experts); // Continuum: a lesson's rows replay the routing she lived
     cb(selected_experts, "ffn_moe_topk", il);
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {

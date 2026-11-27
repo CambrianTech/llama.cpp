@@ -34,6 +34,8 @@ struct llama_cparams {
     uint32_t walk_acc_base  = 0;
     // a later chunk's gradient sits on the recurrent state this chunk leaves
     bool     walk_state_surrogate = false;
+    // a lesson's routing as it was lived, replayed by the MoE graphs that train its rows (llama-pinned-experts.h)
+    const struct llama_pinned_experts * pinned_experts = nullptr;
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
     uint32_t n_ubatch;

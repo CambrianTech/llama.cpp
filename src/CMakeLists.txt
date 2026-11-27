@@ -24,6 +24,7 @@ set(LLAMA_CORE_SOURCES
     llama-context-learn.cpp
     llama-context-learn-tiles.cpp
     llama-walk.cpp
+    llama-pinned-experts.cpp
     llama-cparams.cpp
     llama-grammar.cpp
     llama-graph.cpp
