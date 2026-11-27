@@ -1,10 +1,9 @@
 #include "common.cuh"
 
-// Continuum fork: FLASH_ATTN_BACK on CUDA (ggml.h, ggml_flash_attn_back). Without it a CUDA device has
-// no native attention backward, so training composes the backward from tiles that keep scores, and a
-// resident's in-place lesson over her served window measured 1.897 TB on a 34.19 GB 5090 (Codex's
-// replay of #6292, build 2161, 2026-11-27). One warp per row, recomputing the scores: memory is the
-// gradients alone, as on Metal (kernels/fa_back.metal) and the CPU reference.
+// FLASH_ATTN_BACK (ggml.h, ggml_flash_attn_back): the gradients of FLASH_ATTN_EXT, recomputing the
+// scores instead of keeping them, so a training step's attention backward costs its gradients and a
+// per-row scratch, never queries x keys. Without a native kernel a backend composes the backward from
+// tiles that keep scores, whose memory grows with the window.
 
 void ggml_cuda_flash_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
