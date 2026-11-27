@@ -321,6 +321,8 @@ struct llama_context {
             const llama_token * labels, int32_t n, const llama_token * restore_tokens, int32_t n_restore, ggml_opt_result_t result);
     llama_opt_learn_status opt_learn_step();
     bool opt_learn_tile(uint32_t tile);
+    bool opt_tiles_past_ubatch();
+    bool opt_tiles_admit(const llama_token * labels, int32_t n);
     llama_opt_learn_status opt_tiles_step();
     bool opt_tiles_unit(opt_tiles & tiles);
     llama_opt_learn_unit opt_last_unit = {0, 0}; // the last tiled step's work (llama_opt_learn_last_unit)

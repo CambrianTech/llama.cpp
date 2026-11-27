@@ -817,7 +817,9 @@ int main(int argc, char ** argv) {
         lopt.optimizer_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
         lopt.adapter        = adapter;
         // a reply learning in tiles walks exactly (UNIFIED-PAGING.md, "A long reply learns in tiles")
-        lopt.walk_exact     = getenv("WALK_LIVE_TILES") != nullptr || getenv("WALK_LIVE_EXACT_ONLY") != nullptr;
+        // a reply past one ubatch learns only through the exact walk (llama_opt_learn refuses it otherwise)
+        lopt.walk_exact     = getenv("WALK_LIVE_TILES") != nullptr || getenv("WALK_LIVE_EXACT_ONLY") != nullptr
+                           || getenv("WALK_LIVE_GRAPH_SMALL_UBATCH") != nullptr || getenv("WALK_LIVE_SMALL_RESTORE_BATCH") != nullptr;
         lopt.static_admission = [](ggml_backend_buffer_type_t, const char *, size_t, void * data) {
             ++static_cast<admission_counts *>(data)->statics;
             return true;
@@ -881,6 +883,24 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "FAILED: a refused live learn was accepted or changed her sequence\n");
                 ++failures;
             }
+        }
+        // What this catches: a reply past one ubatch learns only as an exact tile walk over her own stream; a
+        // cache shared among sequences cannot run one, so begin refuses before anything moves (never a plain
+        // split, which lost cosine 0.949 / norm 0.889 on Qwen3.5-0.8B at ubatch 64).
+        if (!streams && (uint32_t) (WINDOW - r0) > llama_n_ubatch(ctx)) {
+            const std::vector<uint8_t> her_before = seq_state(ctx, 0), nb_before = seq_state(ctx, 1);
+            const bool began = llama_opt_learn_begin(ctx, 0, r0, tokens.data() + r0, labels.data(), WINDOW - r0,
+                tokens.data() + r0, WINDOW - r0, nullptr);
+            const bool same = seq_state(ctx, 0) == her_before && seq_state(ctx, 1) == nb_before;
+            printf("  shared cache, reply past one ubatch: %s; both sequences %s\n", began ? "ACCEPTED" : "refused",
+                    same ? "byte-identical" : "CHANGED");
+            if (began || !same) {
+                fprintf(stderr, "FAILED: a shared cache began a reply it cannot walk exactly\n");
+                ++failures;
+            }
+            llama_free(ctx);
+            llama_adapter_lora_free(adapter);
+            continue;
         }
         const auto generation_prefix = seq_state(ctx, 0);
         // What this catches: revoked authority must stop NEW gradients without abandoning KV

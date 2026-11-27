@@ -49,6 +49,7 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
         attn = nullptr;
     }
     // refusals before anything is touched
+    if (!opt_tiles_admit(labels, n)) { return false; } // Continuum: a reply past one ubatch must walk exactly (llama-context-learn-tiles.cpp)
     const llama_pos held = memory->seq_pos_max(seq) + 1;
     if (held < n_cached) {
         opt_fail("llama_opt_learn: sequence " + std::to_string(seq) + " holds " + std::to_string(held)
@@ -145,6 +146,7 @@ llama_opt_learn_status llama_context::opt_learn_step() {
         return LLAMA_OPT_LEARN_FAILED;
     }
     auto & s = *opt_reply;
+    if (!opt_tiles_past_ubatch()) { return LLAMA_OPT_LEARN_MORE; } // Continuum: a reply past one ubatch walks in tiles (llama-context-learn-tiles.cpp)
     if (s.graph_meta) {
         if (s.graph_preparing) {
             if (!ggml_opt_alloc(opt_ctx, true)) {

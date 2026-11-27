@@ -132,6 +132,51 @@ bool llama_context::opt_learn_tile(uint32_t tile) {
     return true;
 }
 
+// At begin: a reply whose labelled rows reach past one ubatch can only learn as an exact tile walk, so the context
+// must be able to run one: the exact walk configured, and her own stream (a cache shared among sequences puts her
+// cells after others'). A context that cannot is the caller's contract broken, refused before anything moves.
+bool llama_context::opt_tiles_admit(const llama_token * labels, int32_t n) {
+    int32_t n_train = n;
+    while (n_train > 0 && labels[n_train - 1] < 0) { --n_train; }
+    if (n_train <= (int32_t) n_ubatch()) {
+        return true;
+    }
+    if (cparams.kv_unified && cparams.n_seq_max > 1) {
+        opt_fail("llama_opt_learn: a reply past one ubatch walks in tiles over her own stream; this context shares one cache among sequences");
+        return false;
+    }
+    if (!opt_walk_exact) {
+        opt_fail("llama_opt_learn: a reply past one ubatch learns only through the exact walk (walk_exact)");
+        return false;
+    }
+    return true;
+}
+
+// A reply's first gradient step, when no tile was asked for. decode() splits a chunk past one ubatch into
+// ubatches that each run their own backward, so the gradient a later row carries into the earlier ones would be
+// lost (measured on Qwen3.5-0.8B at ubatch 64, untiled: cosine 0.949, norm 0.889 against the exact step, exact walk
+// on or off). Such a reply walks exactly, in tiles of one ubatch; a reply within one ubatch is one exact graph.
+// The one-graph quantum (graph_nodes) widens its ubatch to the reply and never splits.
+// Whether this context can walk the reply exactly is the caller's contract, said at begin before anything is
+// touched (opt_tiles_admit); only what the walk measures as it starts (its host budget, its accumulator) can
+// still stop it here.
+// false: the walk could not start; the reply goes to its restoration with that reason, the way a refused chunk
+// does, and the context's stop flags are cleared so the restoring decodes and a neighbour's run as served.
+bool llama_context::opt_tiles_past_ubatch() {
+    auto & s = *opt_reply;
+    if (s.tiles || s.restoring || s.cursor != 0 || s.graph_nodes != 0 || s.n_train <= (int32_t) n_ubatch()) {
+        return true;
+    }
+    if (opt_learn_tile(n_ubatch())) {
+        return true;
+    }
+    s.failure = opt_failure;
+    s.cursor = s.n_train;
+    opt_stop_requested.store(false);
+    opt_alloc_failed.store(false);
+    return false;
+}
+
 // One unit of the walk. The accumulator is bound into the context only while the unit runs, so a neighbour's
 // decode between steps never reads it (Codex on the join). A failure hands the reply to its restoration, its
 // accumulated gradient cleared, the way a failed graph does: she is always restored as served.
