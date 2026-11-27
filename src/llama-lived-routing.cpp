@@ -127,10 +127,13 @@ ggml_tensor * llama_route_experts(const llm_graph_context & graph, int32_t il, g
 
 // ---- the context ----
 
-bool llama_context::set_routing_capture(bool on) {
+llama_routing_capture llama_context::set_routing_capture(bool on) {
     const auto & hp = model.hparams;
-    if (on && (hp.n_expert == 0 || hp.n_expert > (uint32_t) llama_lived_routing::MAX_EXPERTS)) {
-        return false; // no experts to record, or more than a u8 names
+    if (on && hp.n_expert == 0) {
+        return LLAMA_ROUTING_CAPTURE_NO_EXPERTS;
+    }
+    if (on && hp.n_expert > (uint32_t) llama_lived_routing::MAX_EXPERTS) {
+        return LLAMA_ROUTING_CAPTURE_TOO_MANY;
     }
     synchronize(); // nothing queued reads the buffer this replaces
     lived_routing.capture_dev = nullptr;
@@ -152,13 +155,13 @@ bool llama_context::set_routing_capture(bool on) {
             lived_routing.capture_ctx.reset();
             lived_routing.capture = false;
             cparams.lived_routing = lived_routing.pin_n > 0 ? &lived_routing : nullptr;
-            return false; // refused by name to the caller: no room for the buffer, nothing captured
+            return LLAMA_ROUTING_CAPTURE_NO_ROOM;
         }
     }
     lived_routing.capture = on;
     cparams.lived_routing = (on || lived_routing.pin_n > 0) ? &lived_routing : nullptr;
     drop_reusable_graphs(); // a graph built the other way registers (or not) what this one needs
-    return true;
+    return on ? LLAMA_ROUTING_CAPTURE_RECORDING : LLAMA_ROUTING_CAPTURE_OFF;
 }
 
 bool llama_context::set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids) {
@@ -172,8 +175,9 @@ bool llama_context::set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_
         return false;
     }
     const size_t n = (size_t) n_layer * (size_t) n_pos * (size_t) n_used;
+    // -1 (as llama_get_lived_routing reads it): serving never routed that layer there, and the row routes
     for (size_t k = 0; k < n; ++k) {
-        if (ids[k] < 0 || ids[k] >= (int32_t) hp.n_expert) {
+        if (ids[k] < -1 || ids[k] >= (int32_t) hp.n_expert) {
             return false; // not an expert of this model
         }
     }
@@ -182,7 +186,10 @@ bool llama_context::set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_
     lived_routing.n_used  = n_used;
     for (int32_t il = 0; il < n_layer; ++il) {
         for (int32_t p = 0; p < n_pos; ++p) {
-            lived_routing.write(seq, pos0 + p, il, ids + ((size_t) il * n_pos + p) * n_used);
+            const int32_t * row = ids + ((size_t) il * n_pos + p) * n_used;
+            if (row[0] >= 0) {
+                lived_routing.write(seq, pos0 + p, il, row);
+            }
         }
     }
     return pin_lived(seq, pos0, n_pos);
@@ -287,8 +294,9 @@ void llama_context::drop_reusable_graphs() {
 
 // ---- the API ----
 
-bool llama_set_routing_capture(llama_context * ctx, bool on) {
-    return ctx && ctx->set_routing_capture(on);
+llama_routing_capture llama_set_routing_capture(llama_context * ctx, bool on) {
+    GGML_ASSERT(ctx != nullptr);
+    return ctx->set_routing_capture(on);
 }
 
 bool llama_set_pinned_experts(llama_context * ctx, llama_seq_id seq, int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids) {

@@ -241,7 +241,7 @@ struct llama_context {
     llama_context_buffer_bytes buffer_bytes() const;
     int32_t memory_rows(llama_context_memory_row * out, int32_t n_max) const; // Continuum, llama-context-api.cpp
     // Continuum: her routing as lived (llama-lived-routing.h, .cpp)
-    bool set_routing_capture(bool on);
+    llama_routing_capture set_routing_capture(bool on);
     bool set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids);
     bool pin_lived(llama_seq_id seq, llama_pos pos0, int32_t n_pos);
     void clear_pin();

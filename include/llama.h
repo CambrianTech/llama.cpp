@@ -2204,9 +2204,16 @@ extern "C" {
 
     // A mind's routing as she lived it (Continuum; llama-lived-routing.h). On a mixture-of-experts base
     // with capture on, serving records each row's chosen experts per sequence, position and layer; a
-    // live lesson (llama_opt_learn_begin) replays its span's, and is refused for a span she never
-    // served. Capture returns false, changing nothing, for a model without experts or with more than 256.
-    LLAMA_API bool llama_set_routing_capture(struct llama_context * ctx, bool on);
+    // live lesson (llama_opt_learn_begin) replays its span's, and on a mixture-of-experts base is
+    // refused while capture is off. Off always succeeds.
+    enum llama_routing_capture {
+        LLAMA_ROUTING_CAPTURE_RECORDING    = 0, // on: serving records, lessons replay
+        LLAMA_ROUTING_CAPTURE_NO_EXPERTS   = 1, // a dense base: nothing to record, and lessons need none
+        LLAMA_ROUTING_CAPTURE_TOO_MANY     = 2, // more experts than a u8 names (256): refused
+        LLAMA_ROUTING_CAPTURE_NO_ROOM      = 3, // the capture buffer could not be allocated: refused
+        LLAMA_ROUTING_CAPTURE_OFF          = 4, // turned off
+    };
+    LLAMA_API enum llama_routing_capture llama_set_routing_capture(struct llama_context * ctx, bool on);
 
     // Import a span's routing into the table and pin it: `ids` holds, for each MoE layer and each
     // position in [pos0, pos0 + n_pos) of sequence `seq`, its n_used chosen experts

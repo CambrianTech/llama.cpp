@@ -1,5 +1,6 @@
 // Live-sequence learning: one owner for synchronous calls and resumable serving-loop chunks.
 #include "llama-context.h"
+#include "llama-model.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 #include <algorithm>
@@ -68,6 +69,11 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
     }
     // the reply's rows, and the served tail it restores, replay the routing she served them with
     // (llama-lived-routing.h); with capture on, a span she never served is refused by name, never routed afresh
+    if (model.hparams.n_expert > 0 && !lived_routing.capture) {
+        opt_fail("llama_opt_learn: a lesson on a mixture-of-experts base replays the routing she served, and this context "
+            "records none: turn on llama_set_routing_capture before she serves");
+        return false;
+    }
     if (lived_routing.capture && !pin_lived(seq, n_cached, std::max(n, n_restore))) {
         opt_fail("llama_opt_learn: sequence " + std::to_string(seq) + " has positions in [" + std::to_string(n_cached) + ", "
             + std::to_string(n_cached + std::max(n, n_restore)) + ") its serving never routed; a lesson replays only what she lived");
