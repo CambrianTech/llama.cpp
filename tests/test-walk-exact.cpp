@@ -284,6 +284,13 @@ static int32_t model_n_expert(const llama_model * model) {
     GGML_ASSERT(llama_model_meta_val_str(model, (std::string(arch) + ".expert_count").c_str(), val, sizeof(val)) > 0);
     return (int32_t) std::atoi(val);
 }
+// the model's experts per token, from its own metadata (<arch>.expert_used_count)
+static int32_t model_n_expert_used(const llama_model * model) {
+    char arch[64], val[32];
+    GGML_ASSERT(llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0);
+    GGML_ASSERT(llama_model_meta_val_str(model, (std::string(arch) + ".expert_used_count").c_str(), val, sizeof(val)) > 0);
+    return (int32_t) std::atoi(val);
+}
 // what this catches (Codex on fork #167): a context-wide pin that hands a neighbour the lesson's experts
 // at the same positions, or drops the whole ubatch to the router when one row is uncovered.
 static int pinned_rows_are_per_sequence(const common_params & params, llama_model * model, const std::vector<llama_token> & tokens) {
@@ -390,6 +397,113 @@ static int pinned_rows_survive_graph_reuse(const common_params & params, llama_m
         failed += wrong != 0;
     }
     return failed;
+}
+
+// what this catches: serving's capture recording something other than what the graph selected, or a
+// last-layer row serving never routed (the cut keeps only outputs) recorded as lived. One serving
+// decode of n rows, only the last an output (a prompt's prefill), with capture on and the graph's own
+// ffn_moe_topk recorded beside it: every layer but the last matches row by row, and the last holds
+// only the output row.
+static int capture_records_what_serving_routed(const common_params & params_in, llama_model * model, const std::vector<llama_token> & tokens) {
+    const uint32_t n = 32;
+    common_params params = params_in;
+    lived_routing r;
+    r.n_layer = llama_model_n_layer(model);
+    r.n_pos   = (int32_t) n;
+    params.cb_eval           = routing_eval;
+    params.cb_eval_user_data = &r;
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_ctx      = 2 * n;
+    cparams.n_batch    = n;
+    cparams.n_ubatch   = n;
+    cparams.kv_unified = true;
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(llama_set_routing_capture(ctx, true) == LLAMA_ROUTING_CAPTURE_RECORDING);
+    llama_batch batch = llama_batch_init((int32_t) n, 0, 1);
+    for (uint32_t i = 0; i < n; ++i) {
+        batch.token[i]     = tokens[i];
+        batch.pos[i]       = (llama_pos) i;
+        batch.n_seq_id[i]  = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i]    = i + 1 == n;
+    }
+    batch.n_tokens = (int32_t) n;
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    llama_batch_free(batch);
+    std::vector<int32_t> table((size_t) r.n_layer * n * r.n_used);
+    GGML_ASSERT(llama_get_lived_routing(ctx, 0, 0, (int32_t) n, table.data()));
+    const size_t bytes = llama_lived_routing_bytes(ctx);
+    llama_free(ctx);
+    int wrong = 0;
+    const int32_t last = r.n_layer - 1;
+    for (int32_t il = 0; il < r.n_layer; ++il) {
+        for (uint32_t p = 0; p < n; ++p) {
+            const int32_t * got = &table[((size_t) il * n + p) * r.n_used];
+            if (il == last && p + 1 < n) {
+                wrong += got[0] != -1; // never routed by serving
+                continue;
+            }
+            // the recorder keeps the last layer's single output row at its row 0
+            const size_t row = il == last ? 0 : p;
+            wrong += std::memcmp(got, &r.ids[((size_t) il * r.n_pos + row) * r.n_used], sizeof(int32_t) * r.n_used) != 0;
+        }
+    }
+    printf("  capture: %d of %u rows x %d layers differ from what the graph selected (the last layer: its output only); table %zu bytes\n",
+           wrong, n, r.n_layer, bytes);
+    return wrong == 0 ? 0 : 1;
+}
+
+// WALK_ROUTING_BENCH: what capture costs serving. One context, a prefill, then single-token decodes
+// (the generation shape) with capture off and on, alternated so the node's other load falls on both
+// arms alike; each arm reports tokens per second over its decodes.
+static void routing_capture_bench(const common_params & params, llama_model * model, const std::vector<llama_token> & tokens) {
+    const uint32_t n_prompt = 64, n_gen = 64, rounds = 8;
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_ctx      = n_prompt + rounds * 2 * n_gen + 8;
+    cparams.n_batch    = n_prompt;
+    cparams.n_ubatch   = n_prompt;
+    cparams.kv_unified = true;
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    GGML_ASSERT(ctx != nullptr);
+    llama_batch batch = llama_batch_init((int32_t) n_prompt, 0, 1);
+    auto put = [&](uint32_t k, llama_token t, llama_pos p, bool out) {
+        batch.token[k] = t; batch.pos[k] = p; batch.n_seq_id[k] = 1; batch.seq_id[k][0] = 0; batch.logits[k] = out;
+    };
+    for (uint32_t i = 0; i < n_prompt; ++i) {
+        put(i, tokens[i], (llama_pos) i, i + 1 == n_prompt);
+    }
+    batch.n_tokens = (int32_t) n_prompt;
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    llama_synchronize(ctx);
+    llama_pos pos = (llama_pos) n_prompt;
+    double tps[2][8] = {};
+    for (uint32_t r = 0; r < rounds; ++r) {
+        for (int on = 0; on < 2; ++on) {
+            GGML_ASSERT(llama_set_routing_capture(ctx, on != 0) == (on ? LLAMA_ROUTING_CAPTURE_RECORDING : LLAMA_ROUTING_CAPTURE_OFF));
+            const int64_t t0 = ggml_time_us();
+            for (uint32_t g = 0; g < n_gen; ++g) {
+                put(0, tokens[(size_t) pos % tokens.size()], pos, true);
+                batch.n_tokens = 1;
+                GGML_ASSERT(llama_decode(ctx, batch) == 0);
+                (void) llama_get_logits_ith(ctx, -1); // the sampler's read: the step's synchronize
+                ++pos;
+            }
+            tps[on][r] = n_gen * 1e6 / (double) (ggml_time_us() - t0);
+        }
+    }
+    llama_batch_free(batch);
+    auto median = [&](int on) {
+        std::vector<double> v(tps[on], tps[on] + rounds);
+        std::sort(v.begin(), v.end());
+        return (v[rounds / 2 - 1] + v[rounds / 2]) / 2.0;
+    };
+    printf("  capture bench (%u rounds of %u decodes, alternated): median off %.2f tok/s, on %.2f tok/s (on/off %.3f); table %zu bytes; capture host time %.1f us per captured decode\n",
+           rounds, n_gen, median(0), median(1), median(1) / median(0), llama_lived_routing_bytes(ctx), (double) llama_lived_routing_host_us(ctx) / (rounds * n_gen));
+    for (uint32_t r = 0; r < rounds; ++r) {
+        printf("    round %u: off %.2f  on %.2f\n", r, tps[0][r], tps[1][r]);
+    }
+    llama_free(ctx);
 }
 // one SGD step from the fresh adapter: the step itself, -lr * the gradient it took
 static std::vector<float> step_delta(const common_params & params, llama_model * model, const std::string & init,
@@ -860,10 +974,24 @@ int main(int argc, char ** argv) {
     // walk, or routing flips between row shapes? Both are measured: each graph routing for itself, then
     // both replaying the routing the window was served with. If pinning restores agreement, routing
     // was the cause, and the walk replays the lived routing by design.
+    if (getenv("WALK_ROUTING_BENCH")) {
+        routing_capture_bench(params, model, tokens);
+        std::remove(init.c_str());
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
     if (getenv("WALK_PINNED")) {
-        if (pinned_rows_are_per_sequence(params, model, tokens) != 0 || pinned_rows_survive_graph_reuse(params, model, tokens) != 0) {
+        if (capture_records_what_serving_routed(params, model, tokens) != 0 || pinned_rows_are_per_sequence(params, model, tokens) != 0 ||
+            pinned_rows_survive_graph_reuse(params, model, tokens) != 0) {
             fprintf(stderr, "FAILED: a pinned row is not its own sequence's (Codex on fork #167)\n");
             return 1;
+        }
+        if (getenv("WALK_PINNED_CHECKS_ONLY")) { // the routing checks alone, without the learning comparison
+            std::remove(init.c_str());
+            llama_model_free(model);
+            llama_backend_free();
+            return 0;
         }
         std::vector<uint8_t> all(WINDOW + 1, 1);
         all[0] = 0;
@@ -1012,7 +1140,11 @@ int main(int argc, char ** argv) {
                 };
                 cp.cb_eval_user_data = &graph_segments;
             }
-            return llama_init_from_model(model, cp);
+            llama_context * c = llama_init_from_model(model, cp);
+            if (getenv("WALK_LIVE_PINNED")) { // serving records her routing; her lesson replays it
+                GGML_ASSERT(llama_set_routing_capture(c, true) == LLAMA_ROUTING_CAPTURE_RECORDING);
+            }
+            return c;
         };
         auto decode_span = [&](llama_context * c, llama_seq_id sq, const llama_token * t, llama_pos p0, int32_t n) {
             llama_batch b = llama_opt_batch_init(WINDOW);
@@ -1063,6 +1195,22 @@ int main(int argc, char ** argv) {
         if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS")) {
             want_second_neighbour = seq_state(ctl, 2);
         }
+        // WALK_LIVE_PINNED: her routing as served, and the reference step that replays it
+        lived_routing served_routing;
+        std::vector<float> want_pinned;
+        if (getenv("WALK_LIVE_PINNED")) {
+            served_routing.n_layer = llama_model_n_layer(model);
+            served_routing.n_used  = model_n_expert_used(model);
+            served_routing.n_pos   = (int32_t) WINDOW;
+            served_routing.ids.resize((size_t) served_routing.n_layer * WINDOW * served_routing.n_used);
+            GGML_ASSERT(llama_get_lived_routing(ctl, 0, 0, (int32_t) WINDOW, served_routing.ids.data()));
+            const ggml_type kept = g_cache_type;
+            g_cache_type = streams ? GGML_TYPE_F16 : GGML_TYPE_F32; // the cache the live context keeps
+            g_pinned     = &served_routing;
+            want_pinned  = step_delta(params, model, init, tokens, reply, WINDOW, true);
+            g_pinned     = nullptr;
+            g_cache_type = kept;
+        }
         llama_free(ctl);
 
         llama_adapter_lora * adapter = llama_adapter_lora_init(model, init.c_str());
@@ -1072,6 +1220,19 @@ int main(int argc, char ** argv) {
         GGML_ASSERT(llama_set_adapters_lora(ctx, &adapter, 1, &scale) == 0);
         decode_span(ctx, 1, neighbour, 0, 200);
         decode_span(ctx, 0, tokens.data(), 0, r0); // her context, as served
+        if (getenv("WALK_LIVE_PINNED")) {
+            // her reply was served in the control: carry its routing here, as a sequence paged in carries
+            // it, then lift the pin so only her lesson replays it (the table keeps it)
+            const int32_t span = (int32_t) WINDOW - r0;
+            std::vector<int32_t> reply_routing((size_t) served_routing.n_layer * span * served_routing.n_used);
+            for (int32_t il = 0; il < served_routing.n_layer; ++il) {
+                std::memcpy(&reply_routing[(size_t) il * span * served_routing.n_used],
+                            &served_routing.ids[((size_t) il * WINDOW + r0) * served_routing.n_used],
+                            sizeof(int32_t) * span * served_routing.n_used);
+            }
+            GGML_ASSERT(llama_set_pinned_experts(ctx, 0, served_routing.n_layer, served_routing.n_used, r0, span, reply_routing.data()));
+            GGML_ASSERT(llama_set_pinned_experts(ctx, 0, served_routing.n_layer, served_routing.n_used, 0, 0, nullptr));
+        }
         if (getenv("WALK_LIVE_BRACKET_NEIGHBOURS")) { decode_span(ctx, 2, neighbour, 0, 200); }
         const std::vector<uint8_t> neighbour_before = seq_state(ctx, 1);
         struct admission_counts { size_t statics = 0, workspace = 0; bool allow_workspace = true; std::map<std::string, size_t> limits; } stale_admission, current_admission;
@@ -1540,7 +1701,8 @@ int main(int argc, char ** argv) {
             got[i] = after[i] - before[i];
         }
         printf("  live sequence: learned=%d \"%s\"\n", (int) learned, learned ? "" : "see the log");
-        if (!learned || !same_step(compare("live sequence: her reply learned in place vs the walk's exact step", got, streams ? want_f16 : want_f32))) {
+        const auto & want_live = getenv("WALK_LIVE_PINNED") ? want_pinned : (streams ? want_f16 : want_f32);
+        if (!learned || !same_step(compare("live sequence: her reply learned in place vs the walk's exact step", got, want_live))) {
             fprintf(stderr, "FAILED: learning on a live sequence is not the walk's step\n");
             ++failures;
         }

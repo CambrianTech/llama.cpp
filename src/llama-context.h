@@ -8,7 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
-#include "llama-pinned-experts.h"
+#include "llama-lived-routing.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -240,9 +240,26 @@ struct llama_context {
 
     llama_context_buffer_bytes buffer_bytes() const;
     int32_t memory_rows(llama_context_memory_row * out, int32_t n_max) const; // Continuum, llama-context-api.cpp
-    bool set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids); // Continuum, llama-pinned-experts.cpp
-    void drop_reusable_graphs(); // Continuum: no cached graph is reused across a change it cannot see
-    llama_pinned_experts pinned_experts; // Continuum: a lesson's lived routing (llama-pinned-experts.h)
+    // Continuum: her routing as lived (llama-lived-routing.h, .cpp)
+    llama_routing_capture set_routing_capture(bool on);
+    bool set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids);
+    bool pin_lived(llama_seq_id seq, llama_pos pos0, int32_t n_pos);
+    void clear_pin();
+    void routing_queue(const llm_graph_result * res, const llama_ubatch & ubatch); // after a serving ubatch computes
+    void routing_settle();                                                         // at synchronize
+    void drop_reusable_graphs(); // no cached graph is reused across a change it cannot see
+    llama_lived_routing lived_routing;
+    struct routing_pending {
+        std::vector<std::vector<llama_seq_id>> seqs; // per ubatch row
+        std::vector<llama_pos> pos;
+        std::vector<uint8_t>   out;   // per ubatch row: an output row
+        std::vector<uint8_t>   pinned;
+        uint32_t n_tokens = 0;
+        std::vector<std::pair<int32_t, int64_t>> layers; // il, rows it holds at rows [il * n_tokens, ...)
+        std::vector<int32_t> ids;                        // the buffer's first n_layer * n_tokens rows
+    };
+    std::vector<routing_pending> routing_queued; // reused: [0, routing_used) wait for synchronize
+    size_t routing_used = 0;
     llama_memory_breakdown memory_breakdown() const;
 
     //

@@ -1,5 +1,6 @@
 // Live-sequence learning: one owner for synchronous calls and resumable serving-loop chunks.
 #include "llama-context.h"
+#include "llama-model.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 #include <algorithm>
@@ -66,6 +67,18 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
         opt_fail("llama_opt_learn: sequence " + std::to_string(seq) + " has a pending recurrent rollback: finish or drop the draft first");
         return false;
     }
+    // the reply's rows, and the served tail it restores, replay the routing she served them with
+    // (llama-lived-routing.h); with capture on, a span she never served is refused by name, never routed afresh
+    if (model.hparams.n_expert > 0 && !lived_routing.capture) {
+        opt_fail("llama_opt_learn: a lesson on a mixture-of-experts base replays the routing she served, and this context "
+            "records none: turn on llama_set_routing_capture before she serves");
+        return false;
+    }
+    if (lived_routing.capture && !pin_lived(seq, n_cached, std::max(n, n_restore))) {
+        opt_fail("llama_opt_learn: sequence " + std::to_string(seq) + " has positions in [" + std::to_string(n_cached) + ", "
+            + std::to_string(n_cached + std::max(n, n_restore)) + ") its serving never routed; a lesson replays only what she lived");
+        return false;
+    }
     // her stable recurrent state at the served prefix, for the restore
     std::vector<uint8_t> snap;
     if (recr != nullptr) {
@@ -73,11 +86,13 @@ bool llama_context::opt_learn_begin(llama_seq_id seq, llama_pos n_cached, const 
         snap.resize(state_seq_get_size(seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
         if (state_seq_get_data(seq, snap.data(), snap.size(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != snap.size()) {
             opt_fail("could not capture the recurrent prefix; live learning was not started");
+            clear_pin();
             return false;
         }
     }
     if (attn != nullptr && !attn->seq_rm(seq, n_cached, -1)) {
         opt_fail("llama_opt_learn: could not drop sequence " + std::to_string(seq) + "'s cells past " + std::to_string(n_cached));
+        clear_pin();
         return false;
     }
     auto state = std::make_unique<opt_live_reply>();
@@ -203,6 +218,7 @@ llama_opt_learn_status llama_context::opt_learn_step() {
         if (!restored) {
             opt_fail("live reply could not restore its served prefix: re-prefill it");
             opt_reply.reset();
+            clear_pin(); // Continuum: the lesson no longer replays her routing
             return LLAMA_OPT_LEARN_FAILED;
         }
     }
@@ -212,6 +228,7 @@ llama_opt_learn_status llama_context::opt_learn_step() {
         cparams.walk_active = false;
         const auto failure = s.failure;
         opt_reply.reset();
+        clear_pin(); // Continuum: the lesson no longer replays her routing
         if (!failure.empty()) {
             opt_fail(failure.c_str());
             return LLAMA_OPT_LEARN_FAILED;
@@ -263,6 +280,7 @@ llama_opt_learn_status llama_context::opt_learn_step() {
         if (s.restoring) {
             opt_fail("live reply restoration failed: re-prefill its sequence");
             opt_reply.reset();
+            clear_pin(); // Continuum: the lesson no longer replays her routing
             return LLAMA_OPT_LEARN_FAILED;
         }
         s.failure = opt_failure.empty() ? "live reply training chunk failed" : opt_failure;
@@ -273,6 +291,7 @@ llama_opt_learn_status llama_context::opt_learn_step() {
     if (s.restoring && s.cursor == end) {
         const auto failure = s.failure;
         opt_reply.reset();
+        clear_pin(); // Continuum: the lesson no longer replays her routing
         if (!failure.empty()) {
             opt_fail(failure.c_str());
             return LLAMA_OPT_LEARN_FAILED;

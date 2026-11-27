@@ -1106,6 +1106,7 @@ public:
 
     // [0] is the LLAMA_MOE_RANDOM_ROUTING input, the rest are views of it
     std::vector<ggml_tensor *> t_moe_ids;
+    std::vector<std::pair<int32_t, ggml_tensor *>> t_routing; // Continuum: each MoE layer's selected ids, for capture (llama-lived-routing.h)
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
