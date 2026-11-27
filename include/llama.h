@@ -2202,14 +2202,33 @@ extern "C" {
     // name before anything is decoded (llama_opt_failure). Set before llama_opt_epoch.
     LLAMA_API void llama_opt_set_walk_host_budget(struct llama_context * lctx, size_t bytes);
 
-    // Replay a lesson's routing as it was lived (Continuum): `ids` holds, for each MoE layer and each
+    // A mind's routing as she lived it (Continuum; llama-lived-routing.h). On a mixture-of-experts base
+    // with capture on, serving records each row's chosen experts per sequence, position and layer; a
+    // live lesson (llama_opt_learn_begin) replays its span's, and is refused for a span she never
+    // served. Capture returns false, changing nothing, for a model without experts or with more than 256.
+    LLAMA_API bool llama_set_routing_capture(struct llama_context * ctx, bool on);
+
+    // Import a span's routing into the table and pin it: `ids` holds, for each MoE layer and each
     // position in [pos0, pos0 + n_pos) of sequence `seq`, its n_used chosen experts
-    // ([n_layer][n_pos][n_used]). Per row: a row of `seq` alone inside the range replays its experts;
-    // every other row in the same ubatch (a neighbour's, or `seq` outside the range) routes as it
-    // serves. n_pos 0 clears. Returns false, setting nothing, when the shape is not the model's (its
-    // layers and experts per token) or an id is not one of its experts.
+    // ([n_layer][n_pos][n_used]). Per row: a row of `seq` alone inside the span replays its experts;
+    // every other row in the same ubatch routes as it serves. n_pos 0 clears the pin. Returns false,
+    // setting nothing, when the shape is not the model's or an id is not one of its experts.
     LLAMA_API bool llama_set_pinned_experts(struct llama_context * ctx, llama_seq_id seq, int32_t n_layer, int32_t n_used,
             llama_pos pos0, int32_t n_pos, const int32_t * ids);
+
+    // Pin a span from what serving recorded; false, pinning nothing, when a position was never served.
+    LLAMA_API bool llama_pin_lived_routing(struct llama_context * ctx, llama_seq_id seq, llama_pos pos0, int32_t n_pos);
+
+    // The bytes the lived-routing table holds, for the owner of this context's memory.
+    LLAMA_API size_t llama_lived_routing_bytes(const struct llama_context * ctx);
+
+    // Read a span's lived routing ([n_layer][n_pos][n_used], -1 where serving never routed that layer at
+    // that position: the last layer runs only a ubatch's outputs): what a sequence paged out carries
+    // with it. False when a position was never served.
+    LLAMA_API bool llama_get_lived_routing(struct llama_context * ctx, llama_seq_id seq, llama_pos pos0, int32_t n_pos, int32_t * ids);
+
+    // The host microseconds capture has spent so far (queueing copies and writing the table): its price.
+    LLAMA_API int64_t llama_lived_routing_host_us(const struct llama_context * ctx);
 
     // The host bytes the exact walk's largest window so far kept (0 before one ran, or when the
     // walk is not exact): what a run of this shape needs, from the run's own arithmetic.

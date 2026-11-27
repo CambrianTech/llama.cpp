@@ -965,6 +965,7 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    routing_settle(); // Continuum: the routing copied after compute lands in her table
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2440,6 +2441,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (opt_retains_graph(mctx, res)) { // Continuum: the live owner keeps the prepared graph
             return 0;
         }
+        routing_queue(res, ubatch); // Continuum: what she served, for the lessons that replay it (llama-lived-routing.cpp)
 
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
