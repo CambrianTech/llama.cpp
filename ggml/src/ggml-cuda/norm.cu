@@ -269,14 +269,20 @@ static __global__ void rms_norm_f32(const T *     x,
     }
 }
 
+struct rms_norm_back_layout {
+    int64_t ne1, ne2;
+    size_t stride[4];
+};
+
 template <int block_size>
 static __global__ void rms_norm_back_f32(
-        const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
+        const float * grad, const float * xf, float * dst, const int ncols, const float eps, rms_norm_back_layout layout) {
     const int row = blockIdx.x*blockDim.y + threadIdx.y;
     const int tid = threadIdx.x;
 
     grad += int64_t(row)*ncols;
-    xf   += int64_t(row)*ncols;
+    const int64_t plane = row / layout.ne1;
+    xf += (row % layout.ne1)*layout.stride[1] + (plane % layout.ne2)*layout.stride[2] + (plane / layout.ne2)*layout.stride[3];
     dst  += int64_t(row)*ncols;
 
     float sum_xx = 0.0f; // sum for squares of x, equivalent to forward pass
@@ -284,7 +290,7 @@ static __global__ void rms_norm_back_f32(
 
     ggml_cuda_pdl_sync();
     for (int col = tid; col < ncols; col += block_size) {
-        const float xfi = xf[col];
+        const float xfi = xf[col*layout.stride[0]];
         sum_xx += xfi * xfi;
         sum_xg += xfi * grad[col];
     }
@@ -318,7 +324,7 @@ static __global__ void rms_norm_back_f32(
     const float scale_x    = -scale_grad * sum_xg/sum_eps;
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = scale_grad*grad[col] + scale_x*xf[col];
+        dst[col] = scale_grad*grad[col] + scale_x*xf[col*layout.stride[0]];
     }
 }
 
@@ -598,13 +604,14 @@ static void rms_norm_launch_typed(ggml_tensor * dst, const F & launch) {
     }
 }
 
-static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps,
+                                   rms_norm_back_layout layout, cudaStream_t stream) {
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
-        rms_norm_back_f32<WARP_SIZE><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+        rms_norm_back_f32<WARP_SIZE><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps, layout);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        rms_norm_back_f32<1024><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps);
+        rms_norm_back_f32<1024><<<nrows, block_dims, 0, stream>>>(grad, xf, dst, ncols, eps, layout);
     }
 }
 
@@ -893,7 +900,11 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
     memcpy(&eps, dst->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
-    rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, stream);
+    rms_norm_back_layout layout{src0f->ne[1], src0f->ne[2], {}};
+    for (int i = 0; i < 4; ++i) {
+        layout.stride[i] = src0f->nb[i] / sizeof(float);
+    }
+    rms_norm_back_f32_cuda(grad_d, src0f_d, dst_d, ne00, nrows, eps, layout, stream);
 }
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

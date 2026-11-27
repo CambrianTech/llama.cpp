@@ -4149,15 +4149,16 @@ struct test_rms_norm_back : public test_case {
     const std::array<int64_t, 4> ne;
     const float eps;
     const bool strided; // a and b are row views into tensors twice as wide (a per-head norm)
+    const bool packed_grad; // Qwen's gradient is packed even when its forward Q input is interleaved with gates
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, eps, strided);
+        return VARS_TO_STR5(type, ne, eps, strided, packed_grad);
     }
 
     test_rms_norm_back(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {64, 5, 4, 3},
-            float eps = 1e-6f, bool strided = false)
-        : type(type), ne(ne), eps(eps), strided(strided) {}
+            float eps = 1e-6f, bool strided = false, bool packed_grad = false)
+        : type(type), ne(ne), eps(eps), strided(strided), packed_grad(packed_grad) {}
 
     ggml_tensor * input(ggml_context * ctx, const char * name) {
         std::array<int64_t, 4> ne_full = ne;
@@ -4168,7 +4169,7 @@ struct test_rms_norm_back : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = input(ctx, "a");
+        ggml_tensor * a = packed_grad ? ggml_new_tensor(ctx, type, 4, ne.data()) : input(ctx, "a");
         ggml_tensor * b = input(ctx, "b");
 
         ggml_tensor * out = ggml_rms_norm_back(ctx, a, b, eps);
@@ -12344,6 +12345,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true, 1.5f));
             test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
             test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
+            test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true, true));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, true));
