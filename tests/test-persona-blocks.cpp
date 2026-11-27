@@ -774,6 +774,8 @@ int main(int argc, char ** argv) {
         g_fail_alloc = false;
         require_move(read_refused, llama_persona_move::out_of_memory, "a read that cannot allocate refuses");
         require(llama_persona_checkpoint_pos(restored) == -1, "and leaves nothing taken");
+        fprintf(stderr, "checkpoint file, every allocation failing: write %s (no file written), read %s (taken position %d)\n",
+                llama_persona_move_name(write_refused), llama_persona_move_name(read_refused), (int) llama_persona_checkpoint_pos(restored));
         require_move(st(llama_persona_checkpoint_read_file(back, kept.c_str(), 13, restored)), llama_persona_move::done, "her checkpoint back");
         require(llama_persona_checkpoint_pos(restored) == f.n_prompt - 1, "it holds through her last prompt position");
         llama_memory_clear(llama_get_memory(f.ctx), true);
