@@ -13,7 +13,11 @@
 //   - rows reordered with their sequence ids kept (Codex's case), a set rebound under another scale on a warm graph,
 //     and the base after an adapted owner: each phase below changes one of these and is held to the same bound;
 //   - interleaved groups (one set on rows 0 and 2): gathered and written back by index, counted, and held to the bound;
-//   - a token shared by sequences wearing different sets: refused, nothing decoded.
+//   - steps of two tokens with logits at the end: past inp_out_ids a tensor holds only the output rows, and each
+//     group adds to its own among them (Codex, #172);
+//   - an adapter nobody wears loaded and freed mid-phase: nothing named changes, every later step reuses its graph
+//     (Codex, #172: a free anywhere on the model refused every named set);
+//   - a token shared by sequences wearing different sets, and a set whose adapter was freed: refused.
 // The adapters are fresh ones with a nonzero B (a fresh B is zero: its delta would be nothing to test).
 
 #include "arg.h"
@@ -32,23 +36,28 @@
 
 static constexpr uint32_t N_MINDS = 4;
 static constexpr uint32_t PHASE   = 6;  // steps per phase
-static constexpr uint32_t PHASES  = 6;
+static constexpr uint32_t PHASES  = 8;
 
 using set_t = std::vector<std::pair<llama_adapter_lora *, float>>;
 
-// the phases: what each mind wears, and the order of her row in the batch
+// the phases: what each mind wears (wears below), the order of her rows in the batch, and how many tokens each mind
+// steps (logits only at her last: past inp_out_ids a tensor holds only those rows, a subset of the ubatch's)
 struct phase_t {
     const char * what;
     uint32_t     order[N_MINDS];
+    uint32_t     tokens;
 };
 static const phase_t phases[PHASES] = {
-    { "each her own set, rows in order",             { 0, 1, 2, 3 } },
-    { "rows swapped, sequence ids kept",             { 1, 0, 3, 2 } },
-    { "mind 0 rebound at another scale (warm graph)", { 0, 1, 2, 3 } },
-    { "mind 1 on the base after her adapter",        { 0, 1, 2, 3 } },
-    { "minds 0 and 2 share a set on rows 0 and 2",   { 0, 1, 2, 3 } },
-    { "the same sets with their rows consecutive",   { 0, 2, 1, 3 } },
+    { "each her own set, rows in order",                 { 0, 1, 2, 3 }, 1 },
+    { "rows swapped, sequence ids kept",                 { 1, 0, 3, 2 }, 1 },
+    { "mind 0 rebound at another scale (warm graph)",    { 0, 1, 2, 3 }, 1 },
+    { "mind 1 on the base after her adapter",            { 0, 1, 2, 3 }, 1 },
+    { "minds 0 and 2 share a set on rows 0 and 2",       { 0, 1, 2, 3 }, 1 },
+    { "the same sets with their rows consecutive",       { 0, 2, 1, 3 }, 1 },
+    { "two tokens each, logits at the end, interleaved", { 0, 1, 2, 3 }, 2 },
+    { "two tokens each, logits at the end, consecutive", { 0, 2, 1, 3 }, 2 },
 };
+static constexpr uint32_t FREES_AN_UNNAMED_ADAPTER = 2; // the phase that loads and frees an adapter nobody wears, mid-phase
 
 static set_t wears(uint32_t phase, uint32_t m, llama_adapter_lora * a, llama_adapter_lora * b) {
     const set_t sets[N_MINDS] = { { { a, 1.0f } }, { { b, 1.0f } }, { { a, 1.0f }, { b, 0.75f } }, {} };
@@ -140,6 +149,7 @@ struct arm_result {
     std::vector<std::vector<float>> logits; // [step * N_MINDS + mind][n_vocab]
     uint64_t gathered[PHASES] = {};
     bool refused_shared = false;
+    bool refused_freed  = false;
     int32_t reused[PHASES] = {}; // graphs reused in each phase after its first step
 };
 
@@ -215,33 +225,43 @@ static arm_result run_arm(const common_params & params, llama_model * model, con
         }
         const uint64_t gathered0 = llama_seq_adapters_gathered(ctx);
         int32_t reused0 = 0;
+        const uint32_t n = phases[ph].tokens;
         for (uint32_t g = 0; g < PHASE; ++g) {
             const uint32_t step = ph * PHASE + g;
-            auto token = [&](uint32_t m) { return tokens[(size_t) (pos[m] + 31 * m) % tokens.size()]; };
+            // mind m's tokens, logits at her last only
+            auto steps = [&](uint32_t m) {
+                for (uint32_t t = 0; t < n; ++t) {
+                    put(tokens[(size_t) (pos[m] + t + 31 * m) % tokens.size()], pos[m] + (llama_pos) t, (llama_seq_id) m, t + 1 == n);
+                }
+            };
             if (kind == arm::batch || kind == arm::base_batch) {
                 for (uint32_t row = 0; row < N_MINDS; ++row) {
-                    const uint32_t m = phases[ph].order[row];
-                    put(token(m), pos[m], (llama_seq_id) m, true);
+                    steps(phases[ph].order[row]);
                 }
                 GGML_ASSERT(decode() == 0);
                 for (uint32_t row = 0; row < N_MINDS; ++row) {
-                    const float * l = llama_get_logits_ith(ctx, (int32_t) row);
+                    const float * l = llama_get_logits_ith(ctx, (int32_t) (row * n + n - 1));
                     r.logits[step * N_MINDS + phases[ph].order[row]].assign(l, l + n_vocab);
                 }
             } else {
                 for (uint32_t m = 0; m < N_MINDS; ++m) {
                     context_set(kind == arm::base ? set_t{} : wears(ph, m, a, b));
-                    put(token(m), pos[m], (llama_seq_id) m, true);
+                    steps(m);
                     GGML_ASSERT(decode() == 0);
                     const float * l = llama_get_logits_ith(ctx, -1);
                     r.logits[step * N_MINDS + m].assign(l, l + n_vocab);
                 }
             }
             for (uint32_t m = 0; m < N_MINDS; ++m) {
-                ++pos[m];
+                pos[m] += (llama_pos) n;
             }
             if (g == 0) {
                 reused0 = llama_perf_context(ctx).n_reused; // the phase's first step builds what its sets need
+            }
+            if (ph == FREES_AN_UNNAMED_ADAPTER && g == 2) {
+                // an adapter nobody wears comes and goes (genes page in and out): nothing named changes, so every later
+                // step decodes and reuses its graph as before
+                llama_adapter_lora_free(adapter(model, params.model.path, 99));
             }
         }
         r.gathered[ph] = llama_seq_adapters_gathered(ctx) - gathered0;
@@ -253,6 +273,12 @@ static arm_result run_arm(const common_params & params, llama_model * model, con
         const int32_t i = put(tokens[0], std::max(pos[0], pos[1]), 0, true);
         GGML_ASSERT(llama_batch_ext_add_seq(batch, i, 1));
         r.refused_shared = decode() != 0;
+        // an adapter a sequence names is freed: her decode is refused until her set is named again
+        llama_adapter_lora * gone = adapter(model, params.model.path, 77);
+        seq_set(3, { { gone, 1.0f } });
+        llama_adapter_lora_free(gone);
+        put(tokens[0], pos[3], 3, true);
+        r.refused_freed = decode() != 0;
     }
     llama_batch_ext_free(batch);
     llama_free(ctx);
@@ -325,7 +351,7 @@ int main(int argc, char ** argv) {
             // adapters' matmuls add their own shapes' difference (measured 1.0-1.6x the base's, 2026-11-28: bounded at 2x)
             const bool exact   = worst <= 2.0f * kernels + FLT_EPSILON * scale;
             const bool passed  = exact && worst * 10.0f < effect;
-            const bool counted = batch.gathered[ph] == (ph == 4 ? PHASE : 0); // phase 4 interleaves, in one ubatch either way
+            const bool counted = batch.gathered[ph] == (ph == 4 || ph == 6 ? PHASE : 0); // phases 4 and 6 interleave, in one ubatch either way
             // groups never cost a reuse: after its first step, a phase reuses exactly the graphs upstream's batch does
             const bool reuses  = batch.reused[ph] == shape.reused[ph];
             printf("seq-adapters:   phase %u (%s): max |batch - nearer reference| %.3e (kernels' own %.3e, upstream's two orders %.3e), "
@@ -337,6 +363,8 @@ int main(int argc, char ** argv) {
         }
         printf("seq-adapters:   a token under two sequences wearing different sets is %s\n", batch.refused_shared ? "refused" : "DECODED  <-- FAILED");
         ok = ok && batch.refused_shared;
+        printf("seq-adapters:   a decode under a named set whose adapter was freed is %s\n", batch.refused_freed ? "refused" : "DECODED  <-- FAILED");
+        ok = ok && batch.refused_freed;
     }
 
     llama_adapter_lora_free(a);

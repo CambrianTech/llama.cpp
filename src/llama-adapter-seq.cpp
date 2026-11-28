@@ -8,6 +8,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 
@@ -15,63 +16,73 @@
 // the sets
 //
 
+uint64_t llama_adapter_lora_next_serial() {
+    static std::atomic<uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 llama_adapter_set llama_adapter_set_of(const llama_adapter_loras & loras, const llama_adapter_lora * shadow) {
     llama_adapter_set set;
     set.adapters.reserve(loras.size());
     for (const auto & [adapter, scale] : loras) {
         if (adapter != shadow && scale != 0.0f) {
-            set.adapters.emplace_back(adapter, scale);
+            set.adapters.push_back({ adapter, adapter->serial, scale });
         }
     }
     std::sort(set.adapters.begin(), set.adapters.end());
     return set;
 }
 
+void llama_adapter_seq_rows::add(int32_t row) {
+    if (n == 0) {
+        begin = row;
+    } else if (consecutive() && row != begin + n) { // its rows interleave with another group's: list them
+        for (int32_t r = begin; r < begin + n; ++r) {
+            rows.push_back(r);
+        }
+    }
+    if (!consecutive()) {
+        rows.push_back(row);
+    }
+    ++n;
+}
+
 bool llama_adapter_seq_groups::gathered() const {
-    return std::any_of(groups.begin(), groups.end(), [](const llama_adapter_seq_group & group) { return !group.consecutive(); });
+    return std::any_of(groups.begin(), groups.end(), [](const llama_adapter_seq_group & group) {
+        return !group.tokens.consecutive() || !group.outputs.consecutive();
+    });
 }
 
-llama_adapter_set llama_adapter_seq_sets::wears(llama_seq_id seq, const llama_adapter_set & context_set) const {
+const llama_adapter_set & llama_adapter_seq_sets::wears(llama_seq_id seq, const llama_adapter_set & context_set) const {
     const auto it = by_seq.find(seq);
-    return it == by_seq.end() ? context_set : it->second.set;
+    return it == by_seq.end() ? context_set : it->second;
 }
 
-llama_adapter_seq_groups llama_adapter_seq_sets::group(const llama_ubatch & ubatch, const llama_adapter_set & context_set, uint64_t lora_frees) const {
+llama_adapter_seq_groups llama_adapter_seq_sets::group(const llama_ubatch & ubatch, const llama_adapter_set & context_set) const {
     llama_adapter_seq_groups out;
-    if (by_seq.empty()) {
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq && !by_seq.empty(); ++s) {
+        out.named = out.named || by_seq.count(ubatch.seq_id_unq[s]) > 0;
+    }
+    if (!out.named) {
         return out;
     }
-    bool named = false;
-    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-        named = named || by_seq.count(ubatch.seq_id_unq[s]) > 0;
-    }
-    if (!named) {
-        return out;
-    }
-    out.named      = true;
-    out.lora_frees = lora_frees;
-    // a row's set is its first sequence's: decode refused a token whose sequences wear different sets (refuses)
+    // a row's set is its first sequence's: decode refused a token whose sequences wear different sets (refuses). Its
+    // output rank is its place among the rows whose logits were asked for (inp_out_ids lists them in row order)
+    int32_t output = 0;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        llama_adapter_set set = wears(ubatch.seq_id[i][0], context_set);
-        if (set.adapters.empty()) {
-            continue; // the base: no delta, no group
-        }
-        auto it = std::find_if(out.groups.begin(), out.groups.end(), [&](const llama_adapter_seq_group & group) { return group.set == set; });
-        if (it == out.groups.end()) {
-            out.groups.push_back({ std::move(set), (int32_t) i, 1, {} });
-            continue;
-        }
-        if (it->consecutive() && it->begin + it->n == (int32_t) i) {
-            ++it->n;
-            continue;
-        }
-        if (it->consecutive()) { // its rows interleave with another group's: list them
-            for (int32_t r = it->begin; r < it->begin + it->n; ++r) {
-                it->rows.push_back(r);
+        const bool outputs = ubatch.output == nullptr || ubatch.output[i];
+        const llama_adapter_set & set = wears(ubatch.seq_id[i][0], context_set);
+        if (!set.adapters.empty()) { // the base: no delta, no group
+            auto it = std::find_if(out.groups.begin(), out.groups.end(), [&](const llama_adapter_seq_group & group) { return group.set == set; });
+            if (it == out.groups.end()) {
+                it = out.groups.insert(out.groups.end(), llama_adapter_seq_group{ set, {}, {} });
+            }
+            it->tokens.add((int32_t) i);
+            if (outputs) {
+                it->outputs.add(output);
             }
         }
-        it->rows.push_back((int32_t) i);
-        ++it->n;
+        output += outputs;
     }
     if (out.gathered()) {
         ++gathered;
@@ -79,20 +90,26 @@ llama_adapter_seq_groups llama_adapter_seq_sets::group(const llama_ubatch & ubat
     return out;
 }
 
-const char * llama_adapter_seq_sets::refuses(const llama_batch_ext & batch, const llama_adapter_set & context_set, uint64_t lora_frees) const {
+const char * llama_adapter_seq_sets::refuses(const llama_batch_ext & batch, const llama_adapter_set & context_set, const llama_model & model) const {
     if (by_seq.empty()) {
         return nullptr;
     }
-    for (const auto & [seq, named] : by_seq) {
-        if (named.lora_frees != lora_frees && !named.set.adapters.empty()) {
-            return "a sequence's adapter set was named before an adapter was freed; name it again";
+    {
+        std::shared_lock<std::shared_mutex> lock(model.loras_mutex); // an adapter may load or free on another thread
+        for (const auto & [seq, set] : by_seq) {
+            for (const auto & entry : set.adapters) {
+                // the address must still be loaded on the model, and be the same load (read only once it is known alive)
+                if (model.loras.count(entry.adapter) == 0 || entry.adapter->serial != entry.serial) {
+                    return "an adapter a sequence names was freed; name its set again";
+                }
+            }
         }
     }
     for (const auto & token : batch.tokens) {
         if (token.seq_ids.size() < 2) {
             continue;
         }
-        const llama_adapter_set first = wears(*token.seq_ids.begin(), context_set);
+        const llama_adapter_set & first = wears(*token.seq_ids.begin(), context_set);
         for (const llama_seq_id seq : token.seq_ids) {
             if (wears(seq, context_set) != first) {
                 return "a token is shared by sequences that wear different adapter sets; submit it once per set";
@@ -111,7 +128,7 @@ int32_t llama_context::set_seq_adapters_lora(llama_seq_id seq, llama_adapter_lor
         LLAMA_LOG_ERROR("%s: sequence %d is outside the context's %u\n", __func__, seq, cparams.n_seq_max);
         return -1;
     }
-    llama_adapter_seq_sets::named named;
+    llama_adapter_set set;
     {
         std::shared_lock<std::shared_mutex> lock(model.loras_mutex); // an adapter may load or free on another thread
         for (size_t i = 0; i < n_adapters; ++i) {
@@ -120,13 +137,12 @@ int32_t llama_context::set_seq_adapters_lora(llama_seq_id seq, llama_adapter_lor
                 return -2;
             }
             if (scales[i] != 0.0f) {
-                named.set.adapters.emplace_back(adapters[i], scales[i]);
+                set.adapters.push_back({ adapters[i], adapters[i]->serial, scales[i] });
             }
         }
-        named.lora_frees = model.lora_frees.load(std::memory_order_acquire);
     }
-    std::sort(named.set.adapters.begin(), named.set.adapters.end());
-    seq_adapters.by_seq[seq] = std::move(named);
+    std::sort(set.adapters.begin(), set.adapters.end());
+    seq_adapters.by_seq[seq] = std::move(set);
     // groups add each set's deltas: the scheduler's node budget is re-reserved only if they could exceed it
     sched_need_reserve = sched_need_reserve || graph_max_nodes() > sched_max_nodes;
     return 0;
@@ -141,7 +157,7 @@ llama_adapter_set llama_context::seq_adapters_context_set() const {
 }
 
 bool llama_context::seq_adapters_refuse(const llama_batch_ext & batch) const {
-    const char * why = seq_adapters.refuses(batch, seq_adapters_context_set(), model.lora_frees.load(std::memory_order_acquire));
+    const char * why = seq_adapters.refuses(batch, seq_adapters_context_set(), model);
     if (why != nullptr) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, why);
     }
@@ -149,7 +165,7 @@ bool llama_context::seq_adapters_refuse(const llama_batch_ext & batch) const {
 }
 
 void llama_context::seq_adapters_graph_params(llm_graph_params & params, const llama_ubatch & ubatch) const {
-    params.seq_groups = seq_adapters.group(ubatch, seq_adapters_context_set(), model.lora_frees.load(std::memory_order_acquire));
+    params.seq_groups = seq_adapters.group(ubatch, seq_adapters_context_set());
 }
 
 uint32_t llama_context::seq_adapters_max_nodes() const {
@@ -191,10 +207,8 @@ public:
     ggml_tensor *        tensor = nullptr;
 };
 
-// t's rows [begin, begin + n), its tokens its outermost dimension
-ggml_tensor * rows_view(ggml_context * ctx, ggml_tensor * t, int64_t n_tokens, int32_t begin, int32_t n) {
-    const int d = ggml_n_dims(t) - 1;
-    GGML_ASSERT(t->ne[d] == n_tokens && "an adapter group's rows are its tensor's outermost dimension");
+// t's rows [begin, begin + n) along dimension `d`, its rows
+ggml_tensor * rows_view(ggml_context * ctx, ggml_tensor * t, int d, int32_t begin, int32_t n) {
     switch (d) {
         case 0:  return ggml_view_1d(ctx, t, n, begin * t->nb[0]);
         case 1:  return ggml_view_2d(ctx, t, t->ne[0], n, t->nb[1], begin * t->nb[1]);
@@ -204,23 +218,38 @@ ggml_tensor * rows_view(ggml_context * ctx, ggml_tensor * t, int64_t n_tokens, i
 
 } // namespace
 
-// one delta per adapter of each group that wears one, on that group's rows; `term` builds an adapter's delta on rows
-// [begin, begin + n) of its inputs (all of them when n is the ubatch's)
+// The rows a tensor holds: the ubatch's tokens, or (after inp_out_ids) its outputs. A count that is neither is a shape
+// this path does not know, and building on it would add a delta to the wrong rows.
+const llama_adapter_seq_rows & llm_graph_context::seq_rows_of(const llama_adapter_seq_group & group, int64_t rows) const {
+    if (rows == (int64_t) n_tokens) {
+        return group.tokens;
+    }
+    if (rows == (int64_t) n_outputs) {
+        return group.outputs;
+    }
+    GGML_ABORT("an adapter target holds %lld rows: neither the ubatch's %u tokens nor its %u outputs", (long long) rows, n_tokens, n_outputs);
+}
+
+// one delta per adapter of each group that wears one, on that group's rows of `res`, which holds `rows` rows along
+// dimension `d`; `term` builds an adapter's delta on rows [begin, begin + n) of its inputs (all of them when n is `rows`)
 template <typename Term>
-ggml_tensor * llm_graph_context::seq_lora_apply(ggml_tensor * res, ggml_tensor * w, Term term) const {
+ggml_tensor * llm_graph_context::seq_lora_apply(ggml_tensor * res, ggml_tensor * w, int d, int64_t rows, Term term) const {
     for (const auto & group : seq_groups.groups) {
-        for (const auto & [adapter, scale] : group.set.adapters) {
-            llama_adapter_lora_weight * lw = adapter->get_weight(w);
+        const llama_adapter_seq_rows & mine = seq_rows_of(group, rows);
+        if (mine.n == 0) {
+            continue; // none of this group's rows are here (none of them asked for logits)
+        }
+        for (const auto & entry : group.set.adapters) {
+            llama_adapter_lora_weight * lw = entry.adapter->get_weight(w);
             if (lw == nullptr) {
                 continue;
             }
-            if (group.n == (int32_t) n_tokens) {
-                res = ggml_add(ctx0, res, term(adapter, lw, scale, 0, group.n));
-            } else if (group.consecutive()) {
-                const int d = ggml_n_dims(res) - 1;
-                res = ggml_acc(ctx0, res, term(adapter, lw, scale, group.begin, group.n), res->nb[1], res->nb[2], res->nb[3], group.begin * res->nb[d]);
+            if (mine.n == rows) {
+                res = ggml_add(ctx0, res, term(entry.adapter, lw, entry.scale, 0, mine.n));
+            } else if (mine.consecutive()) {
+                res = ggml_acc(ctx0, res, term(entry.adapter, lw, entry.scale, mine.begin, mine.n), res->nb[1], res->nb[2], res->nb[3], mine.begin * res->nb[d]);
             } else {
-                res = seq_rows_add(res, term(adapter, lw, scale, 0, (int32_t) n_tokens), group.rows);
+                res = seq_rows_add(res, term(entry.adapter, lw, entry.scale, 0, (int32_t) rows), mine.rows, rows);
             }
         }
     }
@@ -228,7 +257,7 @@ ggml_tensor * llm_graph_context::seq_lora_apply(ggml_tensor * res, ggml_tensor *
     for (const auto & [adapter, scale] : *loras) {
         llama_adapter_lora_weight * lw = adapter == shadow && lora_on(adapter) ? adapter->get_weight(w) : nullptr;
         if (lw != nullptr) {
-            res = shadow_add(res, term(adapter, lw, scale, 0, (int32_t) n_tokens));
+            res = shadow_add(res, term(adapter, lw, scale, 0, (int32_t) rows));
         }
     }
     return res;
@@ -236,35 +265,40 @@ ggml_tensor * llm_graph_context::seq_lora_apply(ggml_tensor * res, ggml_tensor *
 
 // base plus term on the listed rows only, as shadow_add: gathered, added, written back into a copy of base, so every
 // other row is base byte for byte
-ggml_tensor * llm_graph_context::seq_rows_add(ggml_tensor * base, ggml_tensor * term, const std::vector<int32_t> & rows) const {
-    auto inp = std::make_unique<llm_graph_input_seq_rows>(rows);
-    inp->tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) rows.size());
+ggml_tensor * llm_graph_context::seq_rows_add(ggml_tensor * base, ggml_tensor * term, const std::vector<int32_t> & listed, int64_t rows) const {
+    auto inp = std::make_unique<llm_graph_input_seq_rows>(listed);
+    inp->tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) listed.size());
     ggml_set_input(inp->tensor);
     ggml_tensor * idx = inp->tensor;
     res->add_input(std::move(inp));
 
     GGML_ASSERT(ggml_is_contiguous(base));
-    const int64_t n  = ggml_nelements(base) / n_tokens;
-    ggml_tensor * b2 = ggml_n_dims(base) <= 2 ? base : ggml_reshape_2d(ctx0, base, n, n_tokens);
-    ggml_tensor * t2 = ggml_n_dims(term) <= 2 ? term : ggml_reshape_2d(ctx0, ggml_cont(ctx0, term), n, n_tokens);
+    const int64_t n  = ggml_nelements(base) / rows;
+    ggml_tensor * b2 = ggml_n_dims(base) <= 2 ? base : ggml_reshape_2d(ctx0, base, n, rows);
+    ggml_tensor * t2 = ggml_n_dims(term) <= 2 ? term : ggml_reshape_2d(ctx0, ggml_cont(ctx0, term), n, rows);
     ggml_tensor * sel = ggml_add(ctx0, ggml_get_rows(ctx0, b2, idx), ggml_get_rows(ctx0, t2, idx));
     ggml_tensor * updated = ggml_set_rows(ctx0, ggml_dup(ctx0, b2), sel, idx);
     return ggml_n_dims(base) <= 2 ? updated : ggml_reshape(ctx0, updated, base);
 }
 
 ggml_tensor * llm_graph_context::seq_lora_mm(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * out) const {
-    return seq_lora_apply(out, w, [&](llama_adapter_lora * adapter, llama_adapter_lora_weight * lw, float scale, int32_t begin, int32_t n) {
-        ggml_tensor * x = n == (int32_t) n_tokens ? cur : rows_view(ctx0, cur, n_tokens, begin, n);
+    // a projection's input is [n_in, rows] or [n_in, x, rows]: its rows are its outermost dimension
+    GGML_ASSERT(cur->ne[3] == 1 && "a LoRA target's input holds its rows in its second or third dimension");
+    const int     d    = cur->ne[2] > 1 ? 2 : 1;
+    const int64_t rows = cur->ne[d];
+    return seq_lora_apply(out, w, d, rows, [&](llama_adapter_lora * adapter, llama_adapter_lora_weight * lw, float scale, int32_t begin, int32_t n) {
+        ggml_tensor * x = n == rows ? cur : rows_view(ctx0, cur, d, begin, n);
         ggml_tensor * ab = ggml_mul_mat(ctx0, lw->b, ggml_mul_mat(ctx0, lw->a, x));
         return ggml_scale(ctx0, ab, lw->get_scale(adapter->alpha, scale));
     });
 }
 
 ggml_tensor * llm_graph_context::seq_lora_mm_id(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * out) const {
-    return seq_lora_apply(out, w, [&](llama_adapter_lora * adapter, llama_adapter_lora_weight * lw, float scale, int32_t begin, int32_t n) {
-        const bool all = n == (int32_t) n_tokens;
-        ggml_tensor * x  = all ? cur : rows_view(ctx0, cur, n_tokens, begin, n);
-        ggml_tensor * id = all ? ids : rows_view(ctx0, ids, n_tokens, begin, n);
+    const int64_t rows = ids->ne[1]; // ids [n_expert_used, rows]; cur and the result hold their rows in dimension 2
+    return seq_lora_apply(out, w, 2, rows, [&](llama_adapter_lora * adapter, llama_adapter_lora_weight * lw, float scale, int32_t begin, int32_t n) {
+        const bool all = n == rows;
+        ggml_tensor * x  = all ? cur : rows_view(ctx0, cur, 2, begin, n);
+        ggml_tensor * id = all ? ids : rows_view(ctx0, ids, 1, begin, n);
         ggml_tensor * ab = ggml_mul_mat_id(ctx0, lw->b, ggml_mul_mat_id(ctx0, lw->a, x, id), id);
         // as build_lora_mm_id: the rank is B's input width
         const float rank = (float) lw->b->ne[0];
@@ -273,8 +307,9 @@ ggml_tensor * llm_graph_context::seq_lora_mm_id(ggml_tensor * w, ggml_tensor * c
 }
 
 ggml_tensor * llm_graph_context::seq_lora_embd(ggml_tensor * tok_embd, ggml_tensor * ids, ggml_tensor * cur) const {
-    return seq_lora_apply(cur, tok_embd, [&](llama_adapter_lora * adapter, llama_adapter_lora_weight * lw, float scale, int32_t begin, int32_t n) {
-        ggml_tensor * id = n == (int32_t) n_tokens ? ids : rows_view(ctx0, ids, n_tokens, begin, n);
+    const int64_t rows = ids->ne[0]; // the token ids, one per row
+    return seq_lora_apply(cur, tok_embd, 1, rows, [&](llama_adapter_lora * adapter, llama_adapter_lora_weight * lw, float scale, int32_t begin, int32_t n) {
+        ggml_tensor * id = n == rows ? ids : rows_view(ctx0, ids, 0, begin, n);
         return ggml_scale(ctx0, ggml_mul_mat(ctx0, lw->b, ggml_get_rows(ctx0, lw->a, id)), lw->get_scale(adapter->alpha, scale));
     });
 }

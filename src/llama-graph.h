@@ -1612,8 +1612,9 @@ struct llm_graph_context {
     ggml_tensor * seq_lora_mm_id(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * out) const;
     ggml_tensor * seq_lora_embd(ggml_tensor * tok_embd, ggml_tensor * ids, ggml_tensor * cur) const;
     template <typename Term>
-    ggml_tensor * seq_lora_apply(ggml_tensor * res, ggml_tensor * w, Term term) const;
-    ggml_tensor * seq_rows_add(ggml_tensor * base, ggml_tensor * term, const std::vector<int32_t> & rows) const;
+    ggml_tensor * seq_lora_apply(ggml_tensor * res, ggml_tensor * w, int d, int64_t rows, Term term) const;
+    ggml_tensor * seq_rows_add(ggml_tensor * base, ggml_tensor * term, const std::vector<int32_t> & listed, int64_t rows) const;
+    const llama_adapter_seq_rows & seq_rows_of(const llama_adapter_seq_group & group, int64_t rows) const;
     // base plus the shadow's term, on the labelled rows only (Cormac, 2026-10-14): those rows of
     // base and of the term are gathered and added, and written back into a copy of base; every
     // other row is base, byte for byte. A multiplied 0/1 mask was not: an untrained layer's inf or
