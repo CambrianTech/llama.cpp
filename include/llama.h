@@ -2241,6 +2241,20 @@ extern "C" {
     // hers. Name her when she is bound to the sequence; an unnamed sequence is keyed by its id.
     LLAMA_API void llama_set_graph_slot_key(struct llama_context * ctx, llama_seq_id seq, uint64_t key);
 
+    // Keep each decode's logits readable while the next decode is queued behind it (Continuum;
+    // llama-output-ring.h): two output buffers swapped by pointer per decode, and an event per decode,
+    // so a caller serving several minds queues mind B's step before reading mind A's. false, leaving
+    // it off, when the output device records no events.
+    LLAMA_API bool    llama_set_output_ring(struct llama_context * ctx, bool on);
+
+    // The last decode's ticket with the ring on (-1 before any decode, or with it off).
+    LLAMA_API int64_t llama_output_ticket(const struct llama_context * ctx);
+
+    // Row j of the outputs decode `ticket` produced, in the order it produced them, once they landed:
+    // waits for that decode alone, never for one queued after it. NULL once the ticket is no longer
+    // held (the decode after next has begun) or j is past its outputs.
+    LLAMA_API float * llama_ticket_logits(struct llama_context * ctx, int64_t ticket, int32_t j);
+
     // The bytes the lived-routing table holds, for the owner of this context's memory.
     LLAMA_API size_t llama_lived_routing_bytes(const struct llama_context * ctx);
 

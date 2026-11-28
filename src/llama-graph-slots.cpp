@@ -78,6 +78,7 @@ void llama_context::graph_slot_enter(const llama_ubatch & ubatch) {
                 sched_params_cur.max_nodes, sched_params_cur.parallel, sched_params_cur.op_offload));
         ggml_backend_sched_set_copy_callback(made->sched.get(), sched_copy_experts, this);
         ggml_backend_sched_set_realloc_callback(made->sched.get(), sched_graph_realloc, this);
+        ggml_backend_sched_use_events(made->sched.get()); // her inputs wait for her own last step, never for every mind's queued one
         for (auto & res : made->gf_res_prev) {
             res = std::make_unique<llm_graph_result>(sched_params_cur.max_nodes);
         }
