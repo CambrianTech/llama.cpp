@@ -1848,6 +1848,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    routing_capture_fit(ubatch.n_tokens); // Continuum: the routing capture holds this graph's rows (llama-lived-routing.cpp)
     graph_slot_enter(ubatch); // Continuum: this mind's own slot, where her kept graph is (llama-graph-slots.cpp)
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -3062,6 +3063,7 @@ ggml_cgraph * llama_context::graph_reserve(
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
     }
+    routing_capture_fit(n_tokens); // Continuum: the routing capture holds this graph's rows (llama-lived-routing.cpp)
 
     ggml_backend_sched_reset(sched.get());
 

@@ -168,6 +168,11 @@ static arm_result run_arm(const common_params & params, llama_model * model, con
     cparams.no_perf    = false; // the graphs reused are read back
     llama_context * ctx = llama_init_from_model(model, cparams);
     GGML_ASSERT(ctx != nullptr);
+    // as serving runs: each graph also records the routing it served (llama-lived-routing.h), so a graph the groups
+    // grow is built against the capture buffer too (the M5, 2026-11-28 14:08Z: naming a stream's genes re-reserved the
+    // scheduler and the capture's bound aborted it)
+    const auto capture = llama_set_routing_capture(ctx, true);
+    GGML_ASSERT(capture == LLAMA_ROUTING_CAPTURE_RECORDING || capture == LLAMA_ROUTING_CAPTURE_NO_EXPERTS);
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
     auto context_set = [&](const set_t & set) {

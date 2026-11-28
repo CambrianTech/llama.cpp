@@ -11,6 +11,7 @@
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
+#include "../src/llama-ext.h" // llama_graph_reserve
 
 #include <chrono>
 #include <cmath>
@@ -191,9 +192,18 @@ int main(int argc, char ** argv) {
         const int32_t i = llama_batch_ext_add_token(batch, 0, tokens[0]);
         GGML_ASSERT(i >= 0 && llama_batch_ext_set_pos(batch, i, &at) && llama_batch_ext_set_output_logits(batch, i, true));
         GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch) == 0);
+        // what this catches (the M5, 2026-11-28 14:08Z, 82 aborts): a graph larger than the ubatch the capture was
+        // sized for (a lesson decodes a whole reply in one graph; a scheduler re-reserved beside it reserves at that
+        // size) aborted at the capture's bound. The capture grows to hold it, and the context still decodes
+        llama_batch_ext_clear(batch);
+        GGML_ASSERT(llama_graph_reserve(ctx, 3 * 2048, 3, 3) != nullptr);
+        const llama_pos next = 1;
+        const int32_t j = llama_batch_ext_add_token(batch, 0, tokens[1]);
+        GGML_ASSERT(j >= 0 && llama_batch_ext_set_pos(batch, j, &next) && llama_batch_ext_set_output_logits(batch, j, true));
+        GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch) == 0);
         llama_batch_ext_free(batch);
         llama_free(ctx);
-        printf("graph-slots: three streams reserve and decode with routing captured\n");
+        printf("graph-slots: three streams reserve and decode with routing captured, and a graph past the ubatch grows the capture\n");
     }
 
     bool ok = true;

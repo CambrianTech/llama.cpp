@@ -247,6 +247,8 @@ struct llama_context {
     bool set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids);
     bool pin_lived(llama_seq_id seq, llama_pos pos0, int32_t n_pos);
     void clear_pin();
+    bool routing_capture_alloc(int64_t rows);  // the capture buffer for `rows` tokens a graph
+    void routing_capture_fit(uint32_t n_tokens); // grown before a larger graph is built
     void routing_queue(const llm_graph_result * res, const llama_ubatch & ubatch); // after a serving ubatch computes
     void routing_settle();                                                         // at synchronize
     void drop_reusable_graphs(); // no cached graph is reused across a change it cannot see
