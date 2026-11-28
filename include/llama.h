@@ -2241,6 +2241,27 @@ extern "C" {
     // hers. Name her when she is bound to the sequence; an unnamed sequence is keyed by its id.
     LLAMA_API void llama_set_graph_slot_key(struct llama_context * ctx, llama_seq_id seq, uint64_t key);
 
+    // Give sequence `seq` its own adapter set (Continuum), so one decode serves sequences wearing different
+    // adapters: each adapter's delta is added to its own sequences' rows only. Name it when a mind is bound to the
+    // sequence, never per step; n_adapters 0 (or every scale 0) is the base model, no adapter. The adapters must be
+    // loaded on the context's model. A sequence that names none wears the context's set (llama_set_adapters_lora).
+    // Returns 0, -1 for a sequence outside the context or missing adapters, -2 for an adapter not on the model.
+    // A token shared by sequences wearing different sets is refused by decode; an adapter freed after a set was
+    // named refuses decode until the set is named again.
+    LLAMA_API int32_t llama_set_seq_adapters_lora(
+            struct llama_context * ctx,
+                    llama_seq_id   seq,
+     struct llama_adapter_lora ** adapters,
+                          size_t   n_adapters,
+                     const float * scales);
+
+    // Return sequence `seq` to the context's set: when her mind is released from it.
+    LLAMA_API void llama_clear_seq_adapters_lora(struct llama_context * ctx, llama_seq_id seq);
+
+    // The ubatches whose sequences' sets interleaved, so their rows were gathered and written back by index
+    // instead of viewed: the fast path's misses, for a probe. Order a batch's sequences by set to avoid them.
+    LLAMA_API uint64_t llama_seq_adapters_gathered(const struct llama_context * ctx);
+
     // Keep each decode's logits readable while the next decode is queued behind it (Continuum;
     // llama-output-ring.h): two output buffers swapped by pointer per decode, and an event per decode,
     // so a caller serving several minds queues mind B's step before reading mind A's. false, leaving

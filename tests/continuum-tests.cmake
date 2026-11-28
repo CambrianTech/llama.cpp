@@ -60,6 +60,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # hybrid model (-m), on a GPU backend as well as the CPU (a hybrid passed on the CPU while Metal tore its state)
     llama_build(test-walk-exact.cpp)
     llama_build(test-graph-slots.cpp)
+    # one decode serves minds wearing different adapters, each on her own rows (src/llama-adapter-seq.h): -m a model
+    llama_build(test-seq-adapters.cpp)
     llama_build(test-output-ring.cpp)
     llama_build_and_test(test-server-tokens-range.cpp)
     target_include_directories(test-server-tokens-range PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)

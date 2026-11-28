@@ -2183,6 +2183,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (adapters_restore_uncertain(__func__)) { // Continuum
         return -1;
     }
+    if (seq_adapters_refuse(batch_inp)) { // Continuum: a token under two sequences' different sets (llama-adapter-seq.cpp)
+        return -1;
+    }
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2961,6 +2964,7 @@ uint32_t llama_context::graph_max_nodes() const {
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
+    res += seq_adapters_max_nodes(); // Continuum: each sequence's set adds its deltas, under the lock above (llama-adapter-seq.cpp)
 
     // the MoE cache adds a lookup to each MoE layer, and a second expert path with a CPU share (up to ~16 tensors per layer),
     // which the per-tensor estimates above do not cover for models with few tensors per layer
@@ -3139,6 +3143,7 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
     };
     opt_graph_params(params, ubatch); // Continuum: the shadow, its rows and the streams (llama-context-opt.cpp)
+    seq_adapters_graph_params(params, ubatch); // Continuum: each sequence's adapter set (llama-adapter-seq.cpp)
     return params;
 }
 
