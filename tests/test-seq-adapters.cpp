@@ -24,6 +24,7 @@
 #include "common.h"
 #include "llama.h"
 #include "gguf.h"
+#include "../src/llama-ext.h" // llama_get_memory_breakdown: the compute buffers each arm holds
 
 #include <algorithm>
 #include <chrono>
@@ -150,6 +151,9 @@ struct arm_result {
     uint64_t gathered[PHASES] = {};
     bool refused_shared = false;
     bool refused_freed  = false;
+    bool others_decode  = false; // a parked sequence's freed gene refuses only her
+    bool renamed_decodes = false;
+    size_t compute_bytes = 0; // the compute buffers the context holds after its steps
     int32_t reused[PHASES] = {}; // graphs reused in each phase after its first step
 };
 
@@ -277,8 +281,17 @@ static arm_result run_arm(const common_params & params, llama_model * model, con
         llama_adapter_lora * gone = adapter(model, params.model.path, 77);
         seq_set(3, { { gone, 1.0f } });
         llama_adapter_lora_free(gone);
+        // mind 3 is parked with it: mind 0 decodes alone (Codex, #172), mind 3 is refused until named again
+        put(tokens[0], pos[0], 0, true);
+        r.others_decode = decode() == 0;
         put(tokens[0], pos[3], 3, true);
         r.refused_freed = decode() != 0;
+        seq_set(3, {});
+        put(tokens[0], pos[3], 3, true);
+        r.renamed_decodes = decode() == 0;
+    }
+    for (const auto & [type, held] : llama_get_memory_breakdown(ctx)) {
+        r.compute_bytes += held.compute;
     }
     llama_batch_ext_free(batch);
     llama_free(ctx);
@@ -365,6 +378,28 @@ int main(int argc, char ** argv) {
         ok = ok && batch.refused_shared;
         printf("seq-adapters:   a decode under a named set whose adapter was freed is %s\n", batch.refused_freed ? "refused" : "DECODED  <-- FAILED");
         ok = ok && batch.refused_freed;
+        printf("seq-adapters:   with a parked mind's gene freed, another mind %s, and she decodes once named again: %s\n", batch.others_decode ? "decodes" : "is REFUSED  <-- FAILED", batch.renamed_decodes ? "yes" : "NO  <-- FAILED");
+        ok = ok && batch.others_decode && batch.renamed_decodes;
+        printf("seq-adapters:   compute buffers: batch %.2f MiB, upstream's batch with no adapter %.2f MiB, one mind at a time under the context's set %.2f MiB\n",
+               batch.compute_bytes / 1048576.0, shape.compute_bytes / 1048576.0, ref.compute_bytes / 1048576.0);
+    }
+
+    // the genome: many genes loaded on the model, a few worn. What a context holds follows the worn ones, so the batch
+    // under the same two worn genes holds the same compute buffers with sixteen more loaded and worn by no one
+    {
+        const arm_result few = run_arm(params, model, tokens, a, b, arm::batch, false);
+        std::vector<llama_adapter_lora *> genome;
+        for (uint32_t g = 0; g < 16; ++g) {
+            genome.push_back(adapter(model, params.model.path, 1000 + g));
+        }
+        const arm_result many = run_arm(params, model, tokens, a, b, arm::batch, false);
+        const bool same = many.compute_bytes == few.compute_bytes;
+        printf("seq-adapters: the genome: the batch's compute buffers with 2 genes loaded %.2f MiB, with 18 loaded (2 worn) %.2f MiB%s\n",
+               few.compute_bytes / 1048576.0, many.compute_bytes / 1048576.0, same ? "" : "  <-- FAILED");
+        ok = ok && same;
+        for (llama_adapter_lora * gene : genome) {
+            llama_adapter_lora_free(gene);
+        }
     }
 
     llama_adapter_lora_free(a);

@@ -95,12 +95,20 @@ const char * llama_adapter_seq_sets::refuses(const llama_batch_ext & batch, cons
         return nullptr;
     }
     {
+        // only the sequences this batch decodes: a parked mind whose gene was unloaded refuses her own next step, never
+        // another's (Codex, #172)
         std::shared_lock<std::shared_mutex> lock(model.loras_mutex); // an adapter may load or free on another thread
-        for (const auto & [seq, set] : by_seq) {
-            for (const auto & entry : set.adapters) {
-                // the address must still be loaded on the model, and be the same load (read only once it is known alive)
-                if (model.loras.count(entry.adapter) == 0 || entry.adapter->serial != entry.serial) {
-                    return "an adapter a sequence names was freed; name its set again";
+        for (const auto & token : batch.tokens) {
+            for (const llama_seq_id seq : token.seq_ids) {
+                const auto named = by_seq.find(seq);
+                if (named == by_seq.end()) {
+                    continue;
+                }
+                for (const auto & entry : named->second.adapters) {
+                    // the address must still be loaded on the model, and be the same load (read only once known alive)
+                    if (model.loras.count(entry.adapter) == 0 || entry.adapter->serial != entry.serial) {
+                        return "an adapter a sequence of this batch names was freed; name its set again";
+                    }
                 }
             }
         }
@@ -172,13 +180,25 @@ uint32_t llama_context::seq_adapters_max_nodes() const {
     if (seq_adapters.by_seq.empty()) {
         return 0;
     }
-    // every group may wear every adapter, each delta adding the views of its rows and its add into them. Called by
-    // graph_max_nodes under its shared lock on model.loras_mutex (a second shared lock on one thread is undefined)
-    uint32_t per_set = 0;
-    for (const auto & lora : model.loras) {
-        per_set += lora->get_n_nodes() * 2u;
+    // what the named sets add, never what the model holds: a genome may hold many genes loaded while each mind wears a
+    // few, and the graph's budget follows the worn ones. Each worn adapter adds, per group, its delta (get_n_nodes) and
+    // the views and add into its rows (as many again). A set worn by several sequences is one group: counted once.
+    // Called by graph_max_nodes under its shared lock on model.loras_mutex (a second shared lock on one thread is
+    // undefined); an adapter freed since it was named is skipped (decode refuses it), never read.
+    uint32_t nodes = 0;
+    std::vector<const llama_adapter_set *> counted;
+    for (const auto & [seq, set] : seq_adapters.by_seq) {
+        if (std::any_of(counted.begin(), counted.end(), [&](const llama_adapter_set * other) { return *other == set; })) {
+            continue;
+        }
+        counted.push_back(&set);
+        for (const auto & entry : set.adapters) {
+            if (model.loras.count(entry.adapter) > 0 && entry.adapter->serial == entry.serial) {
+                nodes += entry.adapter->get_n_nodes() * 2u;
+            }
+        }
     }
-    return per_set * cparams.n_seq_max;
+    return nodes;
 }
 
 //
