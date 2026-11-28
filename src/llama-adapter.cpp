@@ -587,6 +587,7 @@ void llama_adapter_lora_free(llama_adapter_lora * adapter) {
     if (adapter->model != nullptr) {
         std::unique_lock<std::shared_mutex> lock(adapter->model->loras_mutex);
         adapter->model->loras.erase(adapter);
+        adapter->model->lora_frees.fetch_add(1, std::memory_order_release); // Continuum (llama-graph-slots.h)
         adapter->model = nullptr;
     }
 

@@ -127,6 +127,14 @@ ggml_tensor * llama_route_experts(const llm_graph_context & graph, int32_t il, g
 
 // ---- the context ----
 
+// The most tokens a graph of this context is built for: a ubatch, rounded up to a multiple of the sequences as
+// graph_reserve rounds it (three streams reserve 2049 of a 2048 ubatch; the M5, 2026-11-28 06:32Z aborted at the
+// capture's bound on exactly that).
+static int64_t capture_rows(const llama_cparams & cparams) {
+    const int64_t seqs = std::max<int64_t>(1, cparams.n_seq_max);
+    return ((int64_t) cparams.n_ubatch + seqs - 1) / seqs * seqs;
+}
+
 llama_routing_capture llama_context::set_routing_capture(bool on) {
     const auto & hp = model.hparams;
     if (on && hp.n_expert == 0) {
@@ -145,7 +153,7 @@ llama_routing_capture llama_context::set_routing_capture(bool on) {
         ggml_init_params params = { /*.mem_size =*/ ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
         lived_routing.capture_ctx.reset(ggml_init(params));
         lived_routing.capture_dev = ggml_new_tensor_2d(lived_routing.capture_ctx.get(), GGML_TYPE_I32, lived_routing.n_used,
-                                                       (int64_t) lived_routing.n_layer * cparams.n_ubatch);
+                                                       (int64_t) lived_routing.n_layer * capture_rows(cparams));
         ggml_set_name(lived_routing.capture_dev, "lived_routing_capture");
         ggml_backend_dev_t dev = model.dev_output();
         auto * buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
@@ -290,6 +298,7 @@ void llama_context::drop_reusable_graphs() {
         res->reset();
     }
     gf_res_prev_active = nullptr;
+    graph_slots_forget(); // Continuum: each mind's kept graph too (llama-graph-slots.cpp)
 }
 
 // ---- the API ----

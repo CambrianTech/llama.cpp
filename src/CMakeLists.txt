@@ -20,6 +20,7 @@ set(LLAMA_CORE_SOURCES
     llama-context-api.cpp
     llama-persona-file.cpp
     llama-context-opt.cpp
+    llama-graph-slots.cpp
     llama-context-opt-measure.cpp
     llama-context-learn.cpp
     llama-context-learn-tiles.cpp
