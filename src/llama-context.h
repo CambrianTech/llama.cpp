@@ -558,6 +558,7 @@ private:
     sched_params sched_params_cur;
 
     bool sched_need_reserve = true;
+    size_t sched_max_nodes = 0; // Continuum: the node budget the scheduler was reserved for (set_adapters_lora)
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
