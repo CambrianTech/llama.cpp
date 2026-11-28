@@ -247,12 +247,22 @@ struct llama_context {
     bool set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids);
     bool pin_lived(llama_seq_id seq, llama_pos pos0, int32_t n_pos);
     void clear_pin();
+    bool routing_capture_alloc(int64_t rows);  // the capture buffer for `rows` tokens a graph
+    void routing_capture_fit(uint32_t n_tokens); // grown before a larger graph is built
     void routing_queue(const llm_graph_result * res, const llama_ubatch & ubatch); // after a serving ubatch computes
     void routing_settle();                                                         // at synchronize
     void drop_reusable_graphs(); // no cached graph is reused across a change it cannot see
     void set_graph_slots(size_t n);    // each mind's decode graph kept across a switch (llama-graph-slots.cpp)
     size_t graph_slots_bytes() const;
     void set_graph_slot_key(llama_seq_id seq, uint64_t key);
+    // Continuum: each sequence's own adapter set (llama-adapter-seq.cpp)
+    int32_t set_seq_adapters_lora(llama_seq_id seq, llama_adapter_lora ** adapters, size_t n_adapters, const float * scales);
+    void clear_seq_adapters_lora(llama_seq_id seq);
+    llama_adapter_set seq_adapters_context_set() const;
+    bool seq_adapters_refuse(const llama_batch_ext & batch) const;
+    void seq_adapters_graph_params(llm_graph_params & params, const llama_ubatch & ubatch) const;
+    uint32_t seq_adapters_max_nodes() const;
+    llama_adapter_seq_sets seq_adapters;
     bool set_output_ring(bool on);       // Continuum: each decode's outputs readable by ticket (llama-output-ring.cpp)
     int64_t output_ticket() const;
     float * ticket_logits(int64_t ticket, int32_t j);

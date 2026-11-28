@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-adapter-seq.h" // Continuum
 
 #include <cstdint>
 #include <cstdlib>
@@ -915,6 +916,8 @@ struct llm_graph_params {
     // the physical attention stream of each of the ubatch's unique sequences (seq_id_unq order): the graph's K/V
     // views are built at these streams, so a graph is reused only when they match
     std::vector<uint32_t> streams = {};
+    // the ubatch's rows grouped by the adapter set each sequence wears (llama-adapter-seq.h); empty: the context's set
+    llama_adapter_seq_groups seq_groups = {};
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -999,6 +1002,7 @@ struct llm_graph_params {
             cparams.training == other.cparams.training && // Continuum: a training graph and its shadow
             shadow == other.shadow &&
             n_shadow_rows == other.n_shadow_rows &&
+            seq_groups == other.seq_groups && // Continuum (llama-adapter-seq.h)
             cross == other.cross;
     }
 };
@@ -1206,6 +1210,7 @@ struct llm_graph_context {
     // Continuum (llama-graph-train.cpp)
     const llama_adapter_lora     * shadow;
     const uint32_t                 n_shadow_rows;
+    const llama_adapter_seq_groups seq_groups; // Continuum (llama-adapter-seq.cpp)
     mutable ggml_tensor * inp_train_rows = nullptr; // build_inp_train_rows, once per graph
     mutable llm_graph_input_training_rows * inp_training_rows = nullptr;
     // the in-place training attention's K/V grad sinks (tap k, chunk k, tap v, chunk v), set by
@@ -1599,6 +1604,17 @@ struct llm_graph_context {
     // whether an attached adapter's term is in this graph: every one but the shadow always, the
     // shadow only when the ubatch has labelled rows
     bool lora_on(const llama_adapter_lora * adapter) const;
+
+    // Continuum: each sequence's own adapter set (llama-adapter-seq.cpp). Where any row's sequence names one, these
+    // replace upstream's loop over the context's set in build_lora_mm, build_lora_mm_id and the token embedding: each
+    // group's adapters add to its own rows, and the training shadow to the labelled rows
+    ggml_tensor * seq_lora_mm(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * out) const;
+    ggml_tensor * seq_lora_mm_id(ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * out) const;
+    ggml_tensor * seq_lora_embd(ggml_tensor * tok_embd, ggml_tensor * ids, ggml_tensor * cur) const;
+    template <typename Term>
+    ggml_tensor * seq_lora_apply(ggml_tensor * res, ggml_tensor * w, int d, int64_t rows, Term term) const;
+    ggml_tensor * seq_rows_add(ggml_tensor * base, ggml_tensor * term, const std::vector<int32_t> & listed, int64_t rows) const;
+    const llama_adapter_seq_rows & seq_rows_of(const llama_adapter_seq_group & group, int64_t rows) const;
     // base plus the shadow's term, on the labelled rows only (Cormac, 2026-10-14): those rows of
     // base and of the term are gathered and added, and written back into a copy of base; every
     // other row is base, byte for byte. A multiplied 0/1 mask was not: an untrained layer's inf or

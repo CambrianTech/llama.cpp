@@ -1732,6 +1732,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     shadow           (params.shadow), // Continuum
     n_shadow_rows    (params.n_shadow_rows),
+    seq_groups       (params.seq_groups), // Continuum
     hdmd             (model.hdmd.rot.empty() ? nullptr : &model.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
     layer_inp_src    (params.layer_inp_src),
@@ -1844,6 +1845,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_mul(ctx0, res, w_s);
     }
 
+    if (!seq_groups.empty()) { return seq_lora_mm(w, cur, res); } // Continuum: each sequence's set (llama-adapter-seq.cpp)
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr || !lora_on(lora.first)) {
@@ -1932,6 +1934,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         s = ggml_get_rows(ctx0, s, ids);
         res = ggml_mul(ctx0, res, s);
     }
+    if (!seq_groups.empty()) { return seq_lora_mm_id(w, cur, ids, res); } // Continuum: each sequence's set (llama-adapter-seq.cpp)
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr || !lora_on(lora.first)) {
@@ -2824,6 +2827,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
         }
 
         // apply lora for embedding tokens if needed
+        if (!seq_groups.empty()) { cur = seq_lora_embd(tok_embd, ids, cur); } else // Continuum: each sequence's set (llama-adapter-seq.cpp)
         for (const auto & lora : *loras) {
             llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
             if (lw == nullptr || !lora_on(lora.first)) {

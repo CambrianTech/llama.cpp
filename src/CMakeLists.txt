@@ -21,6 +21,7 @@ set(LLAMA_CORE_SOURCES
     llama-persona-file.cpp
     llama-context-opt.cpp
     llama-graph-slots.cpp
+    llama-adapter-seq.cpp
     llama-output-ring.cpp
     llama-context-opt-measure.cpp
     llama-context-learn.cpp

@@ -143,33 +143,64 @@ llama_routing_capture llama_context::set_routing_capture(bool on) {
     if (on && hp.n_expert > (uint32_t) llama_lived_routing::MAX_EXPERTS) {
         return LLAMA_ROUTING_CAPTURE_TOO_MANY;
     }
-    synchronize(); // nothing queued reads the buffer this replaces
-    lived_routing.capture_dev = nullptr;
-    lived_routing.capture_buf.reset();
-    lived_routing.capture_ctx.reset();
     lived_routing.n_layer = (int32_t) hp.n_layer();
     lived_routing.n_used  = (int32_t) hp.n_expert_used();
-    if (on) {
-        ggml_init_params params = { /*.mem_size =*/ ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
-        lived_routing.capture_ctx.reset(ggml_init(params));
-        lived_routing.capture_dev = ggml_new_tensor_2d(lived_routing.capture_ctx.get(), GGML_TYPE_I32, lived_routing.n_used,
-                                                       (int64_t) lived_routing.n_layer * capture_rows(cparams));
-        ggml_set_name(lived_routing.capture_dev, "lived_routing_capture");
-        ggml_backend_dev_t dev = model.dev_output();
-        auto * buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
-        lived_routing.capture_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(lived_routing.capture_ctx.get(), buft));
-        if (!lived_routing.capture_buf) {
-            lived_routing.capture_dev = nullptr;
-            lived_routing.capture_ctx.reset();
-            lived_routing.capture = false;
-            cparams.lived_routing = lived_routing.pin_n > 0 ? &lived_routing : nullptr;
-            return LLAMA_ROUTING_CAPTURE_NO_ROOM;
-        }
+    if (!routing_capture_alloc(on ? capture_rows(cparams) : 0)) {
+        return LLAMA_ROUTING_CAPTURE_NO_ROOM;
     }
     lived_routing.capture = on;
     cparams.lived_routing = (on || lived_routing.pin_n > 0) ? &lived_routing : nullptr;
     drop_reusable_graphs(); // a graph built the other way registers (or not) what this one needs
     return on ? LLAMA_ROUTING_CAPTURE_RECORDING : LLAMA_ROUTING_CAPTURE_OFF;
+}
+
+// The capture buffer for `rows` tokens a graph (none for 0), replacing any it held; false, with capture off and no
+// buffer, when the device has no room for it.
+bool llama_context::routing_capture_alloc(int64_t rows) {
+    synchronize(); // nothing queued reads the buffer this replaces
+    lived_routing.capture_dev = nullptr;
+    lived_routing.capture_buf.reset();
+    lived_routing.capture_ctx.reset();
+    if (rows == 0) {
+        return true;
+    }
+    ggml_init_params params = { /*.mem_size =*/ ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    lived_routing.capture_ctx.reset(ggml_init(params));
+    lived_routing.capture_dev = ggml_new_tensor_2d(lived_routing.capture_ctx.get(), GGML_TYPE_I32, lived_routing.n_used,
+                                                   (int64_t) lived_routing.n_layer * rows);
+    ggml_set_name(lived_routing.capture_dev, "lived_routing_capture");
+    ggml_backend_dev_t dev = model.dev_output();
+    auto * buft = dev ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+    lived_routing.capture_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(lived_routing.capture_ctx.get(), buft));
+    if (!lived_routing.capture_buf) {
+        lived_routing.capture_dev = nullptr;
+        lived_routing.capture_ctx.reset();
+        lived_routing.capture = false;
+        cparams.lived_routing = lived_routing.pin_n > 0 ? &lived_routing : nullptr;
+        return false;
+    }
+    return true;
+}
+
+// Before a graph of `n_tokens` is built: the capture holds its rows. A context builds graphs larger than its ubatch
+// (a lesson decodes a whole reply in one graph, raising n_ubatch for it, and a scheduler re-reserved then reserves at
+// that size), so the capture grows to the largest graph it serves instead of aborting at its bound (the M5,
+// 2026-11-28 14:08Z: 82 aborts, a stream naming her genes re-reserved the scheduler beside a lesson). A capture the
+// device has no room to grow turns off by name: serving goes on, and the lessons that need it are refused.
+void llama_context::routing_capture_fit(uint32_t n_tokens) {
+    if (!lived_routing.capture || lived_routing.capture_dev == nullptr) {
+        return;
+    }
+    const int64_t held = lived_routing.capture_dev->ne[1] / lived_routing.n_layer;
+    if ((int64_t) n_tokens <= held) {
+        return;
+    }
+    const int64_t seqs = std::max<int64_t>(1, cparams.n_seq_max);
+    const int64_t rows = ((int64_t) n_tokens + seqs - 1) / seqs * seqs;
+    const bool grown = routing_capture_alloc(rows);
+    LLAMA_LOG_INFO("%s: the routing capture %s from %lld to %lld rows a graph\n", __func__, grown ? "grew" : "could not grow, so it is off,",
+                   (long long) held, (long long) rows);
+    drop_reusable_graphs(); // every kept graph views the buffer this replaced
 }
 
 bool llama_context::set_pinned_experts(llama_seq_id seq, int32_t n_layer, int32_t n_used, llama_pos pos0, int32_t n_pos, const int32_t * ids) {

@@ -60,6 +60,8 @@ struct llama_adapter_lora_weight {
     llama_adapter_lora_weight(ggml_tensor * a, ggml_tensor * b) : a(a), b(b) {}
 };
 
+uint64_t llama_adapter_lora_next_serial(); // Continuum (llama-adapter-seq.cpp)
+
 struct llama_adapter_lora {
     llama_model * model = nullptr;
 
@@ -75,6 +77,9 @@ struct llama_adapter_lora {
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
+
+    // Continuum: which load of an adapter this is, so an address freed and reused is another adapter (llama-adapter-seq.h)
+    const uint64_t serial = llama_adapter_lora_next_serial();
 
     // activated lora (aLoRA)
     std::vector<llama_token> alora_invocation_tokens;
