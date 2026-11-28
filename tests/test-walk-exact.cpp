@@ -505,6 +505,63 @@ static void routing_capture_bench(const common_params & params, llama_model * mo
     }
     llama_free(ctx);
 }
+// WALK_ADAPTER_SWITCH_BENCH: what changing the adapter set costs a decode. Residents switch every few
+// tokens and each carries her own genes, so the set changes at most switches. One context at the
+// serving shape (n_ubatch 2048, flash attention, Q4_0 K/V), a prefill, then single-token decodes: the
+// set held fixed, then alternating between two sets every token. Each arm reports ms per token.
+static void adapter_switch_bench(const common_params & params, llama_model * model, const std::string & init,
+                                 const std::vector<llama_token> & tokens) {
+    const uint32_t n_prompt = 512, n_gen = 64;
+    llama_adapter_lora * a = llama_adapter_lora_init(model, init.c_str());
+    llama_adapter_lora * b = llama_adapter_lora_init(model, init.c_str());
+    GGML_ASSERT(a != nullptr && b != nullptr);
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_ctx           = n_prompt + 3 * n_gen + 8;
+    cparams.n_batch         = 2048;
+    cparams.n_ubatch        = 2048;
+    cparams.kv_unified      = true;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cparams.type_k          = GGML_TYPE_Q4_0;
+    cparams.type_v          = GGML_TYPE_Q4_0;
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    GGML_ASSERT(ctx != nullptr);
+    float one = 1.0f;
+    GGML_ASSERT(llama_set_adapters_lora(ctx, &a, 1, &one) == 0);
+    llama_batch batch = llama_batch_init((int32_t) n_prompt, 0, 1);
+    auto put = [&](uint32_t k, llama_token t, llama_pos p, bool out) {
+        batch.token[k] = t; batch.pos[k] = p; batch.n_seq_id[k] = 1; batch.seq_id[k][0] = 0; batch.logits[k] = out;
+    };
+    for (uint32_t i = 0; i < n_prompt; ++i) {
+        put(i, tokens[i], (llama_pos) i, i + 1 == n_prompt);
+    }
+    batch.n_tokens = (int32_t) n_prompt;
+    GGML_ASSERT(llama_decode(ctx, batch) == 0);
+    (void) llama_get_logits_ith(ctx, -1);
+    llama_pos pos = (llama_pos) n_prompt;
+    auto arm = [&](bool alternate) {
+        const int64_t t0 = ggml_time_us();
+        for (uint32_t g = 0; g < n_gen; ++g) {
+            if (alternate) { // a mind with genes, then one without, as residents alternate (genes=3 / genes=0 live)
+                llama_adapter_lora * set = g % 2 ? a : b;
+                GGML_ASSERT(llama_set_adapters_lora(ctx, g % 3 == 0 ? nullptr : &set, g % 3 == 0 ? 0 : 1, &one) == 0);
+            }
+            put(0, tokens[(size_t) pos % tokens.size()], pos, true);
+            batch.n_tokens = 1;
+            GGML_ASSERT(llama_decode(ctx, batch) == 0);
+            (void) llama_get_logits_ith(ctx, -1);
+            ++pos;
+        }
+        return (double) (ggml_time_us() - t0) / 1000.0 / n_gen;
+    };
+    const double fixed  = arm(false);
+    const double change = arm(true);
+    const double again  = arm(false);
+    printf("  adapter switch bench: %.2f ms/token with the set fixed, %.2f alternating every token, %.2f fixed again\n", fixed, change, again);
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_adapter_lora_free(a);
+    llama_adapter_lora_free(b);
+}
 // one SGD step from the fresh adapter: the step itself, -lr * the gradient it took
 static std::vector<float> step_delta(const common_params & params, llama_model * model, const std::string & init,
                                      const std::vector<llama_token> & tokens, const std::vector<uint8_t> & labelled,
@@ -974,6 +1031,13 @@ int main(int argc, char ** argv) {
     // walk, or routing flips between row shapes? Both are measured: each graph routing for itself, then
     // both replaying the routing the window was served with. If pinning restores agreement, routing
     // was the cause, and the walk replays the lived routing by design.
+    if (getenv("WALK_ADAPTER_SWITCH_BENCH")) {
+        adapter_switch_bench(params, model, init, tokens);
+        std::remove(init.c_str());
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
     if (getenv("WALK_ROUTING_BENCH")) {
         routing_capture_bench(params, model, tokens);
         std::remove(init.c_str());

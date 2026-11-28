@@ -809,6 +809,7 @@ void llama_context::sched_reserve() {
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes();
+    sched_max_nodes = max_nodes; // Continuum
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -1786,7 +1787,12 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
         }
     }
 
-    sched_need_reserve = true;
+    // Continuum: a new set only rebuilds the graph (no cached graph is reused across sets, and the allocator grows
+    // its buffers when a graph needs more). Re-reserving the scheduler on every change drained the GPU, dropped
+    // every mind's cached graphs and built a new scheduler: 6.6 ms per change on the M5's 35B, where residents
+    // with and without genes alternate every few tokens (2026-11-28). Re-reserve only when the set's nodes could
+    // exceed the budget the scheduler was made for.
+    sched_need_reserve = sched_need_reserve || graph_max_nodes() > sched_max_nodes;
 }
 
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
