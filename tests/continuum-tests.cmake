@@ -59,6 +59,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # the exact walk trains on the window's whole gradient whatever the chunking: run on a pure-attention AND a
     # hybrid model (-m), on a GPU backend as well as the CPU (a hybrid passed on the CPU while Metal tore its state)
     llama_build(test-walk-exact.cpp)
+    llama_build(test-graph-slots.cpp)
     llama_build_and_test(test-server-tokens-range.cpp)
     target_include_directories(test-server-tokens-range PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)
     target_link_libraries(test-server-tokens-range PRIVATE server-context)

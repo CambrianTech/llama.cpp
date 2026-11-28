@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
 #include "llama-lived-routing.h"
+#include "llama-graph-slots.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -248,6 +249,9 @@ struct llama_context {
     void routing_queue(const llm_graph_result * res, const llama_ubatch & ubatch); // after a serving ubatch computes
     void routing_settle();                                                         // at synchronize
     void drop_reusable_graphs(); // no cached graph is reused across a change it cannot see
+    void set_graph_slots(size_t n);    // each mind's decode graph kept across a switch (llama-graph-slots.cpp)
+    size_t graph_slots_bytes() const;
+    void set_graph_slot_key(llama_seq_id seq, uint64_t key);
     llama_lived_routing lived_routing;
     struct routing_pending {
         std::vector<std::vector<llama_seq_id>> seqs; // per ubatch row
@@ -559,6 +563,20 @@ private:
 
     bool sched_need_reserve = true;
     size_t sched_max_nodes = 0; // Continuum: the node budget the scheduler was reserved for (set_adapters_lora)
+
+    // Continuum: the minds' decode schedulers, swapped in for a step (llama-graph-slots.cpp)
+    llama_graph_slots graph_slots;
+    void graph_slot_swap(llama_graph_slot & slot);
+    void graph_slot_enter(const llama_ubatch & ubatch);
+    void graph_slot_leave();
+    void graph_slots_drop();
+    void graph_slots_forget();
+    void graph_slots_breakdown(std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> & ret, ggml_backend_t backend) const;
+    struct graph_slot_scope { // slots serve decode() only, and never outlive it
+        llama_context & ctx;
+        explicit graph_slot_scope(llama_context & c) : ctx(c) { ctx.graph_slots.in_decode = true; }
+        ~graph_slot_scope() { ctx.graph_slot_leave(); ctx.graph_slots.in_decode = false; }
+    };
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

@@ -2226,6 +2226,21 @@ extern "C" {
     // Pin a span from what serving recorded; false, pinning nothing, when a position was never served.
     LLAMA_API bool llama_pin_lived_routing(struct llama_context * ctx, llama_seq_id seq, llama_pos pos0, int32_t n_pos);
 
+    // Keep each mind's decode graph built and allocated across a switch to another (Continuum): up to
+    // `n` decode steps of one token per sequence, each keyed by its sequences and adapter set, keep
+    // their own scheduler and graph, so a mind returning to the engine reuses its graph instead of
+    // rebuilding, re-splitting and re-allocating it. The owner sets n from the minds it keeps
+    // resident; 0 (the default) keeps none. Call between decodes.
+    LLAMA_API void llama_set_graph_slots(struct llama_context * ctx, size_t n);
+
+    // The compute buffer bytes the kept graphs hold beside the context's own.
+    LLAMA_API size_t llama_graph_slots_bytes(const struct llama_context * ctx);
+
+    // Name whom sequence `seq` serves (Continuum): her steps keep their graph in her own slot, so a
+    // mind returning to a stream another mind used finds hers, and a change of her shape rebuilds only
+    // hers. Name her when she is bound to the sequence; an unnamed sequence is keyed by its id.
+    LLAMA_API void llama_set_graph_slot_key(struct llama_context * ctx, llama_seq_id seq, uint64_t key);
+
     // The bytes the lived-routing table holds, for the owner of this context's memory.
     LLAMA_API size_t llama_lived_routing_bytes(const struct llama_context * ctx);
 

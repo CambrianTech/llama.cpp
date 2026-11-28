@@ -8,6 +8,7 @@
 #include "llama-vocab.h"
 
 #include <map>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -1008,6 +1009,7 @@ struct llama_model {
     // guards `loras`: an adapter can be loaded or freed on one thread (e.g. a training context
     // in llama-server /train) while another context on the same model sizes its graph from it
     mutable std::shared_mutex loras_mutex;
+    std::atomic<uint64_t> lora_frees{0}; // Continuum: adapters freed so far; a kept graph made before one is dropped (llama-graph-slots.h)
 
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;

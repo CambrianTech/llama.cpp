@@ -810,6 +810,7 @@ void llama_context::sched_reserve() {
 
     const size_t max_nodes = this->graph_max_nodes();
     sched_max_nodes = max_nodes; // Continuum
+    graph_slots_drop(); // Continuum: every slot was made for the scheduler being replaced (llama-graph-slots.cpp)
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -1079,6 +1080,7 @@ bool llama_context::memory_update(bool optimize) {
         }
         gf_res_prev_active = nullptr;
 
+        graph_slots_forget(); // Continuum (llama-graph-slots.cpp)
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
         }
@@ -1846,6 +1848,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    graph_slot_enter(ubatch); // Continuum: this mind's own slot, where her kept graph is (llama-graph-slots.cpp)
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -2390,6 +2393,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         ggml_backend_event_wait(h_nextn_backend, ev_h_nextn_read.get());
     }
 
+    graph_slot_scope slot_scope{*this}; // Continuum: slots serve this decode only; the context's own scheduler is back when it returns
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -4185,6 +4189,7 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             reported.push_back(buft);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
             opt_breakdown_serving(ret, backend); // Continuum
+            graph_slots_breakdown(ret, backend); // Continuum (llama-graph-slots.cpp)
         }
     }
     return ret;

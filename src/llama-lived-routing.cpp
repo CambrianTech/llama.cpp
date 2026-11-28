@@ -290,6 +290,7 @@ void llama_context::drop_reusable_graphs() {
         res->reset();
     }
     gf_res_prev_active = nullptr;
+    graph_slots_forget(); // Continuum: each mind's kept graph too (llama-graph-slots.cpp)
 }
 
 // ---- the API ----
