@@ -409,6 +409,11 @@ extern "C" {
     GGML_API bool ggml_backend_sched_alloc_graph_admitted(ggml_backend_sched_t sched, struct ggml_cgraph * graph,
             const size_t * max_new, size_t * sizes, ggml_backend_sched_allocation_callback callback, void * user_data);
     GGML_API bool                 ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const size_t * max_new, size_t * sizes); // returns success
+    // Continuum: a scheduler of one copy that orders its split inputs by its own events instead of waiting for its
+    // backends to drain, so a graph of its own can be queued behind other work still on the device (a mind's graph
+    // slot, queued while another mind's step computes). False when no backend of it records events (each such backend
+    // keeps its drain).
+    GGML_API bool                 ggml_backend_sched_use_events(ggml_backend_sched_t sched);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);

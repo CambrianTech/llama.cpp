@@ -2346,6 +2346,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // reserve output buffer (none for outputs that only feed a training loss)
     const bool host_outputs = opt_host_outputs(); // Continuum
+    output_ring_swap(); // Continuum: the latest decode's outputs stay readable while this one writes (llama-output-ring.cpp)
     if (output_reserve(host_outputs ? n_outputs_all : 0) < (host_outputs ? n_outputs_all : 0)) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
@@ -2612,6 +2613,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = host_outputs ? n_outputs_all : 0;
+    output_ring_record(); // Continuum: this decode's outputs readable by its ticket once they land (llama-output-ring.cpp)
 
     // set output mappings
     if (n_outputs > 0) {

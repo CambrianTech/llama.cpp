@@ -3301,6 +3301,25 @@ bool ggml_backend_sched_alloc_graph_admitted(ggml_backend_sched_t sched, struct 
     return true;
 }
 
+// Continuum (ggml-backend.h): events for a scheduler of one copy. Each split input then waits for this scheduler's
+// own last use of its backend, never for everything queued on the device; with one copy that use is this
+// scheduler's previous graph.
+bool ggml_backend_sched_use_events(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (sched->n_copies > 1) {
+        return true; // a pipeline-parallel scheduler has them already
+    }
+    // a backend whose device records none (the CPU) keeps its drain: it runs synchronously anyway
+    bool any = false;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->events[b][0] == NULL) {
+            sched->events[b][0] = ggml_backend_event_new(sched->backends[b]->device);
+        }
+        any = any || sched->events[b][0] != NULL;
+    }
+    return any;
+}
+
 bool ggml_backend_sched_alloc_graph_within(ggml_backend_sched_t sched, struct ggml_cgraph * graph,
         const size_t * max_new, size_t * sizes) {
     return ggml_backend_sched_alloc_graph_admitted(sched, graph, max_new, sizes, nullptr, nullptr);

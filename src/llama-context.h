@@ -10,6 +10,7 @@
 #include "llama-moe-cache.h"
 #include "llama-lived-routing.h"
 #include "llama-graph-slots.h"
+#include "llama-output-ring.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -252,6 +253,9 @@ struct llama_context {
     void set_graph_slots(size_t n);    // each mind's decode graph kept across a switch (llama-graph-slots.cpp)
     size_t graph_slots_bytes() const;
     void set_graph_slot_key(llama_seq_id seq, uint64_t key);
+    bool set_output_ring(bool on);       // Continuum: each decode's outputs readable by ticket (llama-output-ring.cpp)
+    int64_t output_ticket() const;
+    float * ticket_logits(int64_t ticket, int32_t j);
     llama_lived_routing lived_routing;
     struct routing_pending {
         std::vector<std::vector<llama_seq_id>> seqs; // per ubatch row
@@ -566,6 +570,9 @@ private:
 
     // Continuum: the minds' decode schedulers, swapped in for a step (llama-graph-slots.cpp)
     llama_graph_slots graph_slots;
+    llama_output_ring output_ring; // Continuum (llama-output-ring.cpp)
+    void output_ring_swap();
+    void output_ring_record();
     void graph_slot_swap(llama_graph_slot & slot);
     void graph_slot_enter(const llama_ubatch & ubatch);
     void graph_slot_leave();
