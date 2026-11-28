@@ -168,6 +168,34 @@ int main(int argc, char ** argv) {
     const std::vector<llama_token> tokens = common_tokenize(llama_model_get_vocab(model), text, true, false);
     GGML_ASSERT(tokens.size() > 2048);
 
+    // what this catches (the M5, 2026-11-28 06:32Z): a context whose streams do not divide its ubatch (three of 2048)
+    // reserves a graph rounded up past the ubatch (2049), and the routing capture sized for exactly the ubatch aborted
+    // at its bound in sched_reserve, before any decode
+    {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max  = 3;
+        cparams.n_ctx      = 3 * 2048;
+        cparams.n_batch    = 2048;
+        cparams.n_ubatch   = 2048;
+        cparams.kv_unified = false;
+        llama_context * ctx = llama_init_from_model(model, cparams);
+        GGML_ASSERT(ctx != nullptr);
+        const auto capture = llama_set_routing_capture(ctx, true);
+        GGML_ASSERT(capture == LLAMA_ROUTING_CAPTURE_RECORDING || capture == LLAMA_ROUTING_CAPTURE_NO_EXPERTS);
+        // a setting changed after the capture is on: the decode re-reserves its graphs with the capture in them, as
+        // serving's does (the abort's path: decode, sched_reserve, graph_reserve)
+        llama_set_embeddings(ctx, true);
+        llama_batch_ext * batch = llama_batch_ext_init(ctx);
+        GGML_ASSERT(batch != nullptr);
+        const llama_pos at = 0;
+        const int32_t i = llama_batch_ext_add_token(batch, 0, tokens[0]);
+        GGML_ASSERT(i >= 0 && llama_batch_ext_set_pos(batch, i, &at) && llama_batch_ext_set_output_logits(batch, i, true));
+        GGML_ASSERT(llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch) == 0);
+        llama_batch_ext_free(batch);
+        llama_free(ctx);
+        printf("graph-slots: three streams reserve and decode with routing captured\n");
+    }
+
     bool ok = true;
     for (const bool one_stream : { false, true }) {
         const arm_result rebuilt = run_arm(params, model, tokens, a, b, 0, one_stream);
